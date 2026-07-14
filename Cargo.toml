@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ash-core",
+    "crates/ash-protocol",
+    "crates/ash-tools",
+    "crates/ash-agent",
+    "crates/ash-orchestrator",
+    "crates/ash-tui",
+    "crates/ash-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal
+ash-core = { path = "crates/ash-core" }
+ash-protocol = { path = "crates/ash-protocol" }
+ash-tools = { path = "crates/ash-tools" }
+ash-agent = { path = "crates/ash-agent" }
+ash-orchestrator = { path = "crates/ash-orchestrator" }
+ash-tui = { path = "crates/ash-tui" }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-stream = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest-eventsource = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI / TUI
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+owo-colors = "4"
+rustyline = "15"
+unicode-width = "0.2.1"
+libc = "0.2"
+pulldown-cmark = "0.10"
+
+# Type system
+strum = { version = "0.26", features = ["derive"] }
+derive_more = { version = "1", features = ["display", "from", "into", "deref", "constructor"] }
+enum-as-inner = "0.6"
+schemars = "0.8"
+smart-default = "0.7"
+
+# Error
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Infrastructure
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
+directories = "6"
+config = "0.14"
+dotenvy = "0.15"
+async-trait = "0.1"
+
+# Tools
+regex = "1"
+globset = "0.4"
+walkdir = "2"
+similar = "2"
+shell-words = "1"
+which = "7"
+tempfile = "3"
+base64 = "0.22"
+
+# MCP
+rmcp = { version = "0.1", features = ["client", "transport-io", "transport-child-process"] }
+
+# Token counting
+tiktoken-rs = "0.6"
+
+# Testing
+insta = { version = "1", features = ["json", "redactions"] }
+pretty_assertions = "1"
+
+[patch.crates-io]
+crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }

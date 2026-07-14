@@ -1,0 +1,22 @@
+[package]
+name = "ash-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+derive_more = { workspace = true }
+strum = { workspace = true }
+enum-as-inner = { workspace = true }
+schemars = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+secrecy = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

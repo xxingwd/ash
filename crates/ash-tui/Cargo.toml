@@ -1,0 +1,16 @@
+[package]
+name = "ash-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ash-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+libc = { workspace = true }
+pulldown-cmark = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

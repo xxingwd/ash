@@ -1,0 +1,16 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: msg
+---
+{
+  "id": "[uuid]",
+  "role": "User",
+  "content": {
+    "ToolResult": {
+      "id": "[uuid]",
+      "result": {
+        "Ok": "file1.txt\nfile2.txt"
+      }
+    }
+  }
+}

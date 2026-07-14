@@ -1,0 +1,20 @@
+[package]
+name = "ash-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ash-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+globset = { workspace = true }
+walkdir = { workspace = true }
+similar = { workspace = true }
+shell-words = { workspace = true }
+which = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,16 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: msg
+---
+{
+  "id": "[uuid]",
+  "role": "User",
+  "content": {
+    "ToolResult": {
+      "id": "[uuid]",
+      "result": {
+        "Err": "command not found"
+      }
+    }
+  }
+}

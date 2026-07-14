@@ -1,0 +1,15 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: content
+---
+{
+  "Image": {
+    "media_type": "image/png",
+    "data": [
+      137,
+      80,
+      78,
+      71
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "ash-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ash"
+path = "src/main.rs"
+
+[dependencies]
+ash-core = { workspace = true }
+ash-protocol = { workspace = true }
+ash-tools = { workspace = true }
+ash-agent = { workspace = true }
+ash-orchestrator = { workspace = true }
+ash-tui = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+owo-colors = { workspace = true }
+directories = { workspace = true }
+config = { workspace = true }
+dotenvy = { workspace = true }
+secrecy = { workspace = true }

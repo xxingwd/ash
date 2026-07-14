@@ -1,0 +1,289 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlashCommand {
+    New,
+    Clear,
+    Resume,
+    Status,
+    Help,
+    Exit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ParsedInput<'a> {
+    Message(&'a str),
+    Command(SlashCommand),
+    Invalid(String),
+}
+
+#[derive(Clone, Copy)]
+struct CommandSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    description: &'static str,
+    command: SlashCommand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommandCompletion {
+    pub(crate) command: SlashCommand,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CommandCompletionState {
+    filter: Option<String>,
+    dismissed_filter: Option<String>,
+    items: Vec<CommandCompletion>,
+    selected: usize,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "new",
+        aliases: &[],
+        description: "start a new chat",
+        command: SlashCommand::New,
+    },
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        description: "start a new chat",
+        command: SlashCommand::Clear,
+    },
+    CommandSpec {
+        name: "resume",
+        aliases: &[],
+        description: "resume the most recently used saved chat",
+        command: SlashCommand::Resume,
+    },
+    CommandSpec {
+        name: "status",
+        aliases: &[],
+        description: "show the current session configuration",
+        command: SlashCommand::Status,
+    },
+    CommandSpec {
+        name: "help",
+        aliases: &["commands"],
+        description: "show available commands",
+        command: SlashCommand::Help,
+    },
+    CommandSpec {
+        name: "exit",
+        aliases: &["quit"],
+        description: "exit Ash",
+        command: SlashCommand::Exit,
+    },
+];
+
+impl SlashCommand {
+    pub(crate) fn available_during_task(self) -> bool {
+        matches!(self, Self::Exit)
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        COMMANDS
+            .iter()
+            .find(|spec| spec.command == self)
+            .map_or("command", |spec| spec.name)
+    }
+}
+
+pub(crate) fn parse(input: &str) -> ParsedInput<'_> {
+    let input = input.trim();
+    let Some(command_line) = input.strip_prefix('/') else {
+        return ParsedInput::Message(input);
+    };
+    let mut parts = command_line.split_whitespace();
+    let Some(name) = parts.next() else {
+        return ParsedInput::Invalid("enter a command after '/'".to_string());
+    };
+    if parts.next().is_some() {
+        return ParsedInput::Invalid(format!("/{name} does not accept arguments"));
+    }
+
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name == name || spec.aliases.contains(&name))
+        .map_or_else(
+            || ParsedInput::Invalid(format!("unknown command '/{name}'; use /help")),
+            |spec| ParsedInput::Command(spec.command),
+        )
+}
+
+pub(crate) fn help_text() -> String {
+    COMMANDS
+        .iter()
+        .map(|spec| format!("/{:<8} {}", spec.name, spec.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {
+    if !input.starts_with('/') || cursor > input.len() || !input.is_char_boundary(cursor) {
+        return None;
+    }
+    let token_end = input[1..]
+        .find(char::is_whitespace)
+        .map_or(input.len(), |index| index + 1);
+    if cursor > token_end {
+        return None;
+    }
+    Some(input[1..cursor.max(1)].to_ascii_lowercase())
+}
+
+fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
+    let mut exact = Vec::new();
+    let mut prefix = Vec::new();
+    for spec in COMMANDS
+        .iter()
+        .filter(|spec| !busy || spec.command.available_during_task())
+    {
+        let names = std::iter::once(spec.name).chain(spec.aliases.iter().copied());
+        let is_exact = names.clone().any(|name| name == filter);
+        let is_prefix = names.into_iter().any(|name| name.starts_with(filter));
+        let completion = CommandCompletion {
+            command: spec.command,
+            name: spec.name,
+            description: spec.description,
+        };
+        if is_exact {
+            exact.push(completion);
+        } else if is_prefix {
+            prefix.push(completion);
+        }
+    }
+    exact.extend(prefix);
+    exact
+}
+
+impl CommandCompletionState {
+    pub(crate) fn sync(&mut self, input: &str, cursor: usize, busy: bool) {
+        let filter = completion_filter(input, cursor);
+        if filter != self.filter {
+            self.filter.clone_from(&filter);
+            self.dismissed_filter = None;
+            self.selected = 0;
+        }
+        if filter.is_some() && filter == self.dismissed_filter {
+            self.items.clear();
+            return;
+        }
+        self.items = filter
+            .as_deref()
+            .map(|filter| completions(filter, busy))
+            .unwrap_or_default();
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.items.len() - 1);
+        }
+    }
+
+    pub(crate) fn items(&self) -> &[CommandCompletion] {
+        &self.items
+    }
+
+    pub(crate) fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn selected(&self) -> Option<CommandCompletion> {
+        self.items.get(self.selected).copied()
+    }
+
+    pub(crate) fn move_up(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.items.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    pub(crate) fn move_down(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
+    }
+
+    pub(crate) fn dismiss(&mut self) {
+        self.dismissed_filter.clone_from(&self.filter);
+        self.items.clear();
+        self.selected = 0;
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        !self.items.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_commands_and_aliases() {
+        assert_eq!(parse("/new"), ParsedInput::Command(SlashCommand::New));
+        assert_eq!(parse(" /quit "), ParsedInput::Command(SlashCommand::Exit));
+        assert_eq!(parse("/commands"), ParsedInput::Command(SlashCommand::Help));
+    }
+
+    #[test]
+    fn keeps_regular_messages_untouched() {
+        assert_eq!(parse("hello"), ParsedInput::Message("hello"));
+    }
+
+    #[test]
+    fn rejects_unknown_commands_and_arguments() {
+        assert!(matches!(parse("/missing"), ParsedInput::Invalid(_)));
+        assert!(matches!(parse("/new now"), ParsedInput::Invalid(_)));
+    }
+
+    #[test]
+    fn only_exit_is_available_during_a_task() {
+        assert!(SlashCommand::Exit.available_during_task());
+        assert!(!SlashCommand::New.available_during_task());
+        assert!(!SlashCommand::Clear.available_during_task());
+        assert!(!SlashCommand::Resume.available_during_task());
+    }
+
+    #[test]
+    fn completes_commands_by_name_and_alias_prefix() {
+        assert_eq!(
+            completions("cl", false),
+            vec![CommandCompletion {
+                command: SlashCommand::Clear,
+                name: "clear",
+                description: "start a new chat",
+            }]
+        );
+        assert_eq!(completions("q", false)[0].command, SlashCommand::Exit);
+    }
+
+    #[test]
+    fn completion_state_navigates_and_can_be_dismissed() {
+        let mut state = CommandCompletionState::default();
+        state.sync("/", 1, false);
+        assert_eq!(state.selected().unwrap().command, SlashCommand::New);
+        state.move_down();
+        assert_eq!(state.selected().unwrap().command, SlashCommand::Clear);
+        state.move_up();
+        assert_eq!(state.selected().unwrap().command, SlashCommand::New);
+        state.dismiss();
+        state.sync("/", 1, false);
+        assert!(!state.is_visible());
+        state.sync("/h", 2, false);
+        assert_eq!(state.selected().unwrap().command, SlashCommand::Help);
+    }
+
+    #[test]
+    fn busy_completion_only_shows_available_commands() {
+        let items = completions("", true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].command, SlashCommand::Exit);
+    }
+}

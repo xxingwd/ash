@@ -1,0 +1,28 @@
+[package]
+name = "ash-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ash-core = { workspace = true }
+ash-protocol = { workspace = true }
+ash-tools = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+async-trait = { workspace = true }
+smart-default = { workspace = true }
+rmcp = { workspace = true }
+tiktoken-rs = { workspace = true }
+
+[dev-dependencies]
+secrecy = { workspace = true }
+tempfile = { workspace = true }

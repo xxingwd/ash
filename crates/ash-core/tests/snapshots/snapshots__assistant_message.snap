@@ -1,0 +1,15 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: msg
+---
+{
+  "id": "[uuid]",
+  "role": "Assistant",
+  "content": {
+    "Assistant": [
+      {
+        "Text": "I can help with that."
+      }
+    ]
+  }
+}

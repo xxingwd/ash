@@ -1,0 +1,10 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: event
+---
+{
+  "Usage": {
+    "input_tokens": 100,
+    "output_tokens": 50
+  }
+}

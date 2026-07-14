@@ -1,0 +1,17 @@
+[package]
+name = "ash-orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ash-core = { workspace = true }
+ash-agent = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }

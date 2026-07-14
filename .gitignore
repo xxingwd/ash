@@ -1,0 +1,8 @@
+/target/
+/codex/
+/.env
+/.env.*
+!/.env.example
+/test
+*.local
+*.log
