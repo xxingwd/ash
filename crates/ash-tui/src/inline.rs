@@ -10,29 +10,32 @@ use crossterm::{
     cursor::{MoveTo, MoveToColumn, MoveToNextLine, MoveToPreviousLine, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
-    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color as CrosstermColor, ResetColor, SetAttribute, SetBackgroundColor,
+        SetForegroundColor,
+    },
     terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
+use ratatui::{
+    buffer::{Buffer, Cell},
+    style::{Color as RatatuiColor, Modifier},
+};
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    block_layout::{layout_stack, StackBoundary, StackFlow, StackItem},
     input::InputState,
     markdown::{render_markdown, RenderedLine, TextStyle},
     markdown_stream::MarkdownStream,
     scrollback::{sanitize_single_line, sanitize_terminal_text, wrap_text},
     slash_command::CommandCompletion,
-    status_line::{compact_path, fit_status_left},
     theme,
     tool_display::{tool_activity_summary, tool_call_summary},
+    viewport::{self, ViewportInput},
     welcome_card::{welcome_card, WelcomeStyle},
 };
 
-const STATUS_ROWS: u16 = 1;
-const TRANSCRIPT_STATUS_SPACING: u16 = 1;
-const STATUS_COMPOSER_SPACING: u16 = 1;
-const COMPOSER_ROWS: u16 = 3;
-const FOOTER_ROWS: u16 = 1;
 const STREAM_CATCH_UP_DEPTH: usize = 8;
 const STREAM_CATCH_UP_AGE: Duration = Duration::from_millis(120);
 const REASONING_VIEW_ROWS: usize = 4;
@@ -48,21 +51,6 @@ struct MarkdownBatch {
     kind: StreamKind,
     start: usize,
     lines: Vec<RenderedLine>,
-}
-
-struct ActiveViewport {
-    show_spacing: bool,
-    start: usize,
-    kind: StreamKind,
-    lines: Vec<RenderedLine>,
-}
-
-impl ActiveViewport {
-    fn rows(&self) -> u16 {
-        u16::try_from(self.lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(u16::from(self.show_spacing))
-    }
 }
 
 impl MarkdownBatch {
@@ -100,15 +88,17 @@ impl Default for PromptSnapshot {
 pub(crate) struct InlineTerminal {
     stdout: Stdout,
     input_background: String,
+    composer_background: Option<crate::palette::Rgb>,
     viewport_visible: bool,
     viewport_rows: u16,
     viewport_cursor_row: u16,
+    viewport_cursor_column: u16,
+    viewport_line_widths: Vec<u16>,
     frame_reusable_rows: u16,
     prompt_width: u16,
     rendered_input: String,
     prompt: PromptSnapshot,
-    has_emitted_history_cells: bool,
-    history_ends_with_spacing: bool,
+    history_boundary: StackBoundary,
     busy: bool,
     status_header: String,
     status_started_at: Option<Instant>,
@@ -138,21 +128,24 @@ pub(crate) struct InlineTerminal {
 impl InlineTerminal {
     pub fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let input_background = crate::palette::composer_background_escape();
+        let composer_background = crate::palette::composer_background_color();
+        let input_background = crate::palette::composer_background_escape(composer_background);
         let mut stdout = io::stdout();
         execute!(stdout, EnableBracketedPaste, Show)?;
         Ok(Self {
             stdout,
             input_background,
+            composer_background,
             viewport_visible: false,
             viewport_rows: 0,
             viewport_cursor_row: 0,
+            viewport_cursor_column: 0,
+            viewport_line_widths: Vec::new(),
             frame_reusable_rows: 0,
             prompt_width: 0,
             rendered_input: String::new(),
             prompt: PromptSnapshot::default(),
-            has_emitted_history_cells: false,
-            history_ends_with_spacing: false,
+            history_boundary: StackBoundary::default(),
             busy: false,
             status_header: String::new(),
             status_started_at: None,
@@ -192,14 +185,14 @@ impl InlineTerminal {
                 WelcomeStyle::Logo => {
                     queue!(
                         self.stdout,
-                        SetForegroundColor(Color::Cyan),
+                        SetForegroundColor(CrosstermColor::Cyan),
                         SetAttribute(Attribute::Bold)
                     )?;
                 }
                 WelcomeStyle::Title => {
                     queue!(
                         self.stdout,
-                        SetForegroundColor(Color::Cyan),
+                        SetForegroundColor(CrosstermColor::Cyan),
                         SetAttribute(Attribute::Bold)
                     )?;
                 }
@@ -212,8 +205,7 @@ impl InlineTerminal {
             queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
             write!(self.stdout, "\r\n")?;
         }
-        self.has_emitted_history_cells = true;
-        self.history_ends_with_spacing = false;
+        self.history_boundary = self.history_boundary.after_block();
         self.stdout.flush()
     }
 
@@ -259,8 +251,7 @@ impl InlineTerminal {
         })?;
         self.reset_inline_state();
         self.reset_session_history();
-        self.has_emitted_history_cells = false;
-        self.history_ends_with_spacing = false;
+        self.history_boundary = StackBoundary::default();
         self.welcome()
     }
 
@@ -270,6 +261,7 @@ impl InlineTerminal {
             .session_history_rows
             .saturating_sub(self.turn_history_rows);
         self.reset_inline_state();
+        self.history_boundary = StackBoundary::default().after_block();
         Ok(())
     }
 
@@ -326,7 +318,7 @@ impl InlineTerminal {
         working_dir: &Path,
     ) -> io::Result<()> {
         let terminal_width = terminal::size()?.0.max(1);
-        let view = input.view(terminal_width.saturating_sub(2));
+        let view = input.view(terminal_width.saturating_sub(3));
         self.prompt.protocol = protocol.to_string();
         self.prompt.model = model.to_string();
         self.prompt.working_dir = working_dir.to_path_buf();
@@ -340,9 +332,6 @@ impl InlineTerminal {
         let batches = self.take_pending_markdown();
         self.content_dirty = false;
         self.command_menu_dirty = false;
-        if batches.is_empty() && self.redraw_active_region()? {
-            return Ok(());
-        }
         self.replace_viewport(move |terminal| terminal.write_markdown_batches(&batches))
     }
 
@@ -450,14 +439,6 @@ impl InlineTerminal {
         })
     }
 
-    pub fn rollback_requested(&mut self) -> io::Result<()> {
-        self.pending_markdown_batches.clear();
-        self.pending_markdown_started_at = None;
-        self.content_dirty = false;
-        self.status_header = "Cancelling".to_string();
-        self.refresh_status()
-    }
-
     pub fn finish_response(&mut self) -> io::Result<()> {
         let width = self.markdown_width()?;
         let batches = self.take_pending_and_finalize(width);
@@ -495,9 +476,6 @@ impl InlineTerminal {
             self.pending_markdown_started_at = None;
         }
         self.content_dirty = false;
-        if batches.is_empty() && self.redraw_active_region()? {
-            return Ok(());
-        }
         self.replace_viewport(move |terminal| terminal.write_markdown_batches(&batches))
     }
 
@@ -505,8 +483,22 @@ impl InlineTerminal {
         self.queued_messages = queued_messages;
     }
 
-    pub fn mark_session_layout_uncertain(&mut self) {
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.session_overflowed = true;
+        if !self.viewport_visible {
+            return;
+        }
+
+        let (viewport_rows, viewport_cursor_row) = resize_reflow_geometry(
+            &self.viewport_line_widths,
+            self.viewport_cursor_row,
+            self.viewport_cursor_column,
+            width.max(1),
+            height.max(1),
+        );
+        self.viewport_rows = viewport_rows;
+        self.viewport_cursor_row = viewport_cursor_row;
+        self.prompt_width = 0;
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
@@ -514,33 +506,11 @@ impl InlineTerminal {
             return Ok(());
         }
         self.status_frame = self.status_frame.wrapping_add(1);
-        if !self.viewport_visible {
-            return self.replace_viewport(|_| Ok(()));
-        }
-
-        let width = terminal::size()?.0.max(1);
         if self.active_kind == Some(StreamKind::Reasoning) {
-            self.rebuild_reasoning_view(width.saturating_sub(2).max(1));
-            if !self.redraw_active_region()? {
-                return self.replace_viewport(|_| Ok(()));
-            }
+            let width = terminal::size()?.0.saturating_sub(2).max(1);
+            self.rebuild_reasoning_view(width);
         }
-        let cursor_column = 2 + self.prompt.cursor_column;
-        self.synchronized(|terminal| {
-            queue!(
-                terminal.stdout,
-                MoveToPreviousLine(STATUS_ROWS + STATUS_COMPOSER_SPACING + 1),
-                MoveToColumn(0),
-                Clear(ClearType::CurrentLine)
-            )?;
-            terminal.render_status(width)?;
-            queue!(
-                terminal.stdout,
-                MoveToNextLine(STATUS_ROWS + STATUS_COMPOSER_SPACING + 1),
-                MoveToColumn(cursor_column)
-            )?;
-            Ok(())
-        })
+        self.replace_viewport(|_| Ok(()))
     }
 
     pub fn leave_line(&mut self) -> io::Result<()> {
@@ -549,6 +519,8 @@ impl InlineTerminal {
             queue!(
                 terminal.stdout,
                 MoveToColumn(0),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
                 Clear(ClearType::CurrentLine)
             )?;
             Ok(())
@@ -662,6 +634,8 @@ impl InlineTerminal {
         self.viewport_visible = false;
         self.viewport_rows = 0;
         self.viewport_cursor_row = 0;
+        self.viewport_cursor_column = 0;
+        self.viewport_line_widths.clear();
         self.frame_reusable_rows = 0;
         self.prompt_width = 0;
         self.prompt.text.clear();
@@ -678,7 +652,6 @@ impl InlineTerminal {
         self.turn_active = false;
         self.turn_history_rows = 0;
         self.counting_history_rows = false;
-        self.history_ends_with_spacing = false;
         self.reset_streams();
     }
 
@@ -729,8 +702,9 @@ impl InlineTerminal {
             queue!(
                 self.stdout,
                 MoveToColumn(0),
-                Clear(ClearType::CurrentLine),
-                ResetColor
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Clear(ClearType::CurrentLine)
             )?;
             if row + 1 < self.viewport_rows {
                 queue!(self.stdout, MoveToNextLine(1))?;
@@ -767,8 +741,9 @@ impl InlineTerminal {
             queue!(
                 self.stdout,
                 MoveToColumn(0),
-                Clear(ClearType::CurrentLine),
-                ResetColor
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Clear(ClearType::CurrentLine)
             )?;
             if row + 1 < clear_rows {
                 queue!(self.stdout, MoveToNextLine(1))?;
@@ -799,74 +774,46 @@ impl InlineTerminal {
 
     fn render_viewport(&mut self, width: u16) -> io::Result<()> {
         let terminal_height = terminal::size()?.1;
-        let command_menu_rows = command_menu_rows(self.command_menu.len());
-        let base_rows = base_viewport_rows(self.busy, command_menu_rows);
-        let active = self.active_viewport(terminal_height, base_rows);
-        let desired_rows = active.rows().saturating_add(base_rows);
+        let elapsed = format_elapsed(
+            self.status_started_at
+                .map_or(0, |started| started.elapsed().as_secs()),
+        );
+        let status_header = sanitize_single_line(&self.status_header);
+        let queued = queued_status(self.queued_messages);
+        let model = sanitize_single_line(&self.prompt.model);
+        let protocol = sanitize_single_line(&self.prompt.protocol);
+        let frame = viewport::render(ViewportInput {
+            terminal_width: width,
+            terminal_height,
+            history_boundary: self.history_boundary,
+            busy: self.busy,
+            active_start: self.active_start,
+            active_lines: &self.active_lines,
+            status_header: &status_header,
+            status_dots: status_dots(self.status_frame),
+            elapsed: &elapsed,
+            queued: &queued,
+            prompt: &self.prompt.text,
+            prompt_cursor_column: self.prompt.cursor_column,
+            composer_background: self.composer_background,
+            command_menu: &self.command_menu,
+            command_menu_selected: self.command_menu_selected,
+            model: &model,
+            protocol: &protocol,
+            working_dir: &self.prompt.working_dir,
+        });
+        let desired_rows = frame.total_rows;
         if (self.session_start_width != 0 && self.session_start_width != width)
             || self.session_history_rows.saturating_add(desired_rows) > terminal_height
         {
             self.session_overflowed = true;
         }
-
-        if active.show_spacing {
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            self.next_frame_row()?;
-        }
-        for (index, line) in active.lines.iter().enumerate() {
-            self.write_markdown_line(active.kind, active.start + index, line)?;
-            self.next_frame_row()?;
-        }
-
-        queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        self.next_frame_row()?;
-
-        if self.busy {
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            self.render_status(width)?;
-            self.next_frame_row()?;
-
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            self.next_frame_row()?;
-        }
-
-        let background = self.input_background.clone();
-        self.fill_row(&background, width)?;
-        self.next_frame_row()?;
-
-        self.fill_row(&background, width)?;
-        queue!(self.stdout, MoveToColumn(0))?;
-        write!(
-            self.stdout,
-            "{background}{}›{}{background} {}{}",
-            theme::BOLD,
-            theme::RESET,
-            self.prompt.text,
-            theme::RESET
-        )?;
-        self.next_frame_row()?;
-
-        self.fill_row(&background, width)?;
-        self.next_frame_row()?;
-
-        if self.command_menu.is_empty() {
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            self.render_footer(width)?;
-        } else {
-            self.render_command_menu(width)?;
-        }
-
-        let rendered_active_rows = active.rows();
-        let status_area_rows = if self.busy {
-            STATUS_ROWS + STATUS_COMPOSER_SPACING
-        } else {
-            0
-        };
+        let line_widths = viewport_line_widths(&frame.buffer);
+        self.write_viewport_buffer(&frame.buffer)?;
         self.viewport_rows = desired_rows;
-        self.viewport_cursor_row = rendered_active_rows
-            .saturating_add(TRANSCRIPT_STATUS_SPACING)
-            .saturating_add(status_area_rows)
-            .saturating_add(1);
+        self.viewport_cursor_row = frame.cursor_row;
+        self.viewport_cursor_column = frame.cursor_column;
+        self.viewport_line_widths = line_widths;
         self.viewport_visible = true;
         self.prompt_width = width;
         self.rendered_input.clone_from(&self.prompt.text);
@@ -880,195 +827,133 @@ impl InlineTerminal {
                     .saturating_sub(1)
                     .saturating_sub(self.viewport_cursor_row)
             ),
-            MoveToColumn(2 + self.prompt.cursor_column)
+            MoveToColumn(frame.cursor_column)
         )
     }
 
-    fn active_viewport(&self, terminal_height: u16, base_rows: u16) -> ActiveViewport {
-        let available_active = usize::from(terminal_height.saturating_sub(base_rows));
-        let wants_spacing = !self.active_lines.is_empty() && self.active_start == 0;
-        let show_spacing =
-            wants_spacing && self.active_lines.len().saturating_add(1) <= available_active;
-        let max_active = available_active.saturating_sub(usize::from(show_spacing));
-        let skip = self.active_lines.len().saturating_sub(max_active);
-        ActiveViewport {
-            show_spacing,
-            start: self.active_start + skip,
-            kind: self.active_kind.unwrap_or(StreamKind::Assistant),
-            lines: self.active_lines[skip..].to_vec(),
-        }
-    }
-
-    fn redraw_active_region(&mut self) -> io::Result<bool> {
-        let terminal_width = terminal::size()?.0.max(1);
-        if !self.viewport_visible || self.prompt_width != terminal_width {
-            return Ok(false);
-        }
-        let terminal_height = terminal::size()?.1;
-        let command_menu_rows = command_menu_rows(self.command_menu.len());
-        let base_rows = base_viewport_rows(self.busy, command_menu_rows);
-        let active = self.active_viewport(terminal_height, base_rows);
-        let previous_active_rows = self.viewport_rows.saturating_sub(base_rows);
-        if active.rows() == 0 || active.rows() != previous_active_rows {
-            return Ok(false);
-        }
-
-        let cursor_row = self.viewport_cursor_row;
-        let cursor_column = 2 + self.prompt.cursor_column;
-        self.synchronized(|terminal| {
-            queue!(terminal.stdout, MoveToPreviousLine(cursor_row))?;
-            let mut rendered_rows = 0u16;
-            if active.show_spacing {
-                queue!(
-                    terminal.stdout,
-                    MoveToColumn(0),
-                    Clear(ClearType::CurrentLine)
-                )?;
-                rendered_rows += 1;
-                if rendered_rows < active.rows() {
-                    queue!(terminal.stdout, MoveToNextLine(1))?;
-                }
-            }
-            for (index, line) in active.lines.iter().enumerate() {
-                terminal.write_markdown_line(active.kind, active.start + index, line)?;
-                rendered_rows += 1;
-                if rendered_rows < active.rows() {
-                    queue!(terminal.stdout, MoveToNextLine(1))?;
-                }
-            }
+    fn write_viewport_buffer(&mut self, buffer: &Buffer) -> io::Result<()> {
+        let height = buffer.area.height;
+        let width = buffer.area.width;
+        for y in 0..height {
+            let background = uniform_row_background(buffer, y);
             queue!(
-                terminal.stdout,
-                MoveToNextLine(cursor_row.saturating_sub(active.rows().saturating_sub(1))),
-                MoveToColumn(cursor_column)
+                self.stdout,
+                MoveToColumn(0),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Clear(ClearType::CurrentLine)
             )?;
-            Ok(())
-        })?;
-        Ok(true)
-    }
-
-    fn render_status(&mut self, width: u16) -> io::Result<()> {
-        if !self.busy {
-            return Ok(());
-        }
-        let elapsed = self
-            .status_started_at
-            .map_or(0, |started| started.elapsed().as_secs());
-        let elapsed = format_elapsed(elapsed);
-        let header = sanitize_single_line(&self.status_header);
-        let dots = status_dots(self.status_frame);
-        let queued = queued_status(self.queued_messages);
-        queue!(self.stdout, MoveToColumn(0))?;
-        if width < 32 {
-            write!(
-                self.stdout,
-                "{bold}{header}{dots}{reset}{dim}{queued}{reset}",
-                bold = theme::BOLD,
-                reset = theme::RESET,
-                dim = theme::DIM,
-            )
-        } else {
-            write!(
-                self.stdout,
-                "{dim}•{reset} {bold}{header}{cyan}{dots}{reset} \
-                 {dim}({elapsed} • esc to interrupt){queued}{reset}",
-                dim = theme::DIM,
-                reset = theme::RESET,
-                bold = theme::BOLD,
-                cyan = theme::CYAN,
-            )
-        }
-    }
-
-    fn render_command_menu(&mut self, width: u16) -> io::Result<()> {
-        if self.command_menu.is_empty() {
-            return Ok(());
-        }
-        let name_width = self
-            .command_menu
-            .iter()
-            .map(|item| UnicodeWidthStr::width(item.name))
-            .max()
-            .unwrap_or(1);
-        let description_column = 2usize
-            .saturating_add(1)
-            .saturating_add(name_width)
-            .saturating_add(2);
-
-        let item_count = self.command_menu.len();
-        for (index, item) in self.command_menu.clone().into_iter().enumerate() {
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            if index == self.command_menu_selected {
-                write!(
+            if background != RatatuiColor::Reset {
+                queue!(
                     self.stdout,
-                    "{}{}› /{:<name_width$}{}",
-                    theme::CYAN,
-                    theme::BOLD,
-                    item.name,
-                    theme::RESET,
+                    SetBackgroundColor(crossterm_color(background)),
+                    Clear(ClearType::CurrentLine),
+                    ResetColor
                 )?;
-            } else {
-                write!(self.stdout, "  /{:<name_width$}", item.name)?;
             }
-            if usize::from(width) > description_column {
-                let available = usize::from(width) - description_column;
-                let description = fit_menu_text(item.description, available);
-                write!(self.stdout, "  {}{description}{}", theme::DIM, theme::RESET)?;
+            let mut current_style = None;
+            let mut current_column = 0;
+            for x in 0..width {
+                let Some(cell) = buffer.cell((
+                    buffer.area.x.saturating_add(x),
+                    buffer.area.y.saturating_add(y),
+                )) else {
+                    continue;
+                };
+                if !cell_needs_write(cell, background) {
+                    continue;
+                }
+                if current_column != x {
+                    queue!(self.stdout, MoveToColumn(x))?;
+                }
+                let style = (cell.fg, cell.bg, cell.modifier);
+                if current_style != Some(style) {
+                    self.write_ratatui_style(cell.fg, cell.bg, cell.modifier)?;
+                    current_style = Some(style);
+                }
+                write!(self.stdout, "{}", cell.symbol())?;
+                current_column = x.saturating_add(cell_display_width(cell));
             }
-            if index + 1 < item_count {
+            queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
+            if y + 1 < height {
                 self.next_frame_row()?;
             }
         }
         Ok(())
     }
 
-    fn render_footer(&mut self, width: u16) -> io::Result<()> {
-        let model = sanitize_single_line(&self.prompt.model);
-        let protocol = sanitize_single_line(&self.prompt.protocol);
-        let path = sanitize_single_line(&compact_path(&self.prompt.working_dir));
-        let protocol_width = UnicodeWidthStr::width(protocol.as_str()) as u16;
-        let right_x = width.saturating_sub(protocol_width.saturating_add(2));
-        let show_protocol = protocol_width > 0 && right_x > 3;
-        let left_width = if show_protocol {
-            right_x.saturating_sub(3)
-        } else {
-            width.saturating_sub(4)
-        };
-        let (model, path) = fit_status_left(&model, &path, left_width);
-
-        queue!(self.stdout, MoveToColumn(2))?;
-        write!(self.stdout, "{}{model}{}", theme::CYAN, theme::RESET)?;
-        if let Some(path) = path {
-            write!(
-                self.stdout,
-                "{} · {}{}{path}{}",
-                theme::DIM,
-                theme::RESET,
-                theme::GREEN,
-                theme::RESET
-            )?;
+    fn write_ratatui_style(
+        &mut self,
+        foreground: RatatuiColor,
+        background: RatatuiColor,
+        modifiers: Modifier,
+    ) -> io::Result<()> {
+        queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
+        if foreground != RatatuiColor::Reset {
+            queue!(self.stdout, SetForegroundColor(crossterm_color(foreground)))?;
         }
-        if show_protocol {
-            queue!(self.stdout, MoveToColumn(right_x))?;
-            write!(self.stdout, "{}{protocol}{}", theme::CYAN, theme::RESET)?;
+        if background != RatatuiColor::Reset {
+            queue!(self.stdout, SetBackgroundColor(crossterm_color(background)))?;
+        }
+        for (modifier, attribute) in [
+            (Modifier::BOLD, Attribute::Bold),
+            (Modifier::DIM, Attribute::Dim),
+            (Modifier::ITALIC, Attribute::Italic),
+            (Modifier::UNDERLINED, Attribute::Underlined),
+            (Modifier::REVERSED, Attribute::Reverse),
+            (Modifier::HIDDEN, Attribute::Hidden),
+            (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+            (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+            (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        ] {
+            if modifiers.contains(modifier) {
+                queue!(self.stdout, SetAttribute(attribute))?;
+            }
         }
         Ok(())
     }
 
     fn update_input(&mut self) -> io::Result<()> {
         if self.rendered_input != self.prompt.text {
-            let previous_width = UnicodeWidthStr::width(self.rendered_input.as_str());
-            let current_width = UnicodeWidthStr::width(self.prompt.text.as_str());
-            queue!(self.stdout, MoveToColumn(2))?;
-            write!(self.stdout, "{}{}", self.input_background, self.prompt.text)?;
-            if previous_width > current_width {
-                write!(
+            queue!(
+                self.stdout,
+                MoveToColumn(0),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Clear(ClearType::CurrentLine)
+            )?;
+            let background = self
+                .composer_background
+                .map_or(RatatuiColor::Reset, |(r, g, b)| RatatuiColor::Rgb(r, g, b));
+            if background != RatatuiColor::Reset {
+                queue!(
                     self.stdout,
-                    "{}",
-                    " ".repeat(previous_width - current_width)
+                    SetBackgroundColor(crossterm_color(background)),
+                    Clear(ClearType::CurrentLine),
+                    ResetColor
                 )?;
             }
-            write!(self.stdout, "{}", theme::RESET)?;
+            self.write_ratatui_style(RatatuiColor::Reset, background, Modifier::BOLD)?;
+            write!(self.stdout, "›")?;
+            if !self.prompt.text.is_empty() {
+                queue!(self.stdout, MoveToColumn(2))?;
+                self.write_ratatui_style(RatatuiColor::Reset, background, Modifier::empty())?;
+                write!(self.stdout, "{}", self.prompt.text)?;
+            }
+            queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
             self.rendered_input.clone_from(&self.prompt.text);
+            if let Some(line_width) = self
+                .viewport_line_widths
+                .get_mut(usize::from(self.viewport_cursor_row))
+            {
+                let prompt_width = u16::try_from(UnicodeWidthStr::width(self.prompt.text.as_str()))
+                    .unwrap_or(u16::MAX);
+                *line_width = if prompt_width == 0 {
+                    1
+                } else {
+                    2_u16.saturating_add(prompt_width)
+                };
+            }
         }
         queue!(self.stdout, MoveToColumn(2 + self.prompt.cursor_column))?;
         self.stdout.flush()
@@ -1094,7 +979,7 @@ impl InlineTerminal {
         let input = sanitize_terminal_text(input);
         let lines = wrap_text(&input, width.saturating_sub(3).max(1));
 
-        self.begin_history_cell()?;
+        self.begin_history_block(StackFlow::Block)?;
         self.fill_row(&background, width)?;
         self.next_frame_row()?;
         for (index, line) in lines.iter().enumerate() {
@@ -1115,19 +1000,26 @@ impl InlineTerminal {
         }
         self.fill_row(&background, width)?;
         self.next_frame_row()?;
-        self.history_ends_with_spacing = true;
+        self.finish_history_block();
         Ok(())
     }
 
     fn write_markdown_batches(&mut self, batches: &[MarkdownBatch]) -> io::Result<()> {
         for batch in batches {
-            if batch.start == 0 && !batch.lines.is_empty() {
-                self.begin_history_cell()?;
+            if batch.lines.is_empty() {
+                continue;
             }
+            let flow = if batch.start == 0 {
+                StackFlow::Block
+            } else {
+                StackFlow::Continuation
+            };
+            self.begin_history_block(flow)?;
             for (index, line) in batch.lines.iter().enumerate() {
                 self.write_markdown_line(batch.kind, batch.start + index, line)?;
                 self.next_frame_row()?;
             }
+            self.finish_history_block();
         }
         Ok(())
     }
@@ -1153,7 +1045,7 @@ impl InlineTerminal {
         arguments: &Value,
         is_error: bool,
     ) -> io::Result<()> {
-        self.begin_history_cell()?;
+        self.begin_history_block(StackFlow::Block)?;
         let width = terminal::size()?.0.max(1);
         let (action, detail) =
             tool_call_summary(name, arguments, is_error, width.saturating_sub(2));
@@ -1172,7 +1064,9 @@ impl InlineTerminal {
         if !detail.is_empty() {
             write!(self.stdout, " {detail}")?;
         }
-        self.next_frame_row()
+        self.next_frame_row()?;
+        self.finish_history_block();
+        Ok(())
     }
 
     fn write_restored_messages(&mut self, messages: &[Message]) -> io::Result<()> {
@@ -1231,7 +1125,7 @@ impl InlineTerminal {
     }
 
     fn write_error_history(&mut self, error: &str) -> io::Result<()> {
-        self.begin_history_cell()?;
+        self.begin_history_block(StackFlow::Block)?;
         let error = sanitize_terminal_text(error);
         let width = terminal::size()?.0.saturating_sub(9).max(1);
         for (index, line) in wrap_text(&error, width).iter().enumerate() {
@@ -1249,11 +1143,12 @@ impl InlineTerminal {
             }
             self.next_frame_row()?;
         }
+        self.finish_history_block();
         Ok(())
     }
 
     fn write_info_history(&mut self, message: &str) -> io::Result<()> {
-        self.begin_history_cell()?;
+        self.begin_history_block(StackFlow::Block)?;
         let message = sanitize_terminal_text(message);
         let width = terminal::size()?.0.saturating_sub(4).max(1);
         let mut first = true;
@@ -1272,31 +1167,37 @@ impl InlineTerminal {
             write!(self.stdout, "{}•{}", theme::DIM, theme::RESET)?;
             self.next_frame_row()?;
         }
+        self.finish_history_block();
         Ok(())
     }
 
     fn write_worked_history(&mut self, elapsed_seconds: u64) -> io::Result<()> {
-        self.begin_history_cell()?;
+        self.begin_history_block(StackFlow::Block)?;
         let width = terminal::size()?.0.max(1);
         let separator = worked_separator(elapsed_seconds, width);
         queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         write!(self.stdout, "{}{separator}{}", theme::DIM, theme::RESET)?;
-        self.next_frame_row()
+        self.next_frame_row()?;
+        self.finish_history_block();
+        Ok(())
     }
 
-    fn begin_history_cell(&mut self) -> io::Result<()> {
-        if history_cell_needs_spacing(
-            self.has_emitted_history_cells,
-            self.history_ends_with_spacing,
-        ) {
+    fn begin_history_block(&mut self, flow: StackFlow) -> io::Result<()> {
+        let item = match flow {
+            StackFlow::Block => StackItem::block(0),
+            StackFlow::Continuation => StackItem::continuation(0),
+        };
+        let layout = layout_stack(1, self.history_boundary, &[item]);
+        let leading_rows = layout.areas.first().map_or(0, |area| area.y);
+        for _ in 0..leading_rows {
             queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
             self.next_frame_row()?;
         }
-        if !self.has_emitted_history_cells {
-            self.has_emitted_history_cells = true;
-        }
-        self.history_ends_with_spacing = false;
         Ok(())
+    }
+
+    fn finish_history_block(&mut self) {
+        self.history_boundary = self.history_boundary.after_block();
     }
 }
 
@@ -1365,11 +1266,134 @@ fn can_clear_session_locally(
         && session_history_rows.saturating_add(viewport_rows) <= terminal_height
 }
 
-fn history_cell_needs_spacing(
-    has_emitted_history_cells: bool,
-    history_ends_with_spacing: bool,
-) -> bool {
-    has_emitted_history_cells && !history_ends_with_spacing
+fn viewport_line_widths(buffer: &Buffer) -> Vec<u16> {
+    (0..buffer.area.height)
+        .map(|y| {
+            let background = uniform_row_background(buffer, y);
+            (0..buffer.area.width).fold(0, |line_width, x| {
+                let Some(cell) = buffer.cell((
+                    buffer.area.x.saturating_add(x),
+                    buffer.area.y.saturating_add(y),
+                )) else {
+                    return line_width;
+                };
+                if cell_needs_write(cell, background) {
+                    line_width.max(x.saturating_add(cell_display_width(cell)))
+                } else {
+                    line_width
+                }
+            })
+        })
+        .collect()
+}
+
+fn uniform_row_background(buffer: &Buffer, row: u16) -> RatatuiColor {
+    let mut background = None;
+    for x in 0..buffer.area.width {
+        let Some(cell) = buffer.cell((
+            buffer.area.x.saturating_add(x),
+            buffer.area.y.saturating_add(row),
+        )) else {
+            continue;
+        };
+        match background {
+            None => background = Some(cell.bg),
+            Some(current) if current == cell.bg => {}
+            Some(_) => return RatatuiColor::Reset,
+        }
+    }
+    background
+        .filter(|background| *background != RatatuiColor::Reset)
+        .unwrap_or(RatatuiColor::Reset)
+}
+
+fn cell_needs_write(cell: &Cell, row_background: RatatuiColor) -> bool {
+    !cell.skip
+        && (cell.symbol() != " "
+            || cell.fg != RatatuiColor::Reset
+            || !cell.modifier.is_empty()
+            || cell.bg != row_background)
+}
+
+fn cell_display_width(cell: &Cell) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(cell.symbol()))
+        .unwrap_or(u16::MAX)
+        .max(1)
+}
+
+fn resize_reflow_geometry(
+    line_widths: &[u16],
+    cursor_row: u16,
+    cursor_column: u16,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> (u16, u16) {
+    let terminal_width = terminal_width.max(1);
+    let terminal_height = terminal_height.max(1);
+    if line_widths.is_empty() {
+        return (1, 0);
+    }
+
+    let visual_rows = line_widths
+        .iter()
+        .map(|line_width| visual_row_count(*line_width, terminal_width))
+        .collect::<Vec<_>>();
+    let total_rows = visual_rows
+        .iter()
+        .copied()
+        .fold(0u16, u16::saturating_add)
+        .max(1);
+    let cursor_row = usize::from(cursor_row).min(visual_rows.len() - 1);
+    let rows_before_cursor = visual_rows[..cursor_row]
+        .iter()
+        .copied()
+        .fold(0u16, u16::saturating_add);
+    let cursor_line_offset = cursor_column
+        .saturating_div(terminal_width)
+        .min(visual_rows[cursor_row].saturating_sub(1));
+    let cursor_visual_row = rows_before_cursor.saturating_add(cursor_line_offset);
+    let hidden_rows = total_rows.saturating_sub(terminal_height);
+    let visible_rows = total_rows.min(terminal_height);
+    let visible_cursor_row = cursor_visual_row
+        .saturating_sub(hidden_rows)
+        .min(visible_rows.saturating_sub(1));
+
+    (visible_rows, visible_cursor_row)
+}
+
+fn visual_row_count(line_width: u16, terminal_width: u16) -> u16 {
+    if line_width == 0 {
+        1
+    } else {
+        line_width
+            .saturating_sub(1)
+            .saturating_div(terminal_width.max(1))
+            .saturating_add(1)
+    }
+}
+
+fn crossterm_color(color: RatatuiColor) -> CrosstermColor {
+    match color {
+        RatatuiColor::Reset => CrosstermColor::Reset,
+        RatatuiColor::Black => CrosstermColor::Black,
+        RatatuiColor::Red => CrosstermColor::DarkRed,
+        RatatuiColor::Green => CrosstermColor::DarkGreen,
+        RatatuiColor::Yellow => CrosstermColor::DarkYellow,
+        RatatuiColor::Blue => CrosstermColor::DarkBlue,
+        RatatuiColor::Magenta => CrosstermColor::DarkMagenta,
+        RatatuiColor::Cyan => CrosstermColor::DarkCyan,
+        RatatuiColor::Gray => CrosstermColor::Grey,
+        RatatuiColor::DarkGray => CrosstermColor::DarkGrey,
+        RatatuiColor::LightRed => CrosstermColor::Red,
+        RatatuiColor::LightGreen => CrosstermColor::Green,
+        RatatuiColor::LightYellow => CrosstermColor::Yellow,
+        RatatuiColor::LightBlue => CrosstermColor::Blue,
+        RatatuiColor::LightMagenta => CrosstermColor::Magenta,
+        RatatuiColor::LightCyan => CrosstermColor::Cyan,
+        RatatuiColor::White => CrosstermColor::White,
+        RatatuiColor::Rgb(r, g, b) => CrosstermColor::Rgb { r, g, b },
+        RatatuiColor::Indexed(value) => CrosstermColor::AnsiValue(value),
+    }
 }
 
 fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<RenderedLine> {
@@ -1399,48 +1423,6 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     let keep_from = body.len().saturating_sub(remaining_rows);
     header.extend(body.into_iter().skip(keep_from));
     header
-}
-
-fn base_viewport_rows(busy: bool, command_menu_rows: u16) -> u16 {
-    TRANSCRIPT_STATUS_SPACING
-        + if busy {
-            STATUS_ROWS + STATUS_COMPOSER_SPACING
-        } else {
-            0
-        }
-        + command_menu_rows
-        + COMPOSER_ROWS
-        + if command_menu_rows == 0 {
-            FOOTER_ROWS
-        } else {
-            0
-        }
-}
-
-fn command_menu_rows(item_count: usize) -> u16 {
-    u16::try_from(item_count).unwrap_or(u16::MAX)
-}
-
-fn fit_menu_text(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut output = String::new();
-    let mut used = 0;
-    let available = width.saturating_sub(1);
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > available {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.push('…');
-    output
 }
 
 fn worked_separator(elapsed_seconds: u64, width: u16) -> String {
@@ -1510,10 +1492,45 @@ mod tests {
     }
 
     #[test]
-    fn reuses_trailing_history_spacing_without_merging_cells() {
-        assert!(history_cell_needs_spacing(true, false));
-        assert!(!history_cell_needs_spacing(true, true));
-        assert!(!history_cell_needs_spacing(false, false));
+    fn viewport_width_ignores_trailing_default_cells() {
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 12, 1));
+        buffer.set_string(0, 0, "ash", ratatui::style::Style::default());
+
+        assert_eq!(viewport_line_widths(&buffer), vec![3]);
+    }
+
+    #[test]
+    fn viewport_width_does_not_treat_uniform_background_as_text() {
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 12, 1));
+        for x in 0..buffer.area.width {
+            buffer
+                .cell_mut((x, 0))
+                .expect("cell")
+                .set_bg(RatatuiColor::Blue);
+        }
+        assert_eq!(viewport_line_widths(&buffer), vec![0]);
+
+        buffer.cell_mut((5, 0)).expect("cell").set_symbol("x");
+        assert_eq!(viewport_line_widths(&buffer), vec![6]);
+    }
+
+    #[test]
+    fn resize_reflow_counts_wrapped_visual_rows() {
+        assert_eq!(visual_row_count(60, 48), 2);
+        assert_eq!(resize_reflow_geometry(&[1, 60, 1], 2, 0, 48, 24), (4, 3));
+    }
+
+    #[test]
+    fn resize_reflow_accounts_for_rows_scrolled_above_the_screen() {
+        assert_eq!(resize_reflow_geometry(&[1, 60, 1, 1], 2, 0, 20, 4), (4, 2));
+    }
+
+    #[test]
+    fn a_new_session_spaces_the_first_active_block_with_flex() {
+        let boundary = StackBoundary::default().after_block().after_block();
+        let layout = layout_stack(80, boundary, &[StackItem::block(1)]);
+
+        assert_eq!(layout.areas[0].y, 1);
     }
 
     #[test]
@@ -1557,17 +1574,9 @@ mod tests {
     }
 
     #[test]
-    fn matches_codex_bottom_pane_vertical_spacing() {
-        assert_eq!(base_viewport_rows(false, 0), 5);
-        assert_eq!(base_viewport_rows(true, 0), 7);
-        assert_eq!(base_viewport_rows(false, 3), 7);
-        assert_eq!(base_viewport_rows(true, 3), 9);
-    }
-
-    #[test]
     fn reserves_one_row_per_command_completion() {
-        assert_eq!(command_menu_rows(0), 0);
-        assert_eq!(command_menu_rows(3), 3);
+        assert_eq!(viewport::command_menu_rows(0), 0);
+        assert_eq!(viewport::command_menu_rows(3), 3);
     }
 
     #[test]
@@ -1606,9 +1615,9 @@ mod tests {
 
     #[test]
     fn truncates_command_descriptions_to_the_menu_width() {
-        assert_eq!(fit_menu_text("abcdef", 4), "abc…");
+        assert_eq!(viewport::fit_menu_text("abcdef", 4), "abc…");
         assert_eq!(
-            UnicodeWidthStr::width(fit_menu_text("中文说明", 5).as_str()),
+            UnicodeWidthStr::width(viewport::fit_menu_text("中文说明", 5).as_str()),
             5
         );
     }

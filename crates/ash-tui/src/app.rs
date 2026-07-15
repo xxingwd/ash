@@ -88,6 +88,7 @@ impl App {
                 event = events.next() => {
                     let Some(event) = event else { break };
                     match event {
+                        event if rollback_in_progress && is_stale_turn_event(&event) => {}
                         Event::AgentStarted { .. } => {
                             if !busy {
                                 render_tick.reset();
@@ -151,6 +152,7 @@ impl App {
                             }
                         }
                         Event::TurnRolledBack { messages: _, prompt } => {
+                            let ui_already_rolled_back = rollback_in_progress;
                             rollback_in_progress = false;
                             busy = false;
                             calls.clear();
@@ -160,7 +162,9 @@ impl App {
                             if input.text() != prompt {
                                 input.restore_submitted(prompt);
                             }
-                            terminal.rollback_turn()?;
+                            if !ui_already_rolled_back {
+                                terminal.rollback_turn()?;
+                            }
                             render_prompt(
                                 &mut terminal,
                                 &input,
@@ -212,8 +216,8 @@ impl App {
                     let Some(key) = key else { break };
                     let event = key?;
                     match event {
-                        CrosstermEvent::Resize(_, _) => {
-                            terminal.mark_session_layout_uncertain();
+                        CrosstermEvent::Resize(width, height) => {
+                            terminal.handle_resize(width, height);
                             render_prompt(
                                 &mut terminal,
                                 &input,
@@ -350,7 +354,7 @@ impl App {
                                 if let Some(prompt) = active_prompt.take() {
                                     input.restore_submitted(prompt);
                                 }
-                                terminal.rollback_requested()?;
+                                terminal.rollback_turn()?;
                                 render_prompt(
                                     &mut terminal,
                                     &input,
@@ -545,6 +549,19 @@ impl App {
     }
 }
 
+fn is_stale_turn_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::AgentStarted { .. }
+            | Event::TextDelta(_)
+            | Event::Thinking(_)
+            | Event::ToolCallStart { .. }
+            | Event::ToolCallEnd { .. }
+            | Event::Usage { .. }
+            | Event::Error(_)
+    )
+}
+
 fn sync_command_menu(
     terminal: &mut InlineTerminal,
     input: &InputState,
@@ -566,4 +583,25 @@ fn render_prompt(
 ) -> std::io::Result<()> {
     sync_command_menu(terminal, input, completion, busy);
     terminal.prompt(input, protocol, model, working_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use ash_core::StopReason;
+
+    use super::*;
+
+    #[test]
+    fn ignores_late_render_events_while_a_turn_is_being_rolled_back() {
+        assert!(is_stale_turn_event(&Event::TextDelta("late".into())));
+        assert!(is_stale_turn_event(&Event::Thinking("late".into())));
+        assert!(is_stale_turn_event(&Event::Error("cancelled".into())));
+        assert!(!is_stale_turn_event(&Event::AgentFinished {
+            reason: StopReason::Aborted,
+        }));
+        assert!(!is_stale_turn_event(&Event::TurnRolledBack {
+            messages: Vec::new(),
+            prompt: "draft".into(),
+        }));
+    }
 }

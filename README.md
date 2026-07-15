@@ -136,6 +136,13 @@ explorer，边界清晰的代码改动优先交给 worker。简单任务和紧�
 出现在最新内容的下一行。`/new` 和 `/clear` 在会话未溢出时局部清理，溢出或布局
 不确定时清空当前可见屏幕；终端 scrollback 始终保留。
 
+底部可变区域使用 Ratatui 组件统一布局，包括活动内容、状态栏、输入框、命令补全
+和底栏；完成后的用户消息、Thought、工具与回答仍由 Crossterm 写入主屏 stdout，
+从而进入原生 shell scrollback。Ratatui 不接管 alternate screen，也不保存一份虚拟
+全屏历史。历史区和底部区域共享块间距规则：完整块只负责内容和内部 padding，父级
+Stack 使用 `Flex::Start` 与统一 spacing 排列；输入框和模型、路径或补全 footer 是
+同一个 ComposerBlock。
+
 模型文本以完整换行作为提交边界。正常情况下逐行展示；当等待队列积压时会自动
 批量追赶。未完成的半行会保留到下一次换行或本轮响应结束，表格则会暂存在可变
 区域，避免流式过程中列宽反复跳动。

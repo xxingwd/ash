@@ -77,11 +77,15 @@
 - 正常交互不清屏；`/new` 和 `/clear` 使用相同的新会话逻辑
 - 当前会话未溢出且宽度未变化时局部擦除 ASH 会话区域；溢出、缩放或布局不确定时
   只清空当前可见屏幕，两条路径都不 Purge shell scrollback
-- 输出直接写入 stdout，让 shell 维护 scrollback
+- Ratatui Buffer 统一计算活动内容、状态栏、输入框、补全和底栏的组件布局
+- 已完成的历史通过 Crossterm 写入主屏 stdout，让 shell 维护 scrollback；Ratatui
+  只负责底部 inline viewport，不使用 alternate screen
 - 只原地重绘当前输入行
 - Agent 工作期间 `Ctrl-C` 不发送取消命令；状态栏提示 `esc to interrupt`，第一次按
   `Esc` 不展示额外状态
 - Agent 工作期间按一次 `Esc` 会取消并回退当前轮，将问题恢复为草稿
+- `Esc` 会先在 UI 侧立即移除当前 turn 并恢复 Composer；后端确认回退前到达的旧
+  Thinking、工具和文本事件不再参与渲染，确认事件也不会重复清除同一区域
 - 回退按本轮已提交的终端行数局部擦除当前轮，不重建整个屏幕，也不 Purge shell
   scrollback；已经滚出当前屏幕的行可能仍由终端保存，但当前轮会从模型上下文移除
 - 文本按换行进入 FIFO 队列，正常逐行提交，积压时批量追赶
@@ -90,14 +94,17 @@
   切换到回答、工具或完成状态时折叠为单行耗时摘要，不把展开正文写入 scrollback
 - 工具历史按工具语义生成单行摘要，隐藏内容参数和默认参数，并把绝对路径缩短为
   可辨识的文件名或末级目录；不把原始工具参数 JSON 写入 scrollback
-- 所有独立历史块之间统一保留一行；用户消息自带的底部留白会被下一历史块复用，
-  避免本轮第一个 Thought 或工具重复产生两行间距
+- 历史和 viewport 使用同一套块布局协议：完整块只声明内容高度并管理内部
+  padding，父级 Stack 使用 `Flex::Start` 和统一 `spacing` 排列块；输入框与模型、
+  路径或补全 footer 组成一个 ComposerBlock，continuation 只表示同一流式块的后续行
 
 模块分工：
 
 - `app`：事件与命令协调
+- `block_layout`：完整块、continuation 与 Ratatui Flex spacing
 - `input`：Unicode 安全的编辑、历史和可视窗口
-- `inline`：终端渲染与 raw mode 生命周期
+- `viewport`：Ratatui 组件、行高、间距和 Buffer 渲染
+- `inline`：Crossterm history insertion、scrollback、raw mode 与 viewport 生命周期
 
 输入框的跨进程历史使用独立的 `history.jsonl`；它只负责上下键召回，不参与模型
 上下文恢复。终端 scrollback 仍由 shell 保存，恢复会话时 UI 根据语义消息重新渲染

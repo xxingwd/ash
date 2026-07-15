@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-type Rgb = (u8, u8, u8);
+pub(crate) type Rgb = (u8, u8, u8);
 
-pub(crate) fn composer_background_escape() -> String {
-    probe_background(PROBE_TIMEOUT)
-        .map(composer_background)
-        .map_or_else(String::new, |(r, g, b)| format!("\x1b[48;2;{r};{g};{b}m"))
+pub(crate) fn composer_background_color() -> Option<Rgb> {
+    probe_background(PROBE_TIMEOUT).map(composer_background)
+}
+
+pub(crate) fn composer_background_escape(color: Option<Rgb>) -> String {
+    color.map_or_else(String::new, |(r, g, b)| format!("\x1b[48;2;{r};{g};{b}m"))
 }
 
 fn composer_background(terminal_background: Rgb) -> Rgb {

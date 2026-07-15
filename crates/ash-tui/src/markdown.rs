@@ -1,6 +1,10 @@
 use std::io::{self, Write};
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui::{
+    style::{Color as RatatuiColor, Modifier, Style},
+    text::{Line as RatatuiLine, Span as RatatuiSpan},
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
@@ -98,6 +102,31 @@ impl TextStyle {
         };
         write!(writer, "{color}")
     }
+
+    fn ratatui_style(self) -> Style {
+        let mut style = Style::default();
+        if self.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.dim {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        if self.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if self.underlined {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        if self.crossed_out {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        match self.color {
+            AnsiColor::Default => style,
+            AnsiColor::Cyan => style.fg(RatatuiColor::Cyan),
+            AnsiColor::Green => style.fg(RatatuiColor::Green),
+            AnsiColor::Blue => style.fg(RatatuiColor::Blue),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -128,6 +157,15 @@ impl RenderedLine {
             write!(writer, "{}", span.text)?;
         }
         write!(writer, "{}", theme::RESET)
+    }
+
+    pub(crate) fn ratatui_line(&self) -> RatatuiLine<'static> {
+        RatatuiLine::from(
+            self.spans
+                .iter()
+                .map(|span| RatatuiSpan::styled(span.text.clone(), span.style.ratatui_style()))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[cfg(test)]
