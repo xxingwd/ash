@@ -198,7 +198,7 @@ impl App {
                             self.model = model;
                             self.protocol = protocol;
                             self.working_dir = working_dir;
-                            terminal.restore_session(&messages)?;
+                            terminal.restore_session(&messages, &self.working_dir)?;
                             render_prompt(
                                 &mut terminal,
                                 &input,

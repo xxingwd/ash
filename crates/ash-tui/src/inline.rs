@@ -177,13 +177,16 @@ impl InlineTerminal {
 
     pub fn welcome(&mut self) -> io::Result<()> {
         let width = terminal::size()?.0.max(1);
-        let lines = welcome_card(width);
+        let lines = welcome_card(width, &self.prompt.working_dir);
         self.session_start_width = width;
         self.session_history_rows = self
             .session_history_rows
             .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
         for line in lines {
             match line.style {
+                WelcomeStyle::Frame => {
+                    queue!(self.stdout, SetAttribute(Attribute::Dim))?;
+                }
                 WelcomeStyle::Logo => {
                     queue!(
                         self.stdout,
@@ -201,7 +204,6 @@ impl InlineTerminal {
                 WelcomeStyle::Subtitle => {
                     queue!(self.stdout, SetAttribute(Attribute::Dim))?;
                 }
-                WelcomeStyle::Plain => {}
             }
             write!(self.stdout, "{}", line.text)?;
             queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
@@ -250,8 +252,9 @@ impl InlineTerminal {
         Ok(())
     }
 
-    pub fn restore_session(&mut self, messages: &[Message]) -> io::Result<()> {
+    pub fn restore_session(&mut self, messages: &[Message], working_dir: &Path) -> io::Result<()> {
         self.begin_appended_session()?;
+        self.prompt.working_dir = working_dir.to_path_buf();
         self.welcome()?;
         let messages = messages.to_vec();
         self.replace_viewport(move |terminal| terminal.write_restored_messages(&messages))
