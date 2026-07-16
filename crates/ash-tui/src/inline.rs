@@ -1,13 +1,13 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::{self, Stdout, Write},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, SessionSummary, ToolCallId};
 use crossterm::{
-    cursor::{MoveToColumn, MoveToNextLine, MoveToPreviousLine, Show},
+    cursor::{MoveTo, MoveToColumn, MoveToNextLine, MoveToPreviousLine, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{
@@ -24,45 +24,23 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    block_layout::{layout_stack, StackBoundary, StackFlow, StackItem},
+    block_layout::StackBoundary,
     history_block::HistoryBlock,
     input::InputState,
+    live_block::LiveBlock,
     markdown::{render_markdown, RenderedLine, TextStyle},
-    markdown_stream::MarkdownStream,
     scrollback::{sanitize_single_line, sanitize_terminal_text},
     slash_command::CommandCompletion,
-    theme,
-    tool_display::{tool_activity_summary, tool_call_summary},
+    tool_display::tool_activity_summary,
     viewport::{self, ViewportInput},
-    welcome_card::{welcome_card, WelcomeStyle},
 };
 
-const STREAM_CATCH_UP_DEPTH: usize = 8;
-const STREAM_CATCH_UP_AGE: Duration = Duration::from_millis(120);
 const REASONING_VIEW_ROWS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamKind {
     Assistant,
     Reasoning,
-}
-
-#[derive(Debug)]
-struct MarkdownBatch {
-    kind: StreamKind,
-    start: usize,
-    lines: Vec<RenderedLine>,
-}
-
-impl MarkdownBatch {
-    fn new(kind: StreamKind, start: usize, mut lines: Vec<RenderedLine>) -> Self {
-        if kind == StreamKind::Reasoning {
-            for line in &mut lines {
-                line.patch_style(TextStyle::dim_italic());
-            }
-        }
-        Self { kind, start, lines }
-    }
 }
 
 #[derive(Debug)]
@@ -99,6 +77,8 @@ pub(crate) struct InlineTerminal {
     rendered_input: String,
     prompt: PromptSnapshot,
     history_boundary: StackBoundary,
+    live_blocks: Vec<LiveBlock>,
+    next_live_block_id: u64,
     busy: bool,
     status_header: String,
     status_started_at: Option<Instant>,
@@ -109,21 +89,16 @@ pub(crate) struct InlineTerminal {
     session_menu: Vec<SessionSummary>,
     session_menu_selected: usize,
     command_menu_dirty: bool,
-    assistant_stream: MarkdownStream,
+    assistant_pending: String,
+    assistant_live_id: Option<u64>,
     reasoning_source: String,
     reasoning_started_at: Option<Instant>,
     active_kind: Option<StreamKind>,
     active_start: usize,
     active_lines: Vec<RenderedLine>,
-    pending_markdown_batches: VecDeque<MarkdownBatch>,
-    pending_markdown_started_at: Option<Instant>,
     content_dirty: bool,
-    turn_active: bool,
-    turn_history_rows: u16,
-    counting_history_rows: bool,
-    session_start_width: u16,
-    session_history_rows: u16,
-    session_overflowed: bool,
+    current_turn_id: Option<u64>,
+    next_turn_id: u64,
     _guard: TerminalGuard,
 }
 
@@ -146,6 +121,8 @@ impl InlineTerminal {
             rendered_input: String::new(),
             prompt: PromptSnapshot::default(),
             history_boundary: StackBoundary::default(),
+            live_blocks: Vec::new(),
+            next_live_block_id: 1,
             busy: false,
             status_header: String::new(),
             status_started_at: None,
@@ -156,108 +133,82 @@ impl InlineTerminal {
             session_menu: Vec::new(),
             session_menu_selected: 0,
             command_menu_dirty: false,
-            assistant_stream: MarkdownStream::default(),
+            assistant_pending: String::new(),
+            assistant_live_id: None,
             reasoning_source: String::new(),
             reasoning_started_at: None,
             active_kind: None,
             active_start: 0,
             active_lines: Vec::new(),
-            pending_markdown_batches: VecDeque::new(),
-            pending_markdown_started_at: None,
             content_dirty: false,
-            turn_active: false,
-            turn_history_rows: 0,
-            counting_history_rows: false,
-            session_start_width: 0,
-            session_history_rows: 0,
-            session_overflowed: false,
+            current_turn_id: None,
+            next_turn_id: 1,
             _guard: TerminalGuard,
         })
     }
 
     pub fn welcome(&mut self) -> io::Result<()> {
-        let width = terminal::size()?.0.max(1);
-        let lines = welcome_card(width, &self.prompt.working_dir);
-        self.session_start_width = width;
-        self.session_history_rows = self
-            .session_history_rows
-            .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-        for line in lines {
-            match line.style {
-                WelcomeStyle::Frame => {
-                    queue!(self.stdout, SetAttribute(Attribute::Dim))?;
-                }
-                WelcomeStyle::Logo => {
-                    queue!(
-                        self.stdout,
-                        SetForegroundColor(CrosstermColor::Cyan),
-                        SetAttribute(Attribute::Bold)
-                    )?;
-                }
-                WelcomeStyle::Title => {
-                    queue!(
-                        self.stdout,
-                        SetForegroundColor(CrosstermColor::Cyan),
-                        SetAttribute(Attribute::Bold)
-                    )?;
-                }
-                WelcomeStyle::Subtitle => {
-                    queue!(self.stdout, SetAttribute(Attribute::Dim))?;
-                }
-            }
-            write!(self.stdout, "{}", line.text)?;
-            queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
-            write!(self.stdout, "\r\n")?;
-        }
-        self.history_boundary = self.history_boundary.after_block();
-        self.stdout.flush()
+        self.enqueue_welcome();
+        self.redraw()
+    }
+
+    fn enqueue_welcome(&mut self) {
+        let id = self.allocate_live_id();
+        self.push_live(LiveBlock::welcome(id, self.prompt.working_dir.clone()));
     }
 
     pub fn command_output(&mut self, message: &str) -> io::Result<()> {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.rendered_input.clear();
-        let message = message.to_string();
-        self.replace_viewport(move |terminal| terminal.write_info_history(&message))
+        self.push_history_block(HistoryBlock::info(message));
+        self.redraw()
     }
 
     pub fn command_error(&mut self, message: &str) -> io::Result<()> {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.rendered_input.clear();
-        let message = message.to_string();
-        self.replace_viewport(move |terminal| terminal.write_error_history(&message))
+        self.push_history_block(HistoryBlock::error(message));
+        self.redraw()
     }
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
-        self.begin_appended_session()?;
-        self.welcome()
+        self.begin_fresh_viewport()?;
+        self.enqueue_welcome();
+        self.redraw()
     }
 
-    fn begin_appended_session(&mut self) -> io::Result<()> {
-        self.synchronized(|terminal| terminal.clear_viewport())?;
-        self.reset_inline_state();
-        self.reset_session_history();
-        self.history_boundary = StackBoundary::default();
-        Ok(())
+    fn begin_fresh_viewport(&mut self) -> io::Result<()> {
+        self.synchronized(|terminal| {
+            terminal.push_viewport_to_scrollback()?;
+            terminal.live_blocks.clear();
+            terminal.reset_inline_state();
+            terminal.history_boundary = StackBoundary::default();
+            Ok(())
+        })
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
-        self.synchronized(|terminal| terminal.clear_current_turn())?;
-        self.session_history_rows = self
-            .session_history_rows
-            .saturating_sub(self.turn_history_rows);
-        self.reset_inline_state();
-        self.history_boundary = StackBoundary::default().after_block();
-        Ok(())
+        let turn_id = self.current_turn_id;
+        self.synchronized(|terminal| {
+            terminal.clear_viewport()?;
+            if let Some(turn_id) = turn_id {
+                terminal
+                    .live_blocks
+                    .retain(|block| !block.belongs_to_turn(turn_id));
+            }
+            terminal.reset_turn_state();
+            terminal.render_viewport(terminal::size()?.0.max(1))
+        })
     }
 
     pub fn restore_session(&mut self, messages: &[Message], working_dir: &Path) -> io::Result<()> {
-        self.begin_appended_session()?;
+        self.begin_fresh_viewport()?;
         self.prompt.working_dir = working_dir.to_path_buf();
-        self.welcome()?;
-        let messages = messages.to_vec();
-        self.replace_viewport(move |terminal| terminal.write_restored_messages(&messages))
+        self.enqueue_welcome();
+        self.push_restored_messages(messages);
+        self.redraw()
     }
 
     pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
@@ -315,10 +266,8 @@ impl InlineTerminal {
         {
             return self.update_input();
         }
-        let batches = self.take_pending_markdown();
-        self.content_dirty = false;
         self.command_menu_dirty = false;
-        self.replace_viewport(move |terminal| terminal.write_markdown_batches(&batches))
+        self.redraw()
     }
 
     pub fn commit_input(&mut self, input: &str) -> io::Result<()> {
@@ -330,8 +279,13 @@ impl InlineTerminal {
     }
 
     fn commit_user_message(&mut self, input: &str, start_working: bool) -> io::Result<()> {
-        self.turn_active = start_working;
-        self.turn_history_rows = 0;
+        self.current_turn_id = if start_working {
+            let turn_id = self.next_turn_id;
+            self.next_turn_id = self.next_turn_id.saturating_add(1);
+            Some(turn_id)
+        } else {
+            None
+        };
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.rendered_input.clear();
@@ -351,8 +305,8 @@ impl InlineTerminal {
             self.status_started_at = None;
             self.status_frame = 0;
         }
-        let input = input.to_string();
-        self.replace_viewport(move |terminal| terminal.write_user_history(&input))
+        self.push_history_block(HistoryBlock::user(input));
+        self.redraw()
     }
 
     pub fn agent_started(&mut self) -> io::Result<()> {
@@ -361,32 +315,23 @@ impl InlineTerminal {
             self.status_header = "Working".to_string();
             self.status_started_at = Some(Instant::now());
             self.status_frame = 0;
-            self.replace_viewport(|_| Ok(()))?;
+            self.redraw()?;
         }
         Ok(())
     }
 
     pub fn text(&mut self, text: &str) -> io::Result<()> {
-        let width = self.markdown_width()?;
-        let batches = self.switch_stream(StreamKind::Assistant, width);
-        self.enqueue_markdown_batches(batches);
+        self.switch_stream(StreamKind::Assistant)?;
         self.status_header = "Working".to_string();
-        if let Some(update) = self.assistant_stream.push_delta(text, width) {
-            self.enqueue_markdown_batches(vec![MarkdownBatch::new(
-                StreamKind::Assistant,
-                update.stable_start,
-                update.stable,
-            )]);
-            self.set_active(StreamKind::Assistant, update.tail_start, update.tail);
-            self.content_dirty = true;
-        }
+        self.assistant_pending
+            .push_str(&sanitize_terminal_text(text));
+        self.content_dirty = true;
         Ok(())
     }
 
     pub fn thinking(&mut self, text: &str) -> io::Result<()> {
         let width = self.markdown_width()?;
-        let batches = self.switch_stream(StreamKind::Reasoning, width);
-        self.enqueue_markdown_batches(batches);
+        self.switch_stream(StreamKind::Reasoning)?;
         if self.reasoning_started_at.is_none() {
             self.reasoning_started_at = Some(Instant::now());
         }
@@ -399,37 +344,28 @@ impl InlineTerminal {
     }
 
     pub fn tool_start(&mut self, name: &str, arguments: &Value) -> io::Result<()> {
-        let width = self.markdown_width()?;
-        let batches = self.take_pending_and_finalize(width);
+        self.finalize_current_stream()?;
         self.content_dirty = false;
-        self.status_header = tool_activity_summary(name, arguments, width);
-        self.replace_viewport(move |terminal| terminal.write_markdown_batches(&batches))
+        self.status_header = tool_activity_summary(name, arguments, self.markdown_width()?);
+        self.redraw()
     }
 
     pub fn tool_end(&mut self, name: &str, arguments: &Value, is_error: bool) -> io::Result<()> {
         self.status_header = "Working".to_string();
-        let name = name.to_string();
-        let arguments = arguments.clone();
-        self.replace_viewport(move |terminal| {
-            terminal.write_tool_history(&name, &arguments, is_error)
-        })
+        self.push_tool_block(name.to_string(), arguments.clone(), is_error);
+        self.redraw()
     }
 
     pub fn error(&mut self, error: &str) -> io::Result<()> {
-        let width = self.markdown_width()?;
-        let batches = self.take_pending_and_finalize(width);
+        self.finalize_current_stream()?;
         self.content_dirty = false;
-        let error = error.to_string();
         self.status_header = "Failed".to_string();
-        self.replace_viewport(move |terminal| {
-            terminal.write_markdown_batches(&batches)?;
-            terminal.write_error_history(&error)
-        })
+        self.push_history_block(HistoryBlock::error(error));
+        self.redraw()
     }
 
     pub fn finish_response(&mut self) -> io::Result<()> {
-        let width = self.markdown_width()?;
-        let batches = self.take_pending_and_finalize(width);
+        self.finalize_current_stream()?;
         let elapsed_seconds = self
             .status_started_at
             .map_or(0, |started| started.elapsed().as_secs());
@@ -438,33 +374,19 @@ impl InlineTerminal {
         self.status_header.clear();
         self.status_started_at = None;
         self.status_frame = 0;
-        let result = self.replace_viewport(move |terminal| {
-            terminal.write_markdown_batches(&batches)?;
-            terminal.write_worked_history(elapsed_seconds)
-        });
-        self.turn_active = false;
-        self.turn_history_rows = 0;
+        self.push_history_block(HistoryBlock::worked(format_elapsed(elapsed_seconds)));
+        let result = self.redraw();
+        self.current_turn_id = None;
         result
     }
 
     pub fn refresh_content(&mut self) -> io::Result<()> {
-        if !self.content_dirty && self.pending_markdown_batches.is_empty() {
+        if !self.content_dirty {
             return Ok(());
         }
-        let drain_count = markdown_drain_count(
-            self.pending_markdown_batches.len(),
-            self.pending_markdown_started_at,
-            Instant::now(),
-        );
-        let batches = self
-            .pending_markdown_batches
-            .drain(..drain_count)
-            .collect::<Vec<_>>();
-        if self.pending_markdown_batches.is_empty() {
-            self.pending_markdown_started_at = None;
-        }
+        self.commit_pending_assistant();
         self.content_dirty = false;
-        self.replace_viewport(move |terminal| terminal.write_markdown_batches(&batches))
+        self.redraw()
     }
 
     pub fn set_queued_messages(&mut self, queued_messages: usize) {
@@ -472,7 +394,6 @@ impl InlineTerminal {
     }
 
     pub fn handle_resize(&mut self, width: u16, height: u16) {
-        self.session_overflowed = true;
         if !self.viewport_visible {
             return;
         }
@@ -487,6 +408,9 @@ impl InlineTerminal {
         self.viewport_rows = viewport_rows;
         self.viewport_cursor_row = viewport_cursor_row;
         self.prompt_width = 0;
+        if self.active_kind == Some(StreamKind::Reasoning) {
+            self.rebuild_reasoning_view(width.saturating_sub(2).max(1));
+        }
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
@@ -498,12 +422,14 @@ impl InlineTerminal {
             let width = terminal::size()?.0.saturating_sub(2).max(1);
             self.rebuild_reasoning_view(width);
         }
-        self.replace_viewport(|_| Ok(()))
+        self.redraw()
     }
 
     pub fn leave_line(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
             terminal.clear_viewport()?;
+            terminal.finalize_current_stream()?;
+            terminal.flush_all_live_blocks()?;
             queue!(
                 terminal.stdout,
                 MoveToColumn(0),
@@ -517,69 +443,40 @@ impl InlineTerminal {
         Ok(())
     }
 
-    fn switch_stream(&mut self, kind: StreamKind, width: u16) -> Vec<MarkdownBatch> {
+    fn switch_stream(&mut self, kind: StreamKind) -> io::Result<()> {
         if self.active_kind == Some(kind) {
-            return Vec::new();
+            return Ok(());
         }
-        let batches = self.finalize_active(width);
+        self.finalize_current_stream()?;
         self.active_kind = Some(kind);
-        batches
+        Ok(())
     }
 
-    fn finalize_active(&mut self, width: u16) -> Vec<MarkdownBatch> {
-        let Some(kind) = self.active_kind.take() else {
-            self.active_lines.clear();
-            return Vec::new();
-        };
-        let update = match kind {
-            StreamKind::Assistant => self.assistant_stream.finalize(width),
-            StreamKind::Reasoning => return self.collapse_reasoning(width),
-        };
+    fn finalize_current_stream(&mut self) -> io::Result<()> {
+        self.commit_pending_assistant();
+        if self.active_kind == Some(StreamKind::Reasoning) {
+            self.commit_collapsed_reasoning();
+        }
+        self.active_kind = None;
         self.active_lines.clear();
-        if update.stable.is_empty() {
-            Vec::new()
-        } else {
-            vec![MarkdownBatch::new(kind, update.stable_start, update.stable)]
+        self.assistant_live_id = None;
+        Ok(())
+    }
+
+    fn commit_pending_assistant(&mut self) {
+        if self.assistant_pending.is_empty() {
+            return;
         }
-    }
-
-    fn take_pending_and_finalize(&mut self, width: u16) -> Vec<MarkdownBatch> {
-        let mut batches = self.take_pending_markdown();
-        batches.extend(self.finalize_active(width));
-        batches
-    }
-
-    fn enqueue_markdown_batches(&mut self, batches: Vec<MarkdownBatch>) {
-        for batch in batches {
-            let kind = batch.kind;
-            let start = batch.start;
-            for (offset, line) in batch.lines.into_iter().enumerate() {
-                if self.pending_markdown_batches.is_empty() {
-                    self.pending_markdown_started_at = Some(Instant::now());
-                }
-                self.pending_markdown_batches.push_back(MarkdownBatch {
-                    kind,
-                    start: start + offset,
-                    lines: vec![line],
-                });
+        let source = std::mem::take(&mut self.assistant_pending);
+        if let Some(id) = self.assistant_live_id {
+            if let Some(block) = self.live_blocks.iter_mut().find(|block| block.id() == id) {
+                let _ = block.append_markdown_source(source);
+                return;
             }
         }
-    }
-
-    fn take_pending_markdown(&mut self) -> Vec<MarkdownBatch> {
-        self.pending_markdown_started_at = None;
-        self.pending_markdown_batches.drain(..).collect()
-    }
-
-    fn set_active(&mut self, kind: StreamKind, start: usize, mut lines: Vec<RenderedLine>) {
-        if kind == StreamKind::Reasoning {
-            for line in &mut lines {
-                line.patch_style(TextStyle::dim_italic());
-            }
-        }
-        self.active_kind = Some(kind);
-        self.active_start = start;
-        self.active_lines = lines;
+        let id = self.allocate_live_id();
+        self.push_live(LiveBlock::markdown(id, source, false));
+        self.assistant_live_id = Some(id);
     }
 
     fn rebuild_reasoning_view(&mut self, width: u16) {
@@ -591,7 +488,7 @@ impl InlineTerminal {
         self.active_lines = render_reasoning_view(&self.reasoning_source, elapsed, width);
     }
 
-    fn collapse_reasoning(&mut self, width: u16) -> Vec<MarkdownBatch> {
+    fn commit_collapsed_reasoning(&mut self) {
         let elapsed = self
             .reasoning_started_at
             .map_or(0, |started| started.elapsed().as_secs());
@@ -600,21 +497,19 @@ impl InlineTerminal {
         self.reasoning_started_at = None;
         self.active_lines.clear();
         if !had_reasoning {
-            return Vec::new();
+            return;
         }
-        let lines = render_markdown(&format!("Thought for {}", format_elapsed(elapsed)), width);
-        vec![MarkdownBatch::new(StreamKind::Reasoning, 0, lines)]
+        self.push_markdown_block(format!("Thought for {}", format_elapsed(elapsed)), true);
     }
 
     fn reset_streams(&mut self) {
-        self.assistant_stream.reset();
+        self.assistant_pending.clear();
+        self.assistant_live_id = None;
         self.reasoning_source.clear();
         self.reasoning_started_at = None;
         self.active_kind = None;
         self.active_start = 0;
         self.active_lines.clear();
-        self.pending_markdown_batches.clear();
-        self.pending_markdown_started_at = None;
         self.content_dirty = false;
     }
 
@@ -639,34 +534,29 @@ impl InlineTerminal {
         self.session_menu.clear();
         self.session_menu_selected = 0;
         self.command_menu_dirty = false;
-        self.turn_active = false;
-        self.turn_history_rows = 0;
-        self.counting_history_rows = false;
+        self.reset_turn_state();
         self.reset_streams();
     }
 
-    fn reset_session_history(&mut self) {
-        self.session_start_width = 0;
-        self.session_history_rows = 0;
-        self.session_overflowed = false;
+    fn reset_turn_state(&mut self) {
+        self.busy = false;
+        self.status_header.clear();
+        self.status_started_at = None;
+        self.status_frame = 0;
+        self.queued_messages = 0;
+        self.current_turn_id = None;
+        self.reset_streams();
     }
 
     fn markdown_width(&self) -> io::Result<u16> {
         Ok(terminal::size()?.0.saturating_sub(2).max(1))
     }
 
-    fn replace_viewport(
-        &mut self,
-        history: impl FnOnce(&mut Self) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let width = terminal::size()?.0.max(1);
+    fn redraw(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
             terminal.clear_viewport()?;
-            terminal.counting_history_rows = true;
-            let history_result = history(terminal);
-            terminal.counting_history_rows = false;
-            history_result?;
-            terminal.render_viewport(width)
+            terminal.flush_live_overflow()?;
+            terminal.render_viewport(terminal::size()?.0.max(1))
         })
     }
 
@@ -707,51 +597,39 @@ impl InlineTerminal {
         Ok(())
     }
 
-    fn clear_current_turn(&mut self) -> io::Result<()> {
+    fn push_viewport_to_scrollback(&mut self) -> io::Result<()> {
         if !self.viewport_visible {
             return Ok(());
         }
-
-        let terminal_height = terminal::size()?.1.max(1);
-        self.clear_owned_region(terminal_height, self.turn_history_rows)
-    }
-
-    fn clear_owned_region(&mut self, terminal_height: u16, history_rows: u16) -> io::Result<()> {
-        if !self.viewport_visible {
-            return Ok(());
-        }
-        let (move_up, clear_rows) = rollback_region(
-            terminal_height,
-            self.viewport_rows,
-            self.viewport_cursor_row,
-            history_rows,
-        );
-        queue!(self.stdout, MoveToPreviousLine(move_up))?;
-        for row in 0..clear_rows {
+        self.finalize_current_stream()?;
+        let (width, height) = terminal::size()?;
+        let height = height.max(1);
+        let frame = self.viewport_frame(width.max(1), height);
+        let history_rows = frame.history_rows.min(height);
+        queue!(
+            self.stdout,
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        self.frame_reusable_rows = 0;
+        if history_rows > 0 {
+            self.write_viewport_buffer_rows(&frame.buffer, history_rows)?;
             queue!(
                 self.stdout,
-                MoveToColumn(0),
                 SetAttribute(Attribute::Reset),
                 ResetColor,
-                Clear(ClearType::CurrentLine)
+                MoveTo(0, height.saturating_sub(1))
             )?;
-            if row + 1 < clear_rows {
-                queue!(self.stdout, MoveToNextLine(1))?;
+            for _ in 0..history_rows {
+                writeln!(self.stdout)?;
             }
         }
-        if clear_rows > 1 {
-            queue!(self.stdout, MoveToPreviousLine(clear_rows - 1))?;
-        }
-        Ok(())
+        queue!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))
     }
 
     fn next_frame_row(&mut self) -> io::Result<()> {
-        if self.counting_history_rows {
-            self.session_history_rows = self.session_history_rows.saturating_add(1);
-            if self.turn_active {
-                self.turn_history_rows = self.turn_history_rows.saturating_add(1);
-            }
-        }
         if self.frame_reusable_rows > 1 {
             self.frame_reusable_rows -= 1;
             queue!(self.stdout, MoveToNextLine(1))?;
@@ -764,42 +642,8 @@ impl InlineTerminal {
 
     fn render_viewport(&mut self, width: u16) -> io::Result<()> {
         let terminal_height = terminal::size()?.1;
-        let elapsed = format_elapsed(
-            self.status_started_at
-                .map_or(0, |started| started.elapsed().as_secs()),
-        );
-        let status_header = sanitize_single_line(&self.status_header);
-        let queued = queued_status(self.queued_messages);
-        let model = sanitize_single_line(&self.prompt.model);
-        let protocol = sanitize_single_line(&self.prompt.protocol);
-        let frame = viewport::render(ViewportInput {
-            terminal_width: width,
-            terminal_height,
-            history_boundary: self.history_boundary,
-            busy: self.busy,
-            active_start: self.active_start,
-            active_lines: &self.active_lines,
-            status_header: &status_header,
-            status_dots: status_dots(self.status_frame),
-            elapsed: &elapsed,
-            queued: &queued,
-            prompt: &self.prompt.text,
-            prompt_cursor_column: self.prompt.cursor_column,
-            composer_background: self.composer_background,
-            command_menu: &self.command_menu,
-            command_menu_selected: self.command_menu_selected,
-            session_menu: &self.session_menu,
-            session_menu_selected: self.session_menu_selected,
-            model: &model,
-            protocol: &protocol,
-            working_dir: &self.prompt.working_dir,
-        });
+        let frame = self.viewport_frame(width, terminal_height);
         let desired_rows = frame.total_rows;
-        if (self.session_start_width != 0 && self.session_start_width != width)
-            || self.session_history_rows.saturating_add(desired_rows) > terminal_height
-        {
-            self.session_overflowed = true;
-        }
         let line_widths = viewport_line_widths(&frame.buffer);
         self.write_viewport_buffer(&frame.buffer)?;
         self.viewport_rows = desired_rows;
@@ -824,7 +668,11 @@ impl InlineTerminal {
     }
 
     fn write_viewport_buffer(&mut self, buffer: &Buffer) -> io::Result<()> {
-        let height = buffer.area.height;
+        self.write_viewport_buffer_rows(buffer, buffer.area.height)
+    }
+
+    fn write_viewport_buffer_rows(&mut self, buffer: &Buffer, height: u16) -> io::Result<()> {
+        let height = height.min(buffer.area.height);
         let width = buffer.area.width;
         for y in 0..height {
             let background = uniform_row_background(buffer, y);
@@ -951,86 +799,32 @@ impl InlineTerminal {
         self.stdout.flush()
     }
 
-    fn write_user_history(&mut self, input: &str) -> io::Result<()> {
-        self.write_history_block(HistoryBlock::user(input), StackFlow::Block)
+    fn allocate_live_id(&mut self) -> u64 {
+        let id = self.next_live_block_id;
+        self.next_live_block_id = self.next_live_block_id.saturating_add(1);
+        id
     }
 
-    fn write_history_block(&mut self, block: HistoryBlock, flow: StackFlow) -> io::Result<()> {
-        let width = terminal::size()?.0.max(1);
-        let buffer = block.render(width, self.composer_background);
-        self.begin_history_block(flow)?;
-        self.write_viewport_buffer(&buffer)?;
-        self.next_frame_row()?;
-        self.finish_history_block();
-        Ok(())
+    fn push_live(&mut self, block: LiveBlock) {
+        self.live_blocks.push(block.with_turn(self.current_turn_id));
     }
 
-    fn write_markdown_batches(&mut self, batches: &[MarkdownBatch]) -> io::Result<()> {
-        for batch in batches {
-            if batch.lines.is_empty() {
-                continue;
-            }
-            let flow = if batch.start == 0 {
-                StackFlow::Block
-            } else {
-                StackFlow::Continuation
-            };
-            self.begin_history_block(flow)?;
-            for (index, line) in batch.lines.iter().enumerate() {
-                self.write_markdown_line(batch.kind, batch.start + index, line)?;
-                self.next_frame_row()?;
-            }
-            self.finish_history_block();
-        }
-        Ok(())
+    fn push_history_block(&mut self, block: HistoryBlock) {
+        let id = self.allocate_live_id();
+        self.push_live(LiveBlock::history(id, block));
     }
 
-    fn write_markdown_line(
-        &mut self,
-        _kind: StreamKind,
-        index: usize,
-        line: &RenderedLine,
-    ) -> io::Result<()> {
-        queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        if index == 0 {
-            write!(self.stdout, "{}•{} ", theme::DIM, theme::RESET)?;
-        } else {
-            write!(self.stdout, "  ")?;
-        }
-        line.write_ansi(&mut self.stdout)
+    fn push_markdown_block(&mut self, source: String, reasoning: bool) {
+        let id = self.allocate_live_id();
+        self.push_live(LiveBlock::markdown(id, source, reasoning));
     }
 
-    fn write_tool_history(
-        &mut self,
-        name: &str,
-        arguments: &Value,
-        is_error: bool,
-    ) -> io::Result<()> {
-        self.begin_history_block(StackFlow::Block)?;
-        let width = terminal::size()?.0.max(1);
-        let (action, detail) =
-            tool_call_summary(name, arguments, is_error, width.saturating_sub(2));
-        let bullet_style = if is_error {
-            theme::TOOL_ERROR_BULLET
-        } else {
-            theme::TOOL_SUCCESS_BULLET
-        };
-        write!(
-            self.stdout,
-            "{bullet_style}•{} {}{action}{}",
-            theme::RESET,
-            theme::BOLD,
-            theme::RESET
-        )?;
-        if !detail.is_empty() {
-            write!(self.stdout, " {detail}")?;
-        }
-        self.next_frame_row()?;
-        self.finish_history_block();
-        Ok(())
+    fn push_tool_block(&mut self, name: String, arguments: Value, is_error: bool) {
+        let id = self.allocate_live_id();
+        self.push_live(LiveBlock::tool(id, name, arguments, is_error));
     }
 
-    fn write_restored_messages(&mut self, messages: &[Message]) -> io::Result<()> {
+    fn push_restored_messages(&mut self, messages: &[Message]) {
         let tool_results = messages
             .iter()
             .filter_map(|message| match &message.content {
@@ -1052,29 +846,23 @@ impl InlineTerminal {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    self.write_user_history(&text)?;
+                    self.push_history_block(HistoryBlock::user(&text));
                 }
                 MessageContent::Assistant(blocks) => {
                     for block in blocks {
                         match block {
                             ContentBlock::Text(text) if !text.is_empty() => {
-                                let width = terminal::size()?.0.saturating_sub(2).max(1);
-                                let lines = render_markdown(text, width);
-                                self.write_markdown_batches(&[MarkdownBatch::new(
-                                    StreamKind::Assistant,
-                                    0,
-                                    lines,
-                                )])?;
+                                self.push_markdown_block(text.clone(), false);
                             }
                             ContentBlock::ToolCall {
                                 id,
                                 name,
                                 arguments,
-                            } => self.write_tool_history(
-                                name,
-                                arguments,
+                            } => self.push_tool_block(
+                                name.clone(),
+                                arguments.clone(),
                                 tool_results.get(id).copied().unwrap_or(false),
-                            )?,
+                            ),
                             ContentBlock::Text(_) => {}
                         }
                     }
@@ -1082,40 +870,78 @@ impl InlineTerminal {
                 MessageContent::ToolResult { .. } => {}
             }
         }
-        Ok(())
     }
 
-    fn write_error_history(&mut self, error: &str) -> io::Result<()> {
-        self.write_history_block(HistoryBlock::error(error), StackFlow::Block)
-    }
-
-    fn write_info_history(&mut self, message: &str) -> io::Result<()> {
-        self.write_history_block(HistoryBlock::info(message), StackFlow::Block)
-    }
-
-    fn write_worked_history(&mut self, elapsed_seconds: u64) -> io::Result<()> {
-        self.write_history_block(
-            HistoryBlock::worked(format_elapsed(elapsed_seconds)),
-            StackFlow::Block,
-        )
-    }
-
-    fn begin_history_block(&mut self, flow: StackFlow) -> io::Result<()> {
-        let item = match flow {
-            StackFlow::Block => StackItem::block(0),
-            StackFlow::Continuation => StackItem::continuation(0),
-        };
-        let layout = layout_stack(1, self.history_boundary, &[item]);
-        let leading_rows = layout.areas.first().map_or(0, |area| area.y);
-        for _ in 0..leading_rows {
-            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-            self.next_frame_row()?;
+    fn flush_live_overflow(&mut self) -> io::Result<()> {
+        let (width, height) = terminal::size()?;
+        while !self.live_blocks.is_empty()
+            && self.viewport_frame(width.max(1), height.max(1)).total_rows > height.max(1)
+        {
+            let block = self.live_blocks.remove(0);
+            self.flush_live_block(block, width.max(1))?;
         }
         Ok(())
     }
 
-    fn finish_history_block(&mut self) {
+    fn flush_all_live_blocks(&mut self) -> io::Result<()> {
+        let width = terminal::size()?.0.max(1);
+        while !self.live_blocks.is_empty() {
+            let block = self.live_blocks.remove(0);
+            self.flush_live_block(block, width)?;
+        }
+        Ok(())
+    }
+
+    fn flush_live_block(&mut self, block: LiveBlock, terminal_width: u16) -> io::Result<()> {
+        let width = terminal_width.saturating_sub(1).max(1);
+        if self.history_boundary != StackBoundary::default()
+            && block.flow() == crate::block_layout::StackFlow::Block
+        {
+            queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            self.next_frame_row()?;
+        }
+        let buffer = block.render(width, self.composer_background);
+        self.write_viewport_buffer(&buffer)?;
+        self.next_frame_row()?;
         self.history_boundary = self.history_boundary.after_block();
+        if self.assistant_live_id == Some(block.id()) {
+            self.assistant_live_id = None;
+        }
+        Ok(())
+    }
+
+    fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
+        let elapsed = format_elapsed(
+            self.status_started_at
+                .map_or(0, |started| started.elapsed().as_secs()),
+        );
+        let status_header = sanitize_single_line(&self.status_header);
+        let queued = queued_status(self.queued_messages);
+        let model = sanitize_single_line(&self.prompt.model);
+        let protocol = sanitize_single_line(&self.prompt.protocol);
+        viewport::render(ViewportInput {
+            terminal_width: width,
+            terminal_height: height,
+            history_boundary: self.history_boundary,
+            live_blocks: &self.live_blocks,
+            busy: self.busy,
+            active_start: self.active_start,
+            active_lines: &self.active_lines,
+            status_header: &status_header,
+            status_dots: status_dots(self.status_frame),
+            elapsed: &elapsed,
+            queued: &queued,
+            prompt: &self.prompt.text,
+            prompt_cursor_column: self.prompt.cursor_column,
+            composer_background: self.composer_background,
+            command_menu: &self.command_menu,
+            command_menu_selected: self.command_menu_selected,
+            session_menu: &self.session_menu,
+            session_menu_selected: self.session_menu_selected,
+            model: &model,
+            protocol: &protocol,
+            working_dir: &self.prompt.working_dir,
+        })
     }
 }
 
@@ -1148,26 +974,6 @@ fn format_elapsed(elapsed_seconds: u64) -> String {
         (elapsed_seconds % 3600) / 60,
         elapsed_seconds % 60
     )
-}
-
-fn rollback_region(
-    terminal_height: u16,
-    viewport_rows: u16,
-    viewport_cursor_row: u16,
-    turn_history_rows: u16,
-) -> (u16, u16) {
-    let terminal_height = terminal_height.max(1);
-    let rows_below_cursor = viewport_rows
-        .saturating_sub(1)
-        .saturating_sub(viewport_cursor_row);
-    let move_up = viewport_cursor_row
-        .saturating_add(turn_history_rows)
-        .min(terminal_height - 1);
-    let clear_rows = move_up
-        .saturating_add(rows_below_cursor)
-        .saturating_add(1)
-        .min(terminal_height);
-    (move_up, clear_rows)
 }
 
 fn viewport_line_widths(buffer: &Buffer) -> Vec<u16> {
@@ -1329,20 +1135,6 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     header
 }
 
-fn markdown_drain_count(queue_depth: usize, queued_at: Option<Instant>, now: Instant) -> usize {
-    if queue_depth == 0 {
-        return 0;
-    }
-    let oldest_age = queued_at.map_or(Duration::ZERO, |queued_at| {
-        now.saturating_duration_since(queued_at)
-    });
-    if queue_depth >= STREAM_CATCH_UP_DEPTH || oldest_age >= STREAM_CATCH_UP_AGE {
-        queue_depth
-    } else {
-        1
-    }
-}
-
 fn status_dots(frame: usize) -> &'static str {
     const FRAMES: [&str; 4] = [".  ", ".. ", "...", ".. "];
     FRAMES[frame % FRAMES.len()]
@@ -1365,16 +1157,6 @@ mod tests {
         assert_eq!(format_elapsed(0), "0s");
         assert_eq!(format_elapsed(61), "1m 01s");
         assert_eq!(format_elapsed(3661), "1h 01m 01s");
-    }
-
-    #[test]
-    fn rollback_region_covers_only_the_current_turn_and_viewport() {
-        assert_eq!(rollback_region(30, 6, 3, 8), (11, 14));
-    }
-
-    #[test]
-    fn rollback_region_stays_inside_the_visible_terminal() {
-        assert_eq!(rollback_region(20, 6, 3, u16::MAX), (19, 20));
     }
 
     #[test]
@@ -1409,14 +1191,6 @@ mod tests {
     #[test]
     fn resize_reflow_accounts_for_rows_scrolled_above_the_screen() {
         assert_eq!(resize_reflow_geometry(&[1, 60, 1, 1], 2, 0, 20, 4), (4, 2));
-    }
-
-    #[test]
-    fn a_new_session_spaces_the_first_active_block_with_flex() {
-        let boundary = StackBoundary::default().after_block().after_block();
-        let layout = layout_stack(80, boundary, &[StackItem::block(1)]);
-
-        assert_eq!(layout.areas[0].y, 1);
     }
 
     #[test]
@@ -1470,25 +1244,6 @@ mod tests {
         assert_eq!(queued_status(0), "");
         assert_eq!(queued_status(1), " · 1 queued");
         assert_eq!(queued_status(3), " · 3 queued");
-    }
-
-    #[test]
-    fn streams_one_line_normally_and_catches_up_under_pressure() {
-        let now = Instant::now();
-        assert_eq!(markdown_drain_count(0, None, now), 0);
-        assert_eq!(markdown_drain_count(3, Some(now), now), 1);
-        assert_eq!(
-            markdown_drain_count(STREAM_CATCH_UP_DEPTH, Some(now), now),
-            STREAM_CATCH_UP_DEPTH
-        );
-        assert_eq!(
-            markdown_drain_count(
-                3,
-                Some(now - STREAM_CATCH_UP_AGE - Duration::from_millis(1)),
-                now,
-            ),
-            3
-        );
     }
 
     #[test]

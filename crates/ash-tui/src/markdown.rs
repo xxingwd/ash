@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::io::{self, Write};
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -6,8 +7,6 @@ use ratatui::{
     text::{Line as RatatuiLine, Span as RatatuiSpan},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::theme;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum AnsiColor {
@@ -77,8 +76,9 @@ impl TextStyle {
         }
     }
 
+    #[cfg(test)]
     fn write_prefix(self, writer: &mut impl Write) -> io::Result<()> {
-        write!(writer, "{}", theme::RESET)?;
+        write!(writer, "\x1b[0m")?;
         if self.bold {
             write!(writer, "\x1b[1m")?;
         }
@@ -151,12 +151,13 @@ impl RenderedLine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_ansi(&self, writer: &mut impl Write) -> io::Result<()> {
         for span in &self.spans {
             span.style.write_prefix(writer)?;
             write!(writer, "{}", span.text)?;
         }
-        write!(writer, "{}", theme::RESET)
+        write!(writer, "\x1b[0m")
     }
 
     pub(crate) fn ratatui_line(&self) -> RatatuiLine<'static> {
