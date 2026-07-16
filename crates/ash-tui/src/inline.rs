@@ -21,8 +21,11 @@ use crate::{
     slash_command::CommandCompletion,
     stream_state::{format_elapsed, FinishedStream, StreamRefresh, StreamState},
     tool_display::tool_activity_summary,
-    viewport::{self, ViewportInput},
+    viewport::{self, drawable_width, ViewportInput, COMPOSER_TEXT_COLUMN},
 };
+
+const CONTENT_PREFIX_COLUMNS: u16 = 2;
+const TERMINAL_SAFE_COLUMN: u16 = 1;
 
 #[derive(Debug)]
 struct PromptSnapshot {
@@ -190,6 +193,7 @@ impl InlineTerminal {
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
         let turn_id = self.current_turn_id;
+        let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
             terminal.surface.clear_viewport()?;
             if let Some(turn_id) = turn_id {
@@ -198,7 +202,7 @@ impl InlineTerminal {
                     .retain(|block| !block.belongs_to_turn(turn_id));
             }
             terminal.reset_turn_state();
-            terminal.render_viewport(terminal::size()?.0.max(1))
+            terminal.render_viewport(width, height)
         })
     }
 
@@ -234,7 +238,10 @@ impl InlineTerminal {
         working_dir: &Path,
     ) -> io::Result<()> {
         let terminal_width = terminal::size()?.0.max(1);
-        let view = input.view(terminal_width.saturating_sub(3));
+        let input_width = terminal_width
+            .saturating_sub(COMPOSER_TEXT_COLUMN)
+            .saturating_sub(TERMINAL_SAFE_COLUMN);
+        let view = input.view(input_width);
         self.prompt.protocol = protocol.to_string();
         self.prompt.model = model.to_string();
         self.prompt.working_dir = working_dir.to_path_buf();
@@ -358,7 +365,7 @@ impl InlineTerminal {
         self.surface.handle_resize(width, height);
         if self.stream.is_reasoning() {
             self.stream
-                .refresh_reasoning(width.saturating_sub(2).max(1));
+                .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
         }
     }
 
@@ -368,7 +375,10 @@ impl InlineTerminal {
         }
         self.status.frame = self.status.frame.wrapping_add(1);
         if self.stream.is_reasoning() {
-            let width = terminal::size()?.0.saturating_sub(2).max(1);
+            let width = terminal::size()?
+                .0
+                .saturating_sub(CONTENT_PREFIX_COLUMNS)
+                .max(1);
             self.stream.refresh_reasoning(width);
         }
         self.redraw()
@@ -433,14 +443,18 @@ impl InlineTerminal {
     }
 
     fn markdown_width(&self) -> io::Result<u16> {
-        Ok(terminal::size()?.0.saturating_sub(2).max(1))
+        Ok(terminal::size()?
+            .0
+            .saturating_sub(CONTENT_PREFIX_COLUMNS)
+            .max(1))
     }
 
     fn redraw(&mut self) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
             terminal.surface.clear_viewport()?;
-            terminal.flush_live_overflow()?;
-            terminal.render_viewport(terminal::size()?.0.max(1))
+            terminal.flush_live_overflow(width, height)?;
+            terminal.render_viewport(width, height)
         })
     }
 
@@ -455,17 +469,11 @@ impl InlineTerminal {
     }
 
     fn push_viewport_to_scrollback(&mut self) -> io::Result<()> {
-        if !self.surface.is_visible() {
-            return Ok(());
-        }
-        let (width, height) = terminal::size()?;
-        let frame = self.viewport_frame(width.max(1), height.max(1));
-        self.surface.push_history_to_scrollback(&frame)
+        self.surface.push_history_to_scrollback()
     }
 
-    fn render_viewport(&mut self, width: u16) -> io::Result<()> {
-        let terminal_height = terminal::size()?.1;
-        let frame = self.viewport_frame(width, terminal_height);
+    fn render_viewport(&mut self, width: u16, height: u16) -> io::Result<()> {
+        let frame = self.viewport_frame(width, height);
         self.surface.render_frame(&frame, width, &self.prompt.text)
     }
 
@@ -550,13 +558,11 @@ impl InlineTerminal {
         }
     }
 
-    fn flush_live_overflow(&mut self) -> io::Result<()> {
-        let (width, height) = terminal::size()?;
-        while !self.live_blocks.is_empty()
-            && self.viewport_frame(width.max(1), height.max(1)).total_rows > height.max(1)
+    fn flush_live_overflow(&mut self, width: u16, height: u16) -> io::Result<()> {
+        while !self.live_blocks.is_empty() && self.viewport_frame(width, height).total_rows > height
         {
             let block = self.live_blocks.remove(0);
-            self.flush_live_block(block, width.max(1))?;
+            self.flush_live_block(block, width)?;
         }
         Ok(())
     }
@@ -571,10 +577,8 @@ impl InlineTerminal {
     }
 
     fn flush_live_block(&mut self, block: LiveBlock, terminal_width: u16) -> io::Result<()> {
-        let width = terminal_width.saturating_sub(1).max(1);
-        if self.history_boundary != StackBoundary::default()
-            && block.flow() == crate::block_layout::StackFlow::Block
-        {
+        let width = drawable_width(terminal_width);
+        if self.history_boundary.has_block() {
             self.surface.clear_current_line()?;
             self.surface.next_row()?;
         }
@@ -598,7 +602,6 @@ impl InlineTerminal {
             history_boundary: self.history_boundary,
             live_blocks: &self.live_blocks,
             busy: self.status.busy,
-            active_start: 0,
             active_lines: self.stream.active_lines(),
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
@@ -621,6 +624,11 @@ impl InlineTerminal {
 fn status_dots(frame: usize) -> &'static str {
     const FRAMES: [&str; 4] = [".  ", ".. ", "...", ".. "];
     FRAMES[frame % FRAMES.len()]
+}
+
+fn terminal_size() -> io::Result<(u16, u16)> {
+    let (width, height) = terminal::size()?;
+    Ok((width.max(1), height.max(1)))
 }
 
 fn queued_status(queued_messages: usize) -> String {

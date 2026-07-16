@@ -11,7 +11,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    block_layout::{layout_stack, stack_height, StackBoundary, StackFlow, StackItem},
+    block_layout::{layout_stack, stack_height, StackBoundary, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
     palette::Rgb,
@@ -23,7 +23,21 @@ const STATUS_ROWS: u16 = 1;
 const COMPOSER_ROWS: u16 = 3;
 const FOOTER_ROWS: u16 = 1;
 const SESSION_MENU_MAX_ROWS: usize = 8;
+const COMPACT_STATUS_WIDTH: u16 = 32;
+const FOOTER_SIDE_PADDING: u16 = 2;
+const FOOTER_COLUMN_GAP: u16 = 3;
+const FOOTER_MIN_LEFT_WIDTH: u16 = 3;
+const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
+const MENU_COLUMN_GAP: usize = 2;
+const MENU_PREFIX_COLUMNS: usize = 2;
+const SESSION_CREATED_MIN_LEFT_COLUMNS: usize = 8;
 const COMPOSER_PADDING: Padding = Padding::new(0, 0, 1, 1);
+pub(crate) const COMPOSER_TEXT_COLUMN: u16 = 2;
+
+pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
+    // Keep the final column free because writing into it can trigger an automatic wrap.
+    terminal_width.saturating_sub(1).max(1)
+}
 
 pub(crate) struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
@@ -31,7 +45,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) history_boundary: StackBoundary,
     pub(crate) live_blocks: &'a [LiveBlock],
     pub(crate) busy: bool,
-    pub(crate) active_start: usize,
     pub(crate) active_lines: &'a [RenderedLine],
     pub(crate) status_header: &'a str,
     pub(crate) status_dots: &'a str,
@@ -58,7 +71,7 @@ pub(crate) struct ViewportFrame {
 }
 
 pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
-    let width = input.terminal_width.saturating_sub(1).max(1);
+    let width = drawable_width(input.terminal_width);
     let menu_rows = if input.session_menu.is_empty() {
         command_menu_rows(input.command_menu.len())
     } else {
@@ -68,12 +81,10 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .live_blocks
         .iter()
         .map(|block| RenderedLiveBlock {
-            flow: block.flow(),
             buffer: block.render(width, input.composer_background),
         })
         .collect::<Vec<_>>();
     let active = active_window(
-        input.active_start,
         input.active_lines,
         input.terminal_height,
         input.history_boundary,
@@ -122,7 +133,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     ViewportFrame {
         buffer,
         cursor_row: composer_input_area.y.saturating_add(COMPOSER_PADDING.top),
-        cursor_column: 2_u16
+        cursor_column: COMPOSER_TEXT_COLUMN
             .saturating_add(input.prompt_cursor_column)
             .min(input.terminal_width.saturating_sub(1)),
         history_rows,
@@ -133,16 +144,13 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 struct ActiveWindow<'a> {
     start: usize,
     lines: &'a [RenderedLine],
-    flow: StackFlow,
 }
 
 struct RenderedLiveBlock {
-    flow: StackFlow,
     buffer: Buffer,
 }
 
 fn active_window<'a>(
-    active_start: usize,
     active_lines: &'a [RenderedLine],
     terminal_height: u16,
     history_boundary: StackBoundary,
@@ -154,30 +162,12 @@ fn active_window<'a>(
         return None;
     }
 
-    let starts_block = active_start == 0;
-    let initial_flow = if starts_block {
-        StackFlow::Block
-    } else {
-        StackFlow::Continuation
-    };
-    let initial_overhead = active_overhead(history_boundary, live, initial_flow, busy, menu_rows);
-    let flow = if starts_block
-        && active_lines
-            .len()
-            .saturating_add(usize::from(initial_overhead))
-            <= usize::from(terminal_height)
-    {
-        StackFlow::Block
-    } else {
-        StackFlow::Continuation
-    };
-    let overhead = active_overhead(history_boundary, live, flow, busy, menu_rows);
+    let overhead = active_overhead(history_boundary, live, busy, menu_rows);
     let max_lines = usize::from(terminal_height.saturating_sub(overhead));
     let skip = active_lines.len().saturating_sub(max_lines);
     Some(ActiveWindow {
-        start: active_start + skip,
+        start: skip,
         lines: &active_lines[skip..],
-        flow,
     })
 }
 
@@ -216,14 +206,12 @@ struct RegionSpec {
 fn active_overhead(
     history_boundary: StackBoundary,
     live: &[RenderedLiveBlock],
-    flow: StackFlow,
     busy: bool,
     menu_rows: u16,
 ) -> u16 {
     let active = ActiveWindow {
         start: 0,
         lines: &[],
-        flow,
     };
     let regions = viewport_regions(live, Some(&active), busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
@@ -240,21 +228,14 @@ fn viewport_regions(
     for (index, block) in live.iter().enumerate() {
         regions.push(RegionSpec {
             kind: ViewportRegion::Live(index),
-            item: StackItem {
-                height: block.buffer.area.height,
-                flow: block.flow,
-            },
+            item: StackItem::block(block.buffer.area.height),
         });
     }
     if let Some(active) = active {
         let height = u16::try_from(active.lines.len()).unwrap_or(u16::MAX);
-        let item = match active.flow {
-            StackFlow::Block => StackItem::block(height),
-            StackFlow::Continuation => StackItem::continuation(height),
-        };
         regions.push(RegionSpec {
             kind: ViewportRegion::Active,
-            item,
+            item: StackItem::block(height),
         });
     }
     if busy {
@@ -313,7 +294,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let line = if area.width < 32 {
+    let line = if area.width < COMPACT_STATUS_WIDTH {
         Line::from(vec![
             Span::styled(
                 format!("{}{}", input.status_header, input.status_dots),
@@ -370,12 +351,14 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     }
     let path = compact_path(input.working_dir);
     let protocol_width = UnicodeWidthStr::width(input.protocol) as u16;
-    let right_x = area.width.saturating_sub(protocol_width.saturating_add(2));
-    let show_protocol = protocol_width > 0 && right_x > 3;
+    let right_x = area
+        .width
+        .saturating_sub(protocol_width.saturating_add(FOOTER_SIDE_PADDING));
+    let show_protocol = protocol_width > 0 && right_x > FOOTER_MIN_LEFT_WIDTH;
     let left_width = if show_protocol {
-        right_x.saturating_sub(3)
+        right_x.saturating_sub(FOOTER_COLUMN_GAP)
     } else {
-        area.width.saturating_sub(4)
+        area.width.saturating_sub(FOOTER_SIDE_PADDING * 2)
     };
     let (model, path) = fit_status_left(input.model, &path, left_width);
     let mut spans = vec![
@@ -407,7 +390,9 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
         .map(|item| UnicodeWidthStr::width(item.name))
         .max()
         .unwrap_or(1);
-    let description_column = 3usize.saturating_add(name_width).saturating_add(2);
+    let description_column = COMMAND_NAME_PREFIX_COLUMNS
+        .saturating_add(name_width)
+        .saturating_add(MENU_COLUMN_GAP);
     for (index, item) in input.command_menu.iter().enumerate() {
         let Ok(offset) = u16::try_from(index) else {
             break;
@@ -468,14 +453,15 @@ fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
             Style::default()
         };
         let created_width = UnicodeWidthStr::width(session.created_at.as_str());
-        let show_created = usize::from(area.width) > created_width.saturating_add(8);
+        let show_created = usize::from(area.width)
+            > created_width.saturating_add(SESSION_CREATED_MIN_LEFT_COLUMNS);
         let title_width = if show_created {
             usize::from(area.width)
-                .saturating_sub(2)
+                .saturating_sub(MENU_PREFIX_COLUMNS)
                 .saturating_sub(created_width)
-                .saturating_sub(2)
+                .saturating_sub(MENU_COLUMN_GAP)
         } else {
-            usize::from(area.width).saturating_sub(2)
+            usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS)
         };
         let title = fit_menu_text(&session.title, title_width);
         let title_used = UnicodeWidthStr::width(title.as_str());
@@ -492,7 +478,7 @@ fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
         ];
         if show_created {
             let spacing = usize::from(area.width)
-                .saturating_sub(2)
+                .saturating_sub(MENU_PREFIX_COLUMNS)
                 .saturating_sub(title_used)
                 .saturating_sub(created_width);
             spans.push(Span::raw(" ".repeat(spacing)));
@@ -571,7 +557,6 @@ mod tests {
             history_boundary: user_boundary(),
             live_blocks: &[],
             busy: true,
-            active_start: 0,
             active_lines: &active,
             status_header: "Working",
             status_dots: "...",
@@ -609,7 +594,6 @@ mod tests {
             history_boundary: welcome_boundary(),
             live_blocks: &[],
             busy: false,
-            active_start: 0,
             active_lines: &[],
             status_header: "",
             status_dots: "",
@@ -646,7 +630,6 @@ mod tests {
             history_boundary: welcome_boundary(),
             live_blocks: &[],
             busy: false,
-            active_start: 0,
             active_lines: &[],
             status_header: "",
             status_dots: "",
@@ -679,7 +662,6 @@ mod tests {
             history_boundary: user_boundary(),
             live_blocks: &[],
             busy: true,
-            active_start: 0,
             active_lines: &active,
             status_header: "Thinking",
             status_dots: "...",
@@ -712,7 +694,6 @@ mod tests {
             history_boundary: StackBoundary::default(),
             live_blocks: &blocks,
             busy: false,
-            active_start: 0,
             active_lines: &[],
             status_header: "",
             status_dots: "",

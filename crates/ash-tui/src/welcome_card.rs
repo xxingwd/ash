@@ -7,6 +7,7 @@ use crate::scrollback::sanitize_single_line;
 const FULL_WORDMARK_MIN_WIDTH: u16 = 34;
 const COMPACT_WORDMARK_MIN_WIDTH: u16 = 14;
 const MIN_CARD_WIDTH: u16 = 10;
+const FRAME_BORDER_COLUMNS: u16 = 2;
 const SUBTITLE: &str = "── TERMINAL CODING AGENT ──";
 
 const FULL_WORDMARK: [&str; 6] = [
@@ -34,12 +35,11 @@ pub(crate) struct WelcomeLine {
     pub(crate) style: WelcomeStyle,
 }
 
-pub(crate) fn welcome_card(terminal_width: u16, working_dir: &Path) -> Vec<WelcomeLine> {
-    // Keep the final column free to avoid terminals automatically wrapping a border glyph.
-    let outer_width = terminal_width.saturating_sub(1);
-    let inner_width = outer_width.saturating_sub(2);
+pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<WelcomeLine> {
+    let outer_width = available_width;
+    let inner_width = outer_width.saturating_sub(FRAME_BORDER_COLUMNS);
     if outer_width < MIN_CARD_WIDTH {
-        return vec![centered(terminal_width, "ASH", WelcomeStyle::Title)];
+        return vec![centered(available_width, "ASH", WelcomeStyle::Title)];
     }
 
     let indent = "";
@@ -98,7 +98,9 @@ fn framed_bottom(indent: &str, outer_width: u16) -> WelcomeLine {
     WelcomeLine {
         text: format!(
             "{indent}╰{}╯",
-            "─".repeat(usize::from(outer_width.saturating_sub(2)))
+            "─".repeat(usize::from(
+                outer_width.saturating_sub(FRAME_BORDER_COLUMNS),
+            ))
         ),
         style: WelcomeStyle::Frame,
     }

@@ -11,33 +11,20 @@ impl StackBoundary {
     pub(crate) const fn after_block(self) -> Self {
         Self { has_block: true }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StackFlow {
-    Block,
-    Continuation,
+    pub(crate) const fn has_block(self) -> bool {
+        self.has_block
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StackItem {
     pub(crate) height: u16,
-    pub(crate) flow: StackFlow,
 }
 
 impl StackItem {
     pub(crate) const fn block(height: u16) -> Self {
-        Self {
-            height,
-            flow: StackFlow::Block,
-        }
-    }
-
-    pub(crate) const fn continuation(height: u16) -> Self {
-        Self {
-            height,
-            flow: StackFlow::Continuation,
-        }
+        Self { height }
     }
 }
 
@@ -85,7 +72,7 @@ fn measure_stack(boundary: StackBoundary, items: &[StackItem]) -> (u16, bool) {
         return (0, false);
     }
 
-    let history_anchor = boundary.has_block && items[0].flow == StackFlow::Block;
+    let history_anchor = boundary.has_block;
     let section_count = items.len() + usize::from(history_anchor);
     let gaps = u16::try_from(section_count.saturating_sub(1)).unwrap_or(u16::MAX);
     let content_height = items
@@ -108,15 +95,6 @@ mod tests {
 
         assert_eq!(layout.height, 3);
         assert_eq!(layout.areas, [Rect::new(0, 1, 80, 2)]);
-    }
-
-    #[test]
-    fn continuation_stays_attached_to_committed_history() {
-        let boundary = StackBoundary::default().after_block();
-        let layout = layout_stack(80, boundary, &[StackItem::continuation(2)]);
-
-        assert_eq!(layout.height, 2);
-        assert_eq!(layout.areas, [Rect::new(0, 0, 80, 2)]);
     }
 
     #[test]

@@ -16,13 +16,17 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{palette::Rgb, viewport::ViewportFrame};
+use crate::{
+    palette::Rgb,
+    viewport::{ViewportFrame, COMPOSER_TEXT_COLUMN},
+};
 
 #[derive(Debug, Default)]
 struct ViewportGeometry {
     rows: u16,
     cursor_row: u16,
     cursor_column: u16,
+    history_rows: u16,
     line_widths: Vec<u16>,
 }
 
@@ -99,16 +103,16 @@ impl InlineSurface {
         Ok(())
     }
 
-    pub(crate) fn push_history_to_scrollback(&mut self, frame: &ViewportFrame) -> io::Result<()> {
-        if self.viewport.is_none() {
+    pub(crate) fn push_history_to_scrollback(&mut self) -> io::Result<()> {
+        let Some(viewport) = &self.viewport else {
             return Ok(());
-        }
+        };
         let height = terminal::size()?.1.max(1);
         let (rows_below_cursor, rows_to_advance) = history_scroll_geometry(
             height,
-            frame.total_rows,
-            frame.history_rows,
-            frame.cursor_row,
+            viewport.rows,
+            viewport.history_rows,
+            viewport.cursor_row,
         );
         queue!(
             self.stdout,
@@ -135,6 +139,7 @@ impl InlineSurface {
             rows: frame.total_rows,
             cursor_row: frame.cursor_row,
             cursor_column: frame.cursor_column,
+            history_rows: frame.history_rows,
             line_widths,
         });
         self.prompt_width = width;
@@ -181,7 +186,7 @@ impl InlineSurface {
             self.write_style(RatatuiColor::Reset, background, Modifier::BOLD)?;
             write!(self.stdout, "›")?;
             if !prompt.is_empty() {
-                queue!(self.stdout, MoveToColumn(2))?;
+                queue!(self.stdout, MoveToColumn(COMPOSER_TEXT_COLUMN))?;
                 self.write_style(RatatuiColor::Reset, background, Modifier::empty())?;
                 write!(self.stdout, "{prompt}")?;
             }
@@ -198,12 +203,15 @@ impl InlineSurface {
                     *line_width = if prompt_width == 0 {
                         1
                     } else {
-                        2_u16.saturating_add(prompt_width)
+                        COMPOSER_TEXT_COLUMN.saturating_add(prompt_width)
                     };
                 }
             }
         }
-        queue!(self.stdout, MoveToColumn(2 + cursor_column))?;
+        queue!(
+            self.stdout,
+            MoveToColumn(COMPOSER_TEXT_COLUMN + cursor_column)
+        )?;
         self.stdout.flush()
     }
 
