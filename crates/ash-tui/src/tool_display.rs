@@ -24,6 +24,16 @@ pub(crate) fn tool_call_summary(
     fit_action_and_detail(action, &detail, usize::from(max_width.max(1)))
 }
 
+pub(crate) fn read_group_summary(arguments: &[Value], max_width: u16) -> (String, String) {
+    let detail = arguments
+        .iter()
+        .map(|arguments| tool_phrase("read", arguments).detail)
+        .filter(|detail| !detail.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    fit_action_and_detail("Read", &detail, usize::from(max_width.max(1)))
+}
+
 struct ToolPhrase {
     running: &'static str,
     completed: &'static str,
@@ -273,6 +283,20 @@ mod tests {
                 80,
             ),
             ("Failed".to_string(), "writing report.md".to_string())
+        );
+    }
+
+    #[test]
+    fn groups_read_paths_behind_one_action() {
+        assert_eq!(
+            read_group_summary(
+                &[
+                    json!({"path": "/workspace/src/inline.rs"}),
+                    json!({"path": "/workspace/src/viewport.rs"}),
+                ],
+                80,
+            ),
+            ("Read".to_string(), "inline.rs, viewport.rs".to_string())
         );
     }
 

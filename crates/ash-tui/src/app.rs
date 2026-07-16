@@ -50,7 +50,7 @@ impl App {
         mut events: impl futures::Stream<Item = Event> + Unpin,
         commands: tokio::sync::mpsc::Sender<UiCommand>,
     ) -> anyhow::Result<()> {
-        let mut terminal = InlineTerminal::enter()?;
+        let mut terminal = InlineTerminal::enter(&self.protocol, &self.model, &self.working_dir)?;
         let mut input = InputState::with_history(std::mem::take(&mut self.input_history));
         let mut keys = EventStream::new();
         let render_interval = Duration::from_nanos(8_333_334);
@@ -74,15 +74,7 @@ impl App {
         let mut rollback_in_progress = false;
 
         terminal.welcome()?;
-        render_prompt(
-            &mut terminal,
-            &input,
-            &mut command_completion,
-            busy,
-            &self.protocol,
-            &self.model,
-            &self.working_dir,
-        )?;
+        render_prompt(&mut terminal, &input, &mut command_completion, busy)?;
 
         loop {
             tokio::select! {
@@ -104,9 +96,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         Event::TextDelta(text) => terminal.text(&text)?,
@@ -115,11 +104,11 @@ impl App {
                             terminal.tool_start(&name, &arguments)?;
                             calls.insert(id.clone(), (name.clone(), arguments));
                         }
-                        Event::ToolCallEnd { id, output: _, is_error } => {
+                        Event::ToolCallEnd { id, output, is_error } => {
                             let (name, arguments) = calls
                                 .remove(&id)
                                 .unwrap_or_else(|| ("tool".into(), serde_json::Value::Null));
-                            terminal.tool_end(&name, &arguments, is_error)?;
+                            terminal.tool_end(&name, &arguments, &output, is_error)?;
                         }
                         Event::Error(error) => {
                             terminal.error(&error)?;
@@ -148,9 +137,6 @@ impl App {
                                     &input,
                                     &mut command_completion,
                                     busy,
-                                    &self.protocol,
-                                    &self.model,
-                                    &self.working_dir,
                                 )?;
                             }
                         }
@@ -173,9 +159,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         Event::SessionRestored {
@@ -198,15 +181,17 @@ impl App {
                             self.model = model;
                             self.protocol = protocol;
                             self.working_dir = working_dir;
-                            terminal.restore_session(&messages, &self.working_dir)?;
+                            terminal.restore_session(
+                                &messages,
+                                &self.protocol,
+                                &self.model,
+                                &self.working_dir,
+                            )?;
                             render_prompt(
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         Event::SessionsListed { sessions } => {
@@ -224,9 +209,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         Event::Usage { .. }
@@ -245,9 +227,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?
                         },
                         CrosstermEvent::Paste(text) => {
@@ -260,9 +239,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         CrosstermEvent::Key(key)
@@ -295,9 +271,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         if let Some(session_id) = selected {
                                             if commands
@@ -321,9 +294,6 @@ impl App {
                                     &input,
                                     &mut command_completion,
                                     busy,
-                                    &self.protocol,
-                                    &self.model,
-                                    &self.working_dir,
                                 )?;
                                 continue;
                             }
@@ -336,12 +306,7 @@ impl App {
                                             command_completion.items(),
                                             command_completion.selected_index(),
                                         );
-                                        terminal.prompt(
-                                            &input,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
-                                        )?;
+                                        terminal.prompt(&input)?;
                                         continue;
                                     }
                                     KeyCode::Up => {
@@ -351,9 +316,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -364,9 +326,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -379,9 +338,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -394,9 +350,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -409,9 +362,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -445,9 +395,6 @@ impl App {
                                     &input,
                                     &mut command_completion,
                                     busy,
-                                    &self.protocol,
-                                    &self.model,
-                                    &self.working_dir,
                                 )?;
                                 if commands.send(UiCommand::CancelAndUndo).await.is_err() {
                                     break;
@@ -470,9 +417,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         continue;
                                     }
@@ -506,10 +450,7 @@ impl App {
                                                         &mut terminal,
                                                         &input,
                                                         &mut command_completion,
-                                                        busy,
-                                                        &self.protocol,
-                                                        &self.model,
-                                                        &self.working_dir,
+                                            busy,
                                                     )?;
                                                     if commands
                                                         .send(UiCommand::NewSession)
@@ -525,9 +466,6 @@ impl App {
                                                         &input,
                                                         &mut command_completion,
                                                         busy,
-                                                        &self.protocol,
-                                                        &self.model,
-                                                        &self.working_dir,
                                                     )?;
                                                     if commands
                                                         .send(UiCommand::ListSessions)
@@ -567,9 +505,6 @@ impl App {
                                             &input,
                                             &mut command_completion,
                                             busy,
-                                            &self.protocol,
-                                            &self.model,
-                                            &self.working_dir,
                                         )?;
                                         if commands.send(UiCommand::Submit(value)).await.is_err() {
                                             break;
@@ -600,10 +535,7 @@ impl App {
                                         &mut terminal,
                                         &input,
                                         &mut command_completion,
-                                        busy,
-                                        &self.protocol,
-                                        &self.model,
-                                        &self.working_dir,
+                                                        busy,
                                     )?;
                                 }
                                 KeyCode::Char('d')
@@ -629,9 +561,6 @@ impl App {
                                 &input,
                                 &mut command_completion,
                                 busy,
-                                &self.protocol,
-                                &self.model,
-                                &self.working_dir,
                             )?;
                         }
                         _ => {}
@@ -673,12 +602,9 @@ fn render_prompt(
     input: &InputState,
     completion: &mut CommandCompletionState,
     busy: bool,
-    protocol: &str,
-    model: &str,
-    working_dir: &std::path::Path,
 ) -> std::io::Result<()> {
     sync_command_menu(terminal, input, completion, busy);
-    terminal.prompt(input, protocol, model, working_dir)
+    terminal.prompt(input)
 }
 
 #[cfg(test)]

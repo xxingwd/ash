@@ -10,6 +10,10 @@ use tracing::debug;
 
 use crate::{AgentConfig, SessionStore};
 
+const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
+const TOOL_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated ...\n";
+
 pub async fn run_agent_loop(
     config: AgentConfig,
     mut messages: Vec<Message>,
@@ -201,8 +205,9 @@ async fn run_with_adapter(
                     arguments: arguments.clone(),
                 })
                 .await;
-            let result =
-                execute_tool(config, messages, session_id, &cancel, &name, arguments).await;
+            let result = limit_tool_result(
+                execute_tool(config, messages, session_id, &cancel, &name, arguments).await,
+            );
             if cancel.is_cancelled() {
                 return Ok(StopReason::Aborted);
             }
@@ -280,6 +285,37 @@ async fn execute_tool(
             result.unwrap_or(Err(ToolError::Timeout(config.tool_timeout)))
         }
     }
+}
+
+fn limit_tool_result(result: Result<String, ToolError>) -> Result<String, ToolError> {
+    match result {
+        Ok(output) => Ok(limit_tool_output(output)),
+        Err(ToolError::Execution(output)) => Err(ToolError::Execution(limit_tool_output(output))),
+        Err(error) => Err(error),
+    }
+}
+
+fn limit_tool_output(output: String) -> String {
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return output;
+    }
+    let content_budget = MAX_TOOL_OUTPUT_BYTES.saturating_sub(TOOL_OUTPUT_TRUNCATION_NOTICE.len());
+    let tail_budget = TOOL_OUTPUT_TAIL_BYTES.min(content_budget);
+    let head_budget = content_budget.saturating_sub(tail_budget);
+    let mut head_end = head_budget.min(output.len());
+    while !output.is_char_boundary(head_end) {
+        head_end = head_end.saturating_sub(1);
+    }
+    let mut tail_start = output.len().saturating_sub(tail_budget);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start = tail_start.saturating_add(1);
+    }
+    format!(
+        "{}{}{}",
+        &output[..head_end],
+        TOOL_OUTPUT_TRUNCATION_NOTICE,
+        &output[tail_start..]
+    )
 }
 
 pub struct Agent;
@@ -420,5 +456,15 @@ mod tests {
         let persisted = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(persisted.contains("assistant_message"));
         assert!(persisted.contains("tool_result"));
+    }
+
+    #[test]
+    fn truncates_large_tool_output_without_splitting_utf8() {
+        let output = "你".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let truncated = limit_tool_output(output);
+
+        assert!(truncated.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(truncated.contains("tool output truncated"));
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }

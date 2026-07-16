@@ -14,6 +14,22 @@ pub(crate) fn existing(root: &Path, requested: &str) -> Result<PathBuf, ToolErro
 pub(crate) fn for_write(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
     let root = canonical_root(root)?;
     let candidate = lexical_path(&root, requested)?;
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+                ToolError::Execution(format!("cannot access {}: {error}", candidate.display()))
+            })?;
+            ensure_inside(&root, resolved)?;
+            return Ok(candidate);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ToolError::Execution(format!(
+                "cannot access {}: {error}",
+                candidate.display()
+            )));
+        }
+    }
     let mut ancestor = candidate.parent().unwrap_or(&root);
     while !ancestor.exists() {
         ancestor = ancestor.parent().ok_or_else(|| {
@@ -99,5 +115,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = for_write(root.path(), "src/new/file.rs").unwrap();
         assert!(path.starts_with(std::fs::canonicalize(root.path()).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_symlink_to_outside_the_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("outside.txt");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        assert!(for_write(root.path(), "outside.txt").is_err());
     }
 }

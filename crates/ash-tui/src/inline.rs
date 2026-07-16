@@ -36,15 +36,21 @@ struct PromptSnapshot {
     cursor_column: u16,
 }
 
-impl Default for PromptSnapshot {
-    fn default() -> Self {
+impl PromptSnapshot {
+    fn new(protocol: &str, model: &str, working_dir: &Path) -> Self {
         Self {
-            protocol: String::new(),
-            model: String::new(),
-            working_dir: std::env::current_dir().unwrap_or_default(),
+            protocol: protocol.to_string(),
+            model: model.to_string(),
+            working_dir: working_dir.to_path_buf(),
             text: String::new(),
             cursor_column: 0,
         }
+    }
+
+    fn set_context(&mut self, protocol: &str, model: &str, working_dir: &Path) {
+        self.protocol = protocol.to_string();
+        self.model = model.to_string();
+        self.working_dir = working_dir.to_path_buf();
     }
 }
 
@@ -133,13 +139,13 @@ pub(crate) struct InlineTerminal {
 }
 
 impl InlineTerminal {
-    pub fn enter() -> io::Result<Self> {
+    pub fn enter(protocol: &str, model: &str, working_dir: &Path) -> io::Result<Self> {
         let surface = InlineSurface::enter()?;
         let composer_background = crate::palette::composer_background_color();
         Ok(Self {
             surface,
             composer_background,
-            prompt: PromptSnapshot::default(),
+            prompt: PromptSnapshot::new(protocol, model, working_dir),
             history_boundary: StackBoundary::default(),
             live_blocks: Vec::new(),
             next_live_block_id: 1,
@@ -206,9 +212,15 @@ impl InlineTerminal {
         })
     }
 
-    pub fn restore_session(&mut self, messages: &[Message], working_dir: &Path) -> io::Result<()> {
+    pub fn restore_session(
+        &mut self,
+        messages: &[Message],
+        protocol: &str,
+        model: &str,
+        working_dir: &Path,
+    ) -> io::Result<()> {
         self.begin_fresh_viewport()?;
-        self.prompt.working_dir = working_dir.to_path_buf();
+        self.prompt.set_context(protocol, model, working_dir);
         self.enqueue_welcome();
         self.push_restored_messages(messages);
         self.redraw()
@@ -230,21 +242,12 @@ impl InlineTerminal {
         self.menus.set_sessions(items, selected);
     }
 
-    pub fn prompt(
-        &mut self,
-        input: &InputState,
-        protocol: &str,
-        model: &str,
-        working_dir: &Path,
-    ) -> io::Result<()> {
+    pub fn prompt(&mut self, input: &InputState) -> io::Result<()> {
         let terminal_width = terminal::size()?.0.max(1);
         let input_width = terminal_width
             .saturating_sub(COMPOSER_TEXT_COLUMN)
             .saturating_sub(TERMINAL_SAFE_COLUMN);
         let view = input.view(input_width);
-        self.prompt.protocol = protocol.to_string();
-        self.prompt.model = model.to_string();
-        self.prompt.working_dir = working_dir.to_path_buf();
         self.prompt.text = view.text;
         self.prompt.cursor_column = view.cursor_column;
 
@@ -318,9 +321,20 @@ impl InlineTerminal {
         self.redraw()
     }
 
-    pub fn tool_end(&mut self, name: &str, arguments: &Value, is_error: bool) -> io::Result<()> {
+    pub fn tool_end(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        output: &str,
+        is_error: bool,
+    ) -> io::Result<()> {
         self.status.header = "Working".to_string();
-        self.push_tool_block(name.to_string(), arguments.clone(), is_error);
+        self.push_tool_block(
+            name.to_string(),
+            arguments.clone(),
+            output.to_string(),
+            is_error,
+        );
         self.redraw()
     }
 
@@ -505,19 +519,31 @@ impl InlineTerminal {
         self.push_live(LiveBlock::markdown(id, source, reasoning));
     }
 
-    fn push_tool_block(&mut self, name: String, arguments: Value, is_error: bool) {
+    fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
+        if self
+            .live_blocks
+            .last_mut()
+            .is_some_and(|block| block.try_append_read(&name, &arguments, is_error))
+        {
+            return;
+        }
         let id = self.allocate_live_id();
-        self.push_live(LiveBlock::tool(id, name, arguments, is_error));
+        self.push_live(LiveBlock::tool(id, name, arguments, output, is_error));
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
         let tool_results = messages
             .iter()
             .filter_map(|message| match &message.content {
-                MessageContent::ToolResult { id, result } => Some((id.clone(), result.is_err())),
+                MessageContent::ToolResult { id, result } => {
+                    let output = match result {
+                        Ok(output) | Err(output) => output.clone(),
+                    };
+                    Some((id.clone(), (result.is_err(), output)))
+                }
                 MessageContent::User(_) | MessageContent::Assistant(_) => None,
             })
-            .collect::<HashMap<ToolCallId, bool>>();
+            .collect::<HashMap<ToolCallId, (bool, String)>>();
 
         for message in messages {
             match &message.content {
@@ -544,11 +570,18 @@ impl InlineTerminal {
                                 id,
                                 name,
                                 arguments,
-                            } => self.push_tool_block(
-                                name.clone(),
-                                arguments.clone(),
-                                tool_results.get(id).copied().unwrap_or(false),
-                            ),
+                            } => {
+                                let (is_error, output) = tool_results
+                                    .get(id)
+                                    .cloned()
+                                    .unwrap_or_else(|| (false, String::new()));
+                                self.push_tool_block(
+                                    name.clone(),
+                                    arguments.clone(),
+                                    output,
+                                    is_error,
+                                );
+                            }
                             ContentBlock::Text(_) => {}
                         }
                     }
