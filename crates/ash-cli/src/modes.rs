@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
 };
-use ash_core::{Message, ModelId, Protocol, ProviderConfig};
+use ash_core::{Message, ModelId, Protocol, ProviderConfig, SessionId};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
@@ -167,7 +167,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                 let cancel = ash_core::CancellationToken::new();
                 let mut turn = Box::pin(session.submit(input, event_tx.clone(), cancel.clone()));
                 let mut reset_after_turn = false;
-                let mut resume_after_turn = false;
+                let mut resume_after_turn = None;
                 let mut undo_after_turn = false;
 
                 loop {
@@ -185,8 +185,15 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                                 let _ = (&mut turn).await;
                                 break;
                             }
-                            Some(ash_tui::UiCommand::ResumeSession) => {
-                                resume_after_turn = true;
+                            Some(ash_tui::UiCommand::ListSessions) => {
+                                let _ = event_tx
+                                    .send(ash_core::Event::Error(
+                                        "/resume is unavailable while working.".to_string(),
+                                    ))
+                                    .await;
+                            }
+                            Some(ash_tui::UiCommand::ResumeSession(session_id)) => {
+                                resume_after_turn = Some(session_id);
                                 let _ = (&mut turn).await;
                                 break;
                             }
@@ -205,9 +212,9 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                 if reset_after_turn {
                     session.reset();
                     queued_inputs.clear();
-                } else if resume_after_turn {
+                } else if let Some(session_id) = resume_after_turn {
                     queued_inputs.clear();
-                    resume_latest_session(&mut session, &event_tx).await;
+                    resume_session(&mut session, session_id, &event_tx).await;
                 } else if undo_after_turn {
                     queued_inputs.clear();
                     rollback_last_turn(&mut session, &event_tx, &history_store).await;
@@ -221,9 +228,12 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                 session.reset();
                 queued_inputs.clear();
             }
-            ash_tui::UiCommand::ResumeSession => {
+            ash_tui::UiCommand::ListSessions => {
+                list_sessions(&session, &event_tx).await;
+            }
+            ash_tui::UiCommand::ResumeSession(session_id) => {
                 queued_inputs.clear();
-                resume_latest_session(&mut session, &event_tx).await;
+                resume_session(&mut session, session_id, &event_tx).await;
             }
             ash_tui::UiCommand::Exit => break,
         }
@@ -254,20 +264,33 @@ async fn rollback_last_turn(
     let _ = event_tx.send(event).await;
 }
 
-async fn resume_latest_session(
-    session: &mut AgentSession,
+async fn list_sessions(
+    session: &AgentSession,
     event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
 ) {
-    let event = match session.resume_latest().await {
+    let event = match session.resumable_sessions().await {
+        Ok(sessions) => ash_core::Event::SessionsListed { sessions },
+        Err(error) => ash_core::Event::Error(format!("Failed to list saved chats: {error}")),
+    };
+    let _ = event_tx.send(event).await;
+}
+
+async fn resume_session(
+    session: &mut AgentSession,
+    session_id: SessionId,
+    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
+) {
+    let event = match session.resume(session_id).await {
         Ok(Some(restored)) => ash_core::Event::SessionRestored {
             session_id: restored.session_id,
             path: restored.path,
+            title: restored.title,
             model: restored.model,
             protocol: restored.protocol,
             working_dir: restored.working_dir,
             messages: restored.messages,
         },
-        Ok(None) => ash_core::Event::Error("No saved chat is available to resume.".to_string()),
+        Ok(None) => ash_core::Event::Error("That saved chat is no longer available.".to_string()),
         Err(error) => ash_core::Event::Error(format!("Failed to resume saved chat: {error}")),
     };
     let _ = event_tx.send(event).await;

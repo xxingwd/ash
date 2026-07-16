@@ -61,8 +61,9 @@
 每个交互会话由一个带日期文件名的 append-only JSONL 保存。`AgentSession` 在用户
 消息、完整 Assistant 消息、工具结果和 Turn 结束这些语义边界同步追加并 flush；
 首行的配置快照包含恢复模型上下文所需的信息，但不包含 API Key、Token 或自定义
-接口地址内容。会话文件延迟到第一条用户消息时创建，`/resume` 读取最近使用的其他
-会话并恢复 `Vec<Message>`。Turn rollback 也以 append-only 记录保存；重放 JSONL
+接口地址内容。`/new` 立即生成 Session ID 和创建时间，但会话文件延迟到第一条用户
+消息时创建；会话标题由重放后的第一条有效用户消息派生。`/resume` 列出其他已保存
+会话的标题和创建时间，选中后按 Session ID 恢复 `Vec<Message>`。Turn rollback 也以 append-only 记录保存；重放 JSONL
 时按顺序截断对应用户轮次，不重写已有文件。
 
 提示词由固定基础约定和启动时上下文组合而成。动态上下文只包含环境信息、从外到

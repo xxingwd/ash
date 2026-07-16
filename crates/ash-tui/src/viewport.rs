@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use ash_core::SessionSummary;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
@@ -20,6 +21,7 @@ use crate::{
 const STATUS_ROWS: u16 = 1;
 const COMPOSER_ROWS: u16 = 3;
 const FOOTER_ROWS: u16 = 1;
+const SESSION_MENU_MAX_ROWS: usize = 8;
 const COMPOSER_PADDING: Padding = Padding::new(0, 0, 1, 1);
 
 pub(crate) struct ViewportInput<'a> {
@@ -38,6 +40,8 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) composer_background: Option<Rgb>,
     pub(crate) command_menu: &'a [CommandCompletion],
     pub(crate) command_menu_selected: usize,
+    pub(crate) session_menu: &'a [SessionSummary],
+    pub(crate) session_menu_selected: usize,
     pub(crate) model: &'a str,
     pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
@@ -52,7 +56,11 @@ pub(crate) struct ViewportFrame {
 
 pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let width = input.terminal_width.saturating_sub(1).max(1);
-    let menu_rows = command_menu_rows(input.command_menu.len());
+    let menu_rows = if input.session_menu.is_empty() {
+        command_menu_rows(input.command_menu.len())
+    } else {
+        session_menu_rows(input.session_menu.len())
+    };
     let active = active_window(
         input.active_start,
         input.active_lines,
@@ -80,7 +88,9 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
                 let (input_area, bottom_area) = composer_areas(*area, menu_rows);
                 composer_input_area = input_area;
                 render_composer(input_area, &input, &mut buffer);
-                if input.command_menu.is_empty() {
+                if !input.session_menu.is_empty() {
+                    render_session_menu(bottom_area, &input, &mut buffer);
+                } else if input.command_menu.is_empty() {
                     render_footer(bottom_area, &input, &mut buffer);
                 } else {
                     render_command_menu(bottom_area, &input, &mut buffer);
@@ -374,8 +384,79 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     }
 }
 
+fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
+    let visible = usize::from(area.height).min(input.session_menu.len());
+    if visible == 0 {
+        return;
+    }
+    let selected = input
+        .session_menu_selected
+        .min(input.session_menu.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(input.session_menu.len().saturating_sub(visible));
+    for (offset, session) in input.session_menu[start..start + visible]
+        .iter()
+        .enumerate()
+    {
+        let index = start + offset;
+        let y = area
+            .y
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        let selected_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let prefix = if index == selected { "› " } else { "  " };
+        let prefix_style = if index == selected {
+            selected_style
+        } else {
+            Style::default()
+        };
+        let created_width = UnicodeWidthStr::width(session.created_at.as_str());
+        let show_created = usize::from(area.width) > created_width.saturating_add(8);
+        let title_width = if show_created {
+            usize::from(area.width)
+                .saturating_sub(2)
+                .saturating_sub(created_width)
+                .saturating_sub(2)
+        } else {
+            usize::from(area.width).saturating_sub(2)
+        };
+        let title = fit_menu_text(&session.title, title_width);
+        let title_used = UnicodeWidthStr::width(title.as_str());
+        let mut spans = vec![
+            Span::styled(prefix, prefix_style),
+            Span::styled(
+                title,
+                if index == selected {
+                    selected_style
+                } else {
+                    Style::default()
+                },
+            ),
+        ];
+        if show_created {
+            let spacing = usize::from(area.width)
+                .saturating_sub(2)
+                .saturating_sub(title_used)
+                .saturating_sub(created_width);
+            spans.push(Span::raw(" ".repeat(spacing)));
+            spans.push(Span::styled(
+                session.created_at.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        buffer.set_line(area.x, y, &Line::from(spans), area.width);
+    }
+}
+
 pub(crate) fn command_menu_rows(item_count: usize) -> u16 {
     u16::try_from(item_count).unwrap_or(u16::MAX)
+}
+
+pub(crate) fn session_menu_rows(item_count: usize) -> u16 {
+    u16::try_from(item_count.min(SESSION_MENU_MAX_ROWS)).unwrap_or(u16::MAX)
 }
 
 pub(crate) fn fit_menu_text(value: &str, width: usize) -> String {
@@ -403,6 +484,8 @@ pub(crate) fn fit_menu_text(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use ash_core::SessionId;
 
     use super::*;
     use crate::{markdown::render_markdown, slash_command::SlashCommand};
@@ -444,6 +527,8 @@ mod tests {
             composer_background: Some((30, 30, 30)),
             command_menu: &[],
             command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -478,6 +563,8 @@ mod tests {
             composer_background: None,
             command_menu: &menu,
             command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -486,6 +573,42 @@ mod tests {
         assert_eq!(frame.total_rows, 5);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
         assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
+    }
+
+    #[test]
+    fn session_menu_shows_the_title_and_creation_time() {
+        let sessions = [SessionSummary {
+            session_id: SessionId::new(),
+            title: "Inspect the session picker".to_string(),
+            created_at: "2026-07-15 12:30".to_string(),
+        }];
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 24,
+            history_boundary: welcome_boundary(),
+            busy: false,
+            active_start: 0,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt: "",
+            prompt_cursor_column: 0,
+            composer_background: None,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &sessions,
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        let menu = row_text(&frame.buffer, frame.total_rows - 1);
+        assert!(menu.contains("Inspect the session picker"));
+        assert!(menu.contains("2026-07-15 12:30"));
+        assert_eq!(session_menu_rows(20), 8);
     }
 
     #[test]
@@ -507,6 +630,8 @@ mod tests {
             composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),

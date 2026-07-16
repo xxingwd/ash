@@ -5,9 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ash_core::{Content, ContentBlock, Message, MessageContent, ToolCallId};
+use ash_core::{Content, ContentBlock, Message, MessageContent, SessionSummary, ToolCallId};
 use crossterm::{
-    cursor::{MoveTo, MoveToColumn, MoveToNextLine, MoveToPreviousLine, Show},
+    cursor::{MoveToColumn, MoveToNextLine, MoveToPreviousLine, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{
@@ -25,10 +25,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     block_layout::{layout_stack, StackBoundary, StackFlow, StackItem},
+    history_block::HistoryBlock,
     input::InputState,
     markdown::{render_markdown, RenderedLine, TextStyle},
     markdown_stream::MarkdownStream,
-    scrollback::{sanitize_single_line, sanitize_terminal_text, wrap_text},
+    scrollback::{sanitize_single_line, sanitize_terminal_text},
     slash_command::CommandCompletion,
     theme,
     tool_display::{tool_activity_summary, tool_call_summary},
@@ -87,7 +88,6 @@ impl Default for PromptSnapshot {
 
 pub(crate) struct InlineTerminal {
     stdout: Stdout,
-    input_background: String,
     composer_background: Option<crate::palette::Rgb>,
     viewport_visible: bool,
     viewport_rows: u16,
@@ -106,6 +106,8 @@ pub(crate) struct InlineTerminal {
     queued_messages: usize,
     command_menu: Vec<CommandCompletion>,
     command_menu_selected: usize,
+    session_menu: Vec<SessionSummary>,
+    session_menu_selected: usize,
     command_menu_dirty: bool,
     assistant_stream: MarkdownStream,
     reasoning_source: String,
@@ -129,12 +131,10 @@ impl InlineTerminal {
     pub fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let composer_background = crate::palette::composer_background_color();
-        let input_background = crate::palette::composer_background_escape(composer_background);
         let mut stdout = io::stdout();
         execute!(stdout, EnableBracketedPaste, Show)?;
         Ok(Self {
             stdout,
-            input_background,
             composer_background,
             viewport_visible: false,
             viewport_rows: 0,
@@ -153,6 +153,8 @@ impl InlineTerminal {
             queued_messages: 0,
             command_menu: Vec::new(),
             command_menu_selected: 0,
+            session_menu: Vec::new(),
+            session_menu_selected: 0,
             command_menu_dirty: false,
             assistant_stream: MarkdownStream::default(),
             reasoning_source: String::new(),
@@ -226,33 +228,16 @@ impl InlineTerminal {
     }
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
-        let (width, height) = terminal::size()?;
-        let clear_locally = can_clear_session_locally(
-            self.session_start_width,
-            width.max(1),
-            self.session_history_rows,
-            self.viewport_rows,
-            height.max(1),
-            self.session_overflowed,
-        );
-        self.synchronized(|terminal| {
-            if clear_locally {
-                terminal.clear_owned_region(height.max(1), terminal.session_history_rows)
-            } else {
-                queue!(
-                    terminal.stdout,
-                    ResetColor,
-                    MoveTo(0, 0),
-                    Clear(ClearType::All),
-                    MoveTo(0, 0)
-                )?;
-                Ok(())
-            }
-        })?;
+        self.begin_appended_session()?;
+        self.welcome()
+    }
+
+    fn begin_appended_session(&mut self) -> io::Result<()> {
+        self.synchronized(|terminal| terminal.clear_viewport())?;
         self.reset_inline_state();
         self.reset_session_history();
         self.history_boundary = StackBoundary::default();
-        self.welcome()
+        Ok(())
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
@@ -265,27 +250,11 @@ impl InlineTerminal {
         Ok(())
     }
 
-    pub fn restore_session(&mut self, messages: &[Message], label: &str) -> io::Result<()> {
-        self.reset_session_history();
-        self.session_start_width = terminal::size()?.0.max(1);
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
-        self.rendered_input.clear();
-        self.busy = false;
-        self.status_header.clear();
-        self.status_started_at = None;
-        self.status_frame = 0;
-        self.queued_messages = 0;
-        self.command_menu.clear();
-        self.command_menu_selected = 0;
-        self.command_menu_dirty = false;
-        self.reset_streams();
+    pub fn restore_session(&mut self, messages: &[Message]) -> io::Result<()> {
+        self.begin_appended_session()?;
+        self.welcome()?;
         let messages = messages.to_vec();
-        let label = sanitize_single_line(label);
-        self.replace_viewport(move |terminal| {
-            terminal.write_info_history(&format!("Resumed session {label}."))?;
-            terminal.write_restored_messages(&messages)
-        })
+        self.replace_viewport(move |terminal| terminal.write_restored_messages(&messages))
     }
 
     pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
@@ -306,6 +275,20 @@ impl InlineTerminal {
             self.command_menu.clear();
             self.command_menu.extend_from_slice(items);
             self.command_menu_selected = selected;
+            self.command_menu_dirty = true;
+        }
+    }
+
+    pub fn set_session_menu(&mut self, items: &[SessionSummary], selected: usize) {
+        let selected = if items.is_empty() {
+            0
+        } else {
+            selected.min(items.len() - 1)
+        };
+        if self.session_menu != items || self.session_menu_selected != selected {
+            self.session_menu.clear();
+            self.session_menu.extend_from_slice(items);
+            self.session_menu_selected = selected;
             self.command_menu_dirty = true;
         }
     }
@@ -352,6 +335,8 @@ impl InlineTerminal {
         self.reset_streams();
         self.command_menu.clear();
         self.command_menu_selected = 0;
+        self.session_menu.clear();
+        self.session_menu_selected = 0;
         self.command_menu_dirty = false;
         self.busy = start_working;
         if start_working {
@@ -648,6 +633,8 @@ impl InlineTerminal {
         self.queued_messages = 0;
         self.command_menu.clear();
         self.command_menu_selected = 0;
+        self.session_menu.clear();
+        self.session_menu_selected = 0;
         self.command_menu_dirty = false;
         self.turn_active = false;
         self.turn_history_rows = 0;
@@ -798,6 +785,8 @@ impl InlineTerminal {
             composer_background: self.composer_background,
             command_menu: &self.command_menu,
             command_menu_selected: self.command_menu_selected,
+            session_menu: &self.session_menu,
+            session_menu_selected: self.session_menu_selected,
             model: &model,
             protocol: &protocol,
             working_dir: &self.prompt.working_dir,
@@ -959,46 +948,15 @@ impl InlineTerminal {
         self.stdout.flush()
     }
 
-    fn fill_row(&mut self, background: &str, width: u16) -> io::Result<()> {
-        queue!(self.stdout, MoveToColumn(0))?;
-        write!(self.stdout, "{background}")?;
-        queue!(self.stdout, Clear(ClearType::CurrentLine))?;
-        write!(
-            self.stdout,
-            "{}",
-            " ".repeat(usize::from(width.saturating_sub(1)))
-        )?;
-        write!(self.stdout, "{}", theme::RESET)?;
-        queue!(self.stdout, MoveToColumn(0))?;
-        Ok(())
+    fn write_user_history(&mut self, input: &str) -> io::Result<()> {
+        self.write_history_block(HistoryBlock::user(input), StackFlow::Block)
     }
 
-    fn write_user_history(&mut self, input: &str) -> io::Result<()> {
+    fn write_history_block(&mut self, block: HistoryBlock, flow: StackFlow) -> io::Result<()> {
         let width = terminal::size()?.0.max(1);
-        let background = self.input_background.clone();
-        let input = sanitize_terminal_text(input);
-        let lines = wrap_text(&input, width.saturating_sub(3).max(1));
-
-        self.begin_history_block(StackFlow::Block)?;
-        self.fill_row(&background, width)?;
-        self.next_frame_row()?;
-        for (index, line) in lines.iter().enumerate() {
-            self.fill_row(&background, width)?;
-            write!(self.stdout, "{background}")?;
-            if index == 0 {
-                write!(
-                    self.stdout,
-                    "{}› {}{background}",
-                    theme::USER_PREFIX,
-                    theme::RESET
-                )?;
-            } else {
-                write!(self.stdout, "  ")?;
-            }
-            write!(self.stdout, "{line}{}", theme::RESET)?;
-            self.next_frame_row()?;
-        }
-        self.fill_row(&background, width)?;
+        let buffer = block.render(width, self.composer_background);
+        self.begin_history_block(flow)?;
+        self.write_viewport_buffer(&buffer)?;
         self.next_frame_row()?;
         self.finish_history_block();
         Ok(())
@@ -1125,61 +1083,18 @@ impl InlineTerminal {
     }
 
     fn write_error_history(&mut self, error: &str) -> io::Result<()> {
-        self.begin_history_block(StackFlow::Block)?;
-        let error = sanitize_terminal_text(error);
-        let width = terminal::size()?.0.saturating_sub(9).max(1);
-        for (index, line) in wrap_text(&error, width).iter().enumerate() {
-            if index == 0 {
-                write!(
-                    self.stdout,
-                    "{}•{} {}Error:{} {line}",
-                    theme::TOOL_ERROR_BULLET,
-                    theme::RESET,
-                    theme::BOLD,
-                    theme::RESET
-                )?;
-            } else {
-                write!(self.stdout, "  {line}")?;
-            }
-            self.next_frame_row()?;
-        }
-        self.finish_history_block();
-        Ok(())
+        self.write_history_block(HistoryBlock::error(error), StackFlow::Block)
     }
 
     fn write_info_history(&mut self, message: &str) -> io::Result<()> {
-        self.begin_history_block(StackFlow::Block)?;
-        let message = sanitize_terminal_text(message);
-        let width = terminal::size()?.0.saturating_sub(4).max(1);
-        let mut first = true;
-        for source_line in message.lines() {
-            for line in wrap_text(source_line, width) {
-                if first {
-                    write!(self.stdout, "{}•{} {line}", theme::DIM, theme::RESET)?;
-                    first = false;
-                } else {
-                    write!(self.stdout, "  {line}")?;
-                }
-                self.next_frame_row()?;
-            }
-        }
-        if first {
-            write!(self.stdout, "{}•{}", theme::DIM, theme::RESET)?;
-            self.next_frame_row()?;
-        }
-        self.finish_history_block();
-        Ok(())
+        self.write_history_block(HistoryBlock::info(message), StackFlow::Block)
     }
 
     fn write_worked_history(&mut self, elapsed_seconds: u64) -> io::Result<()> {
-        self.begin_history_block(StackFlow::Block)?;
-        let width = terminal::size()?.0.max(1);
-        let separator = worked_separator(elapsed_seconds, width);
-        queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        write!(self.stdout, "{}{separator}{}", theme::DIM, theme::RESET)?;
-        self.next_frame_row()?;
-        self.finish_history_block();
-        Ok(())
+        self.write_history_block(
+            HistoryBlock::worked(format_elapsed(elapsed_seconds)),
+            StackFlow::Block,
+        )
     }
 
     fn begin_history_block(&mut self, flow: StackFlow) -> io::Result<()> {
@@ -1250,20 +1165,6 @@ fn rollback_region(
         .saturating_add(1)
         .min(terminal_height);
     (move_up, clear_rows)
-}
-
-fn can_clear_session_locally(
-    session_start_width: u16,
-    current_width: u16,
-    session_history_rows: u16,
-    viewport_rows: u16,
-    terminal_height: u16,
-    session_overflowed: bool,
-) -> bool {
-    !session_overflowed
-        && session_start_width != 0
-        && session_start_width == current_width
-        && session_history_rows.saturating_add(viewport_rows) <= terminal_height
 }
 
 fn viewport_line_widths(buffer: &Buffer) -> Vec<u16> {
@@ -1425,16 +1326,6 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     header
 }
 
-fn worked_separator(elapsed_seconds: u64, width: u16) -> String {
-    let label = format!("─ Worked for {} ─", format_elapsed(elapsed_seconds));
-    let width = usize::from(width);
-    let label_width = UnicodeWidthStr::width(label.as_str());
-    if label_width >= width {
-        return label.chars().take(width).collect();
-    }
-    format!("{label}{}", "─".repeat(width - label_width))
-}
-
 fn markdown_drain_count(queue_depth: usize, queued_at: Option<Instant>, now: Instant) -> usize {
     if queue_depth == 0 {
         return 0;
@@ -1481,14 +1372,6 @@ mod tests {
     #[test]
     fn rollback_region_stays_inside_the_visible_terminal() {
         assert_eq!(rollback_region(20, 6, 3, u16::MAX), (19, 20));
-    }
-
-    #[test]
-    fn clears_a_session_locally_only_when_its_layout_is_still_visible() {
-        assert!(can_clear_session_locally(80, 80, 12, 6, 24, false));
-        assert!(!can_clear_session_locally(80, 100, 12, 6, 24, false));
-        assert!(!can_clear_session_locally(80, 80, 20, 6, 24, false));
-        assert!(!can_clear_session_locally(80, 80, 12, 6, 24, true));
     }
 
     #[test]
@@ -1584,14 +1467,6 @@ mod tests {
         assert_eq!(queued_status(0), "");
         assert_eq!(queued_status(1), " · 1 queued");
         assert_eq!(queued_status(3), " · 3 queued");
-    }
-
-    #[test]
-    fn formats_completed_work_like_codex_turn_separators() {
-        let separator = worked_separator(125, 32);
-        assert!(separator.starts_with("─ Worked for 2m 05s ─"));
-        assert_eq!(UnicodeWidthStr::width(separator.as_str()), 32);
-        assert_eq!(worked_separator(0, 10), "─ Worked f");
     }
 
     #[test]

@@ -7,10 +7,6 @@ pub(crate) fn composer_background_color() -> Option<Rgb> {
     probe_background(PROBE_TIMEOUT).map(composer_background)
 }
 
-pub(crate) fn composer_background_escape(color: Option<Rgb>) -> String {
-    color.map_or_else(String::new, |(r, g, b)| format!("\x1b[48;2;{r};{g};{b}m"))
-}
-
 fn composer_background(terminal_background: Rgb) -> Rgb {
     let luminance = 0.299 * f32::from(terminal_background.0)
         + 0.587 * f32::from(terminal_background.1)

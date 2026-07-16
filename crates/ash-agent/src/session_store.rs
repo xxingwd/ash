@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use ash_core::{Message, MessageContent, SessionId, StopReason, ToolDefinition};
+use ash_core::{
+    Content, Message, MessageContent, SessionId, SessionSummary, StopReason, ToolDefinition,
+};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -240,16 +242,50 @@ impl SessionStore {
     pub(crate) async fn latest_except(
         excluded_path: &Path,
     ) -> Result<Option<StoredSession>, ash_core::AshError> {
-        let directory = Self::default_dir();
+        Ok(Self::stored_sessions(Some(excluded_path))
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    pub(crate) async fn summaries_except(
+        excluded_path: &Path,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        Ok(Self::stored_sessions(Some(excluded_path))
+            .await?
+            .iter()
+            .map(session_summary)
+            .collect())
+    }
+
+    pub(crate) async fn find(
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, ash_core::AshError> {
+        Ok(Self::stored_sessions(None)
+            .await?
+            .into_iter()
+            .find(|stored| stored.metadata.session_id == session_id))
+    }
+
+    async fn stored_sessions(
+        excluded_path: Option<&Path>,
+    ) -> Result<Vec<StoredSession>, ash_core::AshError> {
+        Self::stored_sessions_in(Self::default_dir(), excluded_path).await
+    }
+
+    async fn stored_sessions_in(
+        directory: PathBuf,
+        excluded_path: Option<&Path>,
+    ) -> Result<Vec<StoredSession>, ash_core::AshError> {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
         let mut candidates = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path == excluded_path || !is_session_file(&path) {
+            if excluded_path.is_some_and(|excluded| path == excluded) || !is_session_file(&path) {
                 continue;
             }
             let modified = entry
@@ -260,6 +296,7 @@ impl SessionStore {
             candidates.push((modified, path));
         }
         candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        let mut stored_sessions = Vec::new();
         for (_, path) in candidates {
             let stored = match read_session(&path).await {
                 Ok(stored) if stored.has_user_message() => stored,
@@ -269,9 +306,9 @@ impl SessionStore {
                     continue;
                 }
             };
-            return Ok(Some(stored));
+            stored_sessions.push(stored);
         }
-        Ok(None)
+        Ok(stored_sessions)
     }
 
     pub(crate) async fn resume(stored: &StoredSession) -> Result<Self, ash_core::AshError> {
@@ -287,6 +324,46 @@ impl SessionStore {
             file: Some(file),
         })
     }
+}
+
+fn session_summary(stored: &StoredSession) -> SessionSummary {
+    SessionSummary {
+        session_id: stored.metadata.session_id,
+        title: session_title(&stored.messages),
+        created_at: display_created_at(&stored.metadata.created_at),
+    }
+}
+
+pub(crate) fn session_title(messages: &[Message]) -> String {
+    let title = messages.iter().find_map(|message| {
+        let MessageContent::User(contents) = &message.content else {
+            return None;
+        };
+        let text = contents
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text(text) => Some(text.as_str()),
+                Content::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+    });
+    title
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Untitled chat".to_string())
+}
+
+fn display_created_at(created_at: &str) -> String {
+    DateTime::parse_from_rfc3339(created_at).map_or_else(
+        |_| created_at.to_string(),
+        |created_at| {
+            created_at
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
 }
 
 fn session_filename(session_id: SessionId, timestamp: DateTime<chrono::FixedOffset>) -> String {
@@ -425,6 +502,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_store_does_not_create_a_session_file() {
+        let directory = TempDir::new().unwrap();
+        let sessions_dir = directory.path().join("sessions");
+        let store = SessionStore::new_in(
+            &config(directory.path().to_path_buf()),
+            SessionId::new(),
+            sessions_dir,
+        );
+
+        assert!(!store.path().exists());
+    }
+
     #[tokio::test]
     async fn stores_replayable_messages_without_credentials() {
         let directory = TempDir::new().unwrap();
@@ -489,5 +579,31 @@ mod tests {
             &loaded.messages[1].content,
             MessageContent::Assistant(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn lists_sessions_with_first_user_message_as_the_title() {
+        let directory = TempDir::new().unwrap();
+        let sessions_dir = directory.path().join("sessions");
+        let session_id = SessionId::new();
+        let mut store = SessionStore::new_in(
+            &config(directory.path().to_path_buf()),
+            session_id,
+            sessions_dir.clone(),
+        );
+        store
+            .append_message(&Message::user("  First session title\nwith details  "))
+            .await
+            .unwrap();
+
+        let stored = SessionStore::stored_sessions_in(sessions_dir, None)
+            .await
+            .unwrap();
+        let summaries = stored.iter().map(session_summary).collect::<Vec<_>>();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, session_id);
+        assert_eq!(summaries[0].title, "First session title with details");
+        assert_eq!(summaries[0].created_at.len(), 16);
     }
 }

@@ -1,0 +1,288 @@
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    widgets::{Paragraph, Widget, Wrap},
+};
+use unicode_width::UnicodeWidthStr;
+
+use crate::{
+    palette::Rgb,
+    scrollback::{sanitize_terminal_text, wrap_text},
+};
+
+const USER_HORIZONTAL_INSET: u16 = 2;
+const USER_RIGHT_PADDING: u16 = 1;
+const USER_VERTICAL_PADDING: u16 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryBlock {
+    User(String),
+    Info(String),
+    Error(String),
+    Worked(String),
+}
+
+impl HistoryBlock {
+    pub(crate) fn user(text: &str) -> Self {
+        Self::User(normalize_multiline(text))
+    }
+
+    pub(crate) fn info(message: &str) -> Self {
+        Self::Info(normalize_multiline(message))
+    }
+
+    pub(crate) fn error(error: &str) -> Self {
+        Self::Error(normalize_multiline(error))
+    }
+
+    pub(crate) fn worked(elapsed: String) -> Self {
+        Self::Worked(elapsed)
+    }
+
+    pub(crate) fn render(&self, width: u16, composer_background: Option<Rgb>) -> Buffer {
+        match self {
+            Self::User(text) => render_user(text, width.max(1), composer_background),
+            Self::Info(message) => render_info(message, width.max(1)),
+            Self::Error(error) => render_error(error, width.max(1)),
+            Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
+        }
+    }
+}
+
+fn normalize_multiline(text: &str) -> String {
+    sanitize_terminal_text(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
+fn render_user(text: &str, width: u16, composer_background: Option<Rgb>) -> Buffer {
+    let show_prefix = width > USER_HORIZONTAL_INSET;
+    let content_x = if show_prefix {
+        USER_HORIZONTAL_INSET
+    } else {
+        0
+    };
+    let content_width = width
+        .saturating_sub(content_x)
+        .saturating_sub(u16::from(show_prefix) * USER_RIGHT_PADDING)
+        .max(1);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let content_height = u16::try_from(paragraph.line_count(content_width))
+        .unwrap_or(u16::MAX.saturating_sub(USER_VERTICAL_PADDING * 2))
+        .max(1);
+    let height = content_height.saturating_add(USER_VERTICAL_PADDING * 2);
+    let area = Rect::new(0, 0, width, height);
+    let background = composer_background.map_or(Color::Reset, |(red, green, blue)| {
+        Color::Rgb(red, green, blue)
+    });
+    let mut buffer = Buffer::empty(area);
+    buffer.set_style(area, Style::default().bg(background));
+
+    if show_prefix {
+        buffer.set_string(
+            0,
+            USER_VERTICAL_PADDING,
+            "›",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+        );
+    }
+    paragraph.render(
+        Rect::new(
+            content_x,
+            USER_VERTICAL_PADDING,
+            content_width,
+            content_height,
+        ),
+        &mut buffer,
+    );
+    buffer
+}
+
+fn render_info(message: &str, width: u16) -> Buffer {
+    let content_width = width.saturating_sub(4).max(1);
+    let mut rows = message
+        .lines()
+        .flat_map(|line| wrap_text(line, content_width))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    let content_x = if width > USER_HORIZONTAL_INSET {
+        USER_HORIZONTAL_INSET
+    } else {
+        0
+    };
+    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
+        let y = u16::try_from(index).unwrap_or(u16::MAX);
+        if index == 0 && content_x > 0 {
+            buffer.set_string(0, y, "•", Style::default().add_modifier(Modifier::DIM));
+        }
+        buffer.set_string(content_x, y, row, Style::default());
+    }
+    buffer
+}
+
+fn render_error(error: &str, width: u16) -> Buffer {
+    if width <= 9 {
+        let paragraph = Paragraph::new(format!("Error: {error}"))
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .wrap(Wrap { trim: false });
+        let height = u16::try_from(paragraph.line_count(width))
+            .unwrap_or(u16::MAX)
+            .max(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        paragraph.render(buffer.area, &mut buffer);
+        return buffer;
+    }
+
+    let rows = wrap_text(error, width.saturating_sub(9).max(1));
+    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
+        let y = u16::try_from(index).unwrap_or(u16::MAX);
+        if index == 0 {
+            buffer.set_string(
+                0,
+                y,
+                "•",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            );
+            buffer.set_string(
+                USER_HORIZONTAL_INSET,
+                y,
+                "Error:",
+                Style::default().add_modifier(Modifier::BOLD),
+            );
+            buffer.set_string(9, y, row, Style::default());
+        } else {
+            buffer.set_string(USER_HORIZONTAL_INSET, y, row, Style::default());
+        }
+    }
+    buffer
+}
+
+fn render_worked(elapsed: &str, width: u16) -> Buffer {
+    let separator = worked_separator(elapsed, width);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+    buffer.set_string(
+        0,
+        0,
+        separator,
+        Style::default().add_modifier(Modifier::DIM),
+    );
+    buffer
+}
+
+fn worked_separator(elapsed: &str, width: u16) -> String {
+    let label = format!("─ Worked for {elapsed} ─");
+    let width = usize::from(width);
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    if label_width >= width {
+        return label.chars().take(width).collect();
+    }
+    format!("{label}{}", "─".repeat(width - label_width))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_text(buffer: &Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .filter_map(|column| buffer.cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn user_block_owns_padding_and_hanging_indent() {
+        let buffer = HistoryBlock::user("abcdefghij").render(9, Some((30, 30, 30)));
+
+        assert_eq!(buffer.area.height, 4);
+        assert_eq!(row_text(&buffer, 0), "");
+        assert_eq!(row_text(&buffer, 1), "› abcdef");
+        assert_eq!(row_text(&buffer, 2), "  ghij");
+        assert_eq!(row_text(&buffer, 3), "");
+        assert_eq!(
+            buffer.cell((8, 1)).expect("cell").bg,
+            Color::Rgb(30, 30, 30)
+        );
+    }
+
+    #[test]
+    fn long_user_block_can_be_taller_than_the_terminal() {
+        let buffer = HistoryBlock::user(&"word ".repeat(100)).render(10, None);
+
+        assert!(buffer.area.height > 24);
+    }
+
+    #[test]
+    fn tiny_width_falls_back_to_content_without_a_prefix() {
+        let buffer = HistoryBlock::user("ash").render(1, None);
+
+        assert_eq!(row_text(&buffer, 1), "a");
+        assert_eq!(row_text(&buffer, 2), "s");
+        assert_eq!(row_text(&buffer, 3), "h");
+    }
+
+    #[test]
+    fn user_block_normalizes_carriage_returns() {
+        let block = HistoryBlock::user("one\r\ntwo\rthree");
+
+        assert_eq!(block, HistoryBlock::User("one\ntwo\nthree".to_string()));
+    }
+
+    #[test]
+    fn info_block_preserves_bullet_wrap_and_continuation_indent() {
+        let buffer = HistoryBlock::info("abcdefghij").render(12, None);
+
+        assert_eq!(buffer.area.height, 2);
+        assert_eq!(row_text(&buffer, 0), "• abcdefgh");
+        assert_eq!(row_text(&buffer, 1), "  ij");
+        assert!(buffer
+            .cell((0, 0))
+            .expect("bullet")
+            .modifier
+            .contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn error_block_preserves_label_and_error_style() {
+        let buffer = HistoryBlock::error("abcdefghijklmnop").render(20, None);
+
+        assert_eq!(buffer.area.height, 2);
+        assert_eq!(row_text(&buffer, 0), "• Error: abcdefghijk");
+        assert_eq!(row_text(&buffer, 1), "  lmnop");
+        let bullet = buffer.cell((0, 0)).expect("bullet");
+        assert_eq!(bullet.fg, Color::Red);
+        assert!(bullet.modifier.contains(Modifier::BOLD));
+        assert!(buffer
+            .cell((2, 0))
+            .expect("label")
+            .modifier
+            .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn worked_block_fills_or_truncates_to_the_terminal_width() {
+        let buffer = HistoryBlock::worked("2m 05s".to_string()).render(32, None);
+        let separator = row_text(&buffer, 0);
+
+        assert!(separator.starts_with("─ Worked for 2m 05s ─"));
+        assert_eq!(UnicodeWidthStr::width(separator.as_str()), 32);
+        assert!(buffer
+            .cell((0, 0))
+            .expect("separator")
+            .modifier
+            .contains(Modifier::DIM));
+        assert_eq!(
+            row_text(&HistoryBlock::worked("0s".to_string()).render(10, None), 0),
+            "─ Worked f"
+        );
+    }
+}

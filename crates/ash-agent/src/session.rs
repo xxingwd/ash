@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use ash_core::{
     CancellationToken, Content, Event, Message, MessageContent, ModelId, Protocol, SessionId,
-    StopReason,
+    SessionSummary, StopReason,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -16,6 +16,7 @@ use crate::{AgentConfig, SessionStore};
 pub struct ResumedSession {
     pub session_id: SessionId,
     pub path: PathBuf,
+    pub title: String,
     pub messages: Vec<Message>,
     pub model: String,
     pub protocol: String,
@@ -62,6 +63,20 @@ impl AgentSession {
         self.restore(stored).await.map(Some)
     }
 
+    pub async fn resumable_sessions(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        SessionStore::summaries_except(self.store.path()).await
+    }
+
+    pub async fn resume(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<ResumedSession>, ash_core::AshError> {
+        let Some(stored) = SessionStore::find(session_id).await? else {
+            return Ok(None);
+        };
+        self.restore(stored).await.map(Some)
+    }
+
     async fn restore(
         &mut self,
         stored: StoredSession,
@@ -80,6 +95,7 @@ impl AgentSession {
             )));
         }
         let store = SessionStore::resume(&stored).await?;
+        let title = crate::session_store::session_title(&stored.messages);
         self.id = stored.metadata.session_id;
         self.config.provider.protocol = protocol;
         self.config.model = ModelId::new(&stored.metadata.model);
@@ -99,6 +115,7 @@ impl AgentSession {
         Ok(ResumedSession {
             session_id: self.id,
             path: stored.path,
+            title,
             messages: self.messages.clone(),
             model: self.config.model.as_str().to_string(),
             protocol: self.config.provider.protocol.as_cli_name().to_string(),

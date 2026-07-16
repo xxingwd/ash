@@ -54,7 +54,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "resume",
         aliases: &[],
-        description: "resume the most recently used saved chat",
+        description: "choose a saved chat to resume",
         command: SlashCommand::Resume,
     },
     CommandSpec {

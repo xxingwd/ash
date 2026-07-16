@@ -2,13 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{Event, ToolCallId};
+use ash_core::{Event, SessionId, ToolCallId};
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 
 use crate::{
     inline::InlineTerminal,
     input::InputState,
+    session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
 };
 
@@ -17,7 +18,8 @@ pub enum UiCommand {
     Submit(String),
     CancelAndUndo,
     NewSession,
-    ResumeSession,
+    ListSessions,
+    ResumeSession(SessionId),
     Exit,
 }
 
@@ -65,6 +67,7 @@ impl App {
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut busy = false;
         let mut command_completion = CommandCompletionState::default();
+        let mut session_picker = SessionPickerState::default();
         let mut calls: HashMap<ToolCallId, (String, serde_json::Value)> = HashMap::new();
         let mut queued_inputs: VecDeque<String> = VecDeque::new();
         let mut active_prompt: Option<String> = None;
@@ -177,12 +180,15 @@ impl App {
                         }
                         Event::SessionRestored {
                             session_id: _,
-                            path,
+                            path: _,
+                            title: _,
                             model,
                             protocol,
                             working_dir,
                             messages,
                         } => {
+                            session_picker.close();
+                            terminal.set_session_menu(&[], 0);
                             rollback_in_progress = false;
                             busy = false;
                             calls.clear();
@@ -192,11 +198,27 @@ impl App {
                             self.model = model;
                             self.protocol = protocol;
                             self.working_dir = working_dir;
-                            let label = path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("saved chat");
-                            terminal.restore_session(&messages, label)?;
+                            terminal.restore_session(&messages)?;
+                            render_prompt(
+                                &mut terminal,
+                                &input,
+                                &mut command_completion,
+                                busy,
+                                &self.protocol,
+                                &self.model,
+                                &self.working_dir,
+                            )?;
+                        }
+                        Event::SessionsListed { sessions } => {
+                            if sessions.is_empty() {
+                                terminal.command_output("No saved chats are available to resume.")?;
+                            } else {
+                                session_picker.open(sessions);
+                                terminal.set_session_menu(
+                                    session_picker.sessions(),
+                                    session_picker.selected_index(),
+                                );
+                            }
                             render_prompt(
                                 &mut terminal,
                                 &input,
@@ -229,6 +251,9 @@ impl App {
                             )?
                         },
                         CrosstermEvent::Paste(text) => {
+                            if session_picker.is_visible() {
+                                continue;
+                            }
                             input.insert_str(&text.replace(['\r', '\n'], " "));
                             render_prompt(
                                 &mut terminal,
@@ -243,6 +268,66 @@ impl App {
                         CrosstermEvent::Key(key)
                             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                         {
+                            if session_picker.is_visible() {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        session_picker.close();
+                                        terminal.set_session_menu(&[], 0);
+                                    }
+                                    KeyCode::Up => session_picker.move_up(),
+                                    KeyCode::Down => session_picker.move_down(),
+                                    KeyCode::Char('p')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        session_picker.move_up();
+                                    }
+                                    KeyCode::Char('n')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        session_picker.move_down();
+                                    }
+                                    KeyCode::Enter => {
+                                        let selected = session_picker.selected_session_id();
+                                        session_picker.close();
+                                        terminal.set_session_menu(&[], 0);
+                                        render_prompt(
+                                            &mut terminal,
+                                            &input,
+                                            &mut command_completion,
+                                            busy,
+                                            &self.protocol,
+                                            &self.model,
+                                            &self.working_dir,
+                                        )?;
+                                        if let Some(session_id) = selected {
+                                            if commands
+                                                .send(UiCommand::ResumeSession(session_id))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    _ => continue,
+                                }
+                                terminal.set_session_menu(
+                                    session_picker.sessions(),
+                                    session_picker.selected_index(),
+                                );
+                                render_prompt(
+                                    &mut terminal,
+                                    &input,
+                                    &mut command_completion,
+                                    busy,
+                                    &self.protocol,
+                                    &self.model,
+                                    &self.working_dir,
+                                )?;
+                                continue;
+                            }
+
                             if command_completion.is_visible() {
                                 match key.code {
                                     KeyCode::Esc => {
@@ -413,6 +498,8 @@ impl App {
                                             }
                                             match command {
                                                 SlashCommand::New | SlashCommand::Clear => {
+                                                    session_picker.close();
+                                                    terminal.set_session_menu(&[], 0);
                                                     active_prompt = None;
                                                     terminal.start_new_session()?;
                                                     render_prompt(
@@ -433,8 +520,17 @@ impl App {
                                                     }
                                                 }
                                                 SlashCommand::Resume => {
+                                                    render_prompt(
+                                                        &mut terminal,
+                                                        &input,
+                                                        &mut command_completion,
+                                                        busy,
+                                                        &self.protocol,
+                                                        &self.model,
+                                                        &self.working_dir,
+                                                    )?;
                                                     if commands
-                                                        .send(UiCommand::ResumeSession)
+                                                        .send(UiCommand::ListSessions)
                                                         .await
                                                         .is_err()
                                                     {

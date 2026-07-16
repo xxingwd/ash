@@ -97,11 +97,12 @@ session-2026-07-14T16-30-25.123-<session-id>.jsonl
 消息、Assistant 消息、工具结果和 Turn 结束状态。API Key、访问令牌和自定义接口
 地址内容不会写入文件。
 
-`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史并建立新的 Session。当前会话仍
-完整位于屏幕内且宽度未变化时，ASH 只局部擦除自己占用的区域；会话已经溢出、终端
-缩放或布局不确定时，只清空当前可见屏幕。两条路径都会重新渲染欢迎区，但都不会
-Purge scrollback。`/resume` 会恢复最近使用且不是当前会话的 JSONL，并重新渲染其中
-的对话。输入框的跨进程历史单独保存在 `~/.local/share/ash/history.jsonl`。
+`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史并建立新的 Session。终端已输出的
+稳定历史会保留在 scrollback 中；ASH 只移除当前输入区或菜单，再追加新的欢迎区。`/resume`
+同样保留已有 scrollback，在新的欢迎区后完整重放所选 JSONL。新 Session 会立即获得 ID
+和创建时间，但在第一条用户消息发出前不会创建文件；会话名称取第一条有效用户消息。
+`/resume` 会在输入框下方列出其他已保存会话的名称和创建时间，使用方向键选择。输入框的
+跨进程历史单独保存在 `~/.local/share/ash/history.jsonl`。
 
 ## 子 Agent
 

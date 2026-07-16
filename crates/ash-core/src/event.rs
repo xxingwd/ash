@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::{AgentId, Message, SessionId, ToolCallId};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub title: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, EnumAsInner)]
 pub enum Event {
     TextDelta(String),
@@ -32,10 +39,14 @@ pub enum Event {
     SessionRestored {
         session_id: SessionId,
         path: std::path::PathBuf,
+        title: String,
         model: String,
         protocol: String,
         working_dir: std::path::PathBuf,
         messages: Vec<Message>,
+    },
+    SessionsListed {
+        sessions: Vec<SessionSummary>,
     },
     TurnRolledBack {
         messages: Vec<Message>,
