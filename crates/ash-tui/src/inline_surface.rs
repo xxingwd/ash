@@ -207,13 +207,13 @@ fn take_over_visible_screen(stdout: &mut Stdout) -> io::Result<()> {
 fn render_fullscreen(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
     let visible_rows = frame.buffer.area.height.min(screen.area.height);
     let hidden_rows = frame.buffer.area.height.saturating_sub(visible_rows);
-    let target_y = screen.area.height.saturating_sub(visible_rows);
-    copy_buffer(&frame.buffer, screen, hidden_rows, target_y, visible_rows);
+    copy_buffer(&frame.buffer, screen, hidden_rows, 0, visible_rows);
 
     Position::new(
         frame.cursor_column.min(screen.area.width.saturating_sub(1)),
-        target_y
-            .saturating_add(frame.cursor_row.saturating_sub(hidden_rows))
+        frame
+            .cursor_row
+            .saturating_sub(hidden_rows)
             .min(screen.area.height.saturating_sub(1)),
     )
 }
@@ -272,7 +272,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fullscreen_render_bottom_aligns_the_viewport() {
+    fn fullscreen_render_top_aligns_the_viewport() {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 2));
         source.set_string(0, 0, "first", Style::default());
         source.set_string(0, 1, "last", Style::default());
@@ -286,9 +286,9 @@ mod tests {
 
         let cursor = render_fullscreen(&mut screen, &frame);
 
-        assert_eq!(row_text(&screen, 3), "first");
-        assert_eq!(row_text(&screen, 4), "last");
-        assert_eq!(cursor, Position::new(2, 4));
+        assert_eq!(row_text(&screen, 0), "first");
+        assert_eq!(row_text(&screen, 1), "last");
+        assert_eq!(cursor, Position::new(2, 1));
     }
 
     #[test]
