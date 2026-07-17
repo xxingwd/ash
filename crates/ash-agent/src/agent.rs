@@ -206,7 +206,15 @@ async fn run_with_adapter(
                 })
                 .await;
             let result = limit_tool_result(
-                execute_tool(config, messages, session_id, &cancel, &name, arguments).await,
+                execute_tool(
+                    config,
+                    messages,
+                    session_id,
+                    &cancel,
+                    &name,
+                    arguments.clone(),
+                )
+                .await,
             );
             if cancel.is_cancelled() {
                 return Ok(StopReason::Aborted);
@@ -218,6 +226,8 @@ async fn run_with_adapter(
             let _ = tx
                 .send(Event::ToolCallEnd {
                     id: id.clone(),
+                    name,
+                    arguments,
                     output,
                     is_error,
                 })

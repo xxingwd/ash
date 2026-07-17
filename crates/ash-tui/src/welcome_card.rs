@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
-use crate::scrollback::sanitize_single_line;
+use crate::{scrollback::sanitize_single_line, text_width::truncate_start};
 
 const FULL_WORDMARK_MIN_WIDTH: u16 = 34;
 const COMPACT_WORDMARK_MIN_WIDTH: u16 = 14;
@@ -42,8 +42,7 @@ pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<Welc
         return vec![centered(available_width, "ASH", WelcomeStyle::Title)];
     }
 
-    let indent = "";
-    let mut lines = vec![framed_top(indent, outer_width)];
+    let mut lines = vec![framed_top(outer_width)];
     let wordmark: &[&str] = if inner_width >= FULL_WORDMARK_MIN_WIDTH {
         &FULL_WORDMARK
     } else if inner_width >= COMPACT_WORDMARK_MIN_WIDTH {
@@ -53,51 +52,45 @@ pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<Welc
     };
 
     if wordmark.is_empty() {
-        lines.push(framed_row(indent, inner_width, "ASH", WelcomeStyle::Title));
+        lines.push(framed_row(inner_width, "ASH", WelcomeStyle::Title));
     } else {
-        lines.push(framed_row(indent, inner_width, "", WelcomeStyle::Frame));
+        lines.push(framed_row(inner_width, "", WelcomeStyle::Frame));
         lines.extend(
             wordmark
                 .iter()
-                .map(|line| framed_row(indent, inner_width, line, WelcomeStyle::Logo)),
+                .map(|line| framed_row(inner_width, line, WelcomeStyle::Logo)),
         );
-        lines.push(framed_row(indent, inner_width, "", WelcomeStyle::Frame));
+        lines.push(framed_row(inner_width, "", WelcomeStyle::Frame));
     }
 
     if usize::from(inner_width) >= UnicodeWidthStr::width(SUBTITLE) {
-        lines.push(framed_row(
-            indent,
-            inner_width,
-            SUBTITLE,
-            WelcomeStyle::Subtitle,
-        ));
+        lines.push(framed_row(inner_width, SUBTITLE, WelcomeStyle::Subtitle));
     }
     lines.push(framed_row(
-        indent,
         inner_width,
-        &truncate_from_start(&workspace_label(working_dir), usize::from(inner_width)),
+        &truncate_start(&workspace_label(working_dir), usize::from(inner_width)),
         WelcomeStyle::Subtitle,
     ));
-    lines.push(framed_row(indent, inner_width, "", WelcomeStyle::Frame));
-    lines.push(framed_bottom(indent, outer_width));
+    lines.push(framed_row(inner_width, "", WelcomeStyle::Frame));
+    lines.push(framed_bottom(outer_width));
     lines
 }
 
-fn framed_top(indent: &str, outer_width: u16) -> WelcomeLine {
+fn framed_top(outer_width: u16) -> WelcomeLine {
     let prefix = "╭─ ASH ";
     let fill_width = usize::from(outer_width)
         .saturating_sub(UnicodeWidthStr::width(prefix))
         .saturating_sub(1);
     WelcomeLine {
-        text: format!("{indent}{prefix}{}╮", "─".repeat(fill_width)),
+        text: format!("{prefix}{}╮", "─".repeat(fill_width)),
         style: WelcomeStyle::Frame,
     }
 }
 
-fn framed_bottom(indent: &str, outer_width: u16) -> WelcomeLine {
+fn framed_bottom(outer_width: u16) -> WelcomeLine {
     WelcomeLine {
         text: format!(
-            "{indent}╰{}╯",
+            "╰{}╯",
             "─".repeat(usize::from(
                 outer_width.saturating_sub(FRAME_BORDER_COLUMNS),
             ))
@@ -106,14 +99,14 @@ fn framed_bottom(indent: &str, outer_width: u16) -> WelcomeLine {
     }
 }
 
-fn framed_row(indent: &str, inner_width: u16, content: &str, style: WelcomeStyle) -> WelcomeLine {
+fn framed_row(inner_width: u16, content: &str, style: WelcomeStyle) -> WelcomeLine {
     let content_width = UnicodeWidthStr::width(content);
     let padding = usize::from(inner_width).saturating_sub(content_width);
     let left_padding = padding / 2;
     let right_padding = padding.saturating_sub(left_padding);
     WelcomeLine {
         text: format!(
-            "{indent}│{}{}{}│",
+            "│{}{}{}│",
             " ".repeat(left_padding),
             content,
             " ".repeat(right_padding)
@@ -150,30 +143,6 @@ fn workspace_label_with_home(working_dir: &Path, home: Option<&Path>) -> String 
             },
         );
     sanitize_single_line(&display)
-}
-
-fn truncate_from_start(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_string();
-    }
-
-    let mut suffix = String::new();
-    let mut suffix_width = 0;
-    for character in value.chars().rev() {
-        let character_width = character.width().unwrap_or(0);
-        if suffix_width + character_width > width - 1 {
-            break;
-        }
-        suffix.insert(0, character);
-        suffix_width += character_width;
-    }
-    format!("…{suffix}")
 }
 
 #[cfg(test)]
@@ -234,9 +203,6 @@ mod tests {
 
     #[test]
     fn truncates_the_start_of_long_workspace_paths() {
-        assert_eq!(
-            truncate_from_start("~/very/long/workspace", 12),
-            "…g/workspace"
-        );
+        assert_eq!(truncate_start("~/very/long/workspace", 12), "…g/workspace");
     }
 }

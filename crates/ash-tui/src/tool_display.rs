@@ -1,9 +1,11 @@
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::text_width::truncate_end;
 
 pub(crate) fn tool_activity_summary(name: &str, arguments: &Value, max_width: u16) -> String {
     let phrase = tool_phrase(name, arguments);
-    truncate_width(
+    truncate_end(
         &join_parts(phrase.running, &phrase.detail),
         usize::from(max_width.max(1)),
     )
@@ -43,31 +45,16 @@ struct ToolPhrase {
 
 fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     match name {
-        "read" => phrase(
-            "Reading",
-            "Read",
-            "reading",
-            path_argument(arguments, "path"),
-        ),
-        "write" => phrase(
-            "Writing",
-            "Wrote",
-            "writing",
-            path_argument(arguments, "path"),
-        ),
-        "edit" => phrase(
-            "Editing",
-            "Edited",
-            "editing",
-            path_argument(arguments, "path"),
-        ),
+        "read" => phrase("Reading", "Read", "reading", path_argument(arguments)),
+        "write" => phrase("Writing", "Wrote", "writing", path_argument(arguments)),
+        "edit" => phrase("Editing", "Edited", "editing", path_argument(arguments)),
         "grep" => phrase(
             "Searching",
             "Searched",
             "searching",
             search_detail(arguments),
         ),
-        "find" => phrase("Listing", "Listed", "listing", find_detail(arguments)),
+        "find" => phrase("Listing", "Listed", "listing", search_detail(arguments)),
         "bash" => phrase(
             "Running",
             "Ran",
@@ -125,16 +112,11 @@ fn phrase(
 
 fn search_detail(arguments: &Value) -> String {
     let pattern = string_argument(arguments, "pattern");
-    append_short_path(pattern, arguments, "path")
+    append_short_path(pattern, arguments)
 }
 
-fn find_detail(arguments: &Value) -> String {
-    let pattern = string_argument(arguments, "pattern");
-    append_short_path(pattern, arguments, "path")
-}
-
-fn append_short_path(mut detail: String, arguments: &Value, key: &str) -> String {
-    let Some(path) = arguments.get(key).and_then(Value::as_str) else {
+fn append_short_path(mut detail: String, arguments: &Value) -> String {
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
         return detail;
     };
     let path = path.trim();
@@ -151,9 +133,9 @@ fn append_short_path(mut detail: String, arguments: &Value, key: &str) -> String
     }
 }
 
-fn path_argument(arguments: &Value, key: &str) -> String {
+fn path_argument(arguments: &Value) -> String {
     arguments
-        .get(key)
+        .get("path")
         .and_then(Value::as_str)
         .map(short_display_path)
         .unwrap_or_default()
@@ -173,9 +155,7 @@ fn short_display_path(path: &str) -> String {
     trimmed
         .split('/')
         .rev()
-        .find(|part| {
-            !part.is_empty() && !matches!(*part, "build" | "dist" | "node_modules" | "src")
-        })
+        .find(|part| !part.is_empty())
         .unwrap_or(trimmed)
         .to_string()
 }
@@ -193,7 +173,7 @@ fn join_parts(action: &str, detail: &str) -> String {
 }
 
 fn fit_action_and_detail(action: &str, detail: &str, max_width: usize) -> (String, String) {
-    let action = truncate_width(action, max_width);
+    let action = truncate_end(action, max_width);
     if detail.is_empty() {
         return (action, String::new());
     }
@@ -203,31 +183,8 @@ fn fit_action_and_detail(action: &str, detail: &str, max_width: usize) -> (Strin
     if remaining == 0 {
         (action, String::new())
     } else {
-        (action, truncate_width(detail, remaining))
+        (action, truncate_end(detail, remaining))
     }
-}
-
-fn truncate_width(value: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= max_width {
-        return value.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let mut output = String::new();
-    let mut width = 0;
-    let content_width = max_width.saturating_sub(1);
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if width + character_width > content_width {
-            break;
-        }
-        output.push(character);
-        width += character_width;
-    }
-    output.push('…');
-    output
 }
 
 #[cfg(test)]
@@ -253,7 +210,7 @@ mod tests {
                 false,
                 80,
             ),
-            ("Searched".to_string(), "reasoning in ash-tui".to_string())
+            ("Searched".to_string(), "reasoning in src".to_string())
         );
     }
 

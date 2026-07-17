@@ -254,10 +254,7 @@ async fn rollback_last_turn(
             if let Err(error) = history_store.undo(session.id(), &prompt).await {
                 tracing::warn!(%error, "failed to undo input history entry");
             }
-            ash_core::Event::TurnRolledBack {
-                messages: session.messages().to_vec(),
-                prompt,
-            }
+            ash_core::Event::TurnRolledBack { prompt }
         }
         None => ash_core::Event::Error("No submitted turn is available to undo.".to_string()),
     };
@@ -282,9 +279,6 @@ async fn resume_session(
 ) {
     let event = match session.resume(session_id).await {
         Ok(Some(restored)) => ash_core::Event::SessionRestored {
-            session_id: restored.session_id,
-            path: restored.path,
-            title: restored.title,
             model: restored.model,
             protocol: restored.protocol,
             working_dir: restored.working_dir,

@@ -1,7 +1,9 @@
 use std::time::Instant;
 
+use ratatui::style::{Modifier, Style};
+
 use crate::{
-    markdown::{render_markdown, RenderedLine, TextStyle},
+    markdown::{render_markdown, RenderedLine},
     scrollback::sanitize_terminal_text,
 };
 
@@ -23,7 +25,7 @@ enum StreamMode {
     },
     Reasoning {
         source: String,
-        started_at: Option<Instant>,
+        started_at: Instant,
         lines: Vec<RenderedLine>,
     },
 }
@@ -66,7 +68,7 @@ impl StreamState {
         let finished = self.finish();
         self.mode = StreamMode::Reasoning {
             source: String::new(),
-            started_at: None,
+            started_at: Instant::now(),
             lines: Vec::new(),
         };
         finished
@@ -80,24 +82,11 @@ impl StreamState {
         self.dirty = true;
     }
 
-    pub(crate) fn push_reasoning(&mut self, delta: &str, width: u16) {
-        let StreamMode::Reasoning {
-            source,
-            started_at,
-            lines,
-        } = &mut self.mode
-        else {
+    pub(crate) fn push_reasoning(&mut self, delta: &str) {
+        let StreamMode::Reasoning { source, .. } = &mut self.mode else {
             return;
         };
-        if started_at.is_none() {
-            *started_at = Some(Instant::now());
-        }
         source.push_str(&sanitize_terminal_text(delta));
-        *lines = render_reasoning_view(
-            source,
-            started_at.map_or(0, |started| started.elapsed().as_secs()),
-            width,
-        );
         self.dirty = true;
     }
 
@@ -110,11 +99,7 @@ impl StreamState {
         else {
             return;
         };
-        *lines = render_reasoning_view(
-            source,
-            started_at.map_or(0, |started| started.elapsed().as_secs()),
-            width,
-        );
+        *lines = render_reasoning_view(source, started_at.elapsed().as_secs(), width);
     }
 
     pub(crate) fn take_refresh(&mut self) -> Option<StreamRefresh> {
@@ -168,7 +153,7 @@ impl StreamState {
             StreamMode::Reasoning {
                 source, started_at, ..
             } if !source.trim().is_empty() => Some(FinishedStream::Thought {
-                elapsed_seconds: started_at.map_or(0, |started| started.elapsed().as_secs()),
+                elapsed_seconds: started_at.elapsed().as_secs(),
             }),
             StreamMode::Reasoning { .. } => None,
         }
@@ -200,7 +185,7 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
         width,
     );
     for line in &mut header {
-        line.patch_style(TextStyle::dim_italic());
+        line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
     header.truncate(REASONING_VIEW_ROWS);
     let remaining_rows = REASONING_VIEW_ROWS.saturating_sub(header.len());
@@ -216,7 +201,7 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
         body.pop();
     }
     for line in &mut body {
-        line.patch_style(TextStyle::dim_italic());
+        line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
     let keep_from = body.len().saturating_sub(remaining_rows);
     header.extend(body.into_iter().skip(keep_from));
@@ -250,17 +235,12 @@ mod tests {
     #[test]
     fn reasoning_view_uses_the_completed_thought_style() {
         let lines = render_reasoning_view("detail", 3, 80);
-        let mut header = Vec::new();
-        let mut body = Vec::new();
-        lines[0].write_ansi(&mut header).unwrap();
-        lines[1].write_ansi(&mut body).unwrap();
-        let header = String::from_utf8(header).unwrap();
-        let body = String::from_utf8(body).unwrap();
-
-        for rendered in [header, body] {
-            assert!(rendered.contains("\x1b[2m"));
-            assert!(rendered.contains("\x1b[3m"));
-            assert!(!rendered.contains("\x1b[1m"));
+        for line in &lines {
+            for span in line.ratatui_line().spans {
+                assert!(span.style.add_modifier.contains(Modifier::DIM));
+                assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+                assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+            }
         }
     }
 

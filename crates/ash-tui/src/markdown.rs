@@ -1,138 +1,16 @@
-#[cfg(test)]
-use std::io::{self, Write};
-
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::{Color as RatatuiColor, Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line as RatatuiLine, Span as RatatuiSpan},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum AnsiColor {
-    #[default]
-    Default,
-    Cyan,
-    Green,
-    Blue,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TextStyle {
-    pub(crate) bold: bool,
-    pub(crate) dim: bool,
-    pub(crate) italic: bool,
-    pub(crate) underlined: bool,
-    pub(crate) crossed_out: bool,
-    pub(crate) color: AnsiColor,
-}
-
-impl TextStyle {
-    pub(crate) const fn bold() -> Self {
-        Self {
-            bold: true,
-            ..Self::plain()
-        }
-    }
-
-    pub(crate) const fn dim() -> Self {
-        Self {
-            dim: true,
-            ..Self::plain()
-        }
-    }
-
-    pub(crate) const fn dim_italic() -> Self {
-        Self {
-            dim: true,
-            italic: true,
-            ..Self::plain()
-        }
-    }
-
-    pub(crate) const fn plain() -> Self {
-        Self {
-            bold: false,
-            dim: false,
-            italic: false,
-            underlined: false,
-            crossed_out: false,
-            color: AnsiColor::Default,
-        }
-    }
-
-    fn patch(self, other: Self) -> Self {
-        Self {
-            bold: self.bold || other.bold,
-            dim: self.dim || other.dim,
-            italic: self.italic || other.italic,
-            underlined: self.underlined || other.underlined,
-            crossed_out: self.crossed_out || other.crossed_out,
-            color: if other.color == AnsiColor::Default {
-                self.color
-            } else {
-                other.color
-            },
-        }
-    }
-
-    #[cfg(test)]
-    fn write_prefix(self, writer: &mut impl Write) -> io::Result<()> {
-        write!(writer, "\x1b[0m")?;
-        if self.bold {
-            write!(writer, "\x1b[1m")?;
-        }
-        if self.dim {
-            write!(writer, "\x1b[2m")?;
-        }
-        if self.italic {
-            write!(writer, "\x1b[3m")?;
-        }
-        if self.underlined {
-            write!(writer, "\x1b[4m")?;
-        }
-        if self.crossed_out {
-            write!(writer, "\x1b[9m")?;
-        }
-        let color = match self.color {
-            AnsiColor::Default => "",
-            AnsiColor::Cyan => "\x1b[36m",
-            AnsiColor::Green => "\x1b[32m",
-            AnsiColor::Blue => "\x1b[34m",
-        };
-        write!(writer, "{color}")
-    }
-
-    fn ratatui_style(self) -> Style {
-        let mut style = Style::default();
-        if self.bold {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if self.dim {
-            style = style.add_modifier(Modifier::DIM);
-        }
-        if self.italic {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        if self.underlined {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
-        if self.crossed_out {
-            style = style.add_modifier(Modifier::CROSSED_OUT);
-        }
-        match self.color {
-            AnsiColor::Default => style,
-            AnsiColor::Cyan => style.fg(RatatuiColor::Cyan),
-            AnsiColor::Green => style.fg(RatatuiColor::Green),
-            AnsiColor::Blue => style.fg(RatatuiColor::Blue),
-        }
-    }
-}
+use crate::text_width::truncate_end;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StyledSpan {
     pub(crate) text: String,
-    pub(crate) style: TextStyle,
+    pub(crate) style: Style,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -145,26 +23,17 @@ impl RenderedLine {
         self.spans.iter().all(|span| span.text.trim().is_empty())
     }
 
-    pub(crate) fn patch_style(&mut self, style: TextStyle) {
+    pub(crate) fn patch_style(&mut self, style: Style) {
         for span in &mut self.spans {
             span.style = span.style.patch(style);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_ansi(&self, writer: &mut impl Write) -> io::Result<()> {
-        for span in &self.spans {
-            span.style.write_prefix(writer)?;
-            write!(writer, "{}", span.text)?;
-        }
-        write!(writer, "\x1b[0m")
     }
 
     pub(crate) fn ratatui_line(&self) -> RatatuiLine<'static> {
         RatatuiLine::from(
             self.spans
                 .iter()
-                .map(|span| RatatuiSpan::styled(span.text.clone(), span.style.ratatui_style()))
+                .map(|span| RatatuiSpan::styled(span.text.clone(), span.style))
                 .collect::<Vec<_>>(),
         )
     }
@@ -199,7 +68,7 @@ struct MarkdownWriter {
     width: usize,
     lines: Vec<LogicalLine>,
     current: LogicalLine,
-    inline_styles: Vec<TextStyle>,
+    inline_styles: Vec<Style>,
     needs_block_gap: bool,
     blockquote_depth: usize,
     code_block: bool,
@@ -230,13 +99,13 @@ impl MarkdownWriter {
         }
     }
 
-    fn current_style(&self) -> TextStyle {
-        let mut style = TextStyle::plain();
+    fn current_style(&self) -> Style {
+        let mut style = Style::default();
         if self.blockquote_depth > 0 {
-            style.color = AnsiColor::Green;
+            style = style.fg(Color::Green);
         }
         if self.code_block {
-            style.color = AnsiColor::Cyan;
+            style = style.fg(Color::Cyan);
         }
         for inline in &self.inline_styles {
             style = style.patch(*inline);
@@ -253,11 +122,9 @@ impl MarkdownWriter {
         if !quote_prefix.is_empty() {
             self.current.spans.push(StyledSpan {
                 text: quote_prefix,
-                style: TextStyle {
-                    color: AnsiColor::Green,
-                    dim: true,
-                    ..TextStyle::plain()
-                },
+                style: Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::DIM),
             });
         }
 
@@ -265,7 +132,7 @@ impl MarkdownWriter {
         if !list_indent.is_empty() {
             self.current.spans.push(StyledSpan {
                 text: list_indent.clone(),
-                style: TextStyle::plain(),
+                style: Style::default(),
             });
         }
 
@@ -281,17 +148,14 @@ impl MarkdownWriter {
                 + UnicodeWidthStr::width("│ ") * self.blockquote_depth;
             self.current.spans.push(StyledSpan {
                 text: prefix,
-                style: TextStyle {
-                    color: AnsiColor::Blue,
-                    ..TextStyle::plain()
-                },
+                style: Style::default().fg(Color::Blue),
             });
         }
 
         if self.code_block {
             self.current.spans.push(StyledSpan {
                 text: "  ".to_string(),
-                style: TextStyle::dim(),
+                style: Style::default().add_modifier(Modifier::DIM),
             });
             self.current.continuation_indent = self.current.continuation_indent.max(2);
         }
@@ -340,7 +204,7 @@ impl MarkdownWriter {
         }
     }
 
-    fn push_style(&mut self, style: TextStyle) {
+    fn push_style(&mut self, style: Style) {
         self.inline_styles.push(style);
     }
 
@@ -465,18 +329,18 @@ impl MarkdownWriter {
                 if column > 0 {
                     line.spans.push(StyledSpan {
                         text: "  ".to_string(),
-                        style: TextStyle::dim(),
+                        style: Style::default().add_modifier(Modifier::DIM),
                     });
                 }
                 let value = row.get(column).map(String::as_str).unwrap_or("");
-                let value = fit_plain(value, column_width);
+                let value = truncate_end(value, column_width);
                 let padding = column_width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
                 line.spans.push(StyledSpan {
                     text: format!("{value}{}", " ".repeat(padding)),
                     style: if header {
-                        TextStyle::bold()
+                        Style::default().add_modifier(Modifier::BOLD)
                     } else {
-                        TextStyle::plain()
+                        Style::default()
                     },
                 });
             }
@@ -493,7 +357,7 @@ impl MarkdownWriter {
             self.lines.push(LogicalLine {
                 spans: vec![StyledSpan {
                     text: separator,
-                    style: TextStyle::dim(),
+                    style: Style::default().add_modifier(Modifier::DIM),
                 }],
                 continuation_indent: 0,
             });
@@ -550,11 +414,7 @@ impl MarkdownWriter {
                             self.ensure_prefix();
                             self.current.spans.push(StyledSpan {
                                 text: language.to_string(),
-                                style: TextStyle {
-                                    dim: true,
-                                    color: AnsiColor::Cyan,
-                                    ..TextStyle::plain()
-                                },
+                                style: Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                             });
                             self.finish_line(/*force*/ false);
                         }
@@ -579,23 +439,23 @@ impl MarkdownWriter {
                 }
                 Event::Start(Tag::Item) => self.start_item(),
                 Event::End(TagEnd::Item) => self.finish_item(),
-                Event::Start(Tag::Emphasis) => self.push_style(TextStyle {
-                    italic: true,
-                    ..TextStyle::plain()
-                }),
+                Event::Start(Tag::Emphasis) => {
+                    self.push_style(Style::default().add_modifier(Modifier::ITALIC))
+                }
                 Event::End(TagEnd::Emphasis) => self.pop_style(),
-                Event::Start(Tag::Strong) => self.push_style(TextStyle::bold()),
+                Event::Start(Tag::Strong) => {
+                    self.push_style(Style::default().add_modifier(Modifier::BOLD))
+                }
                 Event::End(TagEnd::Strong) => self.pop_style(),
-                Event::Start(Tag::Strikethrough) => self.push_style(TextStyle {
-                    crossed_out: true,
-                    ..TextStyle::plain()
-                }),
+                Event::Start(Tag::Strikethrough) => {
+                    self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
+                }
                 Event::End(TagEnd::Strikethrough) => self.pop_style(),
-                Event::Start(Tag::Link { .. }) => self.push_style(TextStyle {
-                    underlined: true,
-                    color: AnsiColor::Cyan,
-                    ..TextStyle::plain()
-                }),
+                Event::Start(Tag::Link { .. }) => self.push_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
                 Event::End(TagEnd::Link) => self.pop_style(),
                 Event::Start(Tag::Table(_)) => {
                     self.block_gap();
@@ -603,10 +463,7 @@ impl MarkdownWriter {
                 }
                 Event::Text(text) | Event::Html(text) => self.push_text(&text),
                 Event::Code(code) => {
-                    let style = TextStyle {
-                        color: AnsiColor::Cyan,
-                        ..TextStyle::plain()
-                    };
+                    let style = Style::default().fg(Color::Cyan);
                     self.push_style(style);
                     self.push_text(&code);
                     self.pop_style();
@@ -618,7 +475,7 @@ impl MarkdownWriter {
                     self.lines.push(LogicalLine {
                         spans: vec![StyledSpan {
                             text: "─".repeat(self.width.min(24)),
-                            style: TextStyle::dim(),
+                            style: Style::default().add_modifier(Modifier::DIM),
                         }],
                         continuation_indent: 0,
                     });
@@ -658,50 +515,19 @@ impl MarkdownWriter {
     }
 }
 
-fn heading_style(level: HeadingLevel) -> TextStyle {
+fn heading_style(level: HeadingLevel) -> Style {
     match level {
-        HeadingLevel::H1 => TextStyle {
-            bold: true,
-            underlined: true,
-            ..TextStyle::plain()
-        },
-        HeadingLevel::H2 => TextStyle::bold(),
-        HeadingLevel::H3 => TextStyle {
-            bold: true,
-            italic: true,
-            ..TextStyle::plain()
-        },
-        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => TextStyle {
-            italic: true,
-            ..TextStyle::plain()
-        },
+        HeadingLevel::H1 => Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
+        HeadingLevel::H3 => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => {
+            Style::default().add_modifier(Modifier::ITALIC)
+        }
     }
 }
 
 fn logical_line_is_blank(line: &LogicalLine) -> bool {
     line.spans.iter().all(|span| span.text.trim().is_empty())
-}
-
-fn fit_plain(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut result = String::new();
-    let mut used = 0;
-    let available = width.saturating_sub(1);
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > available {
-            break;
-        }
-        result.push(character);
-        used += character_width;
-    }
-    result.push('…');
-    result
 }
 
 fn wrap_line(line: LogicalLine, width: usize) -> Vec<RenderedLine> {
@@ -722,7 +548,7 @@ fn wrap_line(line: LogicalLine, width: usize) -> Vec<RenderedLine> {
                     let indent = " ".repeat(line.continuation_indent.min(width.saturating_sub(1)));
                     current.spans.push(StyledSpan {
                         text: indent.clone(),
-                        style: TextStyle::plain(),
+                        style: Style::default(),
                     });
                     current_width = UnicodeWidthStr::width(indent.as_str());
                 }
@@ -779,9 +605,15 @@ mod tests {
                 "│ quote",
             ]
         );
-        assert!(lines[0].spans[0].style.bold);
-        assert!(lines[2].spans[1].style.bold);
-        assert_eq!(lines[2].spans[3].style.color, AnsiColor::Cyan);
+        assert!(lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(lines[2].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(lines[2].spans[3].style.fg, Some(Color::Cyan));
     }
 
     #[test]
@@ -797,7 +629,9 @@ mod tests {
     fn wraps_markdown_while_preserving_styles() {
         let lines = render_markdown("**abcdefghij**", 5);
         assert_eq!(text(&lines), vec!["abcde", "fghij"]);
-        assert!(lines.iter().all(|line| line.spans[0].style.bold));
+        assert!(lines
+            .iter()
+            .all(|line| line.spans[0].style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]

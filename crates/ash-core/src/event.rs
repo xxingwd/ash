@@ -22,6 +22,10 @@ pub enum Event {
     },
     ToolCallEnd {
         id: ToolCallId,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
         output: String,
         is_error: bool,
     },
@@ -37,9 +41,6 @@ pub enum Event {
         reason: StopReason,
     },
     SessionRestored {
-        session_id: SessionId,
-        path: std::path::PathBuf,
-        title: String,
         model: String,
         protocol: String,
         working_dir: std::path::PathBuf,
@@ -49,7 +50,6 @@ pub enum Event {
         sessions: Vec<SessionSummary>,
     },
     TurnRolledBack {
-        messages: Vec<Message>,
         prompt: String,
     },
     ChildSpawned {
@@ -89,6 +89,28 @@ mod tests {
         let Event::ToolCallStart { arguments, .. } = event else {
             panic!("expected tool call start");
         };
+        assert_eq!(arguments, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn old_tool_end_events_default_missing_display_context() {
+        let id = ToolCallId::new();
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "ToolCallEnd": {
+                "id": id,
+                "output": "done",
+                "is_error": false
+            }
+        }))
+        .expect("legacy event should deserialize");
+
+        let Event::ToolCallEnd {
+            name, arguments, ..
+        } = event
+        else {
+            panic!("expected tool call end");
+        };
+        assert!(name.is_empty());
         assert_eq!(arguments, serde_json::Value::Null);
     }
 }

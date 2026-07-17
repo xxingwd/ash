@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     history_block::HistoryBlock,
-    markdown::{render_markdown, TextStyle},
+    markdown::render_markdown,
     palette::Rgb,
     scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{read_group_summary, tool_call_summary},
@@ -36,10 +36,8 @@ pub(crate) struct LiveBlock {
 enum LiveBlockKind {
     Welcome(PathBuf),
     History(HistoryBlock),
-    Markdown {
-        source: String,
-        reasoning: bool,
-    },
+    Assistant(String),
+    Thought(String),
     ReadGroup {
         arguments: Vec<Value>,
     },
@@ -60,8 +58,12 @@ impl LiveBlock {
         Self::new(id, LiveBlockKind::History(block))
     }
 
-    pub(crate) fn markdown(id: u64, source: String, reasoning: bool) -> Self {
-        Self::new(id, LiveBlockKind::Markdown { source, reasoning })
+    pub(crate) fn assistant(id: u64, source: String) -> Self {
+        Self::new(id, LiveBlockKind::Assistant(source))
+    }
+
+    pub(crate) fn thought(id: u64, source: String) -> Self {
+        Self::new(id, LiveBlockKind::Thought(source))
     }
 
     pub(crate) fn tool(
@@ -111,14 +113,11 @@ impl LiveBlock {
         self.turn_id == Some(turn_id)
     }
 
-    pub(crate) fn append_markdown_source(&mut self, source: String) -> bool {
-        let LiveBlockKind::Markdown {
-            source: current, ..
-        } = &mut self.kind
-        else {
+    pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
+        let LiveBlockKind::Assistant(current) = &mut self.kind else {
             return false;
         };
-        current.push_str(&source);
+        current.push_str(source);
         true
     }
 
@@ -142,9 +141,14 @@ impl LiveBlock {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
             LiveBlockKind::History(block) => block.render(width, composer_background),
-            LiveBlockKind::Markdown { source, reasoning } => {
-                render_markdown_block(source, *reasoning, width)
+            LiveBlockKind::Assistant(source) => {
+                render_markdown_block(source, Style::default(), width)
             }
+            LiveBlockKind::Thought(source) => render_markdown_block(
+                source,
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                width,
+            ),
             LiveBlockKind::ReadGroup { arguments } => render_read_group(arguments, width),
             LiveBlockKind::Tool {
                 name,
@@ -200,13 +204,11 @@ fn styled_welcome_line(line: &WelcomeLine) -> Line<'static> {
     ])
 }
 
-fn render_markdown_block(source: &str, reasoning: bool, width: u16) -> Buffer {
+fn render_markdown_block(source: &str, style: Style, width: u16) -> Buffer {
     let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
     let mut lines = render_markdown(source, content_width);
-    if reasoning {
-        for line in &mut lines {
-            line.patch_style(TextStyle::dim_italic());
-        }
+    for line in &mut lines {
+        line.patch_style(style);
     }
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
@@ -349,7 +351,7 @@ mod tests {
 
     #[test]
     fn markdown_blocks_reflow_at_the_current_width() {
-        let block = LiveBlock::markdown(1, "a long line that must wrap".to_string(), false);
+        let block = LiveBlock::assistant(1, "a long line that must wrap".to_string());
 
         let narrow = block.render(10, None);
         let wide = block.render(40, None);

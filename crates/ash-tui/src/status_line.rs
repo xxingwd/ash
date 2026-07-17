@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::text_width::truncate_end;
 
 pub(crate) fn compact_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -21,39 +23,18 @@ pub(crate) fn compact_path(path: &Path) -> String {
 pub(crate) fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
     let model_width = UnicodeWidthStr::width(model) as u16;
     if model_width >= width || path.is_empty() {
-        return (fit_width(model, width), None);
+        return (truncate_end(model, usize::from(width)), None);
     }
 
     let path_width = width.saturating_sub(model_width.saturating_add(3));
     if path_width == 0 {
-        (fit_width(model, width), None)
+        (truncate_end(model, usize::from(width)), None)
     } else {
-        (model.to_string(), Some(fit_width(path, path_width)))
+        (
+            model.to_string(),
+            Some(truncate_end(path, usize::from(path_width))),
+        )
     }
-}
-
-fn fit_width(value: &str, width: u16) -> String {
-    let width = usize::from(width);
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-
-    let mut result = String::new();
-    let mut used = 0;
-    let available = width.saturating_sub(1);
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > available {
-            break;
-        }
-        result.push(character);
-        used += character_width;
-    }
-    result.push('…');
-    result
 }
 
 #[cfg(test)]
@@ -62,7 +43,7 @@ mod tests {
 
     #[test]
     fn shortens_status_to_terminal_width() {
-        let value = fit_width("openai-responses · gpt-5 · ~/workspace/ash", 20);
+        let value = truncate_end("openai-responses · gpt-5 · ~/workspace/ash", 20);
         assert!(UnicodeWidthStr::width(value.as_str()) <= 20);
         assert!(value.ends_with('…'));
     }

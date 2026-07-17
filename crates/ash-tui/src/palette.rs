@@ -64,7 +64,7 @@ fn probe_background(timeout: Duration) -> Option<Rgb> {
         original_flags,
     };
 
-    writer.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\").ok()?;
+    writer.write_all(b"\x1b]11;?\x1b\\").ok()?;
     writer.flush().ok()?;
 
     let deadline = Instant::now() + timeout;
@@ -86,7 +86,7 @@ fn probe_background(timeout: Duration) -> Option<Rgb> {
                 Err(_) => return None,
             }
         }
-        if let Some((_, background)) = parse_default_colors(&buffer) {
+        if let Some(background) = parse_osc_color(&buffer, 11) {
             return Some(background);
         }
 
@@ -128,10 +128,6 @@ fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<Rgb> {
             _ => None,
         })?;
     parse_osc_rgb(std::str::from_utf8(&rest[..end]).ok()?)
-}
-
-fn parse_default_colors(buffer: &[u8]) -> Option<(Rgb, Rgb)> {
-    parse_osc_color(buffer, 10).zip(parse_osc_color(buffer, 11))
 }
 
 fn parse_osc_rgb(value: &str) -> Option<Rgb> {
@@ -182,14 +178,10 @@ mod tests {
     }
 
     #[test]
-    fn requires_foreground_and_background_colors() {
+    fn parses_background_without_requiring_foreground() {
         assert_eq!(
-            parse_default_colors(b"\x1b]11;rgb:1111/1111/1111\x07\x1b]10;rgb:eeee/eeee/eeee\x1b\\"),
-            Some(((238, 238, 238), (17, 17, 17)))
-        );
-        assert_eq!(
-            parse_default_colors(b"\x1b]11;rgb:1111/1111/1111\x07"),
-            None
+            parse_osc_color(b"\x1b]11;rgb:1111/1111/1111\x07", 11),
+            Some((17, 17, 17))
         );
     }
 

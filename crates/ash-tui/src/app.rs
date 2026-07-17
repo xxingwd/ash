@@ -1,8 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{Event, SessionId, ToolCallId};
+use ash_core::{Event, SessionId};
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 
@@ -21,6 +21,22 @@ pub enum UiCommand {
     ListSessions,
     ResumeSession(SessionId),
     Exit,
+}
+
+enum TurnPhase {
+    Idle,
+    Running { prompt: Option<String> },
+    RollingBack,
+}
+
+impl TurnPhase {
+    fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn is_rolling_back(&self) -> bool {
+        matches!(self, Self::RollingBack)
+    }
 }
 
 pub struct App {
@@ -65,89 +81,96 @@ impl App {
             status_interval,
         );
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut busy = false;
+        let mut phase = TurnPhase::Idle;
         let mut command_completion = CommandCompletionState::default();
         let mut session_picker = SessionPickerState::default();
-        let mut calls: HashMap<ToolCallId, (String, serde_json::Value)> = HashMap::new();
         let mut queued_inputs: VecDeque<String> = VecDeque::new();
-        let mut active_prompt: Option<String> = None;
-        let mut rollback_in_progress = false;
 
         terminal.welcome()?;
-        render_prompt(&mut terminal, &input, &mut command_completion, busy)?;
+        render_prompt(&mut terminal, &input, &mut command_completion, &phase)?;
 
         loop {
             tokio::select! {
-                _ = render_tick.tick(), if busy => terminal.refresh_content()?,
-                _ = status_tick.tick(), if busy => terminal.refresh_status()?,
+                _ = render_tick.tick(), if phase.is_busy() => terminal.refresh_content()?,
+                _ = status_tick.tick(), if phase.is_busy() => terminal.refresh_status()?,
                 event = events.next() => {
                     let Some(event) = event else { break };
                     match event {
-                        event if rollback_in_progress && is_stale_turn_event(&event) => {}
+                        event if phase.is_rolling_back() && is_stale_turn_event(&event) => {}
                         Event::AgentStarted { .. } => {
-                            if !busy {
+                            if !phase.is_busy() {
                                 render_tick.reset();
                                 status_tick.reset();
+                                phase = TurnPhase::Running { prompt: None };
                             }
-                            busy = true;
                             terminal.agent_started()?;
                             render_prompt(
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
-                        Event::TextDelta(text) => terminal.text(&text)?,
-                        Event::Thinking(text) => terminal.thinking(&text)?,
-                        Event::ToolCallStart { id, name, arguments } => {
+                        Event::TextDelta(text) => terminal.text(&text),
+                        Event::Thinking(text) => terminal.thinking(&text),
+                        Event::ToolCallStart {
+                            id: _,
+                            name,
+                            arguments,
+                        } => {
                             terminal.tool_start(&name, &arguments)?;
-                            calls.insert(id.clone(), (name.clone(), arguments));
                         }
-                        Event::ToolCallEnd { id, output, is_error } => {
-                            let (name, arguments) = calls
-                                .remove(&id)
-                                .unwrap_or_else(|| ("tool".into(), serde_json::Value::Null));
+                        Event::ToolCallEnd {
+                            id: _,
+                            name,
+                            arguments,
+                            output,
+                            is_error,
+                        } => {
                             terminal.tool_end(&name, &arguments, &output, is_error)?;
                         }
                         Event::Error(error) => {
                             terminal.error(&error)?;
                         }
                         Event::AgentFinished { .. } => {
-                            if rollback_in_progress {
+                            if phase.is_rolling_back() {
                                 queued_inputs.clear();
                                 terminal.set_queued_messages(0);
-                                busy = false;
+                                phase = TurnPhase::Idle;
                             } else {
                                 terminal.finish_response()?;
                                 if let Some(next_input) = queued_inputs.pop_front() {
-                                    active_prompt = Some(next_input.clone());
+                                    phase = TurnPhase::Running {
+                                        prompt: Some(next_input.clone()),
+                                    };
                                     terminal.set_queued_messages(queued_inputs.len());
                                     terminal.commit_input(&next_input)?;
                                     render_tick.reset();
                                     status_tick.reset();
-                                    busy = true;
+                                    if commands
+                                        .send(UiCommand::Submit(next_input))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 } else {
-                                    active_prompt = None;
                                     terminal.set_queued_messages(0);
-                                    busy = false;
+                                    phase = TurnPhase::Idle;
                                 }
                                 render_prompt(
                                     &mut terminal,
                                     &input,
                                     &mut command_completion,
-                                    busy,
+                                    &phase,
                                 )?;
                             }
                         }
-                        Event::TurnRolledBack { messages: _, prompt } => {
-                            let ui_already_rolled_back = rollback_in_progress;
-                            rollback_in_progress = false;
-                            busy = false;
-                            calls.clear();
+                        Event::TurnRolledBack { prompt } => {
+                            let ui_already_rolled_back = phase.is_rolling_back();
+                            phase = TurnPhase::Idle;
                             queued_inputs.clear();
                             terminal.set_queued_messages(0);
-                            active_prompt = None;
                             if input.text() != prompt {
                                 input.restore_submitted(prompt);
                             }
@@ -158,13 +181,10 @@ impl App {
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
                         Event::SessionRestored {
-                            session_id: _,
-                            path: _,
-                            title: _,
                             model,
                             protocol,
                             working_dir,
@@ -172,11 +192,8 @@ impl App {
                         } => {
                             session_picker.close();
                             terminal.set_session_menu(&[], 0);
-                            rollback_in_progress = false;
-                            busy = false;
-                            calls.clear();
+                            phase = TurnPhase::Idle;
                             queued_inputs.clear();
-                            active_prompt = None;
                             terminal.set_queued_messages(0);
                             self.model = model;
                             self.protocol = protocol;
@@ -191,7 +208,7 @@ impl App {
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
                         Event::SessionsListed { sessions } => {
@@ -208,7 +225,7 @@ impl App {
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
                         Event::Usage { .. }
@@ -221,12 +238,13 @@ impl App {
                     let event = key?;
                     match event {
                         CrosstermEvent::Resize(width, height) => {
-                            terminal.handle_resize(width, height);
-                            render_prompt(
+                            render_resized_prompt(
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
+                                width,
+                                height,
                             )?
                         },
                         CrosstermEvent::Paste(text) => {
@@ -238,7 +256,7 @@ impl App {
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
                         CrosstermEvent::Key(key)
@@ -270,7 +288,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         if let Some(session_id) = selected {
                                             if commands
@@ -293,7 +311,7 @@ impl App {
                                     &mut terminal,
                                     &input,
                                     &mut command_completion,
-                                    busy,
+                                    &phase,
                                 )?;
                                 continue;
                             }
@@ -315,7 +333,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -325,7 +343,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -337,7 +355,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -349,7 +367,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -361,7 +379,7 @@ impl App {
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -374,19 +392,25 @@ impl App {
                                 }
                             }
 
-                            if busy
+                            if phase.is_busy()
                                 && input.is_empty()
                                 && key.code == KeyCode::Esc
                                 && key.kind == KeyEventKind::Press
                                 && key.modifiers.is_empty()
                             {
-                                if rollback_in_progress {
+                                if phase.is_rolling_back() {
                                     continue;
                                 }
-                                rollback_in_progress = true;
+                                let prompt = match std::mem::replace(
+                                    &mut phase,
+                                    TurnPhase::RollingBack,
+                                ) {
+                                    TurnPhase::Running { prompt } => prompt,
+                                    TurnPhase::Idle | TurnPhase::RollingBack => None,
+                                };
                                 queued_inputs.clear();
                                 terminal.set_queued_messages(0);
-                                if let Some(prompt) = active_prompt.take() {
+                                if let Some(prompt) = prompt {
                                     input.restore_submitted(prompt);
                                 }
                                 terminal.rollback_turn()?;
@@ -394,7 +418,7 @@ impl App {
                                     &mut terminal,
                                     &input,
                                     &mut command_completion,
-                                    busy,
+                                    &phase,
                                 )?;
                                 if commands.send(UiCommand::CancelAndUndo).await.is_err() {
                                     break;
@@ -409,14 +433,14 @@ impl App {
                                         &mut terminal,
                                         &input,
                                         &mut command_completion,
-                                        busy,
+                                        &phase,
                                     );
                                     if value.trim().is_empty() {
                                         render_prompt(
                                             &mut terminal,
                                             &input,
                                             &mut command_completion,
-                                            busy,
+                                            &phase,
                                         )?;
                                         continue;
                                     }
@@ -426,9 +450,9 @@ impl App {
                                         break;
                                     }
                                     match slash_command::parse(&value) {
-                                        ParsedInput::Message(_) => {}
+                                        ParsedInput::Message => {}
                                         ParsedInput::Invalid(error) => {
-                                            if busy {
+                                            if phase.is_busy() {
                                                 terminal.command_blocked("command")?;
                                             } else {
                                                 terminal.command_error(&error)?;
@@ -436,7 +460,9 @@ impl App {
                                             continue;
                                         }
                                         ParsedInput::Command(command) => {
-                                            if busy && !command.available_during_task() {
+                                            if phase.is_busy()
+                                                && !command.available_during_task()
+                                            {
                                                 terminal.command_blocked(command.name())?;
                                                 continue;
                                             }
@@ -444,13 +470,12 @@ impl App {
                                                 SlashCommand::New | SlashCommand::Clear => {
                                                     session_picker.close();
                                                     terminal.set_session_menu(&[], 0);
-                                                    active_prompt = None;
                                                     terminal.start_new_session()?;
                                                     render_prompt(
                                                         &mut terminal,
                                                         &input,
                                                         &mut command_completion,
-                                            busy,
+                                            &phase,
                                                     )?;
                                                     if commands
                                                         .send(UiCommand::NewSession)
@@ -465,7 +490,7 @@ impl App {
                                                         &mut terminal,
                                                         &input,
                                                         &mut command_completion,
-                                                        busy,
+                                                        &phase,
                                                     )?;
                                                     if commands
                                                         .send(UiCommand::ListSessions)
@@ -497,25 +522,23 @@ impl App {
                                             continue;
                                         }
                                     }
-                                    if busy {
+                                    if phase.is_busy() {
                                         queued_inputs.push_back(value.clone());
                                         terminal.set_queued_messages(queued_inputs.len());
-                                        render_prompt(
-                                            &mut terminal,
-                                            &input,
-                                            &mut command_completion,
-                                            busy,
-                                        )?;
-                                        if commands.send(UiCommand::Submit(value)).await.is_err() {
-                                            break;
-                                        }
-                                        continue;
+                                    render_prompt(
+                                        &mut terminal,
+                                        &input,
+                                        &mut command_completion,
+                                        &phase,
+                                    )?;
+                                    continue;
                                     }
-                                    active_prompt = Some(value.clone());
+                                    phase = TurnPhase::Running {
+                                        prompt: Some(value.clone()),
+                                    };
                                     terminal.commit_input(&value)?;
                                     render_tick.reset();
                                     status_tick.reset();
-                                    busy = true;
                                     if commands.send(UiCommand::Submit(value)).await.is_err() {
                                         break;
                                     }
@@ -524,7 +547,7 @@ impl App {
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
                                     if input.is_empty() {
-                                        if busy {
+                                        if phase.is_busy() {
                                             continue;
                                         }
                                         let _ = commands.send(UiCommand::Exit).await;
@@ -535,7 +558,7 @@ impl App {
                                         &mut terminal,
                                         &input,
                                         &mut command_completion,
-                                                        busy,
+                                                        &phase,
                                     )?;
                                 }
                                 KeyCode::Char('d')
@@ -560,7 +583,7 @@ impl App {
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
-                                busy,
+                                &phase,
                             )?;
                         }
                         _ => {}
@@ -591,9 +614,9 @@ fn sync_command_menu(
     terminal: &mut InlineTerminal,
     input: &InputState,
     completion: &mut CommandCompletionState,
-    busy: bool,
+    phase: &TurnPhase,
 ) {
-    completion.sync(input.text(), input.cursor(), busy);
+    completion.sync(input.text(), input.cursor(), phase.is_busy());
     terminal.set_command_menu(completion.items(), completion.selected_index());
 }
 
@@ -601,10 +624,22 @@ fn render_prompt(
     terminal: &mut InlineTerminal,
     input: &InputState,
     completion: &mut CommandCompletionState,
-    busy: bool,
+    phase: &TurnPhase,
 ) -> std::io::Result<()> {
-    sync_command_menu(terminal, input, completion, busy);
+    sync_command_menu(terminal, input, completion, phase);
     terminal.prompt(input)
+}
+
+fn render_resized_prompt(
+    terminal: &mut InlineTerminal,
+    input: &InputState,
+    completion: &mut CommandCompletionState,
+    phase: &TurnPhase,
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    sync_command_menu(terminal, input, completion, phase);
+    terminal.resize(input, width, height)
 }
 
 #[cfg(test)]
@@ -622,7 +657,6 @@ mod tests {
             reason: StopReason::Aborted,
         }));
         assert!(!is_stale_turn_event(&Event::TurnRolledBack {
-            messages: Vec::new(),
             prompt: "draft".into(),
         }));
     }

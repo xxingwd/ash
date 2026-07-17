@@ -1702,6 +1702,7 @@ dependencies = [
  "bitflags",
  "cassowary",
  "compact_str",
+ "crossterm",
  "indoc",
  "instability",
  "itertools",

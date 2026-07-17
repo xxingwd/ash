@@ -8,7 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Padding, Widget},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     block_layout::{layout_stack, stack_height, StackBoundary, StackItem},
@@ -17,6 +17,7 @@ use crate::{
     palette::Rgb,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left},
+    text_width::truncate_end,
 };
 
 const STATUS_ROWS: u16 = 1;
@@ -39,6 +40,7 @@ pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
     terminal_width.saturating_sub(1).max(1)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
@@ -66,7 +68,6 @@ pub(crate) struct ViewportFrame {
     pub(crate) buffer: Buffer,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_column: u16,
-    pub(crate) history_rows: u16,
     pub(crate) total_rows: u16,
 }
 
@@ -92,24 +93,24 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         input.busy,
         menu_rows,
     );
-    let regions = viewport_regions(&live, active.as_ref(), input.busy, menu_rows);
+    let active_rows = active
+        .as_ref()
+        .map(|active| u16::try_from(active.lines.len()).unwrap_or(u16::MAX));
+    let regions = viewport_regions(&live, active_rows, input.busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, input.history_boundary, &items);
     let area = Rect::new(0, 0, width, layout.height);
     let mut buffer = Buffer::empty(area);
     let mut composer_input_area = Rect::default();
-    let mut history_rows = 0;
 
     for (region, area) in regions.iter().zip(&layout.areas) {
         match region.kind {
             ViewportRegion::Live(index) => {
-                history_rows = history_rows.max(area.bottom());
                 if let Some(block) = live.get(index) {
                     blit_buffer(&mut buffer, *area, &block.buffer);
                 }
             }
             ViewportRegion::Active => {
-                history_rows = history_rows.max(area.bottom());
                 if let Some(active) = &active {
                     render_active(*area, active, &mut buffer);
                 }
@@ -136,7 +137,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         cursor_column: COMPOSER_TEXT_COLUMN
             .saturating_add(input.prompt_cursor_column)
             .min(input.terminal_width.saturating_sub(1)),
-        history_rows,
         total_rows: layout.height,
     }
 }
@@ -209,18 +209,14 @@ fn active_overhead(
     busy: bool,
     menu_rows: u16,
 ) -> u16 {
-    let active = ActiveWindow {
-        start: 0,
-        lines: &[],
-    };
-    let regions = viewport_regions(live, Some(&active), busy, menu_rows);
+    let regions = viewport_regions(live, Some(0), busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     stack_height(history_boundary, &items)
 }
 
 fn viewport_regions(
     live: &[RenderedLiveBlock],
-    active: Option<&ActiveWindow<'_>>,
+    active_rows: Option<u16>,
     busy: bool,
     menu_rows: u16,
 ) -> Vec<RegionSpec> {
@@ -231,8 +227,7 @@ fn viewport_regions(
             item: StackItem::block(block.buffer.area.height),
         });
     }
-    if let Some(active) = active {
-        let height = u16::try_from(active.lines.len()).unwrap_or(u16::MAX);
+    if let Some(height) = active_rows {
         regions.push(RegionSpec {
             kind: ViewportRegion::Active,
             item: StackItem::block(height),
@@ -415,7 +410,7 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
             let available = usize::from(area.width) - description_column;
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                fit_menu_text(item.description, available),
+                truncate_end(item.description, available),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
@@ -463,7 +458,7 @@ fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
         } else {
             usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS)
         };
-        let title = fit_menu_text(&session.title, title_width);
+        let title = truncate_end(&session.title, title_width);
         let title_used = UnicodeWidthStr::width(title.as_str());
         let mut spans = vec![
             Span::styled(prefix, prefix_style),
@@ -499,28 +494,6 @@ pub(crate) fn session_menu_rows(item_count: usize) -> u16 {
     u16::try_from(item_count.min(SESSION_MENU_MAX_ROWS)).unwrap_or(u16::MAX)
 }
 
-pub(crate) fn fit_menu_text(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut output = String::new();
-    let mut used = 0;
-    let available = width.saturating_sub(1);
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > available {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.push('…');
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -528,7 +501,7 @@ mod tests {
     use ash_core::SessionId;
 
     use super::*;
-    use crate::{markdown::render_markdown, slash_command::SlashCommand};
+    use crate::markdown::render_markdown;
 
     fn row_text(buffer: &Buffer, y: u16) -> String {
         (0..buffer.area.width)
@@ -575,7 +548,6 @@ mod tests {
         });
 
         assert_eq!(frame.total_rows, 9);
-        assert_eq!(frame.history_rows, 2);
         assert_eq!(row_text(&frame.buffer, 1), "• answer");
         assert!(row_text(&frame.buffer, 3).contains("Working..."));
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
@@ -584,7 +556,6 @@ mod tests {
     #[test]
     fn completion_menu_replaces_the_footer_without_changing_composer_spacing() {
         let menu = [CommandCompletion {
-            command: SlashCommand::Clear,
             name: "clear",
             description: "start a new chat",
         }];
@@ -612,7 +583,6 @@ mod tests {
         });
 
         assert_eq!(frame.total_rows, 5);
-        assert_eq!(frame.history_rows, 0);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
         assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
     }
@@ -712,7 +682,6 @@ mod tests {
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• restored output");
-        assert_eq!(frame.history_rows, 1);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
     }
 }

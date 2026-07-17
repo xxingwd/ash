@@ -9,8 +9,8 @@ pub(crate) enum SlashCommand {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ParsedInput<'a> {
-    Message(&'a str),
+pub(crate) enum ParsedInput {
+    Message,
     Command(SlashCommand),
     Invalid(String),
 }
@@ -25,7 +25,6 @@ struct CommandSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CommandCompletion {
-    pub(crate) command: SlashCommand,
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
 }
@@ -90,10 +89,10 @@ impl SlashCommand {
     }
 }
 
-pub(crate) fn parse(input: &str) -> ParsedInput<'_> {
+pub(crate) fn parse(input: &str) -> ParsedInput {
     let input = input.trim();
     let Some(command_line) = input.strip_prefix('/') else {
-        return ParsedInput::Message(input);
+        return ParsedInput::Message;
     };
     let mut parts = command_line.split_whitespace();
     let Some(name) = parts.next() else {
@@ -144,7 +143,6 @@ fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
         let is_exact = names.clone().any(|name| name == filter);
         let is_prefix = names.into_iter().any(|name| name.starts_with(filter));
         let completion = CommandCompletion {
-            command: spec.command,
             name: spec.name,
             description: spec.description,
         };
@@ -234,7 +232,7 @@ mod tests {
 
     #[test]
     fn keeps_regular_messages_untouched() {
-        assert_eq!(parse("hello"), ParsedInput::Message("hello"));
+        assert_eq!(parse("hello"), ParsedInput::Message);
     }
 
     #[test]
@@ -256,34 +254,33 @@ mod tests {
         assert_eq!(
             completions("cl", false),
             vec![CommandCompletion {
-                command: SlashCommand::Clear,
                 name: "clear",
                 description: "start a new chat",
             }]
         );
-        assert_eq!(completions("q", false)[0].command, SlashCommand::Exit);
+        assert_eq!(completions("q", false)[0].name, "exit");
     }
 
     #[test]
     fn completion_state_navigates_and_can_be_dismissed() {
         let mut state = CommandCompletionState::default();
         state.sync("/", 1, false);
-        assert_eq!(state.selected().unwrap().command, SlashCommand::New);
+        assert_eq!(state.selected().unwrap().name, "new");
         state.move_down();
-        assert_eq!(state.selected().unwrap().command, SlashCommand::Clear);
+        assert_eq!(state.selected().unwrap().name, "clear");
         state.move_up();
-        assert_eq!(state.selected().unwrap().command, SlashCommand::New);
+        assert_eq!(state.selected().unwrap().name, "new");
         state.dismiss();
         state.sync("/", 1, false);
         assert!(!state.is_visible());
         state.sync("/h", 2, false);
-        assert_eq!(state.selected().unwrap().command, SlashCommand::Help);
+        assert_eq!(state.selected().unwrap().name, "help");
     }
 
     #[test]
     fn busy_completion_only_shows_available_commands() {
         let items = completions("", true);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].command, SlashCommand::Exit);
+        assert_eq!(items[0].name, "exit");
     }
 }
