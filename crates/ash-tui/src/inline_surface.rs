@@ -166,6 +166,32 @@ impl InlineSurface {
         self.has_committed_output
     }
 
+    pub(crate) fn release_frame(&mut self) -> io::Result<()> {
+        self.sync_terminal_size()?;
+        let (width, height) = terminal::size()?;
+        let area = self.terminal.current_buffer_mut().area;
+        let frame_bottom = area.y.saturating_add(self.rendered_rows).min(height.max(1));
+        let prompt_y = if frame_bottom < height.saturating_sub(1) {
+            queue!(
+                self.terminal.backend_mut().writer_mut(),
+                MoveTo(0, frame_bottom)
+            )?;
+            frame_bottom
+        } else {
+            let writer = self.terminal.backend_mut().writer_mut();
+            queue!(writer, MoveTo(0, height.saturating_sub(1)))?;
+            write!(writer, "\r\n")?;
+            height.saturating_sub(1)
+        };
+        self.terminal
+            .set_viewport_area(Rect::new(0, prompt_y, width.max(1), 1));
+        self.terminal.force_redraw();
+        self.cursor_row = 0;
+        self.rendered_rows = 0;
+        self.has_committed_output = true;
+        Ok(())
+    }
+
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
         self.sync_terminal_size()?;
         let height = terminal::size()?.1.max(1);

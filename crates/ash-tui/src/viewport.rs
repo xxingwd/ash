@@ -54,6 +54,7 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) model: &'a str,
     pub(crate) working_dir: &'a Path,
     pub(crate) separate_from_output: bool,
+    pub(crate) show_composer: bool,
 }
 
 pub(crate) struct ViewportFrame {
@@ -83,11 +84,18 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         input.busy,
         menu_rows,
         input.separate_from_output,
+        input.show_composer,
     );
     let active_rows = active
         .as_ref()
         .map(|active| u16::try_from(active.lines.len()).unwrap_or(u16::MAX));
-    let regions = viewport_regions(&pending, active_rows, input.busy, menu_rows);
+    let regions = viewport_regions(
+        &pending,
+        active_rows,
+        input.busy,
+        menu_rows,
+        input.show_composer,
+    );
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
     let top_gap = u16::from(input.separate_from_output);
@@ -128,12 +136,23 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         }
     }
 
+    let cursor_row = if input.show_composer {
+        composer_input_area.y
+    } else {
+        buffer.area.height.saturating_sub(1)
+    };
+    let cursor_column = if input.show_composer {
+        COMPOSER_TEXT_COLUMN
+            .saturating_add(input.prompt_cursor_column)
+            .min(input.terminal_width.saturating_sub(1))
+    } else {
+        0
+    };
+
     ViewportFrame {
         buffer,
-        cursor_row: composer_input_area.y,
-        cursor_column: COMPOSER_TEXT_COLUMN
-            .saturating_add(input.prompt_cursor_column)
-            .min(input.terminal_width.saturating_sub(1)),
+        cursor_row,
+        cursor_column,
     }
 }
 
@@ -153,12 +172,19 @@ fn active_window<'a>(
     busy: bool,
     menu_rows: u16,
     separate_from_output: bool,
+    show_composer: bool,
 ) -> Option<ActiveWindow<'a>> {
     if active_lines.is_empty() {
         return None;
     }
 
-    let overhead = active_overhead(pending, busy, menu_rows, separate_from_output);
+    let overhead = active_overhead(
+        pending,
+        busy,
+        menu_rows,
+        separate_from_output,
+        show_composer,
+    );
     let max_lines = usize::from(terminal_height.saturating_sub(overhead));
     let skip = active_lines.len().saturating_sub(max_lines);
     Some(ActiveWindow {
@@ -204,8 +230,9 @@ fn active_overhead(
     busy: bool,
     menu_rows: u16,
     separate_from_output: bool,
+    show_composer: bool,
 ) -> u16 {
-    let regions = viewport_regions(pending, Some(0), busy, menu_rows);
+    let regions = viewport_regions(pending, Some(0), busy, menu_rows, show_composer);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     stack_height(&items).saturating_add(u16::from(separate_from_output))
 }
@@ -215,6 +242,7 @@ fn viewport_regions(
     active_rows: Option<u16>,
     busy: bool,
     menu_rows: u16,
+    show_composer: bool,
 ) -> Vec<RegionSpec> {
     let mut regions = Vec::with_capacity(pending.len().saturating_add(3));
     for (index, block) in pending.iter().enumerate() {
@@ -235,10 +263,12 @@ fn viewport_regions(
             item: StackItem::block(STATUS_ROWS),
         });
     }
-    regions.push(RegionSpec {
-        kind: ViewportRegion::Composer,
-        item: StackItem::block(composer_block_rows(menu_rows)),
-    });
+    if show_composer {
+        regions.push(RegionSpec {
+            kind: ViewportRegion::Composer,
+            item: StackItem::block(composer_block_rows(menu_rows)),
+        });
+    }
     regions
 }
 
@@ -491,6 +521,7 @@ mod tests {
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
             separate_from_output: false,
+            show_composer: true,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• answer");
@@ -523,6 +554,7 @@ mod tests {
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
             separate_from_output: false,
+            show_composer: true,
         });
 
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
@@ -555,6 +587,7 @@ mod tests {
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
             separate_from_output: false,
+            show_composer: true,
         });
 
         let menu = row_text(&frame.buffer, frame.buffer.area.height - 1);
@@ -585,9 +618,48 @@ mod tests {
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
             separate_from_output: false,
+            show_composer: true,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
+    }
+
+    #[test]
+    fn hides_the_next_composer_while_a_turn_is_running() {
+        let blocks = [LiveBlock::history(
+            1,
+            crate::history_block::HistoryBlock::user_with_prompt(
+                "first",
+                "gpt-5",
+                Path::new("/tmp/ash"),
+            ),
+        )];
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 24,
+            pending_blocks: &blocks,
+            busy: false,
+            active_lines: &[],
+            status_header: "Working",
+            status_dots: "...",
+            elapsed: "1s",
+            queued: "",
+            prompt: "",
+            prompt_cursor_column: 0,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "gpt-5",
+            working_dir: Path::new("/tmp/ash"),
+            separate_from_output: false,
+            show_composer: false,
+        });
+
+        assert_eq!(frame.buffer.area.height, 2);
+        assert_eq!(row_text(&frame.buffer, 0), "/tmp/ash · gpt-5");
+        assert_eq!(row_text(&frame.buffer, 1), "› first");
+        assert_eq!(frame.cursor_row, 1);
     }
 
     #[test]
@@ -615,6 +687,7 @@ mod tests {
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
             separate_from_output: true,
+            show_composer: true,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "");

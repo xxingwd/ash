@@ -169,6 +169,7 @@ pub(crate) struct InlineTerminal {
     prompt: PromptSnapshot,
     pending_blocks: Vec<LiveBlock>,
     next_live_block_id: u64,
+    show_composer: bool,
     status: StatusState,
     menus: MenuState,
     stream: StreamState,
@@ -184,6 +185,7 @@ impl InlineTerminal {
             prompt: PromptSnapshot::new(protocol, model, working_dir),
             pending_blocks: Vec::new(),
             next_live_block_id: 1,
+            show_composer: true,
             status: StatusState::default(),
             menus: MenuState::default(),
             stream: StreamState::default(),
@@ -278,22 +280,25 @@ impl InlineTerminal {
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.current_turn_id = Some(turn_id);
         self.status.start("Working");
-        self.commit_user_message(input)
+        self.show_composer = false;
+        self.stage_user_message(input);
+        self.redraw()
     }
 
     pub fn commit_exit(&mut self, input: &str) -> io::Result<()> {
         self.current_turn_id = None;
         self.status.stop();
-        self.commit_user_message(input)
+        self.show_composer = false;
+        self.stage_user_message(input);
+        self.redraw()
     }
 
-    fn commit_user_message(&mut self, input: &str) -> io::Result<()> {
+    fn stage_user_message(&mut self, input: &str) {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.stream.reset();
         self.menus.clear();
         self.push_user_prompt(input);
-        self.commit_and_redraw()
     }
 
     pub fn agent_started(&mut self) -> io::Result<()> {
@@ -321,7 +326,7 @@ impl InlineTerminal {
     pub fn tool_start(&mut self, name: &str, arguments: &Value) -> io::Result<()> {
         self.finish_stream();
         self.status.header = tool_activity_summary(name, arguments, self.markdown_width()?);
-        self.commit_and_redraw()
+        self.redraw()
     }
 
     pub fn tool_end(
@@ -338,14 +343,14 @@ impl InlineTerminal {
             output.to_string(),
             is_error,
         );
-        self.commit_and_redraw()
+        self.redraw()
     }
 
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
         self.status.header = "Failed".to_string();
         self.push_history_block(HistoryBlock::error(error));
-        self.commit_and_redraw()
+        self.redraw()
     }
 
     pub fn finish_response(&mut self) -> io::Result<()> {
@@ -353,9 +358,7 @@ impl InlineTerminal {
         let elapsed_seconds = self.status.elapsed_seconds();
         self.status.stop();
         self.push_history_block(HistoryBlock::worked(format_elapsed(elapsed_seconds)));
-        let result = self.commit_and_redraw();
-        self.current_turn_id = None;
-        result
+        self.finish_turn_frame()
     }
 
     pub fn refresh_content(&mut self) -> io::Result<()> {
@@ -365,15 +368,11 @@ impl InlineTerminal {
         self.synchronized(|terminal| {
             match refresh {
                 StreamRefresh::Assistant { pending, block_id } => {
-                    if block_id.is_none() {
-                        terminal.commit_pending_blocks()?;
-                    }
                     if let Some(id) = terminal.append_assistant(pending, block_id) {
                         terminal.stream.set_assistant_block_id(id);
                     }
                 }
                 StreamRefresh::Reasoning => {
-                    terminal.commit_pending_blocks()?;
                     let width = terminal.markdown_width()?;
                     terminal.stream.refresh_reasoning(width);
                 }
@@ -393,7 +392,6 @@ impl InlineTerminal {
         self.status.frame = self.status.frame.wrapping_add(1);
         self.synchronized(|terminal| {
             if terminal.stream.is_reasoning() {
-                terminal.commit_pending_blocks()?;
                 let width = terminal::size()?
                     .0
                     .saturating_sub(CONTENT_PREFIX_COLUMNS)
@@ -407,8 +405,11 @@ impl InlineTerminal {
     pub fn leave_line(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
             terminal.finish_stream();
-            terminal.commit_pending_blocks()?;
+            terminal.status.stop();
+            terminal.show_composer = false;
             terminal.render_viewport()?;
+            terminal.surface.release_frame()?;
+            terminal.pending_blocks.clear();
             terminal.surface.leave_screen()
         })
     }
@@ -454,6 +455,7 @@ impl InlineTerminal {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.menus.clear();
+        self.show_composer = true;
         self.reset_turn_state();
         Ok(())
     }
@@ -462,6 +464,7 @@ impl InlineTerminal {
         self.status.reset();
         self.current_turn_id = None;
         self.stream.reset();
+        self.show_composer = true;
     }
 
     fn markdown_width(&self) -> io::Result<u16> {
@@ -473,6 +476,20 @@ impl InlineTerminal {
 
     fn redraw(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| terminal.render_viewport())
+    }
+
+    fn finish_turn_frame(&mut self) -> io::Result<()> {
+        self.show_composer = false;
+        let result = self.synchronized(|terminal| {
+            terminal.render_viewport()?;
+            terminal.surface.release_frame()?;
+            terminal.pending_blocks.clear();
+            terminal.current_turn_id = None;
+            terminal.show_composer = true;
+            terminal.render_viewport()
+        });
+        self.current_turn_id = None;
+        result
     }
 
     fn commit_and_redraw(&mut self) -> io::Result<()> {
@@ -663,6 +680,7 @@ impl InlineTerminal {
             model: &model,
             working_dir: &self.prompt.working_dir,
             separate_from_output: self.surface.has_committed_output(),
+            show_composer: self.show_composer,
         })
     }
 }

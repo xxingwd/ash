@@ -424,6 +424,10 @@ impl App {
                                 continue;
                             }
 
+                            if phase.is_busy() {
+                                continue;
+                            }
+
                             match key.code {
                                 KeyCode::Enter => {
                                     let value = input.submit();
