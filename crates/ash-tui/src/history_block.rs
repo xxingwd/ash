@@ -22,7 +22,7 @@ pub(crate) enum HistoryBlock {
     Info(String),
     Error(String),
     Worked(String),
-    Divider,
+    SessionStarted,
 }
 
 impl HistoryBlock {
@@ -46,8 +46,8 @@ impl HistoryBlock {
         Self::Worked(elapsed)
     }
 
-    pub(crate) const fn divider() -> Self {
-        Self::Divider
+    pub(crate) const fn session_started() -> Self {
+        Self::SessionStarted
     }
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
@@ -60,7 +60,7 @@ impl HistoryBlock {
             Self::Info(message) => render_info(message, width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
             Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
-            Self::Divider => render_divider(width.max(1)),
+            Self::SessionStarted => render_session_started(width.max(1)),
         }
     }
 }
@@ -180,12 +180,12 @@ fn render_worked(elapsed: &str, width: u16) -> Buffer {
     buffer
 }
 
-fn render_divider(width: u16) -> Buffer {
+fn render_session_started(width: u16) -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
     buffer.set_string(
         0,
         0,
-        "─".repeat(usize::from(width)),
+        "New session",
         Style::default().add_modifier(Modifier::DIM),
     );
     buffer
@@ -302,10 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn divider_fills_the_available_width() {
-        let buffer = HistoryBlock::divider().render(8);
+    fn session_started_is_a_dim_label() {
+        let buffer = HistoryBlock::session_started().render(32);
 
-        assert_eq!(row_text(&buffer, 0), "────────");
+        assert_eq!(row_text(&buffer, 0), "New session");
         assert!(buffer
             .cell((0, 0))
             .expect("divider")

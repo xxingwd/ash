@@ -214,7 +214,7 @@ impl InlineTerminal {
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
         self.replace_viewport(|terminal| {
-            terminal.push_history_block(HistoryBlock::divider());
+            terminal.push_history_block(HistoryBlock::session_started());
         })
     }
 
