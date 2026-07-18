@@ -20,8 +20,10 @@ enum StreamMode {
     #[default]
     Idle,
     Assistant {
-        pending: String,
-        block_id: Option<u64>,
+        source: String,
+        emitted_lines: usize,
+        first_line_emitted: bool,
+        tail: Vec<RenderedLine>,
     },
     Reasoning {
         source: String,
@@ -32,8 +34,8 @@ enum StreamMode {
 
 pub(crate) enum FinishedStream {
     Assistant {
-        pending: String,
-        block_id: Option<u64>,
+        lines: Vec<RenderedLine>,
+        first_line: bool,
     },
     Thought {
         elapsed_seconds: u64,
@@ -42,30 +44,32 @@ pub(crate) enum FinishedStream {
 
 pub(crate) enum StreamRefresh {
     Assistant {
-        pending: String,
-        block_id: Option<u64>,
+        lines: Vec<RenderedLine>,
+        first_line: bool,
     },
     Reasoning,
 }
 
 impl StreamState {
-    pub(crate) fn start_assistant(&mut self) -> Option<FinishedStream> {
+    pub(crate) fn start_assistant(&mut self, width: u16) -> Option<FinishedStream> {
         if matches!(self.mode, StreamMode::Assistant { .. }) {
             return None;
         }
-        let finished = self.finish();
+        let finished = self.finish(width);
         self.mode = StreamMode::Assistant {
-            pending: String::new(),
-            block_id: None,
+            source: String::new(),
+            emitted_lines: 0,
+            first_line_emitted: false,
+            tail: Vec::new(),
         };
         finished
     }
 
-    pub(crate) fn start_reasoning(&mut self) -> Option<FinishedStream> {
+    pub(crate) fn start_reasoning(&mut self, width: u16) -> Option<FinishedStream> {
         if matches!(self.mode, StreamMode::Reasoning { .. }) {
             return None;
         }
-        let finished = self.finish();
+        let finished = self.finish(width);
         self.mode = StreamMode::Reasoning {
             source: String::new(),
             started_at: Instant::now(),
@@ -75,10 +79,10 @@ impl StreamState {
     }
 
     pub(crate) fn push_assistant(&mut self, delta: &str) {
-        let StreamMode::Assistant { pending, .. } = &mut self.mode else {
+        let StreamMode::Assistant { source, .. } = &mut self.mode else {
             return;
         };
-        pending.push_str(&sanitize_terminal_text(delta));
+        source.push_str(&sanitize_terminal_text(delta));
         self.dirty = true;
     }
 
@@ -102,15 +106,45 @@ impl StreamState {
         *lines = render_reasoning_view(source, started_at.elapsed().as_secs(), width);
     }
 
-    pub(crate) fn take_refresh(&mut self) -> Option<StreamRefresh> {
+    pub(crate) fn refresh_assistant(&mut self, width: u16) {
+        let StreamMode::Assistant {
+            source,
+            emitted_lines,
+            tail,
+            ..
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let rendered = render_assistant_source(source, width);
+        *emitted_lines = (*emitted_lines).min(rendered.len());
+        *tail = rendered[*emitted_lines..].to_vec();
+    }
+
+    pub(crate) fn take_refresh(&mut self, width: u16) -> Option<StreamRefresh> {
         if !std::mem::take(&mut self.dirty) {
             return None;
         }
         match &mut self.mode {
-            StreamMode::Assistant { pending, block_id } if !pending.is_empty() => {
+            StreamMode::Assistant {
+                source,
+                emitted_lines,
+                first_line_emitted,
+                tail,
+            } if !source.is_empty() => {
+                let rendered = render_assistant_source(source, width);
+                let stable_lines = stable_prefix_len(source, width, rendered.len());
+                let stable_lines = stable_lines.max(*emitted_lines).min(rendered.len());
+                let newly_stable = rendered[*emitted_lines..stable_lines].to_vec();
+                *emitted_lines = stable_lines;
+                *tail = rendered[stable_lines..].to_vec();
+                let first_line = !*first_line_emitted;
+                if !newly_stable.is_empty() {
+                    *first_line_emitted = true;
+                }
                 Some(StreamRefresh::Assistant {
-                    pending: std::mem::take(pending),
-                    block_id: *block_id,
+                    lines: newly_stable,
+                    first_line,
                 })
             }
             StreamMode::Reasoning { .. } => Some(StreamRefresh::Reasoning),
@@ -118,24 +152,21 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn set_assistant_block_id(&mut self, id: u64) {
-        if let StreamMode::Assistant { block_id, .. } = &mut self.mode {
-            *block_id = Some(id);
-        }
-    }
-
-    pub(crate) fn clear_block_id(&mut self, id: u64) {
-        if let StreamMode::Assistant { block_id, .. } = &mut self.mode {
-            if *block_id == Some(id) {
-                *block_id = None;
-            }
-        }
-    }
-
     pub(crate) fn active_lines(&self) -> &[RenderedLine] {
         match &self.mode {
+            StreamMode::Assistant { tail, .. } => tail,
             StreamMode::Reasoning { lines, .. } => lines,
-            StreamMode::Idle | StreamMode::Assistant { .. } => &[],
+            StreamMode::Idle => &[],
+        }
+    }
+
+    pub(crate) fn active_starts_stream(&self) -> bool {
+        match &self.mode {
+            StreamMode::Assistant {
+                first_line_emitted, ..
+            } => !first_line_emitted,
+            StreamMode::Reasoning { .. } => true,
+            StreamMode::Idle => false,
         }
     }
 
@@ -143,12 +174,21 @@ impl StreamState {
         matches!(self.mode, StreamMode::Reasoning { .. })
     }
 
-    pub(crate) fn finish(&mut self) -> Option<FinishedStream> {
+    pub(crate) fn finish(&mut self, width: u16) -> Option<FinishedStream> {
         self.dirty = false;
         match std::mem::take(&mut self.mode) {
             StreamMode::Idle => None,
-            StreamMode::Assistant { pending, block_id } => {
-                Some(FinishedStream::Assistant { pending, block_id })
+            StreamMode::Assistant {
+                source,
+                emitted_lines,
+                first_line_emitted,
+                ..
+            } => {
+                let rendered = render_assistant_source(&source, width);
+                Some(FinishedStream::Assistant {
+                    lines: rendered[emitted_lines.min(rendered.len())..].to_vec(),
+                    first_line: !first_line_emitted,
+                })
             }
             StreamMode::Reasoning {
                 source, started_at, ..
@@ -162,6 +202,22 @@ impl StreamState {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+fn render_assistant_source(source: &str, width: u16) -> Vec<RenderedLine> {
+    render_markdown(source, width)
+}
+
+fn stable_prefix_len(source: &str, width: u16, rendered_len: usize) -> usize {
+    if source.contains("|---") || source.contains("| ---") {
+        return 0;
+    }
+    let Some(end) = source.rfind('\n') else {
+        return 0;
+    };
+    render_assistant_source(&source[..=end], width)
+        .len()
+        .min(rendered_len)
 }
 
 pub(crate) fn format_elapsed(elapsed_seconds: u64) -> String {
@@ -247,15 +303,45 @@ mod tests {
     #[test]
     fn stream_modes_cannot_overlap() {
         let mut stream = StreamState::default();
-        assert!(stream.start_assistant().is_none());
+        assert!(stream.start_assistant(80).is_none());
         stream.push_assistant("answer");
-        let finished = stream.start_reasoning();
+        let finished = stream.start_reasoning(80);
 
         assert!(matches!(
             finished,
-            Some(FinishedStream::Assistant { pending, .. }) if pending == "answer"
+            Some(FinishedStream::Assistant { lines, .. })
+                if lines.iter().map(RenderedLine::plain_text).collect::<String>() == "answer"
         ));
         assert!(stream.is_reasoning());
         assert!(stream.active_lines().is_empty());
+    }
+
+    #[test]
+    fn assistant_commits_complete_lines_and_keeps_the_tail_live() {
+        let mut stream = StreamState::default();
+        stream.start_assistant(80);
+        stream.push_assistant("first\nsecond");
+
+        let Some(StreamRefresh::Assistant { lines, first_line }) = stream.take_refresh(80) else {
+            panic!("assistant refresh");
+        };
+
+        assert!(first_line);
+        assert_eq!(
+            lines
+                .iter()
+                .map(RenderedLine::plain_text)
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert_eq!(
+            stream
+                .active_lines()
+                .iter()
+                .map(RenderedLine::plain_text)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(!stream.active_starts_stream());
     }
 }

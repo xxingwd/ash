@@ -36,7 +36,7 @@ Operating rules:
 - Review returned changes before integrating them.
 </multi_agent_mode>"#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
     Default,
@@ -89,7 +89,7 @@ impl FromStr for AgentRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Pending,
@@ -100,10 +100,6 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    fn is_active(&self) -> bool {
-        matches!(self, Self::Pending | Self::Running)
-    }
-
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Interrupted | Self::Errored)
     }
@@ -142,12 +138,58 @@ struct ChildRecord {
     id: AgentId,
     task_name: String,
     role: AgentRole,
-    status: AgentStatus,
+    state: ChildState,
     last_task_message: String,
-    final_message: Option<String>,
-    error: Option<String>,
     command_tx: mpsc::Sender<ChildCommand>,
-    current_cancel: Option<CancellationToken>,
+}
+
+enum ChildState {
+    Pending,
+    Running(CancellationToken),
+    Completed(Option<String>),
+    Interrupted(Option<String>),
+    Errored {
+        final_message: Option<String>,
+        error: String,
+    },
+}
+
+impl ChildState {
+    fn status(&self) -> AgentStatus {
+        match self {
+            Self::Pending => AgentStatus::Pending,
+            Self::Running(_) => AgentStatus::Running,
+            Self::Completed(_) => AgentStatus::Completed,
+            Self::Interrupted(_) => AgentStatus::Interrupted,
+            Self::Errored { .. } => AgentStatus::Errored,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Pending | Self::Running(_))
+    }
+
+    fn final_message(&self) -> Option<&str> {
+        match self {
+            Self::Completed(message) | Self::Interrupted(message) => message.as_deref(),
+            Self::Errored { final_message, .. } => final_message.as_deref(),
+            Self::Pending | Self::Running(_) => None,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Errored { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    fn cancel(&self) -> Option<CancellationToken> {
+        match self {
+            Self::Running(cancel) => Some(cancel.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl ChildRecord {
@@ -156,10 +198,10 @@ impl ChildRecord {
             agent_id: self.id,
             task_name: self.task_name.clone(),
             agent_type: self.role,
-            status: self.status.clone(),
+            status: self.state.status(),
             last_task_message: self.last_task_message.clone(),
-            final_message: self.final_message.clone(),
-            error: self.error.clone(),
+            final_message: self.state.final_message().map(str::to_string),
+            error: self.state.error().map(str::to_string),
         }
     }
 }
@@ -169,6 +211,25 @@ enum ChildCommand {
     Followup(String),
 }
 
+#[derive(Clone, Copy)]
+enum MessageDelivery {
+    Queue,
+    Followup,
+}
+
+impl MessageDelivery {
+    fn triggers_turn(self) -> bool {
+        matches!(self, Self::Followup)
+    }
+
+    fn command(self, message: String) -> ChildCommand {
+        match self {
+            Self::Queue => ChildCommand::Queue(message),
+            Self::Followup => ChildCommand::Followup(message),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SpawnAgentArgs {
     /// Task name using lowercase letters, digits, and underscores.
@@ -176,7 +237,7 @@ struct SpawnAgentArgs {
     /// Initial plain-text task for the new agent.
     message: String,
     /// Optional role: default, explorer, or worker.
-    agent_type: Option<String>,
+    agent_type: Option<AgentRole>,
     /// Context to fork: none, all, or a positive number of recent turns.
     fork_turns: Option<String>,
 }
@@ -277,7 +338,11 @@ impl Supervisor {
             "Send a message to an existing agent. The message is queued promptly and does not trigger a new turn.",
             move |context, args: MessageAgentArgs| {
                 let supervisor = send.clone();
-                async move { supervisor.send_message(&context, args, false).await }
+                async move {
+                    supervisor
+                        .send_message(&context, args, MessageDelivery::Queue)
+                        .await
+                }
             },
         );
 
@@ -287,7 +352,11 @@ impl Supervisor {
             "Reuse an existing agent for context-dependent work. Send a follow-up task and trigger another turn when it is idle; if it is running, queue the task for its next turn. Prefer this over spawning a replacement agent for related work.",
             move |context, args: MessageAgentArgs| {
                 let supervisor = followup.clone();
-                async move { supervisor.send_message(&context, args, true).await }
+                async move {
+                    supervisor
+                        .send_message(&context, args, MessageDelivery::Followup)
+                        .await
+                }
             },
         );
 
@@ -338,20 +407,22 @@ impl Supervisor {
                 "spawn_agent message cannot be empty".to_string(),
             ));
         }
-        let role = AgentRole::from_str(args.agent_type.as_deref().unwrap_or("default"))
-            .map_err(ToolError::Execution)?;
+        let role = args.agent_type.unwrap_or(AgentRole::Default);
         let fork_mode = ForkMode::parse(args.fork_turns.as_deref())?;
-        let parent_path = normalized_agent_path(&context.agent_path);
+        let parent_path = normalized_agent_path(&context.agent.agent_path);
         let task_name = format!("{parent_path}/{}", args.task_name);
         let id = AgentId::new();
         let (command_tx, command_rx) = mpsc::channel(32);
 
         {
             let mut state = self.inner.state.lock().await;
-            let session = state.sessions.entry(context.root_session_id).or_default();
+            let session = state
+                .sessions
+                .entry(context.agent.root_session_id)
+                .or_default();
             let active_count = session
                 .values()
-                .filter(|record| record.status.is_active())
+                .filter(|record| record.state.is_active())
                 .count();
             if active_count >= self.inner.max_concurrent_children {
                 return Err(ToolError::Execution(format!(
@@ -370,38 +441,35 @@ impl Supervisor {
                     id,
                     task_name: task_name.clone(),
                     role,
-                    status: AgentStatus::Pending,
+                    state: ChildState::Pending,
                     last_task_message: args.message.clone(),
-                    final_message: None,
-                    error: None,
                     command_tx,
-                    current_cancel: None,
                 },
             );
         }
 
-        let mut messages = fork_messages(&context.messages, fork_mode);
+        let mut messages = fork_messages(&context.agent.messages, fork_mode);
         messages.push(Message::user(&args.message));
         let config = AgentConfig {
-            provider: context.provider,
-            system_prompt: subagent_system_prompt(
-                context.system_prompt.as_deref(),
+            provider: context.agent.provider,
+            system_prompt: Some(subagent_system_prompt(
+                context.agent.system_prompt.as_deref(),
                 role,
                 &parent_path,
                 &task_name,
-            ),
-            tools: context.tools,
-            model: context.model,
-            max_turns: context.max_turns,
+            )),
+            tools: context.agent.tools,
+            model: context.agent.model,
+            max_turns: context.agent.max_turns,
             working_dir: context.working_dir,
-            max_context_tokens: context.max_context_tokens,
-            max_output_tokens: context.max_output_tokens,
-            tool_timeout: context.timeout,
+            max_context_tokens: context.agent.max_context_tokens,
+            max_output_tokens: context.agent.max_output_tokens,
+            max_tool_duration: context.max_duration,
             agent_path: task_name.clone(),
-            root_session_id: Some(context.root_session_id),
+            root_session_id: Some(context.agent.root_session_id),
         };
         let supervisor = self.clone();
-        let root_session_id = context.root_session_id;
+        let root_session_id = context.agent.root_session_id;
         tokio::spawn(async move {
             supervisor
                 .run_child(root_session_id, id, config, messages, command_rx)
@@ -420,7 +488,7 @@ impl Supervisor {
         &self,
         context: &ToolContext,
         args: MessageAgentArgs,
-        trigger_turn: bool,
+        delivery: MessageDelivery,
     ) -> Result<String, ToolError> {
         if args.message.trim().is_empty() {
             return Err(ToolError::Execution("message cannot be empty".to_string()));
@@ -429,19 +497,19 @@ impl Supervisor {
             let mut state = self.inner.state.lock().await;
             let active_count = state
                 .sessions
-                .get(&context.root_session_id)
+                .get(&context.agent.root_session_id)
                 .into_iter()
                 .flat_map(HashMap::values)
-                .filter(|record| record.status.is_active())
+                .filter(|record| record.state.is_active())
                 .count();
             let record = resolve_target_mut(
                 &mut state,
-                context.root_session_id,
-                &context.agent_path,
+                context.agent.root_session_id,
+                &context.agent.agent_path,
                 &args.target,
             )?;
-            if trigger_turn
-                && !record.status.is_active()
+            if delivery.triggers_turn()
+                && !record.state.is_active()
                 && active_count >= self.inner.max_concurrent_children
             {
                 return Err(ToolError::Execution(format!(
@@ -450,17 +518,12 @@ impl Supervisor {
                 )));
             }
             record.last_task_message.clone_from(&args.message);
-            if trigger_turn && !matches!(record.status, AgentStatus::Running) {
-                record.status = AgentStatus::Pending;
-                record.error = None;
+            if delivery.triggers_turn() && !matches!(record.state, ChildState::Running(_)) {
+                record.state = ChildState::Pending;
             }
             (record.task_name.clone(), record.command_tx.clone())
         };
-        let command = if trigger_turn {
-            ChildCommand::Followup(args.message)
-        } else {
-            ChildCommand::Queue(args.message)
-        };
+        let command = delivery.command(args.message);
         command_tx
             .send(command)
             .await
@@ -469,7 +532,7 @@ impl Supervisor {
         json_output(&serde_json::json!({
             "target": target,
             "queued": true,
-            "turn_triggered": trigger_turn,
+            "turn_triggered": delivery.triggers_turn(),
         }))
     }
 
@@ -482,14 +545,14 @@ impl Supervisor {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.root_session_id,
-                &context.agent_path,
+                context.agent.root_session_id,
+                &context.agent.agent_path,
                 &args.target,
             )?;
             (
                 record.task_name.clone(),
-                record.status.clone(),
-                record.current_cancel.clone(),
+                record.state.status(),
+                record.state.cancel(),
             )
         };
         if let Some(cancel) = cancel {
@@ -503,22 +566,25 @@ impl Supervisor {
 
     async fn list(&self, context: &ToolContext, args: ListAgentsArgs) -> Result<String, ToolError> {
         let agents = self
-            .snapshots(context.root_session_id, args.path_prefix.as_deref())
+            .snapshots(context.agent.root_session_id, args.path_prefix.as_deref())
             .await;
         json_output(&serde_json::json!({ "agents": agents }))
     }
 
     async fn wait(&self, context: &ToolContext, args: WaitAgentArgs) -> Result<String, ToolError> {
+        let max_timeout_ms = u64::try_from(context.max_duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(MAX_WAIT_TIMEOUT_MS);
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
-            .min(MAX_WAIT_TIMEOUT_MS);
+            .min(max_timeout_ms);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let notified = self.inner.updates.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let agents = self.snapshots(context.root_session_id, None).await;
+            let agents = self.snapshots(context.agent.root_session_id, None).await;
             if agents.is_empty() || agents.iter().any(|agent| agent.status.is_terminal()) {
                 return json_output(&serde_json::json!({
                     "agents": agents,
@@ -527,12 +593,11 @@ impl Supervisor {
             }
 
             let timed_out = tokio::select! {
-                _ = context.cancel.cancelled() => return Err(ToolError::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => true,
                 _ = &mut notified => false,
             };
             if timed_out {
-                let agents = self.snapshots(context.root_session_id, None).await;
+                let agents = self.snapshots(context.agent.root_session_id, None).await;
                 return json_output(&serde_json::json!({
                     "agents": agents,
                     "timed_out": true,
@@ -610,17 +675,13 @@ impl Supervisor {
             else {
                 return;
             };
-            record.status = AgentStatus::Running;
-            record.final_message = None;
-            record.error = None;
-            record.current_cancel = Some(cancel.clone());
+            record.state = ChildState::Running(cancel.clone());
         }
         self.inner.updates.notify_waiters();
 
-        let (event_tx, mut event_rx) = mpsc::channel(256);
-        let event_drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
         let result = run_agent_turn(config, messages, event_tx, cancel, SessionId::new()).await;
-        let _ = event_drain.await;
         let final_message = final_assistant_message(messages);
 
         let mut state = self.inner.state.lock().await;
@@ -631,22 +692,20 @@ impl Supervisor {
         else {
             return;
         };
-        record.current_cancel = None;
-        record.final_message = final_message;
-        match result {
-            Ok(StopReason::Aborted) => record.status = AgentStatus::Interrupted,
-            Ok(_) => record.status = AgentStatus::Completed,
-            Err(error) => {
-                record.status = AgentStatus::Errored;
-                record.error = Some(error.to_string());
-            }
-        }
+        record.state = match result {
+            Ok(StopReason::Aborted) => ChildState::Interrupted(final_message),
+            Ok(_) => ChildState::Completed(final_message),
+            Err(error) => ChildState::Errored {
+                final_message,
+                error: error.to_string(),
+            },
+        };
         drop(state);
         self.inner.updates.notify_waiters();
     }
 }
 
-pub fn install_subagent_tools(config: &mut AgentConfig) -> Supervisor {
+pub fn install_subagent_tools(config: &mut AgentConfig) {
     let supervisor = Supervisor::default();
     config.tools.extend(supervisor.tools());
     let system_prompt = config.system_prompt.get_or_insert_with(String::new);
@@ -656,7 +715,6 @@ pub fn install_subagent_tools(config: &mut AgentConfig) -> Supervisor {
         }
         system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
     }
-    supervisor
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -759,7 +817,7 @@ fn subagent_system_prompt(
     role: AgentRole,
     parent_path: &str,
     task_name: &str,
-) -> Option<String> {
+) -> String {
     let context = format!(
         "<subagent_context>\nYou are `{task_name}`, a `{}` sub-agent spawned by `{parent_path}`. You share the same workspace with the parent and other agents.\n\n{}\n</subagent_context>",
         role.name(),
@@ -769,8 +827,8 @@ fn subagent_system_prompt(
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
     {
-        Some(base_prompt) => Some(format!("{base_prompt}\n\n{context}")),
-        None => Some(context),
+        Some(base_prompt) => format!("{base_prompt}\n\n{context}"),
+        None => context,
     }
 }
 
@@ -800,7 +858,7 @@ fn json_output(value: &serde_json::Value) -> Result<String, ToolError> {
 mod tests {
     use std::path::PathBuf;
 
-    use ash_core::{ModelId, Protocol, ProviderConfig};
+    use ash_core::{AgentToolContext, ModelId, Protocol, ProviderConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -819,7 +877,7 @@ mod tests {
             working_dir: PathBuf::from("."),
             max_context_tokens: None,
             max_output_tokens: None,
-            tool_timeout: Duration::from_secs(5),
+            max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
         }
@@ -931,12 +989,9 @@ mod tests {
                     id: agent_id,
                     task_name: "/root/inspect".to_string(),
                     role: AgentRole::Explorer,
-                    status: AgentStatus::Completed,
+                    state: ChildState::Completed(Some("done".to_string())),
                     last_task_message: "inspect".to_string(),
-                    final_message: Some("done".to_string()),
-                    error: None,
                     command_tx,
-                    current_cancel: None,
                 },
             );
 
@@ -996,23 +1051,23 @@ mod tests {
         let root_session_id = SessionId::new();
         let context = ToolContext {
             working_dir: PathBuf::from("."),
-            timeout: Duration::from_secs(5),
-            cancel: CancellationToken::new(),
-            session_id: root_session_id,
-            root_session_id,
-            agent_path: "/root".to_string(),
-            messages: vec![Message::user("delegate this")],
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: Some(format!("http://{address}")),
+            max_duration: Duration::from_secs(5),
+            agent: AgentToolContext {
+                root_session_id,
+                agent_path: "/root".to_string(),
+                messages: vec![Message::user("delegate this")],
+                provider: ProviderConfig {
+                    protocol: Protocol::OpenaiResponses,
+                    api_key: "test".into(),
+                    base_url: Some(format!("http://{address}")),
+                },
+                system_prompt: Some("base prompt".to_string()),
+                tools: Vec::new(),
+                model: ModelId::new("test-model"),
+                max_turns: 2,
+                max_context_tokens: None,
+                max_output_tokens: None,
             },
-            system_prompt: Some("base prompt".to_string()),
-            tools: Vec::new(),
-            model: ModelId::new("test-model"),
-            max_turns: 2,
-            max_context_tokens: None,
-            max_output_tokens: None,
         };
         let followup_context = context.clone();
         supervisor
@@ -1021,7 +1076,7 @@ mod tests {
                 SpawnAgentArgs {
                     task_name: "inspect".to_string(),
                     message: "Inspect the parser.".to_string(),
-                    agent_type: Some("explorer".to_string()),
+                    agent_type: Some(AgentRole::Explorer),
                     fork_turns: Some("all".to_string()),
                 },
             )
@@ -1051,7 +1106,7 @@ mod tests {
                     target: "/root/inspect".to_string(),
                     message: "Confirm the finding.".to_string(),
                 },
-                true,
+                MessageDelivery::Followup,
             )
             .await
             .unwrap();

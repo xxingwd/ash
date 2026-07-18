@@ -135,6 +135,8 @@ pub enum MessageContent {
     ToolResult {
         id: ToolCallId,
         result: std::result::Result<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Content>,
     },
 }
 

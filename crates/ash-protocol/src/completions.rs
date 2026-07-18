@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use ash_core::{
     ContentBlock, MessageContent, ProtocolError, ProviderConfig, StopReason, ToolCallId,
 };
+use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
@@ -35,56 +36,74 @@ impl CompletionsAdapter {
         if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
         }
-        messages.extend(req.messages.iter().map(|msg| match &msg.content {
-            MessageContent::User(contents) => {
-                let text = contents
-                    .iter()
-                    .filter_map(|content| match content {
-                        ash_core::Content::Text(text) => Some(text.as_str()),
-                        ash_core::Content::Image { .. } => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                json!({"role": "user", "content": text})
-            }
-            MessageContent::Assistant(blocks) => {
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(text) => Some(text.as_str()),
-                        ContentBlock::ToolCall { .. } => None,
-                    })
-                    .collect::<String>();
-                let calls: Vec<Value> = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        } => Some(json!({
-                            "id": id.as_str(),
-                            "type": "function",
-                            "function": {"name": name, "arguments": arguments.to_string()},
-                        })),
-                        ContentBlock::Text(_) => None,
-                    })
-                    .collect();
-                let mut value = json!({"role": "assistant", "content": text});
-                if !calls.is_empty() {
-                    value["tool_calls"] = json!(calls);
+        let mut index = 0;
+        while index < req.messages.len() {
+            match &req.messages[index].content {
+                MessageContent::User(contents) => {
+                    messages.push(json!({"role": "user", "content": chat_content(contents)}));
+                    index += 1;
                 }
-                value
+                MessageContent::Assistant(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.as_str()),
+                            ContentBlock::ToolCall { .. } => None,
+                        })
+                        .collect::<String>();
+                    let calls: Vec<Value> = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => Some(json!({
+                                "id": id.as_str(),
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments.to_string()},
+                            })),
+                            ContentBlock::Text(_) => None,
+                        })
+                        .collect();
+                    let mut value = json!({"role": "assistant", "content": text});
+                    if !calls.is_empty() {
+                        value["tool_calls"] = json!(calls);
+                    }
+                    messages.push(value);
+                    index += 1;
+                }
+                MessageContent::ToolResult { .. } => {
+                    let mut attachments = Vec::new();
+                    while index < req.messages.len() {
+                        let MessageContent::ToolResult {
+                            id,
+                            result,
+                            attachments: result_attachments,
+                        } = &req.messages[index].content
+                        else {
+                            break;
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": id.as_str(),
+                            "content": result.as_ref().map_or_else(
+                                |error| format!("Error: {error}"),
+                                Clone::clone,
+                            ),
+                        }));
+                        attachments.extend(result_attachments.iter().cloned());
+                        index += 1;
+                    }
+                    if !attachments.is_empty() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": chat_content(&attachments),
+                        }));
+                    }
+                }
             }
-            MessageContent::ToolResult { id, result } => json!({
-                "role": "tool",
-                "tool_call_id": id.as_str(),
-                "content": result.as_ref().map_or_else(
-                    |error| format!("Error: {error}"),
-                    Clone::clone,
-                ),
-            }),
-        }));
+        }
 
         let tools: Vec<Value> = req
             .tools
@@ -115,6 +134,38 @@ impl CompletionsAdapter {
         }
         body
     }
+}
+
+fn chat_content(contents: &[ash_core::Content]) -> Value {
+    if !contents
+        .iter()
+        .any(|content| matches!(content, ash_core::Content::Image { .. }))
+    {
+        return json!(contents
+            .iter()
+            .filter_map(|content| match content {
+                ash_core::Content::Text(text) => Some(text.as_str()),
+                ash_core::Content::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    json!(contents
+        .iter()
+        .map(|content| match content {
+            ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
+            ash_core::Content::Image { media_type, data } => json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{media_type};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    )
+                }
+            }),
+        })
+        .collect::<Vec<_>>())
 }
 
 impl ProtocolAdapter for CompletionsAdapter {
@@ -244,6 +295,8 @@ impl sse::Decoder for CompletionsDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
+    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use secrecy::SecretString;
 
     #[test]
     fn aggregates_fragmented_tool_call() {
@@ -288,5 +341,52 @@ mod tests {
                 StreamItem::TextDelta("done".into()),
             ]
         );
+    }
+
+    #[test]
+    fn sends_tool_images_after_all_chat_completion_tool_results() {
+        let adapter = CompletionsAdapter::new(ProviderConfig {
+            protocol: Protocol::OpenaiCompletions,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![
+                tool_result("first", Vec::new()),
+                tool_result(
+                    "second",
+                    vec![Content::Image {
+                        media_type: "image/png".into(),
+                        data: vec![1, 2, 3],
+                    }],
+                ),
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request);
+
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(
+            body["messages"][2]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+    }
+
+    fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
+        Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id: ToolCallId::new(),
+                result: Ok(text.into()),
+                attachments,
+            },
+        }
     }
 }

@@ -5,15 +5,30 @@ const BLOCK_SPACING: u16 = 1;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StackBoundary {
     has_block: bool,
+    leading_gap: bool,
 }
 
 impl StackBoundary {
     pub(crate) const fn after_block(self) -> Self {
-        Self { has_block: true }
+        Self {
+            has_block: true,
+            leading_gap: true,
+        }
+    }
+
+    pub(crate) const fn after_continuation(self) -> Self {
+        Self {
+            has_block: true,
+            leading_gap: false,
+        }
     }
 
     pub(crate) const fn has_block(self) -> bool {
         self.has_block
+    }
+
+    pub(crate) const fn needs_leading_gap(self) -> bool {
+        self.leading_gap
     }
 }
 
@@ -72,7 +87,7 @@ fn measure_stack(boundary: StackBoundary, items: &[StackItem]) -> (u16, bool) {
         return (0, false);
     }
 
-    let history_anchor = boundary.has_block;
+    let history_anchor = boundary.needs_leading_gap();
     let section_count = items.len() + usize::from(history_anchor);
     let gaps = u16::try_from(section_count.saturating_sub(1)).unwrap_or(u16::MAX);
     let content_height = items
@@ -117,5 +132,14 @@ mod tests {
             layout.areas,
             [Rect::new(0, 1, 80, 2), Rect::new(0, 4, 80, 1)]
         );
+    }
+
+    #[test]
+    fn continuation_starts_without_a_new_history_gap() {
+        let boundary = StackBoundary::default().after_continuation();
+        let layout = layout_stack(80, boundary, &[StackItem::block(2)]);
+
+        assert_eq!(layout.height, 2);
+        assert_eq!(layout.areas, [Rect::new(0, 0, 80, 2)]);
     }
 }

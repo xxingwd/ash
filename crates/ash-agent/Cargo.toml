@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 ash-core = { workspace = true }
 ash-protocol = { workspace = true }
-ash-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

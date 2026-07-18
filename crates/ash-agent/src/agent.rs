@@ -1,6 +1,6 @@
 use ash_core::{
-    CancellationToken, ContentBlock, Event, Message, MessageContent, Role, SessionId, StopReason,
-    ToolContext, ToolDefinition, ToolError,
+    AgentToolContext, CancellationToken, ContentBlock, Event, Message, MessageContent, Role,
+    SessionId, StopReason, ToolContext, ToolDefinition, ToolError, ToolOutput,
 };
 use ash_protocol::{create_adapter, LlmRequest, ProtocolAdapter, StreamItem};
 use futures::StreamExt;
@@ -8,11 +8,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use crate::{AgentConfig, SessionStore};
+use crate::{session_store::SessionStore, AgentConfig};
 
-const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
-const TOOL_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
-const TOOL_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated ...\n";
+const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
+const AGENT_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
+const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the agent ...\n";
 
 pub async fn run_agent_loop(
     config: AgentConfig,
@@ -220,7 +220,7 @@ async fn run_with_adapter(
                 return Ok(StopReason::Aborted);
             }
             let (output, is_error) = match &result {
-                Ok(output) => (output.clone(), false),
+                Ok(output) => (output.text.clone(), false),
                 Err(error) => (error.to_string(), true),
             };
             let _ = tx
@@ -232,12 +232,17 @@ async fn run_with_adapter(
                     is_error,
                 })
                 .await;
+            let (result, attachments) = match result {
+                Ok(output) => (Ok(output.text), output.attachments),
+                Err(error) => (Err(error.to_string()), Vec::new()),
+            };
             let message = Message {
                 id: ash_core::MessageId::new(),
                 role: Role::User,
                 content: MessageContent::ToolResult {
                     id,
-                    result: result.map_err(|error| error.to_string()),
+                    result,
+                    attachments,
                 },
             };
             persist_message(store.as_deref_mut(), &message).await;
@@ -268,49 +273,53 @@ async fn execute_tool(
     cancel: &CancellationToken,
     name: &str,
     arguments: serde_json::Value,
-) -> Result<String, ToolError> {
+) -> Result<ToolOutput, ToolError> {
     let Some(tool) = config.tools.iter().find(|tool| tool.name() == name) else {
         return Err(ToolError::Execution(format!("unknown tool: {name}")));
     };
     let context = ToolContext {
         working_dir: config.working_dir.clone(),
-        timeout: config.tool_timeout,
-        cancel: cancel.clone(),
-        session_id,
-        root_session_id: config.root_session_id.unwrap_or(session_id),
-        agent_path: config.agent_path.clone(),
-        messages: messages.to_vec(),
-        provider: config.provider.clone(),
-        system_prompt: config.system_prompt.clone(),
-        tools: config.tools.clone(),
-        model: config.model.clone(),
-        max_turns: config.max_turns,
-        max_context_tokens: config.max_context_tokens,
-        max_output_tokens: config.max_output_tokens,
+        max_duration: config.max_tool_duration,
+        agent: AgentToolContext {
+            root_session_id: config.root_session_id.unwrap_or(session_id),
+            agent_path: config.agent_path.clone(),
+            messages: messages.to_vec(),
+            provider: config.provider.clone(),
+            system_prompt: config.system_prompt.clone(),
+            tools: config.tools.clone(),
+            model: config.model.clone(),
+            max_turns: config.max_turns,
+            max_context_tokens: config.max_context_tokens,
+            max_output_tokens: config.max_output_tokens,
+        },
     };
 
     tokio::select! {
         _ = cancel.cancelled() => Err(ToolError::Cancelled),
-        result = tokio::time::timeout(config.tool_timeout, tool.execute(context, arguments)) => {
-            result.unwrap_or(Err(ToolError::Timeout(config.tool_timeout)))
+        result = tokio::time::timeout(config.max_tool_duration, tool.execute(context, arguments)) => {
+            result.unwrap_or(Err(ToolError::Timeout(config.max_tool_duration)))
         }
     }
 }
 
-fn limit_tool_result(result: Result<String, ToolError>) -> Result<String, ToolError> {
+fn limit_tool_result(result: Result<ToolOutput, ToolError>) -> Result<ToolOutput, ToolError> {
     match result {
-        Ok(output) => Ok(limit_tool_output(output)),
+        Ok(mut output) => {
+            output.text = limit_tool_output(output.text);
+            Ok(output)
+        }
         Err(ToolError::Execution(output)) => Err(ToolError::Execution(limit_tool_output(output))),
         Err(error) => Err(error),
     }
 }
 
 fn limit_tool_output(output: String) -> String {
-    if output.len() <= MAX_TOOL_OUTPUT_BYTES {
+    if output.len() <= MAX_AGENT_OUTPUT_BYTES {
         return output;
     }
-    let content_budget = MAX_TOOL_OUTPUT_BYTES.saturating_sub(TOOL_OUTPUT_TRUNCATION_NOTICE.len());
-    let tail_budget = TOOL_OUTPUT_TAIL_BYTES.min(content_budget);
+    let content_budget =
+        MAX_AGENT_OUTPUT_BYTES.saturating_sub(AGENT_OUTPUT_TRUNCATION_NOTICE.len());
+    let tail_budget = AGENT_OUTPUT_TAIL_BYTES.min(content_budget);
     let head_budget = content_budget.saturating_sub(tail_budget);
     let mut head_end = head_budget.min(output.len());
     while !output.is_char_boundary(head_end) {
@@ -323,7 +332,7 @@ fn limit_tool_output(output: String) -> String {
     format!(
         "{}{}{}",
         &output[..head_end],
-        TOOL_OUTPUT_TRUNCATION_NOTICE,
+        AGENT_OUTPUT_TRUNCATION_NOTICE,
         &output[tail_start..]
     )
 }
@@ -392,10 +401,11 @@ mod tests {
             &self,
             _context: ToolContext,
             arguments: serde_json::Value,
-        ) -> Result<String, ToolError> {
+        ) -> Result<ToolOutput, ToolError> {
             arguments["value"]
                 .as_str()
                 .map(ToOwned::to_owned)
+                .map(Into::into)
                 .ok_or_else(|| ToolError::Execution("missing value".into()))
         }
     }
@@ -433,14 +443,13 @@ mod tests {
             working_dir: PathBuf::from("."),
             max_context_tokens: None,
             max_output_tokens: None,
-            tool_timeout: Duration::from_secs(1),
+            max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
         };
         let mut messages = vec![Message::user("use a tool")];
         let directory = TempDir::new().unwrap();
-        let mut store =
-            SessionStore::new_in(&config, SessionId::new(), directory.path().to_path_buf());
+        let mut store = SessionStore::new_in(&config, SessionId::new(), directory.path());
         store.append_message(&messages[0]).await.unwrap();
         let (tx, _rx) = mpsc::channel(32);
 
@@ -470,10 +479,10 @@ mod tests {
 
     #[test]
     fn truncates_large_tool_output_without_splitting_utf8() {
-        let output = "你".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let output = "你".repeat(MAX_AGENT_OUTPUT_BYTES);
         let truncated = limit_tool_output(output);
 
-        assert!(truncated.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(truncated.len() <= MAX_AGENT_OUTPUT_BYTES);
         assert!(truncated.contains("tool output truncated"));
         assert!(truncated.is_char_boundary(truncated.len()));
     }

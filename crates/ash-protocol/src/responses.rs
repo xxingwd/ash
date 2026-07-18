@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ash_core::{
     ContentBlock, MessageContent, ProtocolError, ProviderConfig, StopReason, ToolCallId,
 };
+use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
@@ -32,18 +33,12 @@ impl ResponsesAdapter {
 
     fn build_request(&self, req: &LlmRequest) -> Value {
         let mut input = Vec::new();
-        for message in &req.messages {
-            match &message.content {
+        let mut index = 0;
+        while index < req.messages.len() {
+            match &req.messages[index].content {
                 MessageContent::User(contents) => {
-                    let text = contents
-                        .iter()
-                        .filter_map(|content| match content {
-                            ash_core::Content::Text(text) => Some(text.as_str()),
-                            ash_core::Content::Image { .. } => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    input.push(json!({"role": "user", "content": text}));
+                    input.push(json!({"role": "user", "content": responses_content(contents)}));
+                    index += 1;
                 }
                 MessageContent::Assistant(blocks) => {
                     let text = blocks
@@ -69,15 +64,37 @@ impl ResponsesAdapter {
                         })),
                         ContentBlock::Text(_) => None,
                     }));
+                    index += 1;
                 }
-                MessageContent::ToolResult { id, result } => input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": id.as_str(),
-                    "output": result.as_ref().map_or_else(
-                        |error| format!("Error: {error}"),
-                        Clone::clone,
-                    ),
-                })),
+                MessageContent::ToolResult { .. } => {
+                    let mut attachments = Vec::new();
+                    while index < req.messages.len() {
+                        let MessageContent::ToolResult {
+                            id,
+                            result,
+                            attachments: result_attachments,
+                        } = &req.messages[index].content
+                        else {
+                            break;
+                        };
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": id.as_str(),
+                            "output": result.as_ref().map_or_else(
+                                |error| format!("Error: {error}"),
+                                Clone::clone,
+                            ),
+                        }));
+                        attachments.extend(result_attachments.iter().cloned());
+                        index += 1;
+                    }
+                    if !attachments.is_empty() {
+                        input.push(json!({
+                            "role": "user",
+                            "content": responses_content(&attachments),
+                        }));
+                    }
+                }
             }
         }
 
@@ -109,6 +126,36 @@ impl ResponsesAdapter {
         }
         body
     }
+}
+
+fn responses_content(contents: &[ash_core::Content]) -> Value {
+    if !contents
+        .iter()
+        .any(|content| matches!(content, ash_core::Content::Image { .. }))
+    {
+        return json!(contents
+            .iter()
+            .filter_map(|content| match content {
+                ash_core::Content::Text(text) => Some(text.as_str()),
+                ash_core::Content::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    json!(contents
+        .iter()
+        .map(|content| match content {
+            ash_core::Content::Text(text) => json!({"type": "input_text", "text": text}),
+            ash_core::Content::Image { media_type, data } => json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{media_type};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(data)
+                ),
+            }),
+        })
+        .collect::<Vec<_>>())
 }
 
 impl ProtocolAdapter for ResponsesAdapter {
@@ -299,6 +346,8 @@ impl sse::Decoder for ResponsesDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
+    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use secrecy::SecretString;
 
     #[test]
     fn emits_one_call_for_many_argument_deltas() {
@@ -362,5 +411,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(items, vec![StreamItem::ThinkingDelta("checked".into())]);
+    }
+
+    #[test]
+    fn sends_tool_images_after_all_response_function_outputs() {
+        let adapter = ResponsesAdapter::new(ProviderConfig {
+            protocol: Protocol::OpenaiResponses,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![
+                tool_result("first", Vec::new()),
+                tool_result(
+                    "second",
+                    vec![Content::Image {
+                        media_type: "image/png".into(),
+                        data: vec![1, 2, 3],
+                    }],
+                ),
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request);
+
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(
+            body["input"][2]["content"][0]["image_url"],
+            "data:image/png;base64,AQID"
+        );
+    }
+
+    fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
+        Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id: ToolCallId::new(),
+                result: Ok(text.into()),
+                attachments,
+            },
+        }
     }
 }

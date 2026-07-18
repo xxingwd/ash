@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
-use ash_core::{Tool, ToolContext, ToolError};
+use ash_core::{Tool, ToolContext, ToolError, ToolOutput};
 use rmcp::model::{CallToolRequestParam, JsonObject};
 use rmcp::serve_client;
 use rmcp::service::{Peer, RoleClient};
@@ -60,7 +60,7 @@ impl Tool for McpToolAdapter {
         &self,
         _ctx: ToolContext,
         args: serde_json::Value,
-    ) -> Result<String, ToolError> {
+    ) -> Result<ToolOutput, ToolError> {
         let arguments: Option<JsonObject> = serde_json::from_value(args)
             .map_err(|e| ToolError::Execution(format!("invalid args: {e}")))?;
 
@@ -85,7 +85,7 @@ impl Tool for McpToolAdapter {
         if result.is_error.unwrap_or(false) {
             Err(ToolError::Execution(output))
         } else {
-            Ok(output)
+            Ok(output.into())
         }
     }
 }

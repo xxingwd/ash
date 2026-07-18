@@ -45,6 +45,7 @@ fn test_tool_result_message_snapshot() {
         content: MessageContent::ToolResult {
             id: ToolCallId::new(),
             result: Ok("file1.txt\nfile2.txt".to_string()),
+            attachments: Vec::new(),
         },
     };
     assert_json_snapshot!("tool_result_message", msg, {
@@ -61,6 +62,7 @@ fn test_tool_result_error_snapshot() {
         content: MessageContent::ToolResult {
             id: ToolCallId::new(),
             result: Err("command not found".to_string()),
+            attachments: Vec::new(),
         },
     };
     assert_json_snapshot!("tool_result_error", msg, {

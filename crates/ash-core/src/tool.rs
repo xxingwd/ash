@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 pub use tokio_util::sync::CancellationToken;
 
-use crate::{error::ToolError, Message, ModelId, ProviderConfig, SessionId};
+use crate::{error::ToolError, Content, Message, ModelId, ProviderConfig, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -13,10 +13,17 @@ pub struct ToolDefinition {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    /// Workspace boundary shared by every built-in tool.
     pub working_dir: std::path::PathBuf,
-    pub timeout: Duration,
-    pub cancel: CancellationToken,
-    pub session_id: SessionId,
+    /// Framework safety cap; a tool may impose a stricter per-call limit.
+    pub max_duration: Duration,
+    /// Context needed only by agent-aware extension tools.
+    pub agent: AgentToolContext,
+}
+
+/// Additional state exposed only to tools that manage child agents.
+#[derive(Clone)]
+pub struct AgentToolContext {
     pub root_session_id: SessionId,
     pub agent_path: String,
     pub messages: Vec<Message>,
@@ -29,24 +36,33 @@ pub struct ToolContext {
     pub max_output_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub output: String,
-    pub is_error: bool,
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub attachments: Vec<Content>,
 }
 
-impl From<std::result::Result<String, ToolError>> for ToolResult {
-    fn from(result: std::result::Result<String, ToolError>) -> Self {
-        match result {
-            Ok(output) => Self {
-                output,
-                is_error: false,
-            },
-            Err(e) => Self {
-                output: e.to_string(),
-                is_error: true,
-            },
+impl ToolOutput {
+    pub fn with_attachments(text: impl Into<String>, attachments: Vec<Content>) -> Self {
+        Self {
+            text: text.into(),
+            attachments,
         }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
     }
 }
 
@@ -66,22 +82,23 @@ pub trait Tool: Send + Sync {
         &self,
         ctx: ToolContext,
         args: serde_json::Value,
-    ) -> std::result::Result<String, ToolError>;
+    ) -> std::result::Result<ToolOutput, ToolError>;
 }
 
-pub struct FnTool<Args, F, Fut> {
+pub struct FnTool<Args, F, Fut, Output> {
     name: String,
     description: String,
     schema: serde_json::Value,
     execute: F,
-    _phantom: std::marker::PhantomData<fn(Args) -> Fut>,
+    _phantom: std::marker::PhantomData<fn(Args) -> (Fut, Output)>,
 }
 
-pub fn define_tool<Args, F, Fut>(name: &str, description: &str, f: F) -> Arc<dyn Tool>
+pub fn define_tool<Args, F, Fut, Output>(name: &str, description: &str, f: F) -> Arc<dyn Tool>
 where
     Args: serde::de::DeserializeOwned + Send + Sync + schemars::JsonSchema + 'static,
     F: Fn(ToolContext, Args) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = std::result::Result<String, ToolError>> + Send + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Output, ToolError>> + Send + 'static,
+    Output: Into<ToolOutput> + Send + Sync + 'static,
 {
     let schema = schemars::schema_for!(Args);
     let schema_value = serde_json::to_value(schema).unwrap_or_default();
@@ -96,11 +113,12 @@ where
 }
 
 #[async_trait::async_trait]
-impl<Args, F, Fut> Tool for FnTool<Args, F, Fut>
+impl<Args, F, Fut, Output> Tool for FnTool<Args, F, Fut, Output>
 where
     Args: serde::de::DeserializeOwned + Send + Sync + 'static,
     F: Fn(ToolContext, Args) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = std::result::Result<String, ToolError>> + Send + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Output, ToolError>> + Send + 'static,
+    Output: Into<ToolOutput> + Send + Sync + 'static,
 {
     fn name(&self) -> &str {
         &self.name
@@ -118,9 +136,9 @@ where
         &self,
         ctx: ToolContext,
         args: serde_json::Value,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let typed_args: Args = serde_json::from_value(args)
             .map_err(|e| ToolError::Execution(format!("invalid arguments: {e}")))?;
-        (self.execute)(ctx, typed_args).await
+        (self.execute)(ctx, typed_args).await.map(Into::into)
     }
 }

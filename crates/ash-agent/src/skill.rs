@@ -70,11 +70,6 @@ impl Skill {
         if let Some(model) = &self.model {
             config.model = model.clone();
         }
-        if let Some(tools) = &self.tools {
-            config
-                .tools
-                .retain(|t| tools.contains(&t.name().to_string()));
-        }
     }
 
     pub fn instructions(&self) -> &str {

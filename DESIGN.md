@@ -43,8 +43,8 @@
 
 提供工具定义和内置工具。
 
-`path` 模块统一完成路径规范化、工作目录边界和符号链接检查。`bash` 子进程启用
-`kill_on_drop`，取消或超时会停止等待并终止进程。
+`path` 模块统一完成路径规范化、工作目录边界和符号链接检查。Agent 执行器统一管理
+工具取消和超时；`bash` 子进程启用 `kill_on_drop`，执行 Future 被丢弃时会终止进程。
 
 ### `ash-agent`
 
@@ -59,7 +59,7 @@
 上下文压缩只作用于发送给模型的副本，不破坏会话保存的完整历史。
 
 每个交互会话由一个带日期文件名的 append-only JSONL 保存。`AgentSession` 在用户
-消息、完整 Assistant 消息、工具结果和 Turn 结束这些语义边界同步追加并 flush；
+消息、完整 Assistant 消息和工具结果这些可恢复的语义边界同步追加并 flush；
 首行的配置快照包含恢复模型上下文所需的信息，但不包含 API Key、Token 或自定义
 接口地址内容。`/new` 立即生成 Session ID 和创建时间，但会话文件延迟到第一条用户
 消息时创建；会话标题由重放后的第一条有效用户消息派生。`/resume` 列出其他已保存
@@ -78,6 +78,8 @@
 - 正常交互不清屏；`/new` 和 `/clear` 使用相同的新会话逻辑
 - 当前会话未溢出且宽度未变化时局部擦除 ASH 会话区域；溢出、缩放或布局不确定时
   只清空当前可见屏幕，两条路径都不 Purge shell scrollback
+- 缩放使用同一个终端尺寸快照完成 geometry、裁剪和重绘；超出新高度的活动 viewport
+  行只做非破坏性顶部裁剪，不把保留的 live blocks 提交到 shell scrollback
 - Ratatui Buffer 统一计算活动内容、状态栏、输入框、补全和底栏的组件布局
 - 已完成的历史通过 Crossterm 写入主屏 stdout，让 shell 维护 scrollback；Ratatui
   只负责底部 inline viewport，不使用 alternate screen
@@ -132,7 +134,8 @@
 - 根 Session ID 是 Agent 树的隔离边界；新会话不会看到旧树
 - 默认允许三个并发子 Agent，加上根 Agent 共四个执行槽
 
-工具调用通过 `ToolContext` 获得当前 Session、Agent 路径、消息快照和运行配置。
+工具调用通过 `ToolContext` 获得当前 Session、Agent 路径、消息快照和运行配置；
+取消和总超时由 Agent 工具执行器统一负责。
 子 Agent 在后台运行，主 Agent 通过 list/wait 获取结构化状态和最终消息。普通
 `send_message` 只排队，`followup_task` 才会触发下一轮；interrupt 只取消当前轮次，
 不会销毁该 Agent 的既有上下文。

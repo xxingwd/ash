@@ -43,6 +43,29 @@ pub(crate) fn for_write(root: &Path, requested: &str) -> Result<PathBuf, ToolErr
     Ok(candidate)
 }
 
+pub(crate) fn files(root: &Path) -> Box<dyn Iterator<Item = PathBuf>> {
+    if root.is_file() {
+        return Box::new(std::iter::once(root.to_path_buf()));
+    }
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .parents(true)
+        .sort_by_file_path(|left, right| left.cmp(right));
+    Box::new(
+        builder
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.into_path()),
+    )
+}
+
 fn canonical_root(root: &Path) -> Result<PathBuf, ToolError> {
     std::fs::canonicalize(root).map_err(|error| {
         ToolError::Execution(format!(

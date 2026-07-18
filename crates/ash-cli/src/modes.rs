@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
@@ -10,6 +8,12 @@ use owo_colors::OwoColorize;
 use secrecy::SecretString;
 
 use crate::Cli;
+
+enum AfterTurn {
+    None,
+    Undo,
+    Exit,
+}
 
 pub async fn run(cli: Cli) -> Result<()> {
     let config = build_config(&cli)?;
@@ -60,6 +64,11 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         })
         .transpose()?;
     let system_prompt = build_system_prompt(&working_dir, &skills, active_skill.as_ref())?;
+    let tools = ash_tools::tools(
+        active_skill
+            .as_ref()
+            .and_then(|skill| skill.tools.as_deref()),
+    );
 
     let mut config = AgentConfig {
         provider: ProviderConfig {
@@ -69,12 +78,12 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         },
         system_prompt: Some(system_prompt),
         model: ModelId::new(model),
-        tools: ash_tools::builtin_tools(),
+        tools,
         max_turns: 100,
         working_dir,
         max_context_tokens: None,
         max_output_tokens: None,
-        tool_timeout: std::time::Duration::from_secs(120),
+        max_tool_duration: std::time::Duration::from_secs(120),
         agent_path: "/root".to_string(),
         root_session_id: None,
     };
@@ -82,8 +91,6 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     if let Some(skill) = active_skill {
         skill.apply_overrides(&mut config);
     }
-
-    ash_orchestrator::install_subagent_tools(&mut config);
 
     Ok(config)
 }
@@ -146,13 +153,13 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
             Vec::new()
         }
     };
+    let mut session = AgentSession::new(config);
     let app = ash_tui::App::new(protocol, model, working_dir).with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
-    let mut session = AgentSession::new(config);
-    let mut queued_inputs = VecDeque::new();
+    let mut pending_input = None;
 
     'controller: loop {
-        let command = match queued_inputs.pop_front() {
+        let command = match pending_input.take() {
             Some(input) => ash_tui::UiCommand::Submit(input),
             None => match command_rx.recv().await {
                 Some(command) => command,
@@ -166,73 +173,58 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                 }
                 let cancel = ash_core::CancellationToken::new();
                 let mut turn = Box::pin(session.submit(input, event_tx.clone(), cancel.clone()));
-                let mut reset_after_turn = false;
-                let mut resume_after_turn = None;
-                let mut undo_after_turn = false;
-
-                loop {
+                let after_turn = loop {
                     tokio::select! {
-                        _ = &mut turn => break,
+                        _ = &mut turn => break AfterTurn::None,
                         command = command_rx.recv() => match command {
                             Some(ash_tui::UiCommand::CancelAndUndo) => {
-                                undo_after_turn = true;
                                 cancel.cancel();
                                 let _ = (&mut turn).await;
-                                break;
+                                break AfterTurn::Undo;
                             }
-                            Some(ash_tui::UiCommand::NewSession) => {
-                                reset_after_turn = true;
-                                let _ = (&mut turn).await;
-                                break;
-                            }
-                            Some(ash_tui::UiCommand::ListSessions) => {
+                            Some(ash_tui::UiCommand::NewSession)
+                            | Some(ash_tui::UiCommand::ListSessions)
+                            | Some(ash_tui::UiCommand::ResumeSession(_)) => {
                                 let _ = event_tx
                                     .send(ash_core::Event::Error(
-                                        "/resume is unavailable while working.".to_string(),
+                                        "That command is unavailable while working.".to_string(),
                                     ))
                                     .await;
                             }
-                            Some(ash_tui::UiCommand::ResumeSession(session_id)) => {
-                                resume_after_turn = Some(session_id);
-                                let _ = (&mut turn).await;
-                                break;
-                            }
                             Some(ash_tui::UiCommand::Exit) | None => {
                                 cancel.cancel();
-                                let _ = turn.await;
-                                break 'controller;
+                                let _ = (&mut turn).await;
+                                break AfterTurn::Exit;
                             }
                             Some(ash_tui::UiCommand::Submit(input)) => {
-                                queued_inputs.push_back(input);
+                                pending_input = Some(input);
                             }
                         }
                     }
-                }
+                };
                 drop(turn);
-                if reset_after_turn {
-                    session.reset();
-                    queued_inputs.clear();
-                } else if let Some(session_id) = resume_after_turn {
-                    queued_inputs.clear();
-                    resume_session(&mut session, session_id, &event_tx).await;
-                } else if undo_after_turn {
-                    queued_inputs.clear();
-                    rollback_last_turn(&mut session, &event_tx, &history_store).await;
+                match after_turn {
+                    AfterTurn::None => {}
+                    AfterTurn::Undo => {
+                        pending_input = None;
+                        rollback_last_turn(&mut session, &event_tx, &history_store).await;
+                    }
+                    AfterTurn::Exit => break 'controller,
                 }
             }
             ash_tui::UiCommand::CancelAndUndo => {
-                queued_inputs.clear();
+                pending_input = None;
                 rollback_last_turn(&mut session, &event_tx, &history_store).await;
             }
             ash_tui::UiCommand::NewSession => {
                 session.reset();
-                queued_inputs.clear();
+                pending_input = None;
             }
             ash_tui::UiCommand::ListSessions => {
                 list_sessions(&session, &event_tx).await;
             }
             ash_tui::UiCommand::ResumeSession(session_id) => {
-                queued_inputs.clear();
+                pending_input = None;
                 resume_session(&mut session, session_id, &event_tx).await;
             }
             ash_tui::UiCommand::Exit => break,

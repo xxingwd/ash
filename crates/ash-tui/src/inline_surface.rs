@@ -1,7 +1,7 @@
 use std::io::{self, Stdout, Write};
 
 use crossterm::{
-    cursor::{MoveTo, Show},
+    cursor::{position, MoveTo, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{Attribute, ResetColor, SetAttribute},
@@ -11,7 +11,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     buffer::Buffer,
     layout::{Position, Rect},
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
 };
 
 use crate::viewport::ViewportFrame;
@@ -67,13 +67,22 @@ impl Write for FrameWriter {
     }
 }
 
-type FullscreenTerminal = Terminal<CrosstermBackend<FrameWriter>>;
+type ManagedTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 
-/// Owns the entire visible primary screen. Rows leave this surface only through
-/// `insert_history`, which moves them into the terminal's scrollback buffer.
+#[derive(Clone, Copy)]
+struct PendingResize {
+    area: Rect,
+    inline_top: Option<u16>,
+}
+
+/// Starts at the shell cursor and promotes once, when resize/reset/history
+/// first needs it, to ownership of the entire visible primary screen.
 pub(crate) struct InlineSurface {
-    terminal: FullscreenTerminal,
-    pending_resize: Option<Rect>,
+    terminal: ManagedTerminal,
+    fullscreen: bool,
+    cursor_row: u16,
+    rendered_rows: u16,
+    pending_resize: Option<PendingResize>,
     _guard: TerminalGuard,
 }
 
@@ -83,15 +92,23 @@ impl InlineSurface {
         let guard = TerminalGuard;
         let mut stdout = io::stdout();
         execute!(stdout, EnableBracketedPaste, Show)?;
-        take_over_visible_screen(&mut stdout)?;
+        let (_, top) = position()?;
+        let (width, height) = terminal::size()?;
+        let initial_area = Rect::new(0, top.min(height.saturating_sub(1)), width.max(1), 1);
 
         let backend = CrosstermBackend::new(FrameWriter::new(stdout));
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
-        terminal.force_redraw();
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(initial_area),
+            },
+        )?;
 
         Ok(Self {
             terminal,
+            fullscreen: false,
+            cursor_row: 0,
+            rendered_rows: 0,
             pending_resize: None,
             _guard: guard,
         })
@@ -109,21 +126,49 @@ impl InlineSurface {
         writer.commit_frame()
     }
 
-    pub(crate) fn resize(&mut self, width: u16, height: u16) {
-        self.pending_resize = Some(Rect::new(0, 0, width.max(1), height.max(1)));
+    pub(crate) fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
+        let area = Rect::new(0, 0, width.max(1), height.max(1));
+        let inline_top = if self.fullscreen {
+            None
+        } else {
+            let (_, cursor_y) = position()?;
+            Some(cursor_y.saturating_sub(self.cursor_row))
+        };
+        self.pending_resize = Some(PendingResize { area, inline_top });
+        Ok(())
     }
 
     pub(crate) fn reset(&mut self) -> io::Result<()> {
         self.apply_pending_resize()?;
-        self.terminal.clear()?;
+        let (width, height) = terminal::size()?;
+        let current = self.terminal.current_buffer_mut().area;
+        let top = if self.fullscreen {
+            0
+        } else {
+            current.y.min(height.saturating_sub(1))
+        };
+        clear_from_row(self.terminal.backend_mut().writer_mut(), top)?;
+        self.terminal
+            .set_viewport_area(Rect::new(0, top, width.max(1), 1));
         self.terminal.force_redraw();
+        self.fullscreen = false;
+        self.cursor_row = 0;
+        self.rendered_rows = 0;
         Ok(())
     }
 
     pub(crate) fn render_frame(&mut self, frame: &ViewportFrame) -> io::Result<()> {
         self.apply_pending_resize()?;
+        if !self.fullscreen {
+            self.prepare_inline_area(frame)?;
+        }
+        let area_height = self.terminal.current_buffer_mut().area.height;
+        self.cursor_row = frame
+            .cursor_row
+            .saturating_sub(frame.buffer.area.height.saturating_sub(area_height));
+        self.rendered_rows = frame.buffer.area.height.min(area_height);
         self.terminal.draw(|terminal_frame| {
-            let cursor = render_fullscreen(terminal_frame.buffer_mut(), frame);
+            let cursor = render_area(terminal_frame.buffer_mut(), frame);
             terminal_frame.set_cursor_position(cursor);
         })?;
         Ok(())
@@ -135,7 +180,9 @@ impl InlineSurface {
         leading_blank: bool,
     ) -> io::Result<()> {
         self.apply_pending_resize()?;
-        let width = self.terminal.current_buffer_mut().area.width.max(1);
+        let (width, height) = terminal::size()?;
+        let width = width.max(1);
+        let height = height.max(1);
         let mut history = Buffer::empty(Rect::new(
             0,
             0,
@@ -144,77 +191,212 @@ impl InlineSurface {
         ));
         let target_y = u16::from(leading_blank);
         copy_buffer(buffer, &mut history, 0, target_y, buffer.area.height);
+        self.insert_before_viewport(&history, height)
+    }
 
-        // This is the full-screen case of Ratatui's inline `insert_before`:
-        // borrow the top row, draw one history row into it, then scroll that
-        // one-row region into the primary screen's scrollback.
-        for y in 0..history.area.height {
+    pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
+        self.apply_pending_resize()?;
+        let height = terminal::size()?.1.max(1);
+        let area = self.terminal.current_buffer_mut().area;
+        let next_row = area.y.saturating_add(self.rendered_rows).min(height);
+        if next_row < height {
+            clear_from_row(self.terminal.backend_mut().writer_mut(), next_row)?;
+            queue!(
+                self.terminal.backend_mut().writer_mut(),
+                MoveTo(0, next_row)
+            )
+        } else {
+            let writer = self.terminal.backend_mut().writer_mut();
+            queue!(
+                writer,
+                ResetColor,
+                SetAttribute(Attribute::Reset),
+                MoveTo(0, height.saturating_sub(1))
+            )?;
+            write!(writer, "\r\n")
+        }
+    }
+
+    fn prepare_inline_area(&mut self, frame: &ViewportFrame) -> io::Result<()> {
+        let (width, height) = terminal::size()?;
+        let width = width.max(1);
+        let height = height.max(1);
+        let current = self.terminal.current_buffer_mut().area;
+        if frame.buffer.area.height > height {
+            self.promote_to_fullscreen(current.y, Rect::new(0, 0, width, height))?;
+            return Ok(());
+        }
+
+        let next_height = frame.buffer.area.height.max(1);
+        let scroll_rows = current.y.saturating_add(next_height).saturating_sub(height);
+        let next = Rect::new(0, current.y.saturating_sub(scroll_rows), width, next_height);
+        if current != next {
+            clear_from_row(self.terminal.backend_mut().writer_mut(), current.y)?;
+            if scroll_rows > 0 {
+                let backend = self.terminal.backend_mut();
+                backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
+                backend.append_lines(scroll_rows)?;
+            }
+            self.terminal.set_viewport_area(next);
+            self.terminal.force_redraw();
+        }
+        Ok(())
+    }
+
+    fn insert_before_viewport(&mut self, history: &Buffer, screen_height: u16) -> io::Result<()> {
+        let mut source_y = 0;
+        let mut remaining = history.area.height;
+        let mut area = self.terminal.current_buffer_mut().area;
+
+        if area.height == screen_height {
+            return self.insert_fullscreen_history(history);
+        }
+
+        if area.bottom() < screen_height {
+            let rows = remaining.min(screen_height.saturating_sub(area.bottom()));
+            if rows > 0 {
+                self.terminal
+                    .backend_mut()
+                    .scroll_region_down(area.top()..area.bottom().saturating_add(rows), rows)?;
+                self.draw_history_rows(history, source_y, area.top(), rows)?;
+                source_y = source_y.saturating_add(rows);
+                remaining = remaining.saturating_sub(rows);
+                area.y = area.y.saturating_add(rows);
+                self.terminal.set_viewport_area(area);
+            }
+        }
+
+        while remaining > 0 {
+            let rows = remaining.min(area.top());
+            if rows == 0 {
+                return self.insert_fullscreen_history_rows(history, source_y, remaining);
+            }
+            self.terminal
+                .backend_mut()
+                .scroll_region_up(0..area.top(), rows)?;
+            self.draw_history_rows(history, source_y, area.top().saturating_sub(rows), rows)?;
+            source_y = source_y.saturating_add(rows);
+            remaining = remaining.saturating_sub(rows);
+        }
+
+        self.terminal.force_redraw();
+        Ok(())
+    }
+
+    fn insert_fullscreen_history(&mut self, history: &Buffer) -> io::Result<()> {
+        self.insert_fullscreen_history_rows(history, 0, history.area.height)
+    }
+
+    fn insert_fullscreen_history_rows(
+        &mut self,
+        history: &Buffer,
+        source_y: u16,
+        rows: u16,
+    ) -> io::Result<()> {
+        let width = self.terminal.current_buffer_mut().area.width.max(1);
+        // A full-screen viewport has no rows above it to scroll. Borrow its top
+        // row, draw one history row there, then scroll only that one-row region
+        // into terminal scrollback. This is the same bounded-scroll strategy as
+        // Ratatui's `insert_before`, kept here because InlineSurface owns a
+        // custom Fixed viewport and the promotion/reflow state around it.
+        for y in 0..rows {
+            let source_y = source_y.saturating_add(y);
             let backend = self.terminal.backend_mut();
-            backend
-                .draw((0..width).filter_map(|x| history.cell((x, y)).map(|cell| (x, 0, cell))))?;
+            backend.draw(
+                (0..width).filter_map(|x| history.cell((x, source_y)).map(|cell| (x, 0, cell))),
+            )?;
             backend.scroll_region_up(0..1, 1)?;
         }
         self.terminal.force_redraw();
         Ok(())
     }
 
-    pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
-        self.apply_pending_resize()?;
-        let height = self.terminal.current_buffer_mut().area.height.max(1);
-        let writer = self.terminal.backend_mut().writer_mut();
-        queue!(
-            writer,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            MoveTo(0, height.saturating_sub(1)),
-            Clear(ClearType::CurrentLine)
-        )?;
-        write!(writer, "\r\n")
+    fn draw_history_rows(
+        &mut self,
+        history: &Buffer,
+        source_y: u16,
+        target_y: u16,
+        rows: u16,
+    ) -> io::Result<()> {
+        let width = self.terminal.current_buffer_mut().area.width.max(1);
+        self.terminal.backend_mut().draw((0..rows).flat_map(|row| {
+            (0..width).filter_map(move |x| {
+                history
+                    .cell((x, source_y.saturating_add(row)))
+                    .map(|cell| (x, target_y.saturating_add(row), cell))
+            })
+        }))
     }
 
     fn apply_pending_resize(&mut self) -> io::Result<()> {
-        let Some(area) = self.pending_resize.take() else {
+        let Some(resize) = self.pending_resize.take() else {
             return Ok(());
         };
-        self.terminal.resize(area)?;
+        if let Some(inline_top) = resize.inline_top {
+            let current_height = self
+                .terminal
+                .current_buffer_mut()
+                .area
+                .height
+                .min(resize.area.height)
+                .max(1);
+            let top = inline_top.min(resize.area.height.saturating_sub(1));
+            clear_from_row(self.terminal.backend_mut().writer_mut(), top)?;
+            self.terminal
+                .set_viewport_area(Rect::new(0, top, resize.area.width, current_height));
+            self.terminal.force_redraw();
+            self.fullscreen = false;
+        } else {
+            clear_from_row(self.terminal.backend_mut().writer_mut(), 0)?;
+            self.terminal.set_viewport_area(resize.area);
+            self.terminal.force_redraw();
+        }
+        Ok(())
+    }
+
+    fn promote_to_fullscreen(&mut self, inline_top: u16, area: Rect) -> io::Result<()> {
+        let height = area.height.max(1);
+        let inline_top = inline_top.min(height.saturating_sub(1));
+        clear_from_row(self.terminal.backend_mut().writer_mut(), inline_top)?;
+        if inline_top > 0 {
+            let backend = self.terminal.backend_mut();
+            backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
+            backend.append_lines(inline_top)?;
+        }
+        self.terminal.set_viewport_area(area);
         self.terminal.force_redraw();
+        self.fullscreen = true;
+        self.cursor_row = 0;
+        self.rendered_rows = 0;
         Ok(())
     }
 }
 
-fn take_over_visible_screen(stdout: &mut Stdout) -> io::Result<()> {
-    let (_, height) = terminal::size()?;
-    let height = height.max(1);
+fn clear_from_row(writer: &mut impl Write, row: u16) -> io::Result<()> {
     queue!(
-        stdout,
-        BeginSynchronizedUpdate,
-        MoveTo(0, height.saturating_sub(1))
-    )?;
-    // Preserve the shell's current screen by moving it into scrollback once.
-    // After this point every visible row belongs to Ash.
-    for _ in 0..height {
-        write!(stdout, "\r\n")?;
-    }
-    queue!(
-        stdout,
-        Clear(ClearType::All),
-        MoveTo(0, 0),
-        EndSynchronizedUpdate
-    )?;
-    stdout.flush()
+        writer,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        MoveTo(0, row),
+        Clear(ClearType::FromCursorDown)
+    )
 }
 
-fn render_fullscreen(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
+fn render_area(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
     let visible_rows = frame.buffer.area.height.min(screen.area.height);
     let hidden_rows = frame.buffer.area.height.saturating_sub(visible_rows);
     copy_buffer(&frame.buffer, screen, hidden_rows, 0, visible_rows);
 
     Position::new(
-        frame.cursor_column.min(screen.area.width.saturating_sub(1)),
-        frame
-            .cursor_row
-            .saturating_sub(hidden_rows)
-            .min(screen.area.height.saturating_sub(1)),
+        screen
+            .area
+            .x
+            .saturating_add(frame.cursor_column.min(screen.area.width.saturating_sub(1))),
+        screen
+            .area
+            .y
+            .saturating_add(frame.cursor_row.saturating_sub(hidden_rows))
+            .min(screen.area.bottom().saturating_sub(1)),
     )
 }
 
@@ -280,11 +462,10 @@ mod tests {
             buffer: source,
             cursor_row: 1,
             cursor_column: 2,
-            total_rows: 2,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
-        let cursor = render_fullscreen(&mut screen, &frame);
+        let cursor = render_area(&mut screen, &frame);
 
         assert_eq!(row_text(&screen, 0), "first");
         assert_eq!(row_text(&screen, 1), "last");
@@ -301,11 +482,10 @@ mod tests {
             buffer: source,
             cursor_row: 3,
             cursor_column: 1,
-            total_rows: 4,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
-        let cursor = render_fullscreen(&mut screen, &frame);
+        let cursor = render_area(&mut screen, &frame);
 
         assert_eq!(row_text(&screen, 0), "three");
         assert_eq!(row_text(&screen, 1), "four");
@@ -320,6 +500,23 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(writer.frame.as_deref(), Some(b"first\r\nsecond".as_slice()));
+    }
+
+    #[test]
+    fn fixed_render_uses_the_viewport_origin() {
+        let mut source = Buffer::empty(Rect::new(0, 0, 6, 1));
+        source.set_string(0, 0, "frame", Style::default());
+        let frame = ViewportFrame {
+            buffer: source,
+            cursor_row: 0,
+            cursor_column: 2,
+        };
+        let mut screen = Buffer::empty(Rect::new(0, 2, 6, 1));
+
+        let cursor = render_area(&mut screen, &frame);
+
+        assert_eq!(row_text(&screen, 2), "frame");
+        assert_eq!(cursor, Position::new(2, 2));
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {

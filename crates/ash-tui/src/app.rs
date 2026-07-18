@@ -111,8 +111,8 @@ impl App {
                                 &phase,
                             )?;
                         }
-                        Event::TextDelta(text) => terminal.text(&text),
-                        Event::Thinking(text) => terminal.thinking(&text),
+                        Event::TextDelta(text) => terminal.text(&text)?,
+                        Event::Thinking(text) => terminal.thinking(&text)?,
                         Event::ToolCallStart {
                             id: _,
                             name,

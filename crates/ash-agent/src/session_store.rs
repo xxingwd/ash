@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ash_core::{
-    Content, Message, MessageContent, SessionId, SessionSummary, StopReason, ToolDefinition,
-};
+use ash_core::{Content, Message, MessageContent, SessionId, SessionSummary};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -13,7 +11,7 @@ use crate::AgentConfig;
 const SESSION_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionMetadata {
+pub(crate) struct SessionMetadata {
     pub format_version: u32,
     pub session_id: SessionId,
     pub created_at: String,
@@ -21,12 +19,10 @@ pub struct SessionMetadata {
     pub model: String,
     pub working_dir: PathBuf,
     pub system_prompt: Option<String>,
-    pub tools: Vec<ToolDefinition>,
     pub max_turns: u32,
     pub max_context_tokens: Option<usize>,
     pub max_output_tokens: Option<u32>,
     pub tool_timeout_ms: u64,
-    pub uses_custom_base_url: bool,
 }
 
 impl SessionMetadata {
@@ -39,26 +35,13 @@ impl SessionMetadata {
             model: config.model.as_str().to_string(),
             working_dir: config.working_dir.clone(),
             system_prompt: config.system_prompt.clone(),
-            tools: config.tools.iter().map(|tool| tool.definition()).collect(),
             max_turns: config.max_turns,
             max_context_tokens: config.max_context_tokens,
             max_output_tokens: config.max_output_tokens,
-            tool_timeout_ms: u64::try_from(config.tool_timeout.as_millis()).unwrap_or(u64::MAX),
-            uses_custom_base_url: config.provider.base_url.is_some(),
+            tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
+                .unwrap_or(u64::MAX),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TurnFinishedRecord {
-    reason: StopReason,
-    duration_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TurnFailedRecord {
-    error_kind: String,
-    duration_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,8 +56,8 @@ enum SessionRecord {
     UserMessage(Message),
     AssistantMessage(Message),
     ToolResult(Message),
-    TurnFinished(TurnFinishedRecord),
-    TurnFailed(TurnFailedRecord),
+    TurnFinished(serde_json::Value),
+    TurnFailed(serde_json::Value),
     TurnRolledBack(TurnRolledBackRecord),
 }
 
@@ -131,18 +114,18 @@ impl StoredSession {
     }
 }
 
-pub struct SessionStore {
+pub(crate) struct SessionStore {
     path: PathBuf,
     metadata: SessionMetadata,
     file: Option<tokio::fs::File>,
 }
 
 impl SessionStore {
-    pub fn new(config: &AgentConfig, session_id: SessionId) -> Self {
-        Self::new_in(config, session_id, Self::default_dir())
+    pub(crate) fn new(config: &AgentConfig, session_id: SessionId) -> Self {
+        Self::new_in(config, session_id, &Self::default_dir())
     }
 
-    pub(crate) fn new_in(config: &AgentConfig, session_id: SessionId, directory: PathBuf) -> Self {
+    pub(crate) fn new_in(config: &AgentConfig, session_id: SessionId, directory: &Path) -> Self {
         let local_now = Local::now().fixed_offset();
         let created_at = local_now.with_timezone(&Utc);
         let path = directory.join(session_filename(session_id, local_now));
@@ -153,46 +136,25 @@ impl SessionStore {
         }
     }
 
-    pub fn default_dir() -> PathBuf {
+    fn default_dir() -> PathBuf {
         directories::ProjectDirs::from("", "", "ash")
             .map(|dirs| dirs.data_dir().join("sessions"))
             .unwrap_or_else(|| PathBuf::from(".ash/sessions"))
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub async fn append_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
+    pub(crate) async fn append_message(
+        &mut self,
+        message: &Message,
+    ) -> Result<(), ash_core::AshError> {
         self.append_record(SessionRecord::from_message(message))
             .await
     }
 
-    pub async fn append_turn_finished(
-        &mut self,
-        reason: StopReason,
-        duration_ms: u64,
-    ) -> Result<(), ash_core::AshError> {
-        self.append_record(SessionRecord::TurnFinished(TurnFinishedRecord {
-            reason,
-            duration_ms,
-        }))
-        .await
-    }
-
-    pub async fn append_turn_failed(
-        &mut self,
-        error_kind: &str,
-        duration_ms: u64,
-    ) -> Result<(), ash_core::AshError> {
-        self.append_record(SessionRecord::TurnFailed(TurnFailedRecord {
-            error_kind: error_kind.to_string(),
-            duration_ms,
-        }))
-        .await
-    }
-
-    pub async fn append_turn_rolled_back(
+    pub(crate) async fn append_turn_rolled_back(
         &mut self,
         num_turns: u32,
     ) -> Result<(), ash_core::AshError> {
@@ -237,15 +199,6 @@ impl SessionStore {
         file.flush().await?;
         self.file = Some(file);
         Ok(())
-    }
-
-    pub(crate) async fn latest_except(
-        excluded_path: &Path,
-    ) -> Result<Option<StoredSession>, ash_core::AshError> {
-        Ok(Self::stored_sessions(Some(excluded_path))
-            .await?
-            .into_iter()
-            .next())
     }
 
     pub(crate) async fn summaries_except(
@@ -482,7 +435,7 @@ mod tests {
             working_dir,
             max_context_tokens: Some(1000),
             max_output_tokens: Some(200),
-            tool_timeout: Duration::from_secs(5),
+            max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
         }
@@ -509,7 +462,7 @@ mod tests {
         let store = SessionStore::new_in(
             &config(directory.path().to_path_buf()),
             SessionId::new(),
-            sessions_dir,
+            &sessions_dir,
         );
 
         assert!(!store.path().exists());
@@ -527,10 +480,6 @@ mod tests {
                 .expect("session filename should exist"),
         );
         store.append_message(&Message::user("hello")).await.unwrap();
-        store
-            .append_turn_finished(StopReason::EndTurn, 25)
-            .await
-            .unwrap();
 
         let contents = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(contents.contains("session_meta"));
@@ -589,7 +538,7 @@ mod tests {
         let mut store = SessionStore::new_in(
             &config(directory.path().to_path_buf()),
             session_id,
-            sessions_dir.clone(),
+            &sessions_dir,
         );
         store
             .append_message(&Message::user("  First session title\nwith details  "))

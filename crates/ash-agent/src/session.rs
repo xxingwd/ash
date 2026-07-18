@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ash_core::{
     CancellationToken, Content, Event, Message, MessageContent, ModelId, Protocol, SessionId,
@@ -10,13 +10,10 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::agent::run_agent_turn_persisted;
-use crate::session_store::StoredSession;
-use crate::{AgentConfig, SessionStore};
+use crate::session_store::{SessionStore, StoredSession};
+use crate::AgentConfig;
 
 pub struct ResumedSession {
-    pub session_id: SessionId,
-    pub path: PathBuf,
-    pub title: String,
     pub messages: Vec<Message>,
     pub model: String,
     pub protocol: String,
@@ -56,13 +53,6 @@ impl AgentSession {
         self.store = SessionStore::new(&self.config, self.id);
     }
 
-    pub async fn resume_latest(&mut self) -> Result<Option<ResumedSession>, ash_core::AshError> {
-        let Some(stored) = SessionStore::latest_except(self.store.path()).await? else {
-            return Ok(None);
-        };
-        self.restore(stored).await.map(Some)
-    }
-
     pub async fn resumable_sessions(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         SessionStore::summaries_except(self.store.path()).await
     }
@@ -95,7 +85,6 @@ impl AgentSession {
             )));
         }
         let store = SessionStore::resume(&stored).await?;
-        let title = crate::session_store::session_title(&stored.messages);
         self.id = stored.metadata.session_id;
         self.config.provider.protocol = protocol;
         self.config.model = ModelId::new(&stored.metadata.model);
@@ -108,14 +97,11 @@ impl AgentSession {
         self.config.max_turns = stored.metadata.max_turns;
         self.config.max_context_tokens = stored.metadata.max_context_tokens;
         self.config.max_output_tokens = stored.metadata.max_output_tokens;
-        self.config.tool_timeout = Duration::from_millis(stored.metadata.tool_timeout_ms);
+        self.config.max_tool_duration = Duration::from_millis(stored.metadata.tool_timeout_ms);
         self.messages = stored.messages;
         self.store = store;
 
         Ok(ResumedSession {
-            session_id: self.id,
-            path: stored.path,
-            title,
             messages: self.messages.clone(),
             model: self.config.model.as_str().to_string(),
             protocol: self.config.provider.protocol.as_cli_name().to_string(),
@@ -136,8 +122,7 @@ impl AgentSession {
             self.store.path(),
         );
         self.messages.push(user_message);
-        let started_at = Instant::now();
-        let result = run_agent_turn_persisted(
+        run_agent_turn_persisted(
             &self.config,
             &mut self.messages,
             events,
@@ -145,23 +130,7 @@ impl AgentSession {
             self.id,
             &mut self.store,
         )
-        .await;
-        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match &result {
-            Ok(reason) => persist_or_warn(
-                self.store
-                    .append_turn_finished(reason.clone(), duration_ms)
-                    .await,
-                self.store.path(),
-            ),
-            Err(error) => persist_or_warn(
-                self.store
-                    .append_turn_failed(error_kind(error), duration_ms)
-                    .await,
-                self.store.path(),
-            ),
-        }
-        result
+        .await
     }
 
     pub async fn rollback_last_turn(&mut self) -> Option<String> {
@@ -193,16 +162,6 @@ fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
         .collect::<Vec<_>>()
         .join("\n");
     Some((index, prompt))
-}
-
-fn error_kind(error: &ash_core::AshError) -> &'static str {
-    match error {
-        ash_core::AshError::Protocol(_) => "protocol",
-        ash_core::AshError::Tool(_) => "tool",
-        ash_core::AshError::Io(_) => "io",
-        ash_core::AshError::Config(_) => "config",
-        ash_core::AshError::Cancelled => "cancelled",
-    }
 }
 
 fn persist_or_warn(result: Result<(), ash_core::AshError>, path: &std::path::Path) {
@@ -239,6 +198,7 @@ mod tests {
                 content: MessageContent::ToolResult {
                     id: tool_id,
                     result: Ok("done".to_string()),
+                    attachments: Vec::new(),
                 },
             },
         ];

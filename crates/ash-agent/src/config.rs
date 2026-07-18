@@ -12,7 +12,7 @@ pub struct AgentConfig {
     pub working_dir: PathBuf,
     pub max_context_tokens: Option<usize>,
     pub max_output_tokens: Option<u32>,
-    pub tool_timeout: Duration,
+    pub max_tool_duration: Duration,
     pub agent_path: String,
     pub root_session_id: Option<SessionId>,
 }

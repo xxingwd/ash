@@ -74,11 +74,27 @@ impl AnthropicAdapter {
                         .collect();
                     json!({"role": "assistant", "content": content})
                 }
-                MessageContent::ToolResult { id, result } => {
-                    let (content, is_error) = match result {
+                MessageContent::ToolResult {
+                    id,
+                    result,
+                    attachments,
+                } => {
+                    let (text, is_error) = match result {
                         Ok(output) => (output, false),
                         Err(error) => (error, true),
                     };
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    content.extend(attachments.iter().map(|attachment| match attachment {
+                        ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
+                        ash_core::Content::Image { media_type, data } => json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": base64::engine::general_purpose::STANDARD.encode(data),
+                            }
+                        }),
+                    }));
                     json!({
                         "role": "user",
                         "content": [{
@@ -262,6 +278,8 @@ impl sse::Decoder for AnthropicDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
+    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use secrecy::SecretString;
 
     #[test]
     fn aggregates_tool_arguments_and_preserves_provider_id() {
@@ -292,6 +310,44 @@ mod tests {
                 name: "read".into(),
                 arguments: json!({"path": "README.md"}),
             }]
+        );
+    }
+
+    #[test]
+    fn sends_tool_images_inside_the_anthropic_tool_result() {
+        let adapter = AnthropicAdapter::new(ProviderConfig {
+            protocol: Protocol::AnthropicMessages,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: MessageContent::ToolResult {
+                    id: ToolCallId::from_provider("call"),
+                    result: Ok("Read image file [image/png]".into()),
+                    attachments: vec![Content::Image {
+                        media_type: "image/png".into(),
+                        data: vec![1, 2, 3],
+                    }],
+                },
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request);
+
+        assert_eq!(
+            body["messages"][0]["content"][0]["content"][1]["type"],
+            "image"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            "AQID"
         );
     }
 }

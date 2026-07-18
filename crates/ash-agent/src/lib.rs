@@ -15,5 +15,4 @@ pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;
 pub use session::{AgentSession, ResumedSession};
-pub use session_store::{SessionMetadata, SessionStore};
 pub use skill::Skill;
