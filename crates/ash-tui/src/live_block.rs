@@ -27,6 +27,8 @@ const CHANGE_PREVIEW_MAX_LINES: usize = 12;
 /// terminal and cannot be safely reflowed after a resize.
 #[derive(Clone, Debug)]
 pub(crate) struct LiveBlock {
+    id: u64,
+    turn_id: Option<u64>,
     kind: LiveBlockKind,
 }
 
@@ -48,38 +50,91 @@ enum LiveBlockKind {
 }
 
 impl LiveBlock {
-    pub(crate) fn welcome(working_dir: PathBuf) -> Self {
-        Self::new(LiveBlockKind::Welcome(working_dir))
+    pub(crate) fn welcome(id: u64, working_dir: PathBuf) -> Self {
+        Self::new(id, LiveBlockKind::Welcome(working_dir))
     }
 
-    pub(crate) fn history(block: HistoryBlock) -> Self {
-        Self::new(LiveBlockKind::History(block))
+    pub(crate) fn history(id: u64, block: HistoryBlock) -> Self {
+        Self::new(id, LiveBlockKind::History(block))
     }
 
-    pub(crate) fn assistant(source: String) -> Self {
-        Self::new(LiveBlockKind::Assistant(source))
+    pub(crate) fn assistant(id: u64, source: String) -> Self {
+        Self::new(id, LiveBlockKind::Assistant(source))
     }
 
-    pub(crate) fn thought(source: String) -> Self {
-        Self::new(LiveBlockKind::Thought(source))
+    pub(crate) fn thought(id: u64, source: String) -> Self {
+        Self::new(id, LiveBlockKind::Thought(source))
     }
 
-    pub(crate) fn tool(name: String, arguments: Value, output: String, is_error: bool) -> Self {
+    pub(crate) fn tool(
+        id: u64,
+        name: String,
+        arguments: Value,
+        output: String,
+        is_error: bool,
+    ) -> Self {
         if name == "read" && !is_error {
-            return Self::new(LiveBlockKind::ReadGroup {
-                arguments: vec![arguments],
-            });
+            return Self::new(
+                id,
+                LiveBlockKind::ReadGroup {
+                    arguments: vec![arguments],
+                },
+            );
         }
-        Self::new(LiveBlockKind::Tool {
-            name,
-            arguments,
-            output,
-            is_error,
-        })
+        Self::new(
+            id,
+            LiveBlockKind::Tool {
+                name,
+                arguments,
+                output,
+                is_error,
+            },
+        )
     }
 
-    fn new(kind: LiveBlockKind) -> Self {
-        Self { kind }
+    fn new(id: u64, kind: LiveBlockKind) -> Self {
+        Self {
+            id,
+            turn_id: None,
+            kind,
+        }
+    }
+
+    pub(crate) fn with_turn(mut self, turn_id: Option<u64>) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn belongs_to_turn(&self, turn_id: u64) -> bool {
+        self.turn_id == Some(turn_id)
+    }
+
+    pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
+        let LiveBlockKind::Assistant(current) = &mut self.kind else {
+            return false;
+        };
+        current.push_str(source);
+        true
+    }
+
+    pub(crate) fn try_append_read(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        is_error: bool,
+    ) -> bool {
+        if name != "read" || is_error {
+            return false;
+        }
+        let LiveBlockKind::ReadGroup { arguments: current } = &mut self.kind else {
+            return false;
+        };
+        current.push(arguments.clone());
+        true
     }
 
     pub(crate) fn render(&self, width: u16, composer_background: Option<Rgb>) -> Buffer {
@@ -155,29 +210,13 @@ fn render_markdown_block(source: &str, style: Style, width: u16) -> Buffer {
     for line in &mut lines {
         line.patch_style(style);
     }
-    render_markdown_lines(&lines, true, width)
-}
-
-pub(crate) fn render_assistant_lines(
-    lines: &[crate::markdown::RenderedLine],
-    first_line: bool,
-    width: u16,
-) -> Buffer {
-    render_markdown_lines(lines, first_line, width)
-}
-
-fn render_markdown_lines(
-    lines: &[crate::markdown::RenderedLine],
-    first_line: bool,
-    width: u16,
-) -> Buffer {
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
     for (index, rendered) in lines.iter().take(usize::from(height)).enumerate() {
         let Ok(y) = u16::try_from(index) else {
             break;
         };
-        let mut spans = vec![if index == 0 && first_line {
+        let mut spans = vec![if index == 0 {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::raw("  ")
@@ -188,10 +227,10 @@ fn render_markdown_lines(
     buffer
 }
 
-fn render_tool(name: &str, arguments: &Value, _output: &str, is_error: bool, width: u16) -> Buffer {
+fn render_tool(name: &str, arguments: &Value, output: &str, is_error: bool, width: u16) -> Buffer {
     if !is_error {
         let preview = match name {
-            "edit" => edit_preview(arguments),
+            "edit" if !output.is_empty() => Some(output.to_string()),
             "write" => arguments
                 .get("content")
                 .and_then(Value::as_str)
@@ -227,26 +266,6 @@ fn render_tool_title(action: String, detail: String, is_error: bool, width: u16)
     let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), 1));
     buffer.set_line(0, 0, &Line::from(spans), width);
     buffer
-}
-
-fn edit_preview(arguments: &Value) -> Option<String> {
-    let edits = arguments.get("edits")?.as_array()?;
-    let mut lines = Vec::new();
-    for edit in edits {
-        lines.extend(
-            edit.get("oldText")?
-                .as_str()?
-                .lines()
-                .map(|line| format!("-{line}")),
-        );
-        lines.extend(
-            edit.get("newText")?
-                .as_str()?
-                .lines()
-                .map(|line| format!("+{line}")),
-        );
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn write_preview(content: &str) -> String {
@@ -332,7 +351,7 @@ mod tests {
 
     #[test]
     fn markdown_blocks_reflow_at_the_current_width() {
-        let block = LiveBlock::assistant("a long line that must wrap".to_string());
+        let block = LiveBlock::assistant(1, "a long line that must wrap".to_string());
 
         let narrow = block.render(10, None);
         let wide = block.render(40, None);
@@ -341,35 +360,53 @@ mod tests {
     }
 
     #[test]
-    fn successful_reads_render_a_summary() {
-        let block = LiveBlock::tool(
+    fn blocks_keep_turn_ownership() {
+        let block = LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(7));
+
+        assert!(block.belongs_to_turn(7));
+    }
+
+    #[test]
+    fn consecutive_successful_reads_share_one_summary() {
+        let mut block = LiveBlock::tool(
+            1,
             "read".to_string(),
             serde_json::json!({"path": "/workspace/src/inline.rs"}),
             String::new(),
             false,
         );
 
+        assert!(block.try_append_read(
+            "read",
+            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+            false,
+        ));
+        assert!(!block.try_append_read(
+            "read",
+            &serde_json::json!({"path": "/workspace/src/live_block.rs"}),
+            true,
+        ));
+
         let buffer = block.render(80, None);
         let rendered = (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, 0)))
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("• Read inline.rs"));
+        assert!(rendered.contains("• Read inline.rs, viewport.rs"));
     }
 
     #[test]
     fn edit_and_write_render_different_change_previews() {
         let edit = LiveBlock::tool(
+            1,
             "edit".to_string(),
-            serde_json::json!({
-                "path": "/workspace/src/main.rs",
-                "edits": [{"oldText": "old", "newText": "new"}]
-            }),
-            "Successfully replaced 1 block(s).".to_string(),
+            serde_json::json!({"path": "/workspace/src/main.rs"}),
+            "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
             false,
         )
         .render(60, None);
         let write = LiveBlock::tool(
+            2,
             "write".to_string(),
             serde_json::json!({"path": "/workspace/src/new.rs", "content": "one\ntwo"}),
             String::new(),
@@ -377,11 +414,12 @@ mod tests {
         )
         .render(60, None);
 
-        assert_eq!(edit.cell((2, 1)).expect("deleted line").fg, Color::Red);
-        assert_eq!(edit.cell((2, 2)).expect("added line").fg, Color::Green);
+        assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
+        assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
         assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);
 
         let tiny = LiveBlock::tool(
+            3,
             "write".to_string(),
             serde_json::json!({"path": "new.rs", "content": "one"}),
             String::new(),

@@ -55,7 +55,6 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
             search_detail(arguments),
         ),
         "find" => phrase("Listing", "Listed", "listing", search_detail(arguments)),
-        "ls" => phrase("Listing", "Listed", "listing", path_argument(arguments)),
         "bash" => phrase(
             "Running",
             "Ran",
@@ -196,7 +195,12 @@ mod tests {
     #[test]
     fn renders_builtin_tools_as_semantic_summaries() {
         assert_eq!(
-            tool_call_summary("bash", &json!({"command": "cargo test"}), false, 80,),
+            tool_call_summary(
+                "bash",
+                &json!({"command": "cargo test", "cwd": "/tmp/project"}),
+                false,
+                80,
+            ),
             ("Ran".to_string(), "cargo test".to_string())
         );
         assert_eq!(
@@ -216,10 +220,8 @@ mod tests {
             "edit",
             &json!({
                 "path": "/home/user/work/ash/crates/ash-tui/src/inline.rs",
-                "edits": [{
-                    "oldText": "many lines of old content",
-                    "newText": "many lines of new content"
-                }]
+                "old": "many lines of old content",
+                "new": "many lines of new content"
             }),
             false,
             80,
