@@ -5,7 +5,7 @@ use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{Attribute, ResetColor, SetAttribute},
-    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
+    terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -73,7 +73,6 @@ type ManagedTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 /// and become normal terminal output; resize only changes the next frame size.
 pub(crate) struct InlineSurface {
     terminal: ManagedTerminal,
-    cursor_row: u16,
     rendered_rows: u16,
     has_committed_output: bool,
     _guard: TerminalGuard,
@@ -96,7 +95,6 @@ impl InlineSurface {
 
         Ok(Self {
             terminal,
-            cursor_row: 0,
             rendered_rows: 0,
             has_committed_output: false,
             _guard: guard,
@@ -122,7 +120,6 @@ impl InlineSurface {
         self.terminal
             .set_viewport_area(Rect::new(0, area.y, area.width.max(1), 1));
         self.terminal.force_redraw();
-        self.cursor_row = 0;
         self.rendered_rows = 0;
         Ok(())
     }
@@ -131,13 +128,12 @@ impl InlineSurface {
         self.sync_terminal_size()?;
         self.prepare_inline_area(frame)?;
         let area_height = self.terminal.current_buffer_mut().area.height;
-        self.cursor_row = frame
-            .cursor_row
-            .saturating_sub(frame.buffer.area.height.saturating_sub(area_height));
         self.rendered_rows = frame.buffer.area.height.min(area_height);
         self.terminal.draw(|terminal_frame| {
             let cursor = render_area(terminal_frame.buffer_mut(), frame);
-            terminal_frame.set_cursor_position(cursor);
+            if frame.show_cursor {
+                terminal_frame.set_cursor_position(cursor);
+            }
         })?;
         Ok(())
     }
@@ -186,7 +182,6 @@ impl InlineSurface {
         self.terminal
             .set_viewport_area(Rect::new(0, prompt_y, width.max(1), 1));
         self.terminal.force_redraw();
-        self.cursor_row = 0;
         self.rendered_rows = 0;
         self.has_committed_output = true;
         Ok(())
@@ -197,25 +192,12 @@ impl InlineSurface {
         let height = terminal::size()?.1.max(1);
         let area = self.terminal.current_buffer_mut().area;
         let next_row = area.y.saturating_add(self.rendered_rows).min(height);
+        let writer = self.terminal.backend_mut().writer_mut();
+        queue!(writer, ResetColor, SetAttribute(Attribute::Reset))?;
         if next_row < height {
-            clear_rows(
-                self.terminal.backend_mut().writer_mut(),
-                next_row,
-                height.saturating_sub(next_row),
-                height,
-            )?;
-            queue!(
-                self.terminal.backend_mut().writer_mut(),
-                MoveTo(0, next_row)
-            )
+            queue!(writer, MoveTo(0, next_row))
         } else {
-            let writer = self.terminal.backend_mut().writer_mut();
-            queue!(
-                writer,
-                ResetColor,
-                SetAttribute(Attribute::Reset),
-                MoveTo(0, height.saturating_sub(1))
-            )?;
+            queue!(writer, MoveTo(0, height.saturating_sub(1)))?;
             write!(writer, "\r\n")
         }
     }
@@ -245,15 +227,6 @@ impl InlineSurface {
         self.terminal.autoresize()?;
         Ok(())
     }
-}
-
-fn clear_rows(writer: &mut impl Write, top: u16, rows: u16, screen_height: u16) -> io::Result<()> {
-    let bottom = top.saturating_add(rows).min(screen_height);
-    queue!(writer, ResetColor, SetAttribute(Attribute::Reset))?;
-    for y in top..bottom {
-        queue!(writer, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
-    }
-    Ok(())
 }
 
 fn render_area(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
@@ -336,6 +309,7 @@ mod tests {
             buffer: source,
             cursor_row: 1,
             cursor_column: 2,
+            show_cursor: true,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
@@ -356,6 +330,7 @@ mod tests {
             buffer: source,
             cursor_row: 3,
             cursor_column: 1,
+            show_cursor: true,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
@@ -384,6 +359,7 @@ mod tests {
             buffer: source,
             cursor_row: 0,
             cursor_column: 2,
+            show_cursor: true,
         };
         let mut screen = Buffer::empty(Rect::new(0, 2, 6, 1));
 

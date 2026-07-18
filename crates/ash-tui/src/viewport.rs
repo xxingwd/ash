@@ -61,6 +61,7 @@ pub(crate) struct ViewportFrame {
     pub(crate) buffer: Buffer,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_column: u16,
+    pub(crate) show_cursor: bool,
 }
 
 pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
@@ -153,6 +154,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         buffer,
         cursor_row,
         cursor_column,
+        show_cursor: input.show_composer,
     }
 }
 
@@ -660,6 +662,7 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, 0), "/tmp/ash · gpt-5");
         assert_eq!(row_text(&frame.buffer, 1), "› first");
         assert_eq!(frame.cursor_row, 1);
+        assert!(!frame.show_cursor);
     }
 
     #[test]

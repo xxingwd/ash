@@ -406,10 +406,12 @@ impl InlineTerminal {
         self.synchronized(|terminal| {
             terminal.finish_stream();
             terminal.status.stop();
-            terminal.show_composer = false;
-            terminal.render_viewport()?;
-            terminal.surface.release_frame()?;
-            terminal.pending_blocks.clear();
+            if !terminal.pending_blocks.is_empty() {
+                terminal.show_composer = false;
+                terminal.render_viewport()?;
+                terminal.surface.release_frame()?;
+                terminal.pending_blocks.clear();
+            }
             terminal.surface.leave_screen()
         })
     }
