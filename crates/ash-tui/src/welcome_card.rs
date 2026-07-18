@@ -6,9 +6,23 @@ use crate::{
 };
 
 const SUBTITLE: &str = "Terminal coding agent";
+const FULL_WORDMARK_MIN_WIDTH: u16 = 28;
+const COMPACT_WORDMARK_MIN_WIDTH: u16 = 12;
+
+const FULL_WORDMARK: [&str; 6] = [
+    " █████╗ ███████╗██╗  ██╗ ",
+    "██╔══██╗██╔════╝██║  ██║",
+    "███████║███████╗███████║",
+    "██╔══██║╚════██║██╔══██║",
+    "██║  ██║███████║██║  ██║",
+    "╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝",
+];
+
+const COMPACT_WORDMARK: [&str; 2] = ["▄▀█  █▀  █ █", "█▀█  ▄█  █▀█"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WelcomeStyle {
+    Logo,
     Title,
     Subtitle,
 }
@@ -21,11 +35,28 @@ pub(crate) struct WelcomeLine {
 
 pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<WelcomeLine> {
     let width = usize::from(available_width.max(1));
-    vec![
-        WelcomeLine {
+    let wordmark: &[&str] = if available_width >= FULL_WORDMARK_MIN_WIDTH {
+        &FULL_WORDMARK
+    } else if available_width >= COMPACT_WORDMARK_MIN_WIDTH {
+        &COMPACT_WORDMARK
+    } else {
+        &[]
+    };
+    let mut lines = if wordmark.is_empty() {
+        vec![WelcomeLine {
             text: truncate_end("ASH", width),
             style: WelcomeStyle::Title,
-        },
+        }]
+    } else {
+        wordmark
+            .iter()
+            .map(|line| WelcomeLine {
+                text: truncate_end(line.trim_start(), width),
+                style: WelcomeStyle::Logo,
+            })
+            .collect()
+    };
+    lines.extend([
         WelcomeLine {
             text: truncate_end(SUBTITLE, width),
             style: WelcomeStyle::Subtitle,
@@ -34,7 +65,8 @@ pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<Welc
             text: truncate_start(&workspace_label(working_dir), width),
             style: WelcomeStyle::Subtitle,
         },
-    ]
+    ]);
+    lines
 }
 
 fn workspace_label(working_dir: &Path) -> String {
@@ -65,17 +97,31 @@ mod tests {
     #[test]
     fn renders_a_left_aligned_welcome() {
         let lines = welcome_card(80, Path::new("/home/example/workspace/ash"));
-        assert_eq!(lines[0].text, "ASH");
-        assert_eq!(lines[1].text, SUBTITLE);
-        assert_eq!(lines[2].text, "/home/example/workspace/ash");
+        assert_eq!(lines[0].text, FULL_WORDMARK[0].trim_start());
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.style == WelcomeStyle::Logo)
+                .count(),
+            FULL_WORDMARK.len()
+        );
+        assert_eq!(lines[lines.len() - 2].text, SUBTITLE);
+        assert_eq!(lines[lines.len() - 1].text, "/home/example/workspace/ash");
     }
 
     #[test]
     fn truncates_welcome_lines_without_centering_or_framing() {
         let lines = welcome_card(24, Path::new("/project"));
-        assert_eq!(lines[0].text, "ASH");
-        assert_eq!(lines[1].text, SUBTITLE);
-        assert_eq!(lines[2].text, "/project");
+        assert_eq!(lines[0].text, COMPACT_WORDMARK[0]);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.style == WelcomeStyle::Logo)
+                .count(),
+            COMPACT_WORDMARK.len()
+        );
+        assert_eq!(lines[lines.len() - 2].text, SUBTITLE);
+        assert_eq!(lines[lines.len() - 1].text, "/project");
     }
 
     #[test]

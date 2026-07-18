@@ -10,7 +10,6 @@ futures = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true, features = ["scrolling-regions"] }
 unicode-width = { workspace = true }
-libc = { workspace = true }
 pulldown-cmark = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

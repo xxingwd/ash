@@ -167,7 +167,6 @@ impl MenuState {
 
 pub(crate) struct InlineTerminal {
     surface: InlineSurface,
-    composer_background: Option<crate::palette::Rgb>,
     prompt: PromptSnapshot,
     history_boundary: StackBoundary,
     live_blocks: Vec<LiveBlock>,
@@ -182,10 +181,8 @@ pub(crate) struct InlineTerminal {
 impl InlineTerminal {
     pub fn enter(protocol: &str, model: &str, working_dir: &Path) -> io::Result<Self> {
         let surface = InlineSurface::enter()?;
-        let composer_background = crate::palette::composer_background_color();
         Ok(Self {
             surface,
-            composer_background,
             prompt: PromptSnapshot::new(protocol, model, working_dir),
             history_boundary: StackBoundary::default(),
             live_blocks: Vec::new(),
@@ -391,17 +388,6 @@ impl InlineTerminal {
 
     pub fn set_queued_messages(&mut self, queued_messages: usize) {
         self.status.queued_messages = queued_messages;
-    }
-
-    pub fn resize(&mut self, input: &InputState, width: u16, height: u16) -> io::Result<()> {
-        let width = width.max(1);
-        let height = height.max(1);
-        self.surface.resize(width, height)?;
-        if self.stream.is_reasoning() {
-            self.stream
-                .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
-        }
-        self.prompt_at(input, width, height)
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
@@ -639,7 +625,7 @@ impl InlineTerminal {
 
     fn flush_live_block(&mut self, block: &LiveBlock, terminal_width: u16) -> io::Result<()> {
         let width = drawable_width(terminal_width);
-        let buffer = block.render(width, self.composer_background);
+        let buffer = block.render(width);
         self.surface
             .insert_history(&buffer, self.history_boundary.has_block())?;
         self.history_boundary = self.history_boundary.after_block();
@@ -668,7 +654,6 @@ impl InlineTerminal {
             queued: &queued,
             prompt: &self.prompt.text,
             prompt_cursor_column: self.prompt.cursor_column,
-            composer_background: self.composer_background,
             command_menu,
             command_menu_selected,
             session_menu,

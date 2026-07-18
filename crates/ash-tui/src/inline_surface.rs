@@ -75,7 +75,6 @@ pub(crate) struct InlineSurface {
     terminal: ManagedTerminal,
     cursor_row: u16,
     rendered_rows: u16,
-    pending_resize: Option<Rect>,
     _guard: TerminalGuard,
 }
 
@@ -98,7 +97,6 @@ impl InlineSurface {
             terminal,
             cursor_row: 0,
             rendered_rows: 0,
-            pending_resize: None,
             _guard: guard,
         })
     }
@@ -115,13 +113,8 @@ impl InlineSurface {
         writer.commit_frame()
     }
 
-    pub(crate) fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
-        self.pending_resize = Some(Rect::new(0, 0, width.max(1), height.max(1)));
-        Ok(())
-    }
-
     pub(crate) fn reset(&mut self) -> io::Result<()> {
-        self.apply_pending_resize()?;
+        self.sync_terminal_size()?;
         let area = self.terminal.current_buffer_mut().area;
         self.terminal.clear()?;
         self.terminal
@@ -133,7 +126,7 @@ impl InlineSurface {
     }
 
     pub(crate) fn render_frame(&mut self, frame: &ViewportFrame) -> io::Result<()> {
-        self.apply_pending_resize()?;
+        self.sync_terminal_size()?;
         self.prepare_inline_area(frame)?;
         let area_height = self.terminal.current_buffer_mut().area.height;
         self.cursor_row = frame
@@ -152,7 +145,7 @@ impl InlineSurface {
         buffer: &Buffer,
         leading_blank: bool,
     ) -> io::Result<()> {
-        self.apply_pending_resize()?;
+        self.sync_terminal_size()?;
         let width = terminal::size()?.0.max(1);
         let mut history = Buffer::empty(Rect::new(
             0,
@@ -170,7 +163,7 @@ impl InlineSurface {
     }
 
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
-        self.apply_pending_resize()?;
+        self.sync_terminal_size()?;
         let height = terminal::size()?.1.max(1);
         let area = self.terminal.current_buffer_mut().area;
         let next_row = area.y.saturating_add(self.rendered_rows).min(height);
@@ -218,13 +211,8 @@ impl InlineSurface {
         Ok(())
     }
 
-    fn apply_pending_resize(&mut self) -> io::Result<()> {
-        if let Some(area) = self.pending_resize.take() {
-            self.terminal.resize(area)?;
-            self.terminal.force_redraw();
-        } else {
-            self.terminal.autoresize()?;
-        }
+    fn sync_terminal_size(&mut self) -> io::Result<()> {
+        self.terminal.autoresize()?;
         Ok(())
     }
 }

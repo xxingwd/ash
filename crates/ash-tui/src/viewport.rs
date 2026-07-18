@@ -13,7 +13,6 @@ use crate::{
     block_layout::{layout_stack, stack_height, StackBoundary, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
-    palette::Rgb,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left},
     text_width::truncate_end,
@@ -49,7 +48,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) queued: &'a str,
     pub(crate) prompt: &'a str,
     pub(crate) prompt_cursor_column: u16,
-    pub(crate) composer_background: Option<Rgb>,
     pub(crate) command_menu: &'a [CommandCompletion],
     pub(crate) command_menu_selected: usize,
     pub(crate) session_menu: &'a [SessionSummary],
@@ -77,7 +75,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .live_blocks
         .iter()
         .map(|block| RenderedLiveBlock {
-            buffer: block.render(width, input.composer_background),
+            buffer: block.render(width),
         })
         .collect::<Vec<_>>();
     let active = active_window(
@@ -513,7 +511,6 @@ mod tests {
             queued: "",
             prompt: "draft",
             prompt_cursor_column: 5,
-            composer_background: Some((30, 30, 30)),
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -548,7 +545,6 @@ mod tests {
             queued: "",
             prompt: "/cl",
             prompt_cursor_column: 3,
-            composer_background: None,
             command_menu: &menu,
             command_menu_selected: 0,
             session_menu: &[],
@@ -583,7 +579,6 @@ mod tests {
             queued: "",
             prompt: "",
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &sessions,
@@ -615,7 +610,6 @@ mod tests {
             queued: "",
             prompt: "",
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -647,7 +641,6 @@ mod tests {
             queued: "",
             prompt: "",
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],

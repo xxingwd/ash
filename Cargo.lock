@@ -206,7 +206,6 @@ dependencies = [
  "ash-core",
  "crossterm",
  "futures",
- "libc",
  "pulldown-cmark",
  "ratatui",
  "serde_json",

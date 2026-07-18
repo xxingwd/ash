@@ -237,14 +237,12 @@ impl App {
                     let Some(key) = key else { break };
                     let event = key?;
                     match event {
-                        CrosstermEvent::Resize(width, height) => {
-                            render_resized_prompt(
+                        CrosstermEvent::Resize(_, _) => {
+                            render_prompt(
                                 &mut terminal,
                                 &input,
                                 &mut command_completion,
                                 &phase,
-                                width,
-                                height,
                             )?
                         },
                         CrosstermEvent::Paste(text) => {
@@ -628,18 +626,6 @@ fn render_prompt(
 ) -> std::io::Result<()> {
     sync_command_menu(terminal, input, completion, phase);
     terminal.prompt(input)
-}
-
-fn render_resized_prompt(
-    terminal: &mut InlineTerminal,
-    input: &InputState,
-    completion: &mut CommandCompletionState,
-    phase: &TurnPhase,
-    width: u16,
-    height: u16,
-) -> std::io::Result<()> {
-    sync_command_menu(terminal, input, completion, phase);
-    terminal.resize(input, width, height)
 }
 
 #[cfg(test)]

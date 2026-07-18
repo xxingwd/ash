@@ -11,7 +11,6 @@ use serde_json::Value;
 use crate::{
     history_block::HistoryBlock,
     markdown::render_markdown,
-    palette::Rgb,
     scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{read_group_summary, tool_call_summary},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
@@ -137,10 +136,10 @@ impl LiveBlock {
         true
     }
 
-    pub(crate) fn render(&self, width: u16, composer_background: Option<Rgb>) -> Buffer {
+    pub(crate) fn render(&self, width: u16) -> Buffer {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
-            LiveBlockKind::History(block) => block.render(width, composer_background),
+            LiveBlockKind::History(block) => block.render(width),
             LiveBlockKind::Assistant(source) => {
                 render_markdown_block(source, Style::default(), width)
             }
@@ -182,7 +181,7 @@ fn render_welcome(width: u16, working_dir: &std::path::Path) -> Buffer {
 fn styled_welcome_line(line: &WelcomeLine) -> Line<'static> {
     let content_style = match line.style {
         WelcomeStyle::Subtitle => Style::default().add_modifier(Modifier::DIM),
-        WelcomeStyle::Title => Style::default()
+        WelcomeStyle::Logo | WelcomeStyle::Title => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     };
@@ -338,8 +337,8 @@ mod tests {
     fn markdown_blocks_reflow_at_the_current_width() {
         let block = LiveBlock::assistant(1, "a long line that must wrap".to_string());
 
-        let narrow = block.render(10, None);
-        let wide = block.render(40, None);
+        let narrow = block.render(10);
+        let wide = block.render(40);
 
         assert!(narrow.area.height > wide.area.height);
     }
@@ -372,7 +371,7 @@ mod tests {
             true,
         ));
 
-        let buffer = block.render(80, None);
+        let buffer = block.render(80);
         let rendered = (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, 0)))
             .map(|cell| cell.symbol())
@@ -389,7 +388,7 @@ mod tests {
             "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
             false,
         )
-        .render(60, None);
+        .render(60);
         let write = LiveBlock::tool(
             2,
             "write".to_string(),
@@ -397,7 +396,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(60, None);
+        .render(60);
 
         assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
@@ -410,7 +409,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(1, None);
+        .render(1);
         assert_eq!(tiny.area.width, 1);
     }
 
@@ -418,9 +417,21 @@ mod tests {
     fn welcome_title_is_left_aligned_and_subtitle_is_dim() {
         let buffer = render_welcome(40, std::path::Path::new("/workspace/ash"));
         assert_eq!(buffer.cell((0, 0)).expect("title").fg, Color::Cyan);
-        assert_eq!(buffer.cell((0, 1)).expect("subtitle").fg, Color::Reset);
+        let subtitle_row = (0..buffer.area.height)
+            .find(|&row| {
+                (0..buffer.area.width)
+                    .filter_map(|column| buffer.cell((column, row)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Terminal coding agent")
+            })
+            .expect("subtitle row");
+        assert_eq!(
+            buffer.cell((0, subtitle_row)).expect("subtitle").fg,
+            Color::Reset
+        );
         assert!(buffer
-            .cell((0, 1))
+            .cell((0, subtitle_row))
             .expect("subtitle")
             .modifier
             .contains(Modifier::DIM));
