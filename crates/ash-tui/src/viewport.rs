@@ -14,13 +14,13 @@ use crate::{
     live_block::LiveBlock,
     markdown::RenderedLine,
     slash_command::CommandCompletion,
-    status_line::{compact_path, fit_status_left},
+    status_line::prompt_header_line,
     text_width::truncate_end,
 };
 
 const STATUS_ROWS: u16 = 1;
+const PROMPT_HEADER_ROWS: u16 = 1;
 const COMPOSER_ROWS: u16 = 1;
-const FOOTER_ROWS: u16 = 1;
 const SESSION_MENU_MAX_ROWS: usize = 8;
 const COMPACT_STATUS_WIDTH: u16 = 32;
 const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
@@ -53,7 +53,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) session_menu: &'a [SessionSummary],
     pub(crate) session_menu_selected: usize,
     pub(crate) model: &'a str,
-    pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
 }
 
@@ -110,15 +109,14 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
             }
             ViewportRegion::Status => render_status(*area, &input, &mut buffer),
             ViewportRegion::Composer => {
-                let (input_area, bottom_area) = composer_areas(*area, menu_rows);
+                let (header_area, input_area, menu_area) = composer_areas(*area, menu_rows);
                 composer_input_area = input_area;
+                render_prompt_header(header_area, &input, &mut buffer);
                 render_composer(input_area, &input, &mut buffer);
                 if !input.session_menu.is_empty() {
-                    render_session_menu(bottom_area, &input, &mut buffer);
-                } else if input.command_menu.is_empty() {
-                    render_footer(bottom_area, &input, &mut buffer);
-                } else {
-                    render_command_menu(bottom_area, &input, &mut buffer);
+                    render_session_menu(menu_area, &input, &mut buffer);
+                } else if !input.command_menu.is_empty() {
+                    render_command_menu(menu_area, &input, &mut buffer);
                 }
             }
         }
@@ -255,27 +253,21 @@ fn blit_buffer(destination: &mut Buffer, area: Rect, source: &Buffer) {
 }
 
 fn composer_block_rows(menu_rows: u16) -> u16 {
-    COMPOSER_ROWS.saturating_add(if menu_rows == 0 {
-        FOOTER_ROWS
-    } else {
-        menu_rows
-    })
+    PROMPT_HEADER_ROWS
+        .saturating_add(COMPOSER_ROWS)
+        .saturating_add(menu_rows)
 }
 
-fn composer_areas(area: Rect, menu_rows: u16) -> (Rect, Rect) {
-    let bottom_rows = if menu_rows == 0 {
-        FOOTER_ROWS
-    } else {
-        menu_rows
-    };
+fn composer_areas(area: Rect, menu_rows: u16) -> (Rect, Rect, Rect) {
     let areas = Layout::vertical([
+        Constraint::Length(PROMPT_HEADER_ROWS),
         Constraint::Length(COMPOSER_ROWS),
-        Constraint::Length(bottom_rows),
+        Constraint::Length(menu_rows),
     ])
     .flex(Flex::Start)
     .spacing(0)
     .split(area);
-    (areas[0], areas[1])
+    (areas[0], areas[1], areas[2])
 }
 
 fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -325,31 +317,16 @@ fn render_composer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     buffer.set_line(area.x, area.y, &line, area.width);
 }
 
-fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
+fn render_prompt_header(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let path = compact_path(input.working_dir);
-    let (model, path) = fit_status_left(input.model, &path, area.width);
-    let mut spans = vec![Span::styled(model, Style::default().fg(Color::Cyan))];
-    if let Some(path) = path {
-        spans.push(Span::styled(
-            " · ",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        spans.push(Span::styled(path, Style::default().fg(Color::Green)));
-    }
-    if !input.protocol.is_empty() {
-        spans.push(Span::styled(
-            " · ",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        spans.push(Span::styled(
-            input.protocol.to_string(),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-    buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &prompt_header_line(input.model, input.working_dir, area.width),
+        area.width,
+    );
 }
 
 fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -496,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn lays_out_active_status_composer_and_footer_once() {
+    fn lays_out_active_status_and_prompt_once() {
         let active = render_markdown("answer", 80);
         let frame = render(ViewportInput {
             terminal_width: 80,
@@ -516,7 +493,6 @@ mod tests {
             session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
-            protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
         });
 
@@ -527,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_menu_replaces_the_footer_without_changing_composer_spacing() {
+    fn completion_menu_follows_the_prompt_without_extra_spacing() {
         let menu = [CommandCompletion {
             name: "clear",
             description: "start a new chat",
@@ -550,11 +526,10 @@ mod tests {
             session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
-            protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 3);
+        assert_eq!(frame.total_rows, 4);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
         assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
     }
@@ -584,7 +559,6 @@ mod tests {
             session_menu: &sessions,
             session_menu_selected: 0,
             model: "mock",
-            protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
         });
 
@@ -615,7 +589,6 @@ mod tests {
             session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
-            protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
         });
 
@@ -646,7 +619,6 @@ mod tests {
             session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
-            protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
         });
 

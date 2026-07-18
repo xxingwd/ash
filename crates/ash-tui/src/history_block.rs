@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -6,20 +8,29 @@ use ratatui::{
 };
 
 use crate::scrollback::{sanitize_terminal_text, wrap_text};
+use crate::status_line::prompt_header_line;
 
 const USER_HORIZONTAL_INSET: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HistoryBlock {
-    User(String),
+    User {
+        text: String,
+        model: String,
+        working_dir: PathBuf,
+    },
     Info(String),
     Error(String),
     Worked(String),
 }
 
 impl HistoryBlock {
-    pub(crate) fn user(text: &str) -> Self {
-        Self::User(normalize_multiline(text))
+    pub(crate) fn user_with_prompt(text: &str, model: &str, working_dir: &Path) -> Self {
+        Self::User {
+            text: normalize_multiline(text),
+            model: model.to_string(),
+            working_dir: working_dir.to_path_buf(),
+        }
     }
 
     pub(crate) fn info(message: &str) -> Self {
@@ -36,7 +47,11 @@ impl HistoryBlock {
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
         match self {
-            Self::User(text) => render_user(text, width.max(1)),
+            Self::User {
+                text,
+                model,
+                working_dir,
+            } => render_user(text, model, working_dir, width.max(1)),
             Self::Info(message) => render_info(message, width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
             Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
@@ -50,7 +65,7 @@ fn normalize_multiline(text: &str) -> String {
         .replace('\r', "\n")
 }
 
-fn render_user(text: &str, width: u16) -> Buffer {
+fn render_user(text: &str, model: &str, working_dir: &Path, width: u16) -> Buffer {
     let show_prefix = width > USER_HORIZONTAL_INSET;
     let content_x = if show_prefix {
         USER_HORIZONTAL_INSET
@@ -62,14 +77,24 @@ fn render_user(text: &str, width: u16) -> Buffer {
     let content_height = u16::try_from(paragraph.line_count(content_width))
         .unwrap_or(u16::MAX)
         .max(1);
-    let area = Rect::new(0, 0, width, content_height);
+    let show_header = !model.is_empty() || !working_dir.as_os_str().is_empty();
+    let header_rows = u16::from(show_header);
+    let area = Rect::new(0, 0, width, header_rows.saturating_add(content_height));
     let mut buffer = Buffer::empty(area);
 
+    if show_header {
+        buffer.set_line(0, 0, &prompt_header_line(model, working_dir, width), width);
+    }
     if show_prefix {
-        buffer.set_string(0, 0, "›", Style::default().add_modifier(Modifier::BOLD));
+        buffer.set_string(
+            0,
+            header_rows,
+            "›",
+            Style::default().add_modifier(Modifier::BOLD),
+        );
     }
     paragraph.render(
-        Rect::new(content_x, 0, content_width, content_height),
+        Rect::new(content_x, header_rows, content_width, content_height),
         &mut buffer,
     );
     buffer
@@ -162,7 +187,7 @@ mod tests {
 
     #[test]
     fn user_block_matches_the_plain_composer_style() {
-        let buffer = HistoryBlock::user("abcdefghij").render(9);
+        let buffer = HistoryBlock::user_with_prompt("abcdefghij", "", Path::new("")).render(9);
 
         assert_eq!(buffer.area.height, 2);
         assert_eq!(row_text(&buffer, 0), "› abcdefg");
@@ -172,14 +197,15 @@ mod tests {
 
     #[test]
     fn long_user_block_can_be_taller_than_the_terminal() {
-        let buffer = HistoryBlock::user(&"word ".repeat(100)).render(10);
+        let buffer =
+            HistoryBlock::user_with_prompt(&"word ".repeat(100), "", Path::new("")).render(10);
 
         assert!(buffer.area.height > 24);
     }
 
     #[test]
     fn tiny_width_falls_back_to_content_without_a_prefix() {
-        let buffer = HistoryBlock::user("ash").render(1);
+        let buffer = HistoryBlock::user_with_prompt("ash", "", Path::new("")).render(1);
 
         assert_eq!(row_text(&buffer, 0), "a");
         assert_eq!(row_text(&buffer, 1), "s");
@@ -188,9 +214,25 @@ mod tests {
 
     #[test]
     fn user_block_normalizes_carriage_returns() {
-        let block = HistoryBlock::user("one\r\ntwo\rthree");
+        let block = HistoryBlock::user_with_prompt("one\r\ntwo\rthree", "", Path::new(""));
 
-        assert_eq!(block, HistoryBlock::User("one\ntwo\nthree".to_string()));
+        assert_eq!(
+            block,
+            HistoryBlock::User {
+                text: "one\ntwo\nthree".to_string(),
+                model: String::new(),
+                working_dir: PathBuf::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_prompt_block_renders_header_above_input() {
+        let buffer =
+            HistoryBlock::user_with_prompt("hello", "gpt-5", Path::new("/tmp/ash")).render(40);
+
+        assert_eq!(row_text(&buffer, 0), "/tmp/ash · gpt-5");
+        assert_eq!(row_text(&buffer, 1), "› hello");
     }
 
     #[test]

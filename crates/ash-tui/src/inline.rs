@@ -304,7 +304,7 @@ impl InlineTerminal {
         self.prompt.cursor_column = 0;
         self.stream.reset();
         self.menus.clear();
-        self.push_history_block(HistoryBlock::user(input));
+        self.push_user_prompt(input);
         self.redraw()
     }
 
@@ -523,6 +523,12 @@ impl InlineTerminal {
         self.push_live(LiveBlock::history(id, block));
     }
 
+    fn push_user_prompt(&mut self, text: &str) {
+        let model = sanitize_single_line(&self.prompt.model);
+        let working_dir = self.prompt.working_dir.clone();
+        self.push_history_block(HistoryBlock::user_with_prompt(text, &model, &working_dir));
+    }
+
     fn push_assistant_block(&mut self, source: String) {
         let id = self.allocate_live_id();
         self.push_live(LiveBlock::assistant(id, source));
@@ -572,7 +578,7 @@ impl InlineTerminal {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    self.push_history_block(HistoryBlock::user(&text));
+                    self.push_user_prompt(&text);
                 }
                 MessageContent::Assistant(blocks) => {
                     for block in blocks {
@@ -638,7 +644,6 @@ impl InlineTerminal {
         let status_header = sanitize_single_line(&self.status.header);
         let queued = queued_status(self.status.queued_messages);
         let model = sanitize_single_line(&self.prompt.model);
-        let protocol = sanitize_single_line(&self.prompt.protocol);
         let (command_menu, command_menu_selected) = self.menus.commands();
         let (session_menu, session_menu_selected) = self.menus.sessions();
         viewport::render(ViewportInput {
@@ -659,7 +664,6 @@ impl InlineTerminal {
             session_menu,
             session_menu_selected,
             model: &model,
-            protocol: &protocol,
             working_dir: &self.prompt.working_dir,
         })
     }

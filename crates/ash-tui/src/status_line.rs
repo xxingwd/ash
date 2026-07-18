@@ -1,5 +1,9 @@
 use std::path::Path;
 
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::text_width::truncate_end;
@@ -20,21 +24,41 @@ pub(crate) fn compact_path(path: &Path) -> String {
     }
 }
 
-pub(crate) fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
-    let model_width = UnicodeWidthStr::width(model) as u16;
-    if model_width >= width || path.is_empty() {
-        return (truncate_end(model, usize::from(width)), None);
+pub(crate) fn prompt_header_line(model: &str, path: &Path, width: u16) -> Line<'static> {
+    let path = compact_path(path);
+    let model = model.trim();
+    let width = usize::from(width.max(1));
+
+    if path.is_empty() {
+        return Line::from(Span::styled(
+            truncate_end(model, width),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if model.is_empty() {
+        return Line::from(Span::styled(
+            truncate_end(&path, width),
+            Style::default().fg(Color::Green),
+        ));
     }
 
-    let path_width = width.saturating_sub(model_width.saturating_add(3));
-    if path_width == 0 {
-        (truncate_end(model, usize::from(width)), None)
-    } else {
-        (
-            model.to_string(),
-            Some(truncate_end(path, usize::from(path_width))),
-        )
+    let model_width = UnicodeWidthStr::width(model);
+    if model_width.saturating_add(3) >= width {
+        return Line::from(Span::styled(
+            truncate_end(&format!("{path} · {model}"), width),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
+
+    let path_width = width - model_width - 3;
+    Line::from(vec![
+        Span::styled(
+            truncate_end(&path, path_width),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(" · ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(model.to_string(), Style::default().fg(Color::Cyan)),
+    ])
 }
 
 #[cfg(test)]
@@ -49,14 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn prioritizes_model_then_path() {
-        assert_eq!(
-            fit_status_left("gpt-5", "~/workspace/ash", 24),
-            ("gpt-5".to_string(), Some("~/workspace/ash".to_string()))
-        );
-        assert_eq!(
-            fit_status_left("gpt-5", "~/workspace/ash", 12),
-            ("gpt-5".to_string(), Some("~/w…".to_string()))
-        );
+    fn prompt_header_places_model_after_the_path() {
+        let line = prompt_header_line("gpt-5", Path::new("/tmp/ash"), 24);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "/tmp/ash · gpt-5");
     }
 }
