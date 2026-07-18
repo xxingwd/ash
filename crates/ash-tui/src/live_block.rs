@@ -180,28 +180,13 @@ fn render_welcome(width: u16, working_dir: &std::path::Path) -> Buffer {
 }
 
 fn styled_welcome_line(line: &WelcomeLine) -> Line<'static> {
-    let frame_style = Style::default().fg(Color::Cyan);
     let content_style = match line.style {
-        WelcomeStyle::Frame => frame_style,
         WelcomeStyle::Subtitle => Style::default().add_modifier(Modifier::DIM),
-        WelcomeStyle::Logo | WelcomeStyle::Title => Style::default()
+        WelcomeStyle::Title => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     };
-
-    let Some(content) = line
-        .text
-        .strip_prefix('│')
-        .and_then(|content| content.strip_suffix('│'))
-    else {
-        return Line::styled(line.text.clone(), content_style);
-    };
-
-    Line::from(vec![
-        Span::styled("│", frame_style),
-        Span::styled(content.to_string(), content_style),
-        Span::styled("│", frame_style),
-    ])
+    Line::styled(line.text.clone(), content_style)
 }
 
 fn render_markdown_block(source: &str, style: Style, width: u16) -> Buffer {
@@ -430,31 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn welcome_frame_stays_cyan_around_dim_content() {
+    fn welcome_title_is_left_aligned_and_subtitle_is_dim() {
         let buffer = render_welcome(40, std::path::Path::new("/workspace/ash"));
-        let subtitle_row = (0..buffer.area.height)
-            .find(|&row| {
-                (0..buffer.area.width)
-                    .filter_map(|column| buffer.cell((column, row)))
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-                    .contains("TERMINAL CODING AGENT")
-            })
-            .expect("subtitle row");
-
-        assert_eq!(
-            buffer.cell((0, subtitle_row)).expect("left frame").fg,
-            Color::Cyan
-        );
-        assert_eq!(
-            buffer
-                .cell((buffer.area.width - 1, subtitle_row))
-                .expect("right frame")
-                .fg,
-            Color::Cyan
-        );
+        assert_eq!(buffer.cell((0, 0)).expect("title").fg, Color::Cyan);
+        assert_eq!(buffer.cell((0, 1)).expect("subtitle").fg, Color::Reset);
         assert!(buffer
-            .cell((2, subtitle_row))
+            .cell((0, 1))
             .expect("subtitle")
             .modifier
             .contains(Modifier::DIM));

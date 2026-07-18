@@ -6,7 +6,6 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Padding, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -21,18 +20,14 @@ use crate::{
 };
 
 const STATUS_ROWS: u16 = 1;
-const COMPOSER_ROWS: u16 = 3;
+const COMPOSER_ROWS: u16 = 1;
 const FOOTER_ROWS: u16 = 1;
 const SESSION_MENU_MAX_ROWS: usize = 8;
 const COMPACT_STATUS_WIDTH: u16 = 32;
-const FOOTER_SIDE_PADDING: u16 = 2;
-const FOOTER_COLUMN_GAP: u16 = 3;
-const FOOTER_MIN_LEFT_WIDTH: u16 = 3;
 const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
 const MENU_COLUMN_GAP: usize = 2;
 const MENU_PREFIX_COLUMNS: usize = 2;
 const SESSION_CREATED_MIN_LEFT_COLUMNS: usize = 8;
-const COMPOSER_PADDING: Padding = Padding::new(0, 0, 1, 1);
 pub(crate) const COMPOSER_TEXT_COLUMN: u16 = 2;
 
 pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
@@ -133,7 +128,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     ViewportFrame {
         buffer,
-        cursor_row: composer_input_area.y.saturating_add(COMPOSER_PADDING.top),
+        cursor_row: composer_input_area.y,
         cursor_column: COMPOSER_TEXT_COLUMN
             .saturating_add(input.prompt_cursor_column)
             .min(input.terminal_width.saturating_sub(1)),
@@ -321,15 +316,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
 }
 
 fn render_composer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let background = input
-        .composer_background
-        .map_or(Color::Reset, |(r, g, b)| Color::Rgb(r, g, b));
-    let block = Block::default()
-        .style(Style::default().bg(background))
-        .padding(COMPOSER_PADDING);
-    let inner = block.inner(area);
-    block.render(area, buffer);
-    if inner.is_empty() {
+    if area.is_empty() {
         return;
     }
     let line = Line::from(vec![
@@ -337,7 +324,7 @@ fn render_composer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         Span::raw(" "),
         Span::raw(input.prompt.to_string()),
     ]);
-    buffer.set_line(inner.x, inner.y, &line, inner.width);
+    buffer.set_line(area.x, area.y, &line, area.width);
 }
 
 fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -345,21 +332,8 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         return;
     }
     let path = compact_path(input.working_dir);
-    let protocol_width = UnicodeWidthStr::width(input.protocol) as u16;
-    let right_x = area
-        .width
-        .saturating_sub(protocol_width.saturating_add(FOOTER_SIDE_PADDING));
-    let show_protocol = protocol_width > 0 && right_x > FOOTER_MIN_LEFT_WIDTH;
-    let left_width = if show_protocol {
-        right_x.saturating_sub(FOOTER_COLUMN_GAP)
-    } else {
-        area.width.saturating_sub(FOOTER_SIDE_PADDING * 2)
-    };
-    let (model, path) = fit_status_left(input.model, &path, left_width);
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(model, Style::default().fg(Color::Cyan)),
-    ];
+    let (model, path) = fit_status_left(input.model, &path, area.width);
+    let mut spans = vec![Span::styled(model, Style::default().fg(Color::Cyan))];
     if let Some(path) = path {
         spans.push(Span::styled(
             " · ",
@@ -367,15 +341,17 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         ));
         spans.push(Span::styled(path, Style::default().fg(Color::Green)));
     }
-    buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
-    if show_protocol {
-        buffer.set_line(
-            area.x.saturating_add(right_x),
-            area.y,
-            &Line::styled(input.protocol.to_string(), Style::default().fg(Color::Cyan)),
-            protocol_width,
-        );
+    if !input.protocol.is_empty() {
+        spans.push(Span::styled(
+            " · ",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::styled(
+            input.protocol.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
     }
+    buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
 fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -547,7 +523,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 9);
+        assert_eq!(frame.total_rows, 7);
         assert_eq!(row_text(&frame.buffer, 1), "• answer");
         assert!(row_text(&frame.buffer, 3).contains("Working..."));
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
@@ -582,7 +558,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 5);
+        assert_eq!(frame.total_rows, 3);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
         assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
     }
