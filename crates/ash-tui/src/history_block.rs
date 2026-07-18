@@ -168,7 +168,9 @@ fn render_error(error: &str, width: u16) -> Buffer {
 fn render_worked(elapsed: &str, width: u16) -> Buffer {
     let label = format!("Worked for {elapsed}");
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
-    buffer.set_string(0, 0, label, Style::default().add_modifier(Modifier::DIM));
+    let style = Style::default().add_modifier(Modifier::DIM);
+    buffer.set_string(0, 0, "•", style);
+    buffer.set_string(USER_HORIZONTAL_INSET, 0, label, style);
     buffer
 }
 
@@ -267,10 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn worked_block_is_a_plain_dim_label() {
+    fn worked_block_has_a_dim_bullet() {
         let buffer = HistoryBlock::worked("2m 05s".to_string()).render(32);
 
-        assert_eq!(row_text(&buffer, 0), "Worked for 2m 05s");
+        assert_eq!(row_text(&buffer, 0), "• Worked for 2m 05s");
         assert!(buffer
             .cell((0, 0))
             .expect("label")
@@ -278,7 +280,7 @@ mod tests {
             .contains(Modifier::DIM));
         assert_eq!(
             row_text(&HistoryBlock::worked("0s".to_string()).render(10), 0),
-            "Worked for"
+            "• Worked f"
         );
     }
 }
