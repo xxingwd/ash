@@ -12,7 +12,6 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    block_layout::StackBoundary,
     history_block::HistoryBlock,
     inline_surface::InlineSurface,
     input::InputState,
@@ -168,8 +167,7 @@ impl MenuState {
 pub(crate) struct InlineTerminal {
     surface: InlineSurface,
     prompt: PromptSnapshot,
-    history_boundary: StackBoundary,
-    live_blocks: Vec<LiveBlock>,
+    pending_blocks: Vec<LiveBlock>,
     next_live_block_id: u64,
     status: StatusState,
     menus: MenuState,
@@ -184,8 +182,7 @@ impl InlineTerminal {
         Ok(Self {
             surface,
             prompt: PromptSnapshot::new(protocol, model, working_dir),
-            history_boundary: StackBoundary::default(),
-            live_blocks: Vec::new(),
+            pending_blocks: Vec::new(),
             next_live_block_id: 1,
             status: StatusState::default(),
             menus: MenuState::default(),
@@ -197,7 +194,7 @@ impl InlineTerminal {
 
     pub fn welcome(&mut self) -> io::Result<()> {
         self.enqueue_welcome();
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     fn enqueue_welcome(&mut self) {
@@ -209,14 +206,14 @@ impl InlineTerminal {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.push_history_block(HistoryBlock::info(message));
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn command_error(&mut self, message: &str) -> io::Result<()> {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.push_history_block(HistoryBlock::error(message));
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
@@ -225,16 +222,14 @@ impl InlineTerminal {
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
         let turn_id = self.current_turn_id;
-        let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
             if let Some(turn_id) = turn_id {
                 terminal
-                    .live_blocks
+                    .pending_blocks
                     .retain(|block| !block.belongs_to_turn(turn_id));
             }
             terminal.reset_turn_state();
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)
+            terminal.render_viewport()
         })
     }
 
@@ -305,7 +300,7 @@ impl InlineTerminal {
         self.stream.reset();
         self.menus.clear();
         self.push_user_prompt(input);
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn agent_started(&mut self) -> io::Result<()> {
@@ -333,7 +328,7 @@ impl InlineTerminal {
     pub fn tool_start(&mut self, name: &str, arguments: &Value) -> io::Result<()> {
         self.finish_stream();
         self.status.header = tool_activity_summary(name, arguments, self.markdown_width()?);
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn tool_end(
@@ -350,14 +345,14 @@ impl InlineTerminal {
             output.to_string(),
             is_error,
         );
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
         self.status.header = "Failed".to_string();
         self.push_history_block(HistoryBlock::error(error));
-        self.redraw()
+        self.commit_and_redraw()
     }
 
     pub fn finish_response(&mut self) -> io::Result<()> {
@@ -365,25 +360,33 @@ impl InlineTerminal {
         let elapsed_seconds = self.status.elapsed_seconds();
         self.status.stop();
         self.push_history_block(HistoryBlock::worked(format_elapsed(elapsed_seconds)));
-        let result = self.redraw();
+        let result = self.commit_and_redraw();
         self.current_turn_id = None;
         result
     }
 
     pub fn refresh_content(&mut self) -> io::Result<()> {
-        match self.stream.take_refresh() {
-            Some(StreamRefresh::Assistant { pending, block_id }) => {
-                if let Some(id) = self.append_assistant(pending, block_id) {
-                    self.stream.set_assistant_block_id(id);
+        let Some(refresh) = self.stream.take_refresh() else {
+            return Ok(());
+        };
+        self.synchronized(|terminal| {
+            match refresh {
+                StreamRefresh::Assistant { pending, block_id } => {
+                    if block_id.is_none() {
+                        terminal.commit_pending_blocks()?;
+                    }
+                    if let Some(id) = terminal.append_assistant(pending, block_id) {
+                        terminal.stream.set_assistant_block_id(id);
+                    }
+                }
+                StreamRefresh::Reasoning => {
+                    terminal.commit_pending_blocks()?;
+                    let width = terminal.markdown_width()?;
+                    terminal.stream.refresh_reasoning(width);
                 }
             }
-            Some(StreamRefresh::Reasoning) => {
-                let width = self.markdown_width()?;
-                self.stream.refresh_reasoning(width);
-            }
-            None => return Ok(()),
-        }
-        self.redraw()
+            terminal.render_viewport()
+        })
     }
 
     pub fn set_queued_messages(&mut self, queued_messages: usize) {
@@ -395,22 +398,24 @@ impl InlineTerminal {
             return Ok(());
         }
         self.status.frame = self.status.frame.wrapping_add(1);
-        if self.stream.is_reasoning() {
-            let width = terminal::size()?
-                .0
-                .saturating_sub(CONTENT_PREFIX_COLUMNS)
-                .max(1);
-            self.stream.refresh_reasoning(width);
-        }
-        self.redraw()
+        self.synchronized(|terminal| {
+            if terminal.stream.is_reasoning() {
+                terminal.commit_pending_blocks()?;
+                let width = terminal::size()?
+                    .0
+                    .saturating_sub(CONTENT_PREFIX_COLUMNS)
+                    .max(1);
+                terminal.stream.refresh_reasoning(width);
+            }
+            terminal.render_viewport()
+        })
     }
 
     pub fn leave_line(&mut self) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
             terminal.finish_stream();
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)?;
+            terminal.commit_pending_blocks()?;
+            terminal.render_viewport()?;
             terminal.surface.leave_screen()
         })
     }
@@ -437,7 +442,11 @@ impl InlineTerminal {
             return block_id;
         }
         if let Some(id) = block_id {
-            if let Some(block) = self.live_blocks.iter_mut().find(|block| block.id() == id) {
+            if let Some(block) = self
+                .pending_blocks
+                .iter_mut()
+                .find(|block| block.id() == id)
+            {
                 let _ = block.append_markdown_source(&source);
                 return Some(id);
             }
@@ -470,26 +479,27 @@ impl InlineTerminal {
     }
 
     fn redraw(&mut self) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
-        self.redraw_at(width, height)
+        self.synchronized(|terminal| terminal.render_viewport())
     }
 
-    fn redraw_at(&mut self, width: u16, height: u16) -> io::Result<()> {
+    fn commit_and_redraw(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)
+            terminal.commit_pending_blocks()?;
+            terminal.render_viewport()
         })
     }
 
+    fn redraw_at(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.synchronized(|terminal| terminal.render_viewport_at(width, height))
+    }
+
     fn replace_viewport(&mut self, prepare: impl FnOnce(&mut Self)) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
-            terminal.flush_all_live_blocks()?;
+            terminal.commit_pending_blocks()?;
             terminal.reset_inline_state()?;
-            terminal.history_boundary = StackBoundary::default();
             prepare(terminal);
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)
+            terminal.commit_pending_blocks()?;
+            terminal.render_viewport()
         })
     }
 
@@ -503,7 +513,12 @@ impl InlineTerminal {
         operation_result.and(finish_result)
     }
 
-    fn render_viewport(&mut self, width: u16, height: u16) -> io::Result<()> {
+    fn render_viewport(&mut self) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        self.render_viewport_at(width, height)
+    }
+
+    fn render_viewport_at(&mut self, width: u16, height: u16) -> io::Result<()> {
         let frame = self.viewport_frame(width, height);
         self.surface.render_frame(&frame)
     }
@@ -515,7 +530,8 @@ impl InlineTerminal {
     }
 
     fn push_live(&mut self, block: LiveBlock) {
-        self.live_blocks.push(block.with_turn(self.current_turn_id));
+        self.pending_blocks
+            .push(block.with_turn(self.current_turn_id));
     }
 
     fn push_history_block(&mut self, block: HistoryBlock) {
@@ -541,7 +557,7 @@ impl InlineTerminal {
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
         if self
-            .live_blocks
+            .pending_blocks
             .last_mut()
             .is_some_and(|block| block.try_append_read(&name, &arguments, is_error))
         {
@@ -611,30 +627,19 @@ impl InlineTerminal {
         }
     }
 
-    fn flush_live_overflow(&mut self, width: u16, height: u16) -> io::Result<()> {
-        while !self.live_blocks.is_empty() && self.viewport_frame(width, height).total_rows > height
-        {
-            let block = self.live_blocks.remove(0);
-            self.flush_live_block(&block, width)?;
-        }
-        Ok(())
-    }
-
-    fn flush_all_live_blocks(&mut self) -> io::Result<()> {
+    fn commit_pending_blocks(&mut self) -> io::Result<()> {
         let width = terminal::size()?.0.max(1);
-        while !self.live_blocks.is_empty() {
-            let block = self.live_blocks.remove(0);
-            self.flush_live_block(&block, width)?;
+        let blocks = std::mem::take(&mut self.pending_blocks);
+        for block in blocks {
+            self.commit_block(&block, width)?;
         }
         Ok(())
     }
 
-    fn flush_live_block(&mut self, block: &LiveBlock, terminal_width: u16) -> io::Result<()> {
+    fn commit_block(&mut self, block: &LiveBlock, terminal_width: u16) -> io::Result<()> {
         let width = drawable_width(terminal_width);
         let buffer = block.render(width);
-        self.surface
-            .insert_history(&buffer, self.history_boundary.has_block())?;
-        self.history_boundary = self.history_boundary.after_block();
+        self.surface.commit_output(&buffer)?;
         self.stream.clear_block_id(block.id());
         Ok(())
     }
@@ -649,8 +654,7 @@ impl InlineTerminal {
         viewport::render(ViewportInput {
             terminal_width: width,
             terminal_height: height,
-            history_boundary: self.history_boundary,
-            live_blocks: &self.live_blocks,
+            pending_blocks: &self.pending_blocks,
             busy: self.status.is_busy(),
             active_lines: self.stream.active_lines(),
             status_header: &status_header,

@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    block_layout::{layout_stack, stack_height, StackBoundary, StackItem},
+    block_layout::{layout_stack, stack_height, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
     slash_command::CommandCompletion,
@@ -38,8 +38,7 @@ pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
 pub(crate) struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
-    pub(crate) history_boundary: StackBoundary,
-    pub(crate) live_blocks: &'a [LiveBlock],
+    pub(crate) pending_blocks: &'a [LiveBlock],
     pub(crate) busy: bool,
     pub(crate) active_lines: &'a [RenderedLine],
     pub(crate) status_header: &'a str,
@@ -60,7 +59,6 @@ pub(crate) struct ViewportFrame {
     pub(crate) buffer: Buffer,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_column: u16,
-    pub(crate) total_rows: u16,
 }
 
 pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
@@ -70,35 +68,34 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     } else {
         session_menu_rows(input.session_menu.len())
     };
-    let live = input
-        .live_blocks
+    let pending = input
+        .pending_blocks
         .iter()
-        .map(|block| RenderedLiveBlock {
+        .map(|block| RenderedPendingBlock {
             buffer: block.render(width),
         })
         .collect::<Vec<_>>();
     let active = active_window(
         input.active_lines,
         input.terminal_height,
-        input.history_boundary,
-        &live,
+        &pending,
         input.busy,
         menu_rows,
     );
     let active_rows = active
         .as_ref()
         .map(|active| u16::try_from(active.lines.len()).unwrap_or(u16::MAX));
-    let regions = viewport_regions(&live, active_rows, input.busy, menu_rows);
+    let regions = viewport_regions(&pending, active_rows, input.busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
-    let layout = layout_stack(width, input.history_boundary, &items);
+    let layout = layout_stack(width, &items);
     let area = Rect::new(0, 0, width, layout.height);
     let mut buffer = Buffer::empty(area);
     let mut composer_input_area = Rect::default();
 
     for (region, area) in regions.iter().zip(&layout.areas) {
         match region.kind {
-            ViewportRegion::Live(index) => {
-                if let Some(block) = live.get(index) {
+            ViewportRegion::Pending(index) => {
+                if let Some(block) = pending.get(index) {
                     blit_buffer(&mut buffer, *area, &block.buffer);
                 }
             }
@@ -128,7 +125,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         cursor_column: COMPOSER_TEXT_COLUMN
             .saturating_add(input.prompt_cursor_column)
             .min(input.terminal_width.saturating_sub(1)),
-        total_rows: layout.height,
     }
 }
 
@@ -137,15 +133,14 @@ struct ActiveWindow<'a> {
     lines: &'a [RenderedLine],
 }
 
-struct RenderedLiveBlock {
+struct RenderedPendingBlock {
     buffer: Buffer,
 }
 
 fn active_window<'a>(
     active_lines: &'a [RenderedLine],
     terminal_height: u16,
-    history_boundary: StackBoundary,
-    live: &[RenderedLiveBlock],
+    pending: &[RenderedPendingBlock],
     busy: bool,
     menu_rows: u16,
 ) -> Option<ActiveWindow<'a>> {
@@ -153,7 +148,7 @@ fn active_window<'a>(
         return None;
     }
 
-    let overhead = active_overhead(history_boundary, live, busy, menu_rows);
+    let overhead = active_overhead(pending, busy, menu_rows);
     let max_lines = usize::from(terminal_height.saturating_sub(overhead));
     let skip = active_lines.len().saturating_sub(max_lines);
     Some(ActiveWindow {
@@ -182,7 +177,7 @@ fn render_active(area: Rect, active: &ActiveWindow<'_>, buffer: &mut Buffer) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewportRegion {
-    Live(usize),
+    Pending(usize),
     Active,
     Status,
     Composer,
@@ -194,27 +189,22 @@ struct RegionSpec {
     item: StackItem,
 }
 
-fn active_overhead(
-    history_boundary: StackBoundary,
-    live: &[RenderedLiveBlock],
-    busy: bool,
-    menu_rows: u16,
-) -> u16 {
-    let regions = viewport_regions(live, Some(0), busy, menu_rows);
+fn active_overhead(pending: &[RenderedPendingBlock], busy: bool, menu_rows: u16) -> u16 {
+    let regions = viewport_regions(pending, Some(0), busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
-    stack_height(history_boundary, &items)
+    stack_height(&items)
 }
 
 fn viewport_regions(
-    live: &[RenderedLiveBlock],
+    pending: &[RenderedPendingBlock],
     active_rows: Option<u16>,
     busy: bool,
     menu_rows: u16,
 ) -> Vec<RegionSpec> {
-    let mut regions = Vec::with_capacity(live.len().saturating_add(3));
-    for (index, block) in live.iter().enumerate() {
+    let mut regions = Vec::with_capacity(pending.len().saturating_add(3));
+    for (index, block) in pending.iter().enumerate() {
         regions.push(RegionSpec {
-            kind: ViewportRegion::Live(index),
+            kind: ViewportRegion::Pending(index),
             item: StackItem::block(block.buffer.area.height),
         });
     }
@@ -464,22 +454,13 @@ mod tests {
             .to_string()
     }
 
-    fn welcome_boundary() -> StackBoundary {
-        StackBoundary::default().after_block()
-    }
-
-    fn user_boundary() -> StackBoundary {
-        StackBoundary::default().after_block()
-    }
-
     #[test]
     fn lays_out_active_status_and_prompt_once() {
         let active = render_markdown("answer", 80);
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: user_boundary(),
-            live_blocks: &[],
+            pending_blocks: &[],
             busy: true,
             active_lines: &active,
             status_header: "Working",
@@ -496,9 +477,8 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 7);
-        assert_eq!(row_text(&frame.buffer, 1), "• answer");
-        assert!(row_text(&frame.buffer, 3).contains("Working..."));
+        assert_eq!(row_text(&frame.buffer, 0), "• answer");
+        assert!(row_text(&frame.buffer, 2).contains("Working..."));
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
     }
 
@@ -511,8 +491,7 @@ mod tests {
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: welcome_boundary(),
-            live_blocks: &[],
+            pending_blocks: &[],
             busy: false,
             active_lines: &[],
             status_header: "",
@@ -529,9 +508,8 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 4);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
-        assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
+        assert!(row_text(&frame.buffer, frame.buffer.area.height - 1).contains("/clear"));
     }
 
     #[test]
@@ -544,8 +522,7 @@ mod tests {
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: welcome_boundary(),
-            live_blocks: &[],
+            pending_blocks: &[],
             busy: false,
             active_lines: &[],
             status_header: "",
@@ -562,20 +539,19 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        let menu = row_text(&frame.buffer, frame.total_rows - 1);
+        let menu = row_text(&frame.buffer, frame.buffer.area.height - 1);
         assert!(menu.contains("Inspect the session picker"));
         assert!(menu.contains("2026-07-15 12:30"));
         assert_eq!(session_menu_rows(20), 8);
     }
 
     #[test]
-    fn flex_owns_the_gap_before_the_first_active_block() {
+    fn active_output_starts_at_the_top_of_the_local_frame() {
         let active = render_markdown("Thinking (0s)", 80);
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: user_boundary(),
-            live_blocks: &[],
+            pending_blocks: &[],
             busy: true,
             active_lines: &active,
             status_header: "Thinking",
@@ -592,11 +568,11 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(row_text(&frame.buffer, 1), "• Thinking (0s)");
+        assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
     }
 
     #[test]
-    fn live_blocks_share_the_viewport_with_the_composer() {
+    fn pending_blocks_share_the_local_frame_with_the_composer() {
         let blocks = [LiveBlock::history(
             1,
             crate::history_block::HistoryBlock::info("restored output"),
@@ -604,8 +580,7 @@ mod tests {
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: StackBoundary::default(),
-            live_blocks: &blocks,
+            pending_blocks: &blocks,
             busy: false,
             active_lines: &[],
             status_header: "",

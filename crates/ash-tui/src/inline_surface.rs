@@ -75,6 +75,7 @@ pub(crate) struct InlineSurface {
     terminal: ManagedTerminal,
     cursor_row: u16,
     rendered_rows: u16,
+    has_committed_output: bool,
     _guard: TerminalGuard,
 }
 
@@ -97,6 +98,7 @@ impl InlineSurface {
             terminal,
             cursor_row: 0,
             rendered_rows: 0,
+            has_committed_output: false,
             _guard: guard,
         })
     }
@@ -140,24 +142,22 @@ impl InlineSurface {
         Ok(())
     }
 
-    pub(crate) fn insert_history(
-        &mut self,
-        buffer: &Buffer,
-        leading_blank: bool,
-    ) -> io::Result<()> {
+    pub(crate) fn commit_output(&mut self, buffer: &Buffer) -> io::Result<()> {
         self.sync_terminal_size()?;
         let width = terminal::size()?.0.max(1);
-        let mut history = Buffer::empty(Rect::new(
+        let leading_blank = self.has_committed_output;
+        let mut output = Buffer::empty(Rect::new(
             0,
             0,
             width,
             buffer.area.height.saturating_add(u16::from(leading_blank)),
         ));
         let target_y = u16::from(leading_blank);
-        copy_buffer(buffer, &mut history, 0, target_y, buffer.area.height);
-        self.terminal.insert_before(history.area.height, |target| {
-            copy_buffer(&history, target, 0, 0, history.area.height);
+        copy_buffer(buffer, &mut output, 0, target_y, buffer.area.height);
+        self.terminal.insert_before(output.area.height, |target| {
+            copy_buffer(&output, target, 0, 0, output.area.height);
         })?;
+        self.has_committed_output = true;
         self.terminal.force_redraw();
         Ok(())
     }
@@ -306,7 +306,6 @@ mod tests {
             buffer: source,
             cursor_row: 1,
             cursor_column: 2,
-            total_rows: 2,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
@@ -327,7 +326,6 @@ mod tests {
             buffer: source,
             cursor_row: 3,
             cursor_column: 1,
-            total_rows: 4,
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
@@ -356,7 +354,6 @@ mod tests {
             buffer: source,
             cursor_row: 0,
             cursor_column: 2,
-            total_rows: 1,
         };
         let mut screen = Buffer::empty(Rect::new(0, 2, 6, 1));
 

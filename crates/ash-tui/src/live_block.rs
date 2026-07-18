@@ -21,9 +21,9 @@ const CHANGE_PREVIEW_MAX_LINES: usize = 12;
 
 /// A complete piece of output Ash still owns and can therefore re-render.
 ///
-/// Once an entry is emitted to stdout it is dropped from the live queue. The
-/// terminal's scrollback is deliberately not modeled here: it belongs to the
-/// terminal and cannot be safely reflowed after a resize.
+/// Pending blocks are kept only until a semantic boundary commits them to the
+/// terminal. The terminal's scrollback is deliberately not modeled here: it
+/// belongs to the terminal and cannot be safely reflowed after a resize.
 #[derive(Clone, Debug)]
 pub(crate) struct LiveBlock {
     id: u64,
