@@ -23,6 +23,7 @@ pub(crate) enum HistoryBlock {
     Error(String),
     Worked(String),
     SessionStarted,
+    SessionResumed,
 }
 
 impl HistoryBlock {
@@ -50,6 +51,10 @@ impl HistoryBlock {
         Self::SessionStarted
     }
 
+    pub(crate) const fn session_resumed() -> Self {
+        Self::SessionResumed
+    }
+
     pub(crate) fn render(&self, width: u16) -> Buffer {
         match self {
             Self::User {
@@ -60,7 +65,8 @@ impl HistoryBlock {
             Self::Info(message) => render_info(message, width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
             Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
-            Self::SessionStarted => render_session_started(width.max(1)),
+            Self::SessionStarted => render_session_marker("New session", width.max(1)),
+            Self::SessionResumed => render_session_marker("Resume session", width.max(1)),
         }
     }
 }
@@ -180,14 +186,11 @@ fn render_worked(elapsed: &str, width: u16) -> Buffer {
     buffer
 }
 
-fn render_session_started(width: u16) -> Buffer {
+fn render_session_marker(label: &str, width: u16) -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
-    buffer.set_string(
-        0,
-        0,
-        "New session",
-        Style::default().add_modifier(Modifier::DIM),
-    );
+    let style = Style::default().add_modifier(Modifier::DIM);
+    buffer.set_string(0, 0, "•", style);
+    buffer.set_string(USER_HORIZONTAL_INSET, 0, label, style);
     buffer
 }
 
@@ -305,11 +308,18 @@ mod tests {
     fn session_started_is_a_dim_label() {
         let buffer = HistoryBlock::session_started().render(32);
 
-        assert_eq!(row_text(&buffer, 0), "New session");
+        assert_eq!(row_text(&buffer, 0), "• New session");
         assert!(buffer
             .cell((0, 0))
-            .expect("divider")
+            .expect("session marker")
             .modifier
             .contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn resumed_session_uses_the_same_dim_prefix() {
+        let buffer = HistoryBlock::session_resumed().render(32);
+
+        assert_eq!(row_text(&buffer, 0), "• Resume session");
     }
 }

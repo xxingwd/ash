@@ -240,6 +240,7 @@ impl InlineTerminal {
     ) -> io::Result<()> {
         self.replace_viewport(|terminal| {
             terminal.prompt.set_context(protocol, model, working_dir);
+            terminal.push_history_block(HistoryBlock::session_resumed());
             terminal.push_restored_messages(messages);
         })
     }
