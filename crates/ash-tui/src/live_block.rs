@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -13,7 +11,6 @@ use crate::{
     markdown::render_markdown,
     scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{read_group_summary, tool_call_summary},
-    welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
@@ -33,7 +30,6 @@ pub(crate) struct LiveBlock {
 
 #[derive(Clone, Debug)]
 enum LiveBlockKind {
-    Welcome(PathBuf),
     History(HistoryBlock),
     Assistant(String),
     Thought(String),
@@ -49,10 +45,6 @@ enum LiveBlockKind {
 }
 
 impl LiveBlock {
-    pub(crate) fn welcome(id: u64, working_dir: PathBuf) -> Self {
-        Self::new(id, LiveBlockKind::Welcome(working_dir))
-    }
-
     pub(crate) fn history(id: u64, block: HistoryBlock) -> Self {
         Self::new(id, LiveBlockKind::History(block))
     }
@@ -138,7 +130,6 @@ impl LiveBlock {
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
         match &self.kind {
-            LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
             LiveBlockKind::History(block) => block.render(width),
             LiveBlockKind::Assistant(source) => {
                 render_markdown_block(source, Style::default(), width)
@@ -163,29 +154,6 @@ fn render_read_group(arguments: &[Value], width: u16) -> Buffer {
     let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
     let (action, detail) = read_group_summary(arguments, detail_width);
     render_tool_title(action, detail, false, width)
-}
-
-fn render_welcome(width: u16, working_dir: &std::path::Path) -> Buffer {
-    let lines = welcome_card(width, working_dir);
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
-    for (index, line) in lines.iter().take(usize::from(height)).enumerate() {
-        let Ok(y) = u16::try_from(index) else {
-            break;
-        };
-        buffer.set_line(0, y, &styled_welcome_line(line), width);
-    }
-    buffer
-}
-
-fn styled_welcome_line(line: &WelcomeLine) -> Line<'static> {
-    let content_style = match line.style {
-        WelcomeStyle::Subtitle => Style::default().add_modifier(Modifier::DIM),
-        WelcomeStyle::Logo | WelcomeStyle::Title => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    };
-    Line::styled(line.text.clone(), content_style)
 }
 
 fn render_markdown_block(source: &str, style: Style, width: u16) -> Buffer {
@@ -411,29 +379,5 @@ mod tests {
         )
         .render(1);
         assert_eq!(tiny.area.width, 1);
-    }
-
-    #[test]
-    fn welcome_title_is_left_aligned_and_subtitle_is_dim() {
-        let buffer = render_welcome(40, std::path::Path::new("/workspace/ash"));
-        assert_eq!(buffer.cell((0, 0)).expect("title").fg, Color::Cyan);
-        let subtitle_row = (0..buffer.area.height)
-            .find(|&row| {
-                (0..buffer.area.width)
-                    .filter_map(|column| buffer.cell((column, row)))
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-                    .contains("Terminal coding agent")
-            })
-            .expect("subtitle row");
-        assert_eq!(
-            buffer.cell((0, subtitle_row)).expect("subtitle").fg,
-            Color::Reset
-        );
-        assert!(buffer
-            .cell((0, subtitle_row))
-            .expect("subtitle")
-            .modifier
-            .contains(Modifier::DIM));
     }
 }

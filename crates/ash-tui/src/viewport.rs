@@ -53,6 +53,7 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) session_menu_selected: usize,
     pub(crate) model: &'a str,
     pub(crate) working_dir: &'a Path,
+    pub(crate) separate_from_output: bool,
 }
 
 pub(crate) struct ViewportFrame {
@@ -81,6 +82,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         &pending,
         input.busy,
         menu_rows,
+        input.separate_from_output,
     );
     let active_rows = active
         .as_ref()
@@ -88,25 +90,32 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let regions = viewport_regions(&pending, active_rows, input.busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
-    let area = Rect::new(0, 0, width, layout.height);
+    let top_gap = u16::from(input.separate_from_output);
+    let area = Rect::new(0, 0, width, layout.height.saturating_add(top_gap));
     let mut buffer = Buffer::empty(area);
     let mut composer_input_area = Rect::default();
 
-    for (region, area) in regions.iter().zip(&layout.areas) {
+    for (region, layout_area) in regions.iter().zip(&layout.areas) {
+        let area = Rect::new(
+            layout_area.x,
+            layout_area.y.saturating_add(top_gap),
+            layout_area.width,
+            layout_area.height,
+        );
         match region.kind {
             ViewportRegion::Pending(index) => {
                 if let Some(block) = pending.get(index) {
-                    blit_buffer(&mut buffer, *area, &block.buffer);
+                    blit_buffer(&mut buffer, area, &block.buffer);
                 }
             }
             ViewportRegion::Active => {
                 if let Some(active) = &active {
-                    render_active(*area, active, &mut buffer);
+                    render_active(area, active, &mut buffer);
                 }
             }
-            ViewportRegion::Status => render_status(*area, &input, &mut buffer),
+            ViewportRegion::Status => render_status(area, &input, &mut buffer),
             ViewportRegion::Composer => {
-                let (header_area, input_area, menu_area) = composer_areas(*area, menu_rows);
+                let (header_area, input_area, menu_area) = composer_areas(area, menu_rows);
                 composer_input_area = input_area;
                 render_prompt_header(header_area, &input, &mut buffer);
                 render_composer(input_area, &input, &mut buffer);
@@ -143,12 +152,13 @@ fn active_window<'a>(
     pending: &[RenderedPendingBlock],
     busy: bool,
     menu_rows: u16,
+    separate_from_output: bool,
 ) -> Option<ActiveWindow<'a>> {
     if active_lines.is_empty() {
         return None;
     }
 
-    let overhead = active_overhead(pending, busy, menu_rows);
+    let overhead = active_overhead(pending, busy, menu_rows, separate_from_output);
     let max_lines = usize::from(terminal_height.saturating_sub(overhead));
     let skip = active_lines.len().saturating_sub(max_lines);
     Some(ActiveWindow {
@@ -189,10 +199,15 @@ struct RegionSpec {
     item: StackItem,
 }
 
-fn active_overhead(pending: &[RenderedPendingBlock], busy: bool, menu_rows: u16) -> u16 {
+fn active_overhead(
+    pending: &[RenderedPendingBlock],
+    busy: bool,
+    menu_rows: u16,
+    separate_from_output: bool,
+) -> u16 {
     let regions = viewport_regions(pending, Some(0), busy, menu_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
-    stack_height(&items)
+    stack_height(&items).saturating_add(u16::from(separate_from_output))
 }
 
 fn viewport_regions(
@@ -475,6 +490,7 @@ mod tests {
             session_menu_selected: 0,
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
+            separate_from_output: false,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• answer");
@@ -506,6 +522,7 @@ mod tests {
             session_menu_selected: 0,
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
+            separate_from_output: false,
         });
 
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
@@ -537,6 +554,7 @@ mod tests {
             session_menu_selected: 0,
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
+            separate_from_output: false,
         });
 
         let menu = row_text(&frame.buffer, frame.buffer.area.height - 1);
@@ -566,6 +584,7 @@ mod tests {
             session_menu_selected: 0,
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
+            separate_from_output: false,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
@@ -595,9 +614,11 @@ mod tests {
             session_menu_selected: 0,
             model: "mock",
             working_dir: Path::new("/tmp/ash"),
+            separate_from_output: true,
         });
 
-        assert_eq!(row_text(&frame.buffer, 0), "• restored output");
+        assert_eq!(row_text(&frame.buffer, 0), "");
+        assert_eq!(row_text(&frame.buffer, 1), "• restored output");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
     }
 }

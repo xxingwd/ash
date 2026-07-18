@@ -162,6 +162,10 @@ impl InlineSurface {
         Ok(())
     }
 
+    pub(crate) const fn has_committed_output(&self) -> bool {
+        self.has_committed_output
+    }
+
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
         self.sync_terminal_size()?;
         let height = terminal::size()?.1.max(1);

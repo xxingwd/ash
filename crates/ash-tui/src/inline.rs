@@ -193,13 +193,7 @@ impl InlineTerminal {
     }
 
     pub fn welcome(&mut self) -> io::Result<()> {
-        self.enqueue_welcome();
-        self.commit_and_redraw()
-    }
-
-    fn enqueue_welcome(&mut self) {
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::welcome(id, self.prompt.working_dir.clone()));
+        self.redraw()
     }
 
     pub fn command_output(&mut self, message: &str) -> io::Result<()> {
@@ -217,7 +211,7 @@ impl InlineTerminal {
     }
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
-        self.replace_viewport(|terminal| terminal.enqueue_welcome())
+        self.replace_viewport(|_| {})
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
@@ -242,7 +236,6 @@ impl InlineTerminal {
     ) -> io::Result<()> {
         self.replace_viewport(|terminal| {
             terminal.prompt.set_context(protocol, model, working_dir);
-            terminal.enqueue_welcome();
             terminal.push_restored_messages(messages);
         })
     }
@@ -669,6 +662,7 @@ impl InlineTerminal {
             session_menu_selected,
             model: &model,
             working_dir: &self.prompt.working_dir,
+            separate_from_output: self.surface.has_committed_output(),
         })
     }
 }
