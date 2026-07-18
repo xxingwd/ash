@@ -133,9 +133,10 @@ impl StreamState {
                 tail,
             } if !source.is_empty() => {
                 let rendered = render_assistant_source(source, width);
+                let emitted = (*emitted_lines).min(rendered.len());
                 let stable_lines = stable_prefix_len(source, width, rendered.len());
-                let stable_lines = stable_lines.max(*emitted_lines).min(rendered.len());
-                let newly_stable = rendered[*emitted_lines..stable_lines].to_vec();
+                let stable_lines = stable_lines.max(emitted).min(rendered.len());
+                let newly_stable = rendered[emitted..stable_lines].to_vec();
                 *emitted_lines = stable_lines;
                 *tail = rendered[stable_lines..].to_vec();
                 let first_line = !*first_line_emitted;
