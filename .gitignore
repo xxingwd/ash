@@ -6,3 +6,6 @@
 /test
 *.local
 *.log
+/TECH_STACK.md
+/架构.md
+/pi/
