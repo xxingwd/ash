@@ -223,18 +223,7 @@ impl InlineTerminal {
     }
 
     pub fn start_new_session(&mut self) -> io::Result<()> {
-        self.begin_fresh_viewport()?;
-        self.enqueue_welcome();
-        self.redraw()
-    }
-
-    fn begin_fresh_viewport(&mut self) -> io::Result<()> {
-        self.synchronized(|terminal| {
-            terminal.flush_all_live_blocks()?;
-            terminal.reset_inline_state()?;
-            terminal.history_boundary = StackBoundary::default();
-            Ok(())
-        })
+        self.replace_viewport(|terminal| terminal.enqueue_welcome())
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
@@ -259,11 +248,11 @@ impl InlineTerminal {
         model: &str,
         working_dir: &Path,
     ) -> io::Result<()> {
-        self.begin_fresh_viewport()?;
-        self.prompt.set_context(protocol, model, working_dir);
-        self.enqueue_welcome();
-        self.push_restored_messages(messages);
-        self.redraw()
+        self.replace_viewport(|terminal| {
+            terminal.prompt.set_context(protocol, model, working_dir);
+            terminal.enqueue_welcome();
+            terminal.push_restored_messages(messages);
+        })
     }
 
     pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
@@ -407,7 +396,7 @@ impl InlineTerminal {
     pub fn resize(&mut self, input: &InputState, width: u16, height: u16) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        self.surface.resize(width, height);
+        self.surface.resize(width, height)?;
         if self.stream.is_reasoning() {
             self.stream
                 .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
@@ -501,6 +490,18 @@ impl InlineTerminal {
 
     fn redraw_at(&mut self, width: u16, height: u16) -> io::Result<()> {
         self.synchronized(|terminal| {
+            terminal.flush_live_overflow(width, height)?;
+            terminal.render_viewport(width, height)
+        })
+    }
+
+    fn replace_viewport(&mut self, prepare: impl FnOnce(&mut Self)) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        self.synchronized(|terminal| {
+            terminal.flush_all_live_blocks()?;
+            terminal.reset_inline_state()?;
+            terminal.history_boundary = StackBoundary::default();
+            prepare(terminal);
             terminal.flush_live_overflow(width, height)?;
             terminal.render_viewport(width, height)
         })
