@@ -11,14 +11,14 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 
 ## 运行
 
-推荐使用启动脚本：
+直接运行 CLI：
 
 ```bash
 export ASH_PROTOCOL=openai-responses
 export ASH_MODEL=gpt-5
 export ASH_BASE_URL=https://api.example.com
 export ASH_API_KEY=...
-./start.sh
+cargo run -p ash-cli --
 ```
 
 也可以直接写入项目根目录的 `.env`：

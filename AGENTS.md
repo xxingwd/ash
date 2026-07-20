@@ -8,7 +8,6 @@ Ash is a Rust 2021 workspace under `crates/`. `ash-core` defines shared types; `
 
 - `cargo build --workspace` builds every crate in debug mode.
 - `cargo run -p ash-cli -- --print "inspect this project"` runs a single non-interactive request.
-- `./start.sh` launches the CLI and forwards any arguments to `ash-cli`.
 - `cargo test --workspace` runs all unit, integration, and snapshot tests.
 - `cargo fmt --all -- --check` verifies standard Rust formatting.
 - `cargo clippy --workspace --all-targets -- -D warnings` treats every lint warning as an error.
