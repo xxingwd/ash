@@ -142,14 +142,7 @@ impl InlineSurface {
         self.sync_terminal_size()?;
         let width = terminal::size()?.0.max(1);
         let leading_blank = self.has_committed_output;
-        let mut output = Buffer::empty(Rect::new(
-            0,
-            0,
-            width,
-            buffer.area.height.saturating_add(u16::from(leading_blank)),
-        ));
-        let target_y = u16::from(leading_blank);
-        copy_buffer(buffer, &mut output, 0, target_y, buffer.area.height);
+        let output = committed_output(buffer, width, leading_blank);
         self.terminal.insert_before(output.area.height, |target| {
             copy_buffer(&output, target, 0, 0, output.area.height);
         })?;
@@ -160,31 +153,6 @@ impl InlineSurface {
 
     pub(crate) const fn has_committed_output(&self) -> bool {
         self.has_committed_output
-    }
-
-    pub(crate) fn release_frame(&mut self) -> io::Result<()> {
-        self.sync_terminal_size()?;
-        let (width, height) = terminal::size()?;
-        let area = self.terminal.current_buffer_mut().area;
-        let frame_bottom = area.y.saturating_add(self.rendered_rows).min(height.max(1));
-        let prompt_y = if frame_bottom < height.saturating_sub(1) {
-            queue!(
-                self.terminal.backend_mut().writer_mut(),
-                MoveTo(0, frame_bottom)
-            )?;
-            frame_bottom
-        } else {
-            let writer = self.terminal.backend_mut().writer_mut();
-            queue!(writer, MoveTo(0, height.saturating_sub(1)))?;
-            write!(writer, "\r\n")?;
-            height.saturating_sub(1)
-        };
-        self.terminal
-            .set_viewport_area(Rect::new(0, prompt_y, width.max(1), 1));
-        self.terminal.force_redraw();
-        self.rendered_rows = 0;
-        self.has_committed_output = true;
-        Ok(())
     }
 
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
@@ -245,6 +213,23 @@ fn render_area(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
             .saturating_add(frame.cursor_row.saturating_sub(hidden_rows))
             .min(screen.area.bottom().saturating_sub(1)),
     )
+}
+
+fn committed_output(buffer: &Buffer, width: u16, leading_blank: bool) -> Buffer {
+    let mut output = Buffer::empty(Rect::new(
+        0,
+        0,
+        width.max(1),
+        buffer.area.height.saturating_add(u16::from(leading_blank)),
+    ));
+    copy_buffer(
+        buffer,
+        &mut output,
+        0,
+        u16::from(leading_blank),
+        buffer.area.height,
+    );
+    output
 }
 
 fn copy_buffer(
@@ -339,6 +324,21 @@ mod tests {
         assert_eq!(row_text(&screen, 0), "three");
         assert_eq!(row_text(&screen, 1), "four");
         assert_eq!(cursor, Position::new(1, 1));
+    }
+
+    #[test]
+    fn committed_output_preserves_rows_taller_than_the_viewport() {
+        let mut source = Buffer::empty(Rect::new(0, 0, 6, 4));
+        for (row, text) in ["one", "two", "three", "four"].into_iter().enumerate() {
+            source.set_string(0, row as u16, text, Style::default());
+        }
+
+        let output = committed_output(&source, 6, true);
+
+        assert_eq!(output.area.height, 5);
+        assert_eq!(row_text(&output, 0), "");
+        assert_eq!(row_text(&output, 1), "one");
+        assert_eq!(row_text(&output, 4), "four");
     }
 
     #[test]

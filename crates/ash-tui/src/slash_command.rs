@@ -76,19 +76,6 @@ const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-impl SlashCommand {
-    pub(crate) fn available_during_task(self) -> bool {
-        matches!(self, Self::Exit)
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        COMMANDS
-            .iter()
-            .find(|spec| spec.command == self)
-            .map_or("command", |spec| spec.name)
-    }
-}
-
 pub(crate) fn parse(input: &str) -> ParsedInput {
     let input = input.trim();
     let Some(command_line) = input.strip_prefix('/') else {
@@ -132,13 +119,10 @@ pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {
     Some(input[1..cursor.max(1)].to_ascii_lowercase())
 }
 
-fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
+fn completions(filter: &str) -> Vec<CommandCompletion> {
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
-    for spec in COMMANDS
-        .iter()
-        .filter(|spec| !busy || spec.command.available_during_task())
-    {
+    for spec in COMMANDS {
         let names = std::iter::once(spec.name).chain(spec.aliases.iter().copied());
         let is_exact = names.clone().any(|name| name == filter);
         let is_prefix = names.into_iter().any(|name| name.starts_with(filter));
@@ -157,7 +141,7 @@ fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
 }
 
 impl CommandCompletionState {
-    pub(crate) fn sync(&mut self, input: &str, cursor: usize, busy: bool) {
+    pub(crate) fn sync(&mut self, input: &str, cursor: usize) {
         let filter = completion_filter(input, cursor);
         if filter != self.filter {
             self.filter.clone_from(&filter);
@@ -168,10 +152,7 @@ impl CommandCompletionState {
             self.items.clear();
             return;
         }
-        self.items = filter
-            .as_deref()
-            .map(|filter| completions(filter, busy))
-            .unwrap_or_default();
+        self.items = filter.as_deref().map(completions).unwrap_or_default();
         if self.items.is_empty() {
             self.selected = 0;
         } else {
@@ -214,6 +195,10 @@ impl CommandCompletionState {
         self.selected = 0;
     }
 
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
     pub(crate) fn is_visible(&self) -> bool {
         !self.items.is_empty()
     }
@@ -242,45 +227,30 @@ mod tests {
     }
 
     #[test]
-    fn only_exit_is_available_during_a_task() {
-        assert!(SlashCommand::Exit.available_during_task());
-        assert!(!SlashCommand::New.available_during_task());
-        assert!(!SlashCommand::Clear.available_during_task());
-        assert!(!SlashCommand::Resume.available_during_task());
-    }
-
-    #[test]
     fn completes_commands_by_name_and_alias_prefix() {
         assert_eq!(
-            completions("cl", false),
+            completions("cl"),
             vec![CommandCompletion {
                 name: "clear",
                 description: "start a new chat",
             }]
         );
-        assert_eq!(completions("q", false)[0].name, "exit");
+        assert_eq!(completions("q")[0].name, "exit");
     }
 
     #[test]
     fn completion_state_navigates_and_can_be_dismissed() {
         let mut state = CommandCompletionState::default();
-        state.sync("/", 1, false);
+        state.sync("/", 1);
         assert_eq!(state.selected().unwrap().name, "new");
         state.move_down();
         assert_eq!(state.selected().unwrap().name, "clear");
         state.move_up();
         assert_eq!(state.selected().unwrap().name, "new");
         state.dismiss();
-        state.sync("/", 1, false);
+        state.sync("/", 1);
         assert!(!state.is_visible());
-        state.sync("/h", 2, false);
+        state.sync("/h", 2);
         assert_eq!(state.selected().unwrap().name, "help");
-    }
-
-    #[test]
-    fn busy_completion_only_shows_available_commands() {
-        let items = completions("", true);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, "exit");
     }
 }

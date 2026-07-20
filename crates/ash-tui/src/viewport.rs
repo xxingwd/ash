@@ -44,7 +44,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) status_header: &'a str,
     pub(crate) status_dots: &'a str,
     pub(crate) elapsed: &'a str,
-    pub(crate) queued: &'a str,
     pub(crate) prompt: &'a str,
     pub(crate) prompt_cursor_column: u16,
     pub(crate) command_menu: &'a [CommandCompletion],
@@ -312,16 +311,10 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         return;
     }
     let line = if area.width < COMPACT_STATUS_WIDTH {
-        Line::from(vec![
-            Span::styled(
-                format!("{}{}", input.status_header, input.status_dots),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                input.queued.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
+        Line::from(Span::styled(
+            format!("{}{}", input.status_header, input.status_dots),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(vec![
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
@@ -334,7 +327,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
-                format!(" ({} • esc to interrupt){}", input.elapsed, input.queued),
+                format!(" ({} • esc to interrupt)", input.elapsed),
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])
@@ -513,7 +506,6 @@ mod tests {
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
-            queued: "",
             prompt: "draft",
             prompt_cursor_column: 5,
             command_menu: &[],
@@ -546,7 +538,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt: "/cl",
             prompt_cursor_column: 3,
             command_menu: &menu,
@@ -579,7 +570,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt: "",
             prompt_cursor_column: 0,
             command_menu: &[],
@@ -610,7 +600,6 @@ mod tests {
             status_header: "Thinking",
             status_dots: "...",
             elapsed: "0s",
-            queued: "",
             prompt: "",
             prompt_cursor_column: 0,
             command_menu: &[],
@@ -645,7 +634,6 @@ mod tests {
             status_header: "Working",
             status_dots: "...",
             elapsed: "1s",
-            queued: "",
             prompt: "",
             prompt_cursor_column: 0,
             command_menu: &[],
@@ -680,7 +668,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt: "",
             prompt_cursor_column: 0,
             command_menu: &[],

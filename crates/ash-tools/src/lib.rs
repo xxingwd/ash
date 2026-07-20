@@ -20,15 +20,13 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
 }
 
 pub fn tools(enabled: Option<&[String]>) -> Vec<Arc<dyn Tool>> {
-    let default = ["read", "bash", "edit", "write"];
-    all_tools()
+    let tools = all_tools();
+    let Some(names) = enabled else {
+        return tools;
+    };
+    tools
         .into_iter()
-        .filter(|tool| {
-            enabled.map_or_else(
-                || default.contains(&tool.name()),
-                |enabled| enabled.iter().any(|name| name == tool.name()),
-            )
-        })
+        .filter(|tool| names.iter().any(|name| name == tool.name()))
         .collect()
 }
 
@@ -64,13 +62,16 @@ mod tests {
     }
 
     #[test]
-    fn enables_only_coding_tools_by_default() {
+    fn enables_all_tools_by_default() {
         let names = default_tools()
             .into_iter()
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["read", "bash", "edit", "write"]);
+        assert_eq!(
+            names,
+            ["read", "bash", "edit", "write", "grep", "find", "ls"]
+        );
     }
 
     #[test]

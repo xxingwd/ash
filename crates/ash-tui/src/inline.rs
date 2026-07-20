@@ -28,7 +28,6 @@ const TERMINAL_SAFE_COLUMN: u16 = 1;
 
 #[derive(Debug)]
 struct PromptSnapshot {
-    protocol: String,
     model: String,
     working_dir: PathBuf,
     text: String,
@@ -36,9 +35,8 @@ struct PromptSnapshot {
 }
 
 impl PromptSnapshot {
-    fn new(protocol: &str, model: &str, working_dir: &Path) -> Self {
+    fn new(model: &str, working_dir: &Path) -> Self {
         Self {
-            protocol: protocol.to_string(),
             model: model.to_string(),
             working_dir: working_dir.to_path_buf(),
             text: String::new(),
@@ -46,8 +44,7 @@ impl PromptSnapshot {
         }
     }
 
-    fn set_context(&mut self, protocol: &str, model: &str, working_dir: &Path) {
-        self.protocol = protocol.to_string();
+    fn set_context(&mut self, model: &str, working_dir: &Path) {
         self.model = model.to_string();
         self.working_dir = working_dir.to_path_buf();
     }
@@ -58,7 +55,6 @@ struct StatusState {
     header: String,
     started_at: Option<Instant>,
     frame: usize,
-    queued_messages: usize,
 }
 
 impl StatusState {
@@ -89,7 +85,7 @@ impl StatusState {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 enum ActiveMenu {
     #[default]
     None,
@@ -106,7 +102,6 @@ enum ActiveMenu {
 #[derive(Debug, Default)]
 struct MenuState {
     active: ActiveMenu,
-    dirty: bool,
 }
 
 impl MenuState {
@@ -123,10 +118,7 @@ impl MenuState {
                 selected,
             }
         };
-        if self.active != active {
-            self.active = active;
-            self.dirty = true;
-        }
+        self.active = active;
     }
 
     fn set_sessions(&mut self, items: &[SessionSummary], selected: usize) {
@@ -139,10 +131,7 @@ impl MenuState {
                 selected,
             }
         };
-        if self.active != active {
-            self.active = active;
-            self.dirty = true;
-        }
+        self.active = active;
     }
 
     fn commands(&self) -> (&[CommandCompletion], usize) {
@@ -169,7 +158,6 @@ pub(crate) struct InlineTerminal {
     prompt: PromptSnapshot,
     pending_blocks: Vec<LiveBlock>,
     next_live_block_id: u64,
-    show_composer: bool,
     status: StatusState,
     menus: MenuState,
     stream: StreamState,
@@ -178,14 +166,13 @@ pub(crate) struct InlineTerminal {
 }
 
 impl InlineTerminal {
-    pub fn enter(protocol: &str, model: &str, working_dir: &Path) -> io::Result<Self> {
+    pub fn enter(model: &str, working_dir: &Path) -> io::Result<Self> {
         let surface = InlineSurface::enter()?;
         Ok(Self {
             surface,
-            prompt: PromptSnapshot::new(protocol, model, working_dir),
+            prompt: PromptSnapshot::new(model, working_dir),
             pending_blocks: Vec::new(),
             next_live_block_id: 1,
-            show_composer: true,
             status: StatusState::default(),
             menus: MenuState::default(),
             stream: StreamState::default(),
@@ -234,22 +221,14 @@ impl InlineTerminal {
     pub fn restore_session(
         &mut self,
         messages: &[Message],
-        protocol: &str,
         model: &str,
         working_dir: &Path,
     ) -> io::Result<()> {
         self.replace_viewport(|terminal| {
-            terminal.prompt.set_context(protocol, model, working_dir);
+            terminal.prompt.set_context(model, working_dir);
             terminal.push_history_block(HistoryBlock::session_resumed());
             terminal.push_restored_messages(messages);
         })
-    }
-
-    pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
-        self.status.header = format!("/{command} unavailable while working");
-        self.refresh_status()
     }
 
     pub fn set_command_menu(&mut self, items: &[CommandCompletion], selected: usize) {
@@ -274,7 +253,6 @@ impl InlineTerminal {
         let view = input.view(input_width);
         self.prompt.text = view.text;
         self.prompt.cursor_column = view.cursor_column;
-        self.menus.dirty = false;
         self.redraw_at(width, height)
     }
 
@@ -283,17 +261,14 @@ impl InlineTerminal {
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.current_turn_id = Some(turn_id);
         self.status.start("Working");
-        self.show_composer = false;
         self.stage_user_message(input);
         self.redraw()
     }
 
-    pub fn commit_exit(&mut self, input: &str) -> io::Result<()> {
+    pub fn commit_exit(&mut self, input: &str) {
         self.current_turn_id = None;
         self.status.stop();
-        self.show_composer = false;
         self.stage_user_message(input);
-        self.redraw()
     }
 
     fn stage_user_message(&mut self, input: &str) {
@@ -384,10 +359,6 @@ impl InlineTerminal {
         })
     }
 
-    pub fn set_queued_messages(&mut self, queued_messages: usize) {
-        self.status.queued_messages = queued_messages;
-    }
-
     pub fn refresh_status(&mut self) -> io::Result<()> {
         if !self.status.is_busy() {
             return Ok(());
@@ -409,12 +380,8 @@ impl InlineTerminal {
         self.synchronized(|terminal| {
             terminal.finish_stream();
             terminal.status.stop();
-            if !terminal.pending_blocks.is_empty() {
-                terminal.show_composer = false;
-                terminal.render_viewport()?;
-                terminal.surface.release_frame()?;
-                terminal.pending_blocks.clear();
-            }
+            terminal.commit_pending_blocks()?;
+            terminal.surface.reset()?;
             terminal.surface.leave_screen()
         })
     }
@@ -460,7 +427,6 @@ impl InlineTerminal {
         self.prompt.text.clear();
         self.prompt.cursor_column = 0;
         self.menus.clear();
-        self.show_composer = true;
         self.reset_turn_state();
         Ok(())
     }
@@ -469,7 +435,6 @@ impl InlineTerminal {
         self.status.reset();
         self.current_turn_id = None;
         self.stream.reset();
-        self.show_composer = true;
     }
 
     fn markdown_width(&self) -> io::Result<u16> {
@@ -484,13 +449,9 @@ impl InlineTerminal {
     }
 
     fn finish_turn_frame(&mut self) -> io::Result<()> {
-        self.show_composer = false;
         let result = self.synchronized(|terminal| {
-            terminal.render_viewport()?;
-            terminal.surface.release_frame()?;
-            terminal.pending_blocks.clear();
+            terminal.commit_pending_blocks()?;
             terminal.current_turn_id = None;
-            terminal.show_composer = true;
             terminal.render_viewport()
         });
         self.current_turn_id = None;
@@ -662,7 +623,6 @@ impl InlineTerminal {
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
         let elapsed = format_elapsed(self.status.elapsed_seconds());
         let status_header = sanitize_single_line(&self.status.header);
-        let queued = queued_status(self.status.queued_messages);
         let model = sanitize_single_line(&self.prompt.model);
         let (command_menu, command_menu_selected) = self.menus.commands();
         let (session_menu, session_menu_selected) = self.menus.sessions();
@@ -675,7 +635,6 @@ impl InlineTerminal {
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
-            queued: &queued,
             prompt: &self.prompt.text,
             prompt_cursor_column: self.prompt.cursor_column,
             command_menu,
@@ -685,7 +644,7 @@ impl InlineTerminal {
             model: &model,
             working_dir: &self.prompt.working_dir,
             separate_from_output: self.surface.has_committed_output(),
-            show_composer: self.show_composer,
+            show_composer: !self.status.is_busy(),
         })
     }
 }
@@ -698,14 +657,6 @@ fn status_dots(frame: usize) -> &'static str {
 fn terminal_size() -> io::Result<(u16, u16)> {
     let (width, height) = terminal::size()?;
     Ok((width.max(1), height.max(1)))
-}
-
-fn queued_status(queued_messages: usize) -> String {
-    match queued_messages {
-        0 => String::new(),
-        1 => " · 1 queued".to_string(),
-        count => format!(" · {count} queued"),
-    }
 }
 
 #[cfg(test)]
@@ -726,12 +677,5 @@ mod tests {
     fn reserves_one_row_per_command_completion() {
         assert_eq!(viewport::command_menu_rows(0), 0);
         assert_eq!(viewport::command_menu_rows(3), 3);
-    }
-
-    #[test]
-    fn formats_queued_message_status() {
-        assert_eq!(queued_status(0), "");
-        assert_eq!(queued_status(1), " · 1 queued");
-        assert_eq!(queued_status(3), " · 3 queued");
     }
 }
