@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{cell::RefCell, path::PathBuf, sync::Arc};
 
 use ratatui::{
     buffer::Buffer,
@@ -11,25 +11,27 @@ use serde_json::Value;
 use crate::{
     history_block::HistoryBlock,
     markdown::render_markdown,
-    palette::Rgb,
     scrollback::{sanitize_terminal_text, wrap_text},
-    tool_display::{read_group_summary, tool_call_summary},
+    tool_display::{read_group_detail, read_group_summary, tool_call_summary},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
 const CHANGE_PREVIEW_MAX_LINES: usize = 12;
 
-/// A complete piece of output Ash still owns and can therefore re-render.
-///
-/// Once an entry is emitted to stdout it is dropped from the live queue. The
-/// terminal's scrollback is deliberately not modeled here: it belongs to the
-/// terminal and cannot be safely reflowed after a resize.
+/// A complete transcript entry retained by Ash and re-rendered after updates.
 #[derive(Clone, Debug)]
 pub(crate) struct LiveBlock {
     id: u64,
     turn_id: Option<u64>,
     kind: LiveBlockKind,
+    cache: RefCell<Option<RenderCache>>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderCache {
+    width: u16,
+    buffer: Arc<Buffer>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,10 +39,12 @@ enum LiveBlockKind {
     Welcome(PathBuf),
     History(HistoryBlock),
     Assistant(String),
-    Thought(String),
-    ReadGroup {
-        arguments: Vec<Value>,
+    Thought {
+        source: String,
+        elapsed_seconds: u64,
+        expanded: bool,
     },
+    ReadGroup(Vec<String>),
     Tool {
         name: String,
         arguments: Value,
@@ -62,8 +66,15 @@ impl LiveBlock {
         Self::new(id, LiveBlockKind::Assistant(source))
     }
 
-    pub(crate) fn thought(id: u64, source: String) -> Self {
-        Self::new(id, LiveBlockKind::Thought(source))
+    pub(crate) fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
+        Self::new(
+            id,
+            LiveBlockKind::Thought {
+                source,
+                elapsed_seconds,
+                expanded: false,
+            },
+        )
     }
 
     pub(crate) fn tool(
@@ -73,13 +84,10 @@ impl LiveBlock {
         output: String,
         is_error: bool,
     ) -> Self {
-        if name == "read" && !is_error {
-            return Self::new(
-                id,
-                LiveBlockKind::ReadGroup {
-                    arguments: vec![arguments],
-                },
-            );
+        if !is_error {
+            if let Some(detail) = read_group_detail(&name, &arguments) {
+                return Self::new(id, LiveBlockKind::ReadGroup(vec![detail]));
+            }
         }
         Self::new(
             id,
@@ -97,6 +105,7 @@ impl LiveBlock {
             id,
             turn_id: None,
             kind,
+            cache: RefCell::new(None),
         }
     }
 
@@ -113,43 +122,90 @@ impl LiveBlock {
         self.turn_id == Some(turn_id)
     }
 
+    pub(crate) const fn turn_id(&self) -> Option<u64> {
+        self.turn_id
+    }
+
+    pub(crate) fn is_response_for_turn(&self, turn_id: u64) -> bool {
+        self.belongs_to_turn(turn_id)
+            && !matches!(self.kind, LiveBlockKind::History(HistoryBlock::User(_)))
+    }
+
+    pub(crate) fn is_thought(&self) -> bool {
+        matches!(self.kind, LiveBlockKind::Thought { .. })
+    }
+
+    pub(crate) fn toggle_thought(&mut self) -> bool {
+        let LiveBlockKind::Thought { expanded, .. } = &mut self.kind else {
+            return false;
+        };
+        *expanded = !*expanded;
+        self.invalidate();
+        true
+    }
+
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
         let LiveBlockKind::Assistant(current) = &mut self.kind else {
             return false;
         };
         current.push_str(source);
+        self.invalidate();
         true
     }
 
-    pub(crate) fn try_append_read(
+    pub(crate) fn try_append_tool(
         &mut self,
         name: &str,
         arguments: &Value,
         is_error: bool,
     ) -> bool {
-        if name != "read" || is_error {
+        if is_error {
             return false;
         }
-        let LiveBlockKind::ReadGroup { arguments: current } = &mut self.kind else {
+        let Some(detail) = read_group_detail(name, arguments) else {
             return false;
         };
-        current.push(arguments.clone());
+        let LiveBlockKind::ReadGroup(details) = &mut self.kind else {
+            return false;
+        };
+        details.push(detail);
+        self.invalidate();
         true
     }
 
-    pub(crate) fn render(&self, width: u16, composer_background: Option<Rgb>) -> Buffer {
+    pub(crate) fn render(&self, width: u16) -> Arc<Buffer> {
+        let width = width.max(1);
+        if let Some(buffer) = self
+            .cache
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.width == width)
+            .map(|cached| Arc::clone(&cached.buffer))
+        {
+            return buffer;
+        }
+
+        let buffer = Arc::new(self.render_uncached(width));
+        self.cache.replace(Some(RenderCache {
+            width,
+            buffer: Arc::clone(&buffer),
+        }));
+        buffer
+    }
+
+    fn render_uncached(&self, width: u16) -> Buffer {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
-            LiveBlockKind::History(block) => block.render(width, composer_background),
+            LiveBlockKind::History(block) => block.render(width),
             LiveBlockKind::Assistant(source) => {
                 render_markdown_block(source, Style::default(), width)
             }
-            LiveBlockKind::Thought(source) => render_markdown_block(
+            LiveBlockKind::Thought {
                 source,
-                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
-                width,
-            ),
-            LiveBlockKind::ReadGroup { arguments } => render_read_group(arguments, width),
+                elapsed_seconds,
+                expanded,
+            } => render_thought(source, *elapsed_seconds, *expanded, width),
+            LiveBlockKind::ReadGroup(details) => render_read_group(details, width),
             LiveBlockKind::Tool {
                 name,
                 arguments,
@@ -158,11 +214,58 @@ impl LiveBlock {
             } => render_tool(name, arguments, output, *is_error, width),
         }
     }
+
+    fn invalidate(&mut self) {
+        self.cache.get_mut().take();
+    }
 }
 
-fn render_read_group(arguments: &[Value], width: u16) -> Buffer {
+fn render_thought(source: &str, elapsed_seconds: u64, expanded: bool, width: u16) -> Buffer {
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+    let content_x = if width > BULLET_PREFIX_COLUMNS {
+        BULLET_PREFIX_COLUMNS
+    } else {
+        0
+    };
+    let content_width = width.saturating_sub(content_x).max(1);
+    let mut body = if expanded {
+        render_markdown(source, content_width)
+    } else {
+        Vec::new()
+    };
+    for line in &mut body {
+        line.patch_style(style);
+    }
+
+    let height = u16::try_from(body.len().saturating_add(1))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
+    let marker = if expanded { "▾ " } else { "▸ " };
+    buffer.set_line(
+        0,
+        0,
+        &Line::styled(
+            format!(
+                "{marker}Thought for {}",
+                crate::stream_state::format_elapsed(elapsed_seconds)
+            ),
+            style,
+        ),
+        width,
+    );
+    for (index, line) in body.iter().enumerate() {
+        let Ok(y) = u16::try_from(index.saturating_add(1)) else {
+            break;
+        };
+        buffer.set_line(content_x, y, &line.ratatui_line(), content_width);
+    }
+    buffer
+}
+
+fn render_read_group(details: &[String], width: u16) -> Buffer {
     let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let (action, detail) = read_group_summary(arguments, detail_width);
+    let (action, detail) = read_group_summary(details, detail_width);
     render_tool_title(action, detail, false, width)
 }
 
@@ -353,21 +456,57 @@ mod tests {
     fn markdown_blocks_reflow_at_the_current_width() {
         let block = LiveBlock::assistant(1, "a long line that must wrap".to_string());
 
-        let narrow = block.render(10, None);
-        let wide = block.render(40, None);
+        let narrow = block.render(10);
+        let wide = block.render(40);
 
         assert!(narrow.area.height > wide.area.height);
     }
 
     #[test]
-    fn blocks_keep_turn_ownership() {
-        let block = LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(7));
+    fn completed_blocks_reuse_rendering_until_the_content_changes() {
+        let mut block = LiveBlock::assistant(1, "hello".to_string());
 
-        assert!(block.belongs_to_turn(7));
+        let first = block.render(40);
+        let second = block.render(40);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        assert!(block.append_markdown_source(" world"));
+        let updated = block.render(40);
+        assert!(!std::sync::Arc::ptr_eq(&first, &updated));
     }
 
     #[test]
-    fn consecutive_successful_reads_share_one_summary() {
+    fn blocks_keep_turn_ownership() {
+        let response = LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(7));
+        let input = LiveBlock::history(2, HistoryBlock::user("question")).with_turn(Some(7));
+
+        assert!(response.belongs_to_turn(7));
+        assert!(response.is_response_for_turn(7));
+        assert!(!input.is_response_for_turn(7));
+    }
+
+    #[test]
+    fn completed_thoughts_toggle_between_summary_and_full_source() {
+        let mut block = LiveBlock::thought(1, "first\nsecond".to_string(), 3);
+
+        let collapsed = block.render(40);
+        assert!(block.is_thought());
+        assert_eq!(collapsed.area.height, 1);
+        assert!(row_text(&collapsed, 0).contains("▸ Thought for 3s"));
+
+        assert!(block.toggle_thought());
+        let expanded = block.render(40);
+        assert_eq!(expanded.area.height, 3);
+        assert!(row_text(&expanded, 0).contains("▾ Thought for 3s"));
+        assert_eq!(row_text(&expanded, 1), "  first");
+        assert_eq!(row_text(&expanded, 2), "  second");
+
+        assert!(block.toggle_thought());
+        assert_eq!(block.render(40).area.height, 1);
+    }
+
+    #[test]
+    fn consecutive_successful_matching_tools_share_one_summary() {
         let mut block = LiveBlock::tool(
             1,
             "read".to_string(),
@@ -376,23 +515,45 @@ mod tests {
             false,
         );
 
-        assert!(block.try_append_read(
+        assert!(block.try_append_tool(
             "read",
             &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
             false,
         ));
-        assert!(!block.try_append_read(
+        assert!(!block.try_append_tool(
+            "bash",
+            &serde_json::json!({"command": "rg ToolGroup src"}),
+            false,
+        ));
+        assert!(!block.try_append_tool(
             "read",
             &serde_json::json!({"path": "/workspace/src/live_block.rs"}),
             true,
         ));
 
-        let buffer = block.render(80, None);
+        let buffer = block.render(80);
         let rendered = (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, 0)))
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("• Read inline.rs, viewport.rs"));
+    }
+
+    #[test]
+    fn non_groupable_tools_remain_independent() {
+        let mut block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "cargo test"}),
+            String::new(),
+            false,
+        );
+
+        assert!(!block.try_append_tool(
+            "bash",
+            &serde_json::json!({"command": "cargo clippy"}),
+            false,
+        ));
     }
 
     #[test]
@@ -404,7 +565,7 @@ mod tests {
             "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
             false,
         )
-        .render(60, None);
+        .render(60);
         let write = LiveBlock::tool(
             2,
             "write".to_string(),
@@ -412,7 +573,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(60, None);
+        .render(60);
 
         assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
@@ -425,7 +586,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(1, None);
+        .render(1);
         assert_eq!(tiny.area.width, 1);
     }
 
@@ -458,5 +619,15 @@ mod tests {
             .expect("subtitle")
             .modifier
             .contains(Modifier::DIM));
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, y)))
+            .filter(|cell| !cell.skip)
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 }

@@ -8,7 +8,7 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
+use crate::{model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 
 pub struct AnthropicAdapter {
     config: ProviderConfig,
@@ -31,11 +31,11 @@ impl AnthropicAdapter {
             .trim_end_matches('/')
     }
 
-    fn build_request(&self, req: &LlmRequest) -> Value {
+    fn build_request(&self, req: &LlmRequest) -> Result<Value, ProtocolError> {
         let messages: Vec<Value> = req
             .messages
             .iter()
-            .map(|msg| match &msg.content {
+            .filter_map(|msg| match &msg.content {
                 MessageContent::User(contents) => {
                     let content: Vec<Value> = contents
                         .iter()
@@ -53,26 +53,27 @@ impl AnthropicAdapter {
                             }),
                         })
                         .collect();
-                    json!({"role": "user", "content": content})
+                    Some(json!({"role": "user", "content": content}))
                 }
                 MessageContent::Assistant(blocks) => {
                     let content: Vec<Value> = blocks
                         .iter()
-                        .map(|block| match block {
-                            ContentBlock::Text(text) => json!({"type": "text", "text": text}),
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(json!({"type": "text", "text": text})),
+                            ContentBlock::Thought { .. } => None,
                             ContentBlock::ToolCall {
                                 id,
                                 name,
                                 arguments,
-                            } => json!({
+                            } => Some(json!({
                                 "type": "tool_use",
                                 "id": id.as_str(),
                                 "name": name,
                                 "input": arguments,
-                            }),
+                            })),
                         })
                         .collect();
-                    json!({"role": "assistant", "content": content})
+                    (!content.is_empty()).then(|| json!({"role": "assistant", "content": content}))
                 }
                 MessageContent::ToolResult {
                     id,
@@ -95,7 +96,7 @@ impl AnthropicAdapter {
                             }
                         }),
                     }));
-                    json!({
+                    Some(json!({
                         "role": "user",
                         "content": [{
                             "type": "tool_result",
@@ -103,7 +104,7 @@ impl AnthropicAdapter {
                             "content": content,
                             "is_error": is_error,
                         }]
-                    })
+                    }))
                 }
             })
             .collect();
@@ -132,18 +133,20 @@ impl AnthropicAdapter {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        body
+        model_config::apply_from_env(&mut body)?;
+        Ok(body)
     }
 }
 
 impl ProtocolAdapter for AnthropicAdapter {
     fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ProtocolError> {
+        let body = self.build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url()))
             .header("x-api-key", self.config.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
-            .json(&self.build_request(&req));
+            .json(&body);
         sse::stream(request, AnthropicDecoder::default())
     }
 }
@@ -278,7 +281,9 @@ impl sse::Decoder for AnthropicDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
-    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Protocol, Role,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -314,6 +319,37 @@ mod tests {
     }
 
     #[test]
+    fn omits_persisted_thoughts_from_anthropic_history() {
+        let adapter = AnthropicAdapter::new(ProviderConfig {
+            protocol: Protocol::AnthropicMessages,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: MessageContent::Assistant(vec![
+                    ContentBlock::Thought {
+                        text: "private reasoning".into(),
+                        elapsed_seconds: 2,
+                    },
+                    ContentBlock::Text("visible answer".into()),
+                ]),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        assert_eq!(body["messages"][0]["content"][0]["text"], "visible answer");
+        assert!(!body.to_string().contains("private reasoning"));
+    }
+
+    #[test]
     fn sends_tool_images_inside_the_anthropic_tool_result() {
         let adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
@@ -339,7 +375,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request);
+        let body = adapter.build_request(&request).unwrap();
 
         assert_eq!(
             body["messages"][0]["content"][0]["content"][1]["type"],

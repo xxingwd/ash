@@ -27,6 +27,7 @@ fn count_message_tokens(msg: &Message, bpe: &CoreBPE) -> usize {
             .iter()
             .map(|b| match b {
                 ContentBlock::Text(t) => bpe.encode_ordinary(t).len(),
+                ContentBlock::Thought { .. } => 0,
                 ContentBlock::ToolCall {
                     arguments, name, ..
                 } => {
@@ -75,21 +76,37 @@ pub fn compress_if_needed(
 
     let budget = max_tokens.saturating_sub(system_tokens + 3);
 
-    let mut kept = Vec::new();
-    let mut used = 0;
-
-    for msg in non_system.iter().rev() {
-        let msg_tokens = TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(msg, bpe);
-        if used + msg_tokens > budget {
-            break;
+    let mut turns = Vec::new();
+    for message in non_system {
+        if matches!(&message.content, MessageContent::User(_)) || turns.is_empty() {
+            turns.push(Vec::new());
         }
-        used += msg_tokens;
-        kept.push(msg.clone());
+        turns.last_mut().expect("turn exists").push(message);
     }
 
-    kept.reverse();
+    let mut kept_turns = Vec::new();
+    let mut used = 0;
 
-    let dropped = non_system.len() - kept.len();
+    for turn in turns.iter().rev() {
+        let turn_tokens = turn
+            .iter()
+            .map(|message| TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(message, bpe))
+            .sum::<usize>();
+        if used + turn_tokens > budget {
+            break;
+        }
+        used += turn_tokens;
+        kept_turns.push(turn);
+    }
+
+    kept_turns.reverse();
+    let kept = kept_turns
+        .into_iter()
+        .flat_map(|turn| turn.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let non_system_count = turns.iter().map(Vec::len).sum::<usize>();
+    let dropped = non_system_count - kept.len();
     if dropped > 0 {
         debug!(dropped_messages = dropped, "truncated old messages");
         let summary = Message::assistant_text(&format!(
@@ -109,5 +126,77 @@ pub fn get_bpe_for_model(model: &str) -> CoreBPE {
         tiktoken_rs::o200k_base().unwrap_or_else(|_| tiktoken_rs::cl100k_base().unwrap())
     } else {
         tiktoken_rs::cl100k_base().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ash_core::{MessageId, ToolCallId};
+
+    use super::*;
+
+    fn tool_call(id: &ToolCallId) -> Message {
+        Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: MessageContent::Assistant(vec![ContentBlock::ToolCall {
+                id: id.clone(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "Cargo.toml"}),
+            }]),
+        }
+    }
+
+    fn tool_result(id: ToolCallId) -> Message {
+        Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id,
+                result: Ok("contents".to_string()),
+                attachments: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn compression_keeps_complete_turns_with_tool_results() {
+        let bpe = get_bpe_for_model("test-model");
+        let first_call = ToolCallId::from_provider("first");
+        let second_call = ToolCallId::from_provider("second");
+        let first_turn = vec![
+            Message::user("old request"),
+            tool_call(&first_call),
+            tool_result(first_call),
+            Message::assistant_text("old answer"),
+        ];
+        let second_turn = vec![
+            Message::user("new request"),
+            tool_call(&second_call),
+            tool_result(second_call),
+            Message::assistant_text("new answer"),
+        ];
+        let latest_tokens = second_turn
+            .iter()
+            .map(|message| TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(message, &bpe))
+            .sum::<usize>();
+        let messages = first_turn.into_iter().chain(second_turn).collect();
+
+        let compressed = compress_if_needed(messages, &bpe, latest_tokens + 3);
+
+        assert_eq!(compressed.len(), 5);
+        assert!(matches!(compressed[1].content, MessageContent::User(_)));
+        assert!(matches!(
+            compressed[2].content,
+            MessageContent::Assistant(_)
+        ));
+        assert!(matches!(
+            compressed[3].content,
+            MessageContent::ToolResult { .. }
+        ));
+        assert!(matches!(
+            compressed[4].content,
+            MessageContent::Assistant(_)
+        ));
     }
 }

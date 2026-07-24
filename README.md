@@ -5,9 +5,9 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 - Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议
 - 真正的 SSE 增量输出
 - 连续对话与工具调用历史
-- `bash`、`read`、`write`、`edit`、`grep`、`find` 内置工具
+- 默认启用 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`webfetch` 七个内置工具
 - Codex 风格的 `default`、`explorer`、`worker` 子 Agent
-- 非全屏 inline 终端
+- alternate-screen 全屏 TUI
 
 ## 运行
 
@@ -18,6 +18,7 @@ export ASH_PROTOCOL=openai-responses
 export ASH_MODEL=gpt-5
 export ASH_BASE_URL=https://api.example.com
 export ASH_API_KEY=...
+export ASH_MODEL_CONFIG='reasoning.effort=high;temperature=0.2'
 ./start.sh
 ```
 
@@ -28,6 +29,7 @@ ASH_PROTOCOL=openai-responses
 ASH_MODEL=gpt-5
 ASH_BASE_URL=https://api.example.com
 ASH_API_KEY=your-key
+ASH_MODEL_CONFIG=reasoning.effort=high
 ```
 
 CLI 会自动加载该文件，命令行参数优先于 `.env`。`.env` 已被 `.gitignore`
@@ -51,6 +53,13 @@ cargo run -p ash-cli -- \
 
 兼容服务可以通过 `--base-url` 指定地址。
 
+`ASH_MODEL_CONFIG` 用 `;` 分隔 `key=value` 覆盖项，`.` 表示 body 中的嵌套对象。`true`、
+`false`、`null`、整数和小数会保留为 JSON 标量，其余值为字符串。例如 OpenAI Responses
+使用 `reasoning.effort=high`，Anthropic 可使用
+`thinking.type=adaptive;output_config.effort=high`。Ash 不解释这些供应商字段，只在发送前
+写入请求 body；`model`、`messages`、`input`、`tools`、`stream`、`system` 和
+`instructions` 等请求结构字段不能覆盖。
+
 单次输出模式：
 
 ```bash
@@ -63,25 +72,33 @@ Ash 启动时会构建一份精简的系统上下文，包含：
 
 - 内置的 coding agent 工作约定
 - 当前目录、shell、日期、时区、操作系统和架构
-- 从文件系统根目录到当前目录依次生效的 `AGENTS.md`
-- `skills/` 中可用的 Skills，以及通过 `--skill` 显式启用的 Skill 指令
+- 从 Git 项目根目录到当前目录依次生效的 `AGENTS.md`
+- 项目和用户目录中可用的 Skills，以及通过 `--skill` 显式启用的 Skill 指令
 
-同一目录存在 `AGENTS.override.md` 时，它会替代该目录的 `AGENTS.md`。更深目录的
-指令优先级更高；处理子目录文件前，Agent 仍会检查是否存在更具体的说明。
+更深目录中的 `AGENTS.md` 指令优先级更高。找不到 Git 项目根时，只读取当前目录。
 
-Skills 支持 `skills/name.md` 和 `skills/name/SKILL.md` 两种布局：
+项目 Skill 使用 `.agents/skills/<name>/SKILL.md`，用户 Skill 使用
+`~/.agents/skills/<name>/SKILL.md`。项目 Skill 优先于同名用户 Skill，更深目录中的项目
+Skill 优先于上层目录中的同名 Skill：
 
 ```markdown
 ---
-name = "review"
-description = "Review changes for correctness"
-tools = ["read", "grep", "find"]
+name: review
+description: Review changes for correctness
+tools:
+  - read
+  - bash
 ---
 Review the relevant code and report concrete findings.
 ```
 
-使用 `--skill review` 会加载完整 Skill 指令，并应用可选的模型和工具覆盖；未显式
-启用时，模型仍会收到可用 Skills 的名称、描述和文件位置，可按任务需要读取。
+使用 `--skill review` 会在启动时加载完整 Skill 指令，并应用可选的模型和工具覆盖。Skill
+未写 `tools` 时默认启用全部七个内置工具；写了 `tools` 时则只启用名单中的内置工具。
+
+未显式启用 Skill 时，系统上下文只提供可用 Skills 的名称和描述。模型在任务
+匹配时调用 `skill({"name":"review"})`，再获得完整指令、Skill 基础目录和最多 10 个资源
+文件路径。`skill` 是 Agent 层的运行时工具，不受 Skill 的内置工具名单影响，也不会动态
+修改模型或底层工具配置。
 
 ## 会话历史
 
@@ -97,10 +114,11 @@ session-2026-07-14T16-30-25.123-<session-id>.jsonl
 消息、Assistant 消息、工具结果和 Turn 结束状态。API Key、访问令牌和自定义接口
 地址内容不会写入文件。
 
-`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史并建立新的 Session。终端已输出的
-稳定历史会保留在 scrollback 中；ASH 只移除当前输入区或菜单，再追加新的欢迎区。`/resume`
-同样保留已有 scrollback，在新的欢迎区后完整重放所选 JSONL。新 Session 会立即获得 ID
-和创建时间，但在第一条用户消息发出前不会创建文件；会话名称取第一条有效用户消息。
+`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史、建立新的 Session，并重置当前
+全屏 transcript。`/resume` 会用所选 JSONL 重建模型上下文和当前可见 transcript。
+`/undo` 会从内存历史和 Session JSONL 中直接截断最后一轮，并把该轮输入恢复到输入框。
+新 Session 会立即获得 ID 和创建时间，但在第一条用户消息发出前不会创建文件；会话名称
+取第一条有效用户消息。
 `/resume` 会在输入框下方列出其他已保存会话的名称和创建时间，使用方向键选择。输入框的
 跨进程历史单独保存在 `~/.local/share/ash/history.jsonl`。
 
@@ -133,47 +151,44 @@ explorer，边界清晰的代码改动优先交给 worker。简单任务和紧�
 
 ## 终端行为
 
-交互界面不进入 alternate screen。模型输出直接进入 shell 的历史，输入提示符始终
-出现在最新内容的下一行。`/new` 和 `/clear` 在会话未溢出时局部清理，溢出或布局
-不确定时清空当前可见屏幕；终端 scrollback 始终保留。
+交互界面使用 alternate screen，并在正常退出、错误和 Drop 路径中恢复主屏、光标、
+鼠标捕获和 raw mode。Ratatui 接管整个可见区域：状态栏、输入框、命令补全和底栏紧跟在
+transcript 后面；内容填满可用高度后，它们自然位于屏幕底部。完整用户消息、Thought、
+工具与回答都由 UI 保存在语义块中，终端缩放后按新宽度重新排版，不依赖 shell scrollback。
 
-底部可变区域使用 Ratatui 组件统一布局，包括活动内容、状态栏、输入框、命令补全
-和底栏；完成后的用户消息、Thought、工具与回答仍由 Crossterm 写入主屏 stdout，
-从而进入原生 shell scrollback。Ratatui 不接管 alternate screen，也不保存一份虚拟
-全屏历史。历史区和底部区域共享块间距规则：完整块只负责内容和内部 padding，父级
-Stack 使用 `Flex::Start` 与统一 spacing 排列；输入框和模型、路径或补全 footer 是
-同一个 ComposerBlock。
+transcript 默认跟随最新内容。用户滚动到旧内容后，流式更新保持当前绝对行位置；提交新
+问题、切换会话或跳到底部后恢复自动跟随。历史区中的完整块只负责内容和内部 padding，
+父级 Stack 使用 `Flex::Start` 与统一 spacing 排列；输入框和模型、路径或补全 footer
+组成固定的 ComposerBlock。
 
-模型文本以完整换行作为提交边界。正常情况下逐行展示；当等待队列积压时会自动
-批量追赶。未完成的半行会保留到下一次换行或本轮响应结束，表格则会暂存在可变
-区域，避免流式过程中列宽反复跳动。
-
-模型提供思考摘要时，活动区固定显示最多四行：首行为 `Thinking (Xs)`，下面三行
-行内滚动并始终保留最新内容。正文、工具调用或本轮结束后，思考区折叠为一行
-`Thought for Xs`；展开期间的思考正文不会写入 shell scrollback。OpenAI Chat
+模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
+正文、工具调用或本轮结束后，思考区折叠为一行 `Thought for Xs`，正文仍保留在 UI
+状态中；鼠标左键点击该块可以展开或再次折叠。OpenAI Chat
 Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinking` 字段，
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
-工具调用使用语义化单行摘要，不直接打印参数 JSON。读、写、编辑仅显示短文件名；
-搜索和列目录只保留关键词及一个短目录；Shell 调用只显示命令本身。文件内容、编辑
-前后文本、默认参数、工作目录和绝对路径不会进入终端历史，失败调用也使用相同的
-精简格式。每个工具调用仍是独立历史块，块之间统一保留一行间距。
+工具调用使用语义化单行摘要，不直接打印参数 JSON。连续的原生 `read` 调用会聚合为
+一个摘要；`glob`、`grep` 和 `skill` 分别显示匹配模式、正则和 Skill 名称；`bash` 始终
+显示实际命令，不猜测 Shell 意图。文件内容、编辑前后文本、默认参数、工作目录和绝对
+路径不会进入终端历史。聚合只影响展示，底层工具调用、结果和会话记录仍保持独立。
 
 - `Enter`：提交
 - 输入 `/`：显示斜杠命令补全；继续输入会按命令名或别名过滤
 - 补全菜单中 `↑` / `↓`（或 `Ctrl-P` / `Ctrl-N`）：切换选择
 - 补全菜单中 `Tab`：补全命令；`Enter`：执行当前选择；`Esc`：关闭菜单
 - `↑` / `↓`：输入历史
+- `PageUp` / `PageDown`：按页浏览 transcript
+- `Ctrl-Home` / `Ctrl-End`：跳到 transcript 顶部或底部
+- 鼠标滚轮：逐行浏览 transcript
+- 鼠标左键点击 Thought：展开或折叠完整思考正文
 - 任务运行时按一次 `Esc`：取消并撤销当前一轮，将原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求
 - 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出
 
-按下 `Esc` 会从模型会话历史中移除当前轮，只擦除当前屏幕中属于该轮的用户消息和
-回复，并在原位置把问题恢复到输入框；它不会重建整个屏幕，也不会反向撤销已经由
-工具写入文件系统的修改。ASH 不会 Purge shell scrollback，
-因此已经滚出当前可见屏幕的本轮内容可能仍由终端保留，但不会继续存在于模型上下文。
+按下 `Esc` 会从模型会话历史和 UI transcript 中移除当前轮，并把问题恢复到输入框；
+它不会反向撤销已经由工具写入文件系统的修改。
 
 ## 开发检查
 

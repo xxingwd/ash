@@ -121,6 +121,10 @@ pub enum Content {
 #[derive(Debug, Clone, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
 pub enum ContentBlock {
     Text(String),
+    Thought {
+        text: String,
+        elapsed_seconds: u64,
+    },
     ToolCall {
         id: ToolCallId,
         name: String,

@@ -8,7 +8,7 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
+use crate::{model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 
 pub struct ResponsesAdapter {
     config: ProviderConfig,
@@ -31,7 +31,7 @@ impl ResponsesAdapter {
             .trim_end_matches('/')
     }
 
-    fn build_request(&self, req: &LlmRequest) -> Value {
+    fn build_request(&self, req: &LlmRequest) -> Result<Value, ProtocolError> {
         let mut input = Vec::new();
         let mut index = 0;
         while index < req.messages.len() {
@@ -45,7 +45,7 @@ impl ResponsesAdapter {
                         .iter()
                         .filter_map(|block| match block {
                             ContentBlock::Text(text) => Some(text.as_str()),
-                            ContentBlock::ToolCall { .. } => None,
+                            ContentBlock::Thought { .. } | ContentBlock::ToolCall { .. } => None,
                         })
                         .collect::<String>();
                     if !text.is_empty() {
@@ -62,7 +62,7 @@ impl ResponsesAdapter {
                             "name": name,
                             "arguments": arguments.to_string(),
                         })),
-                        ContentBlock::Text(_) => None,
+                        ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
                     }));
                     index += 1;
                 }
@@ -124,7 +124,8 @@ impl ResponsesAdapter {
         if let Some(max_tokens) = req.max_tokens {
             body["max_output_tokens"] = json!(max_tokens);
         }
-        body
+        model_config::apply_from_env(&mut body)?;
+        Ok(body)
     }
 }
 
@@ -160,11 +161,12 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
 
 impl ProtocolAdapter for ResponsesAdapter {
     fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ProtocolError> {
+        let body = self.build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/responses", self.base_url()))
             .bearer_auth(self.config.api_key.expose_secret())
-            .json(&self.build_request(&req));
+            .json(&body);
         sse::stream(request, ResponsesDecoder::default())
     }
 }
@@ -172,6 +174,7 @@ impl ProtocolAdapter for ResponsesAdapter {
 #[derive(Default)]
 struct ResponsesDecoder {
     calls: BTreeMap<String, PendingCall>,
+    emitted_calls: BTreeSet<String>,
     streamed_reasoning_summaries: BTreeSet<u64>,
     done: bool,
 }
@@ -192,6 +195,9 @@ impl ResponsesDecoder {
     }
 
     fn emit_call(&mut self, key: &str) -> Result<Option<StreamItem>, ProtocolError> {
+        if self.emitted_calls.contains(key) {
+            return Ok(None);
+        }
         let Some(call) = self.calls.remove(key) else {
             return Ok(None);
         };
@@ -202,7 +208,7 @@ impl ResponsesDecoder {
                 ProtocolError::InvalidResponse(format!("invalid Responses tool arguments: {error}"))
             })?
         };
-        Ok(Some(StreamItem::ToolCall {
+        let item = StreamItem::ToolCall {
             id: if call.call_id.is_empty() {
                 ToolCallId::new()
             } else {
@@ -210,7 +216,9 @@ impl ResponsesDecoder {
             },
             name: call.name,
             arguments,
-        }))
+        };
+        self.emitted_calls.insert(key.to_string());
+        Ok(Some(item))
     }
 }
 
@@ -346,7 +354,9 @@ impl sse::Decoder for ResponsesDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
-    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Protocol, Role,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -381,6 +391,13 @@ mod tests {
                 arguments: json!({"path": "Cargo.toml"}),
             }]
         );
+
+        let duplicate = decoder
+            .decode(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
+            )
+            .unwrap();
+        assert!(duplicate.is_empty());
     }
 
     #[test]
@@ -414,6 +431,37 @@ mod tests {
     }
 
     #[test]
+    fn omits_persisted_thoughts_from_responses_history() {
+        let adapter = ResponsesAdapter::new(ProviderConfig {
+            protocol: Protocol::OpenaiResponses,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: MessageContent::Assistant(vec![
+                    ContentBlock::Thought {
+                        text: "private reasoning".into(),
+                        elapsed_seconds: 2,
+                    },
+                    ContentBlock::Text("visible answer".into()),
+                ]),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        assert_eq!(body["input"][0]["content"], "visible answer");
+        assert!(!body.to_string().contains("private reasoning"));
+    }
+
+    #[test]
     fn sends_tool_images_after_all_response_function_outputs() {
         let adapter = ResponsesAdapter::new(ProviderConfig {
             protocol: Protocol::OpenaiResponses,
@@ -437,7 +485,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request);
+        let body = adapter.build_request(&request).unwrap();
 
         assert_eq!(body["input"][0]["type"], "function_call_output");
         assert_eq!(body["input"][1]["type"], "function_call_output");

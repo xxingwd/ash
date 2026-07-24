@@ -8,7 +8,7 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
+use crate::{model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 
 pub struct CompletionsAdapter {
     config: ProviderConfig,
@@ -31,7 +31,7 @@ impl CompletionsAdapter {
             .trim_end_matches('/')
     }
 
-    fn build_request(&self, req: &LlmRequest) -> Value {
+    fn build_request(&self, req: &LlmRequest) -> Result<Value, ProtocolError> {
         let mut messages = Vec::new();
         if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
@@ -48,7 +48,7 @@ impl CompletionsAdapter {
                         .iter()
                         .filter_map(|block| match block {
                             ContentBlock::Text(text) => Some(text.as_str()),
-                            ContentBlock::ToolCall { .. } => None,
+                            ContentBlock::Thought { .. } | ContentBlock::ToolCall { .. } => None,
                         })
                         .collect::<String>();
                     let calls: Vec<Value> = blocks
@@ -63,14 +63,16 @@ impl CompletionsAdapter {
                                 "type": "function",
                                 "function": {"name": name, "arguments": arguments.to_string()},
                             })),
-                            ContentBlock::Text(_) => None,
+                            ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
                         })
                         .collect();
                     let mut value = json!({"role": "assistant", "content": text});
                     if !calls.is_empty() {
                         value["tool_calls"] = json!(calls);
                     }
-                    messages.push(value);
+                    if !text.is_empty() || !calls.is_empty() {
+                        messages.push(value);
+                    }
                     index += 1;
                 }
                 MessageContent::ToolResult { .. } => {
@@ -132,7 +134,8 @@ impl CompletionsAdapter {
         if let Some(max_tokens) = req.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
-        body
+        model_config::apply_from_env(&mut body)?;
+        Ok(body)
     }
 }
 
@@ -170,11 +173,12 @@ fn chat_content(contents: &[ash_core::Content]) -> Value {
 
 impl ProtocolAdapter for CompletionsAdapter {
     fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ProtocolError> {
+        let body = self.build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url()))
             .bearer_auth(self.config.api_key.expose_secret())
-            .json(&self.build_request(&req));
+            .json(&body);
         sse::stream(request, CompletionsDecoder::default())
     }
 }
@@ -295,7 +299,9 @@ impl sse::Decoder for CompletionsDecoder {
 mod tests {
     use super::*;
     use crate::sse::Decoder;
-    use ash_core::{Content, Message, MessageId, ModelId, Protocol, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Protocol, Role,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -344,6 +350,37 @@ mod tests {
     }
 
     #[test]
+    fn omits_persisted_thoughts_from_chat_completion_history() {
+        let adapter = CompletionsAdapter::new(ProviderConfig {
+            protocol: Protocol::OpenaiCompletions,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: MessageContent::Assistant(vec![
+                    ContentBlock::Thought {
+                        text: "private reasoning".into(),
+                        elapsed_seconds: 2,
+                    },
+                    ContentBlock::Text("visible answer".into()),
+                ]),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        assert_eq!(body["messages"][0]["content"], "visible answer");
+        assert!(!body.to_string().contains("private reasoning"));
+    }
+
+    #[test]
     fn sends_tool_images_after_all_chat_completion_tool_results() {
         let adapter = CompletionsAdapter::new(ProviderConfig {
             protocol: Protocol::OpenaiCompletions,
@@ -367,7 +404,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request);
+        let body = adapter.build_request(&request).unwrap();
 
         assert_eq!(body["messages"][0]["role"], "tool");
         assert_eq!(body["messages"][1]["role"], "tool");

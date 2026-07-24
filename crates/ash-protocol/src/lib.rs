@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod completions;
+mod model_config;
 pub mod responses;
 mod sse;
 

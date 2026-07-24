@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::Local;
 
@@ -22,7 +22,7 @@ pub fn build_system_prompt(
     let mut sections = vec![BASE_INSTRUCTIONS.trim().to_string()];
     sections.push(environment_context(&working_dir));
     sections.extend(load_agents_instructions(&working_dir)?);
-    if let Some(skills) = skills_context(&working_dir, skills, active_skill) {
+    if let Some(skills) = skills_context(skills, active_skill) {
         sections.push(skills);
     }
     Ok(sections.join("\n\n"))
@@ -45,24 +45,13 @@ fn environment_context(working_dir: &Path) -> String {
 }
 
 fn load_agents_instructions(working_dir: &Path) -> Result<Vec<String>, ash_core::AshError> {
-    let mut directories = working_dir
-        .ancestors()
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    directories.reverse();
-
     let mut sections = Vec::new();
     let mut remaining = MAX_AGENTS_INSTRUCTIONS_BYTES;
-    for directory in directories {
-        let override_path = directory.join("AGENTS.override.md");
-        let default_path = directory.join("AGENTS.md");
-        let path = if override_path.is_file() {
-            override_path
-        } else if default_path.is_file() {
-            default_path
-        } else {
+    for directory in crate::project::directories(working_dir) {
+        let path = directory.join("AGENTS.md");
+        if !path.is_file() {
             continue;
-        };
+        }
         if remaining == 0 {
             break;
         }
@@ -81,27 +70,21 @@ fn load_agents_instructions(working_dir: &Path) -> Result<Vec<String>, ash_core:
     Ok(sections)
 }
 
-fn skills_context(
-    working_dir: &Path,
-    skills: &[Skill],
-    active_skill: Option<&Skill>,
-) -> Option<String> {
+fn skills_context(skills: &[Skill], active_skill: Option<&Skill>) -> Option<String> {
     if skills.is_empty() && active_skill.is_none() {
         return None;
     }
 
-    let mut output = String::from("<skills>\n## Available skills\n");
+    let mut output = String::from(
+        "<skills>\nSkills provide specialized instructions and workflows for specific tasks.\n\
+         Use the `skill` tool to load a skill when a task matches its description.\n\n\
+         ## Available skills\n",
+    );
     if skills.is_empty() {
         output.push_str("- None discovered.\n");
     } else {
         for skill in skills {
-            let path = display_path(working_dir, skill.source_path());
-            output.push_str(&format!(
-                "- `{}`: {} (file: {})\n",
-                skill.name,
-                skill.description,
-                path.display()
-            ));
+            output.push_str(&format!("- `{}`: {}\n", skill.name, skill.description));
         }
     }
 
@@ -114,10 +97,6 @@ fn skills_context(
     }
     output.push_str("</skills>");
     Some(output)
-}
-
-fn display_path(working_dir: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(working_dir).unwrap_or(path).to_path_buf()
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -146,9 +125,9 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: format!("{name} description"),
-            system_prompt: instructions.to_string(),
             tools: None,
             model: None,
+            instructions: instructions.to_string(),
             source_path: path.to_path_buf(),
         }
     }
@@ -158,11 +137,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
         std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "outside rules").unwrap();
         std::fs::write(project.join("AGENTS.md"), "project rules").unwrap();
-        std::fs::write(nested.join("AGENTS.md"), "ignored rules").unwrap();
-        std::fs::write(nested.join("AGENTS.override.md"), "nested override").unwrap();
-        let skill_path = project.join("skills/review.md");
+        std::fs::write(nested.join("AGENTS.md"), "nested rules").unwrap();
+        std::fs::write(nested.join("AGENTS.override.md"), "ignored override").unwrap();
+        let skill_path = project.join(".agents/skills/review/SKILL.md");
         let skill = skill(&skill_path, "review", "review carefully");
 
         let prompt =
@@ -170,10 +151,13 @@ mod tests {
 
         assert!(prompt.contains("<environment_context>"));
         assert!(prompt.contains("project rules"));
-        assert!(prompt.contains("nested override"));
-        assert!(!prompt.contains("ignored rules"));
-        assert!(prompt.find("project rules") < prompt.find("nested override"));
+        assert!(prompt.contains("nested rules"));
+        assert!(!prompt.contains("outside rules"));
+        assert!(!prompt.contains("ignored override"));
+        assert!(prompt.find("project rules") < prompt.find("nested rules"));
+        assert!(prompt.contains("Use the `skill` tool to load a skill"));
         assert!(prompt.contains("`review`: review description"));
+        assert!(!prompt.contains(".agents/skills/review/SKILL.md"));
         assert!(prompt.contains("## Active skill: review"));
         assert!(prompt.contains("review carefully"));
     }

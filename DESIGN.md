@@ -32,6 +32,7 @@
 - `sse` 模块统一管理连接、错误和禁止自动重放 POST 请求
 - 每种协议拥有独立的有状态 decoder
 - 分片工具参数在 decoder 内聚合完成后才交给 Agent
+- `ASH_MODEL_CONFIG` 在协议生成 body 后以受限的点路径覆盖模型参数，不影响消息、工具和流式结构
 
 已实现：
 
@@ -43,8 +44,12 @@
 
 提供工具定义和内置工具。
 
-`path` 模块统一完成路径规范化、工作目录边界和符号链接检查。Agent 执行器统一管理
-工具取消和超时；`bash` 子进程启用 `kill_on_drop`，执行 Future 被丢弃时会终止进程。
+`read`、`write` 和 `edit` 通过已打开的工作目录 capability 执行文件访问，符号链接不能
+逃逸到目录外，也不存在校验后重新打开裸路径的竞态。Agent 执行器统一管理工具取消和
+超时；`bash` 子进程启用 `kill_on_drop`，执行 Future 被丢弃时会终止进程。
+`webfetch` 只请求 HTTP/HTTPS URL，在流式读取阶段限制响应大小，并将 HTML 转为 Markdown。
+`glob` 和 `grep` 使用纯 Rust 遍历，搜索范围限制在工作目录内，遵守 ignore 文件且不跟随
+符号链接；前者匹配文件路径，后者按正则搜索内容，两者都限制为最多 100 条结果。
 
 ### `ash-agent`
 
@@ -66,37 +71,35 @@
 会话的标题和创建时间，选中后按 Session ID 恢复 `Vec<Message>`。Turn rollback 也以 append-only 记录保存；重放 JSONL
 时按顺序截断对应用户轮次，不重写已有文件。
 
-提示词由固定基础约定和启动时上下文组合而成。动态上下文只包含环境信息、从外到
-内生效的 `AGENTS.md` 和 Skills 元数据；显式启用的 Skill 会追加完整指令，并可覆盖
-模型或工具集合。MCP 仍属于独立能力，尚未成为默认交互链路的一部分。
+提示词由固定基础约定和启动时上下文组合而成。动态上下文只包含环境信息、从 Git 项目根到
+当前目录生效的 `AGENTS.md`，以及 `.agents/skills` 中 Skills 的名称与描述；运行时 `skill` 工具按名称注入完整指令、
+基础目录和资源文件列表。显式启用的 Skill 会在启动时追加完整指令，并可覆盖模型或
+内置工具集合。MCP 仍属于独立能力，尚未成为默认交互链路的一部分。
 
 ### `ash-tui`
 
-名称保留为 `ash-tui`，实现实际是 inline terminal UI：
+交互界面是由 Ratatui 管理的 alternate-screen 全屏 TUI：
 
-- 不使用 alternate screen
-- 正常交互不清屏；`/new` 和 `/clear` 使用相同的新会话逻辑
-- 当前会话未溢出且宽度未变化时局部擦除 ASH 会话区域；溢出、缩放或布局不确定时
-  只清空当前可见屏幕，两条路径都不 Purge shell scrollback
-- 缩放使用同一个终端尺寸快照完成 geometry、裁剪和重绘；超出新高度的活动 viewport
-  行只做非破坏性顶部裁剪，不把保留的 live blocks 提交到 shell scrollback
-- Ratatui Buffer 统一计算活动内容、状态栏、输入框、补全和底栏的组件布局
-- 已完成的历史通过 Crossterm 写入主屏 stdout，让 shell 维护 scrollback；Ratatui
-  只负责底部 inline viewport，不使用 alternate screen
-- 只原地重绘当前输入行
+- 进入时启用 raw mode、alternate screen、bracketed paste 和鼠标捕获；正常退出、错误与
+  Drop 路径使用同一个幂等 Guard 恢复终端
+- UI 持有完整的语义 transcript，并在缩放后按当前宽度重新渲染，不依赖 shell scrollback
+- transcript 使用独立的滚动位置；默认跟随底部，用户滚动后保持绝对行位置
+- 状态栏、Composer、命令补全、Session 菜单和 footer 紧跟 transcript；内容填满可用
+  高度后自然位于屏幕底部
+- `/new`、`/clear` 和 `/resume` 替换当前 transcript；跨会话恢复仍以 JSONL 为准
+- 已完成的语义块按宽度缓存渲染结果，viewport 只复制当前可见的 transcript 行
 - Agent 工作期间 `Ctrl-C` 不发送取消命令；状态栏提示 `esc to interrupt`，第一次按
   `Esc` 不展示额外状态
 - Agent 工作期间按一次 `Esc` 会取消并回退当前轮，将问题恢复为草稿
 - `Esc` 会先在 UI 侧立即移除当前 turn 并恢复 Composer；后端确认回退前到达的旧
   Thinking、工具和文本事件不再参与渲染，确认事件也不会重复清除同一区域
-- 回退按本轮已提交的终端行数局部擦除当前轮，不重建整个屏幕，也不 Purge shell
-  scrollback；已经滚出当前屏幕的行可能仍由终端保存，但当前轮会从模型上下文移除
-- 文本按换行进入 FIFO 队列，正常逐行提交，积压时批量追赶
-- 未完成行在响应结束时提交，活动表格在结构稳定前保持为可变尾部
-- 流式思考摘要使用固定四行活动区：一行带耗时的 `Thinking` 标题和最新三行正文；
-  切换到回答、工具或完成状态时折叠为单行耗时摘要，不把展开正文写入 scrollback
+- 回退按 turn ID 从 transcript 中移除当前轮，并从模型上下文移除同一轮
+- 流式思考摘要显示带耗时的 `Thinking` 标题和完整正文，并随 transcript 向下滚动；
+  切换到回答、工具或完成状态时折叠为单行耗时摘要，正文保留在可点击展开的 Thought 块中
 - 工具历史按工具语义生成单行摘要，隐藏内容参数和默认参数，并把绝对路径缩短为
-  可辨识的文件名或末级目录；不把原始工具参数 JSON 写入 scrollback
+  可辨识的文件名或末级目录；不把原始工具参数 JSON 加入 transcript
+- TUI 只聚合连续的原生 `read` 调用；`bash` 始终显示实际命令，不做 Shell 意图猜测，
+  也不改变底层调用、结果或持久化数据
 - 历史和 viewport 使用同一套块布局协议：完整块只声明内容高度并管理内部
   padding，父级 Stack 使用 `Flex::Start` 和统一 `spacing` 排列块；输入框与模型、
   路径或补全 footer 组成一个 ComposerBlock，continuation 只表示同一流式块的后续行
@@ -106,12 +109,12 @@
 - `app`：事件与命令协调
 - `block_layout`：完整块、continuation 与 Ratatui Flex spacing
 - `input`：Unicode 安全的编辑、历史和可视窗口
-- `viewport`：Ratatui 组件、行高、间距和 Buffer 渲染
-- `inline`：Crossterm history insertion、scrollback、raw mode 与 viewport 生命周期
+- `viewport`：transcript 窗口、Composer 组件、行高、间距和 Buffer 渲染
+- `inline`：UI transcript、滚动位置、流状态和 viewport 生命周期
+- `inline_surface`：alternate screen、raw mode、鼠标捕获和终端恢复
 
 输入框的跨进程历史使用独立的 `history.jsonl`；它只负责上下键召回，不参与模型
-上下文恢复。终端 scrollback 仍由 shell 保存，恢复会话时 UI 根据语义消息重新渲染
-对话，而不是解析终端输出。
+上下文恢复。恢复会话时 UI 根据语义消息重新渲染对话，不解析终端输出。
 
 ### `ash-cli`
 
@@ -152,7 +155,7 @@ AgentSession ── LlmRequest ──→ ProtocolAdapter ──→ SSE
     │                                  ↓ StreamItem
     ├── tool execution ──→ ash-orchestrator ──→ child Agent turns
     │
-    └── Event ──→ inline terminal ──→ stdout / shell scrollback
+    └── Event ──→ alternate-screen TUI ──→ Ratatui viewport
 ```
 
 ## 错误和取消

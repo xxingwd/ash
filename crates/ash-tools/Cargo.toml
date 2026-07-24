@@ -6,9 +6,11 @@ edition.workspace = true
 [dependencies]
 ash-core = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 schemars = { workspace = true }
-regex = { workspace = true }
-globset = { workspace = true }
-ignore = { workspace = true }
 tempfile = { workspace = true }
+htmd = { workspace = true }
+cap-std = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }

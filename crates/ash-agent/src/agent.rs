@@ -1,9 +1,10 @@
 use ash_core::{
     AgentToolContext, CancellationToken, ContentBlock, Event, Message, MessageContent, Role,
-    SessionId, StopReason, ToolContext, ToolDefinition, ToolError, ToolOutput,
+    SessionId, StopReason, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolOutput,
 };
-use ash_protocol::{create_adapter, LlmRequest, ProtocolAdapter, StreamItem};
+use ash_protocol::{create_adapter, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 use futures::StreamExt;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -13,6 +14,20 @@ use crate::{session_store::SessionStore, AgentConfig};
 const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
 const AGENT_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the agent ...\n";
+
+struct PendingToolCall {
+    id: ToolCallId,
+    name: String,
+    arguments: serde_json::Value,
+}
+
+struct CollectedResponse {
+    message: Option<Message>,
+    calls: Vec<PendingToolCall>,
+    stop_reason: StopReason,
+    cancelled: bool,
+    error: Option<ash_core::ProtocolError>,
+}
 
 pub async fn run_agent_loop(
     config: AgentConfig,
@@ -123,146 +138,226 @@ async fn run_with_adapter(
             tools: tool_defs.clone(),
             max_tokens: config.max_output_tokens,
         })?;
-
-        let mut blocks = Vec::new();
-        let mut text = String::new();
-        let mut stop_reason = StopReason::EndTurn;
-
-        loop {
-            let next = tokio::select! {
-                _ = cancel.cancelled() => return Ok(StopReason::Aborted),
-                next = stream.next() => next,
-            };
-            let Some(item) = next else {
-                break;
-            };
-
-            match item.map_err(ash_core::AshError::Protocol)? {
-                StreamItem::TextDelta(delta) => {
-                    text.push_str(&delta);
-                    let _ = tx.send(Event::TextDelta(delta)).await;
-                }
-                StreamItem::ThinkingDelta(delta) => {
-                    let _ = tx.send(Event::Thinking(delta)).await;
-                }
-                StreamItem::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => blocks.push(ContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                }),
-                StreamItem::Usage {
-                    input_tokens,
-                    output_tokens,
-                } => {
-                    let _ = tx
-                        .send(Event::Usage {
-                            input_tokens,
-                            output_tokens,
-                        })
-                        .await;
-                }
-                StreamItem::Stop(reason) => stop_reason = reason,
-            }
-        }
-
-        if !text.is_empty() {
-            blocks.insert(0, ContentBlock::Text(text));
-        }
-        let calls: Vec<_> = blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => Some((id.clone(), name.clone(), arguments.clone())),
-                ContentBlock::Text(_) => None,
-            })
-            .collect();
-
-        if !blocks.is_empty() {
-            let message = Message {
-                id: ash_core::MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(blocks),
-            };
-            persist_message(store.as_deref_mut(), &message).await;
+        let CollectedResponse {
+            message,
+            calls,
+            stop_reason,
+            cancelled,
+            error,
+        } = collect_response(&mut stream, &tx, &cancel).await;
+        if let Some(message) = message {
+            persist_message(store.as_deref_mut(), &message).await?;
             messages.push(message);
+        }
+        if let Some(error) = error {
+            return Err(error.into());
         }
         if calls.is_empty() {
-            return Ok(stop_reason);
+            return if cancelled {
+                Ok(StopReason::Aborted)
+            } else {
+                Ok(stop_reason)
+            };
         }
-
-        for (id, name, arguments) in calls {
-            let _ = tx
-                .send(Event::ToolCallStart {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                })
-                .await;
-            let result = limit_tool_result(
-                execute_tool(
-                    config,
-                    messages,
-                    session_id,
-                    &cancel,
-                    &name,
-                    arguments.clone(),
-                )
-                .await,
-            );
-            if cancel.is_cancelled() {
-                return Ok(StopReason::Aborted);
-            }
-            let (output, is_error) = match &result {
-                Ok(output) => (output.text.clone(), false),
-                Err(error) => (error.to_string(), true),
-            };
-            let _ = tx
-                .send(Event::ToolCallEnd {
-                    id: id.clone(),
-                    name,
-                    arguments,
-                    output,
-                    is_error,
-                })
-                .await;
-            let (result, attachments) = match result {
-                Ok(output) => (Ok(output.text), output.attachments),
-                Err(error) => (Err(error.to_string()), Vec::new()),
-            };
-            let message = Message {
-                id: ash_core::MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id,
-                    result,
-                    attachments,
-                },
-            };
-            persist_message(store.as_deref_mut(), &message).await;
-            messages.push(message);
+        execute_tool_calls(
+            config, messages, session_id, &cancel, &tx, &mut store, calls,
+        )
+        .await?;
+        if cancelled || cancel.is_cancelled() {
+            return Ok(StopReason::Aborted);
         }
     }
 
     Ok(StopReason::MaxTurns)
 }
 
-async fn persist_message(store: Option<&mut SessionStore>, message: &Message) {
-    let Some(store) = store else {
+async fn collect_response(
+    stream: &mut ProtocolStream,
+    tx: &mpsc::Sender<Event>,
+    cancel: &CancellationToken,
+) -> CollectedResponse {
+    let mut blocks = Vec::new();
+    let mut thought_started_at = None;
+    let mut stop_reason = StopReason::EndTurn;
+    let mut cancelled = false;
+    let mut error = None;
+
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                None
+            },
+            next = stream.next() => next,
+        };
+        let Some(item) = next else {
+            break;
+        };
+        let item = match item {
+            Ok(item) => item,
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        };
+        match item {
+            StreamItem::TextDelta(delta) => {
+                finish_open_thought(&mut blocks, &mut thought_started_at);
+                match blocks.last_mut() {
+                    Some(ContentBlock::Text(text)) => text.push_str(&delta),
+                    _ => blocks.push(ContentBlock::Text(delta.clone())),
+                }
+                let _ = tx.send(Event::TextDelta(delta)).await;
+            }
+            StreamItem::ThinkingDelta(delta) => {
+                match blocks.last_mut() {
+                    Some(ContentBlock::Thought { text, .. }) => text.push_str(&delta),
+                    _ => {
+                        thought_started_at = Some(Instant::now());
+                        blocks.push(ContentBlock::Thought {
+                            text: delta.clone(),
+                            elapsed_seconds: 0,
+                        });
+                    }
+                }
+                let _ = tx.send(Event::Thinking(delta)).await;
+            }
+            StreamItem::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                finish_open_thought(&mut blocks, &mut thought_started_at);
+                blocks.push(ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+            StreamItem::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                let _ = tx
+                    .send(Event::Usage {
+                        input_tokens,
+                        output_tokens,
+                    })
+                    .await;
+            }
+            StreamItem::Stop(reason) => stop_reason = reason,
+        }
+    }
+    finish_open_thought(&mut blocks, &mut thought_started_at);
+
+    let calls = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some(PendingToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
+        })
+        .collect();
+    let message = (!blocks.is_empty()).then(|| Message {
+        id: ash_core::MessageId::new(),
+        role: Role::Assistant,
+        content: MessageContent::Assistant(blocks),
+    });
+    CollectedResponse {
+        message,
+        calls,
+        stop_reason,
+        cancelled,
+        error,
+    }
+}
+
+async fn execute_tool_calls(
+    config: &AgentConfig,
+    messages: &mut Vec<Message>,
+    session_id: SessionId,
+    cancel: &CancellationToken,
+    tx: &mpsc::Sender<Event>,
+    store: &mut Option<&mut SessionStore>,
+    calls: Vec<PendingToolCall>,
+) -> Result<(), ash_core::AshError> {
+    for call in calls {
+        let _ = tx
+            .send(Event::ToolCallStart {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .await;
+        let result = limit_tool_result(
+            execute_tool(
+                config,
+                messages,
+                session_id,
+                cancel,
+                &call.name,
+                call.arguments.clone(),
+            )
+            .await,
+        );
+        let (output, is_error) = match &result {
+            Ok(output) => (output.text.clone(), false),
+            Err(error) => (error.to_string(), true),
+        };
+        let _ = tx
+            .send(Event::ToolCallEnd {
+                id: call.id.clone(),
+                name: call.name,
+                arguments: call.arguments,
+                output,
+                is_error,
+            })
+            .await;
+        let (result, attachments) = match result {
+            Ok(output) => (Ok(output.text), output.attachments),
+            Err(error) => (Err(error.to_string()), Vec::new()),
+        };
+        let message = Message {
+            id: ash_core::MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id: call.id,
+                result,
+                attachments,
+            },
+        };
+        persist_message(store.as_deref_mut(), &message).await?;
+        messages.push(message);
+    }
+    Ok(())
+}
+
+fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
+    let Some(started) = started_at.take() else {
         return;
     };
-    if let Err(error) = store.append_message(message).await {
-        tracing::warn!(
-            path = %store.path().display(),
-            %error,
-            "failed to persist session message"
-        );
+    if let Some(ContentBlock::Thought {
+        elapsed_seconds, ..
+    }) = blocks.last_mut()
+    {
+        *elapsed_seconds = started.elapsed().as_secs();
+    }
+}
+
+async fn persist_message(
+    store: Option<&mut SessionStore>,
+    message: &Message,
+) -> Result<(), ash_core::AshError> {
+    match store {
+        Some(store) => store.append_message(message).await,
+        None => Ok(()),
     }
 }
 
@@ -410,6 +505,31 @@ mod tests {
         }
     }
 
+    struct BlockingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn description(&self) -> &str {
+            "blocking"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            futures::future::pending().await
+        }
+    }
+
     #[tokio::test]
     async fn preserves_full_history_across_tool_turns() {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -475,6 +595,258 @@ mod tests {
         let persisted = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(persisted.contains("assistant_message"));
         assert!(persisted.contains("tool_result"));
+    }
+
+    #[tokio::test]
+    async fn persists_reasoning_blocks_in_session_history() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                StreamItem::ThinkingDelta("inspect first".into()),
+                StreamItem::TextDelta("done".into()),
+                StreamItem::Stop(StopReason::EndTurn),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                api_key: "test".into(),
+                base_url: None,
+            },
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: None,
+            max_output_tokens: None,
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            root_session_id: None,
+        };
+        let mut messages = vec![Message::user("question")];
+        let directory = TempDir::new().unwrap();
+        let mut store = SessionStore::new_in(&config, SessionId::new(), directory.path());
+        store.append_message(&messages[0]).await.unwrap();
+        let (tx, _rx) = mpsc::channel(32);
+
+        run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            SessionId::new(),
+            &adapter,
+            Some(&mut store),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [
+                    ContentBlock::Thought { text, .. },
+                    ContentBlock::Text(answer),
+                ] if text == "inspect first" && answer == "done")
+        ));
+        let persisted = tokio::fs::read_to_string(store.path()).await.unwrap();
+        assert!(persisted.contains("inspect first"));
+        assert!(persisted.contains("elapsed_seconds"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_partial_assistant_text() {
+        struct PendingAdapter;
+
+        impl ProtocolAdapter for PendingAdapter {
+            fn stream(&self, _req: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+                Ok(Box::pin(
+                    futures::stream::iter([Ok(StreamItem::TextDelta("partial".into()))])
+                        .chain(futures::stream::pending()),
+                ))
+            }
+        }
+
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                api_key: "test".into(),
+                base_url: None,
+            },
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: None,
+            max_output_tokens: None,
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            root_session_id: None,
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let reason = {
+            let turn = run_with_adapter(
+                &config,
+                &mut messages,
+                tx,
+                cancel.clone(),
+                SessionId::new(),
+                &PendingAdapter,
+                None,
+            );
+            tokio::pin!(turn);
+
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
+            };
+            assert!(matches!(event, Some(Event::TextDelta(text)) if text == "partial"));
+            cancel.cancel();
+            (&mut turn).await.unwrap()
+        };
+        assert_eq!(reason, StopReason::Aborted);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "partial")
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_errors_preserve_partial_assistant_content() {
+        struct FailingAdapter;
+
+        impl ProtocolAdapter for FailingAdapter {
+            fn stream(&self, _req: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+                Ok(Box::pin(futures::stream::iter([
+                    Ok(StreamItem::ThinkingDelta("checking".into())),
+                    Ok(StreamItem::TextDelta("partial".into())),
+                    Err(ash_core::ProtocolError::InvalidResponse(
+                        "stream ended badly".into(),
+                    )),
+                ])))
+            }
+        }
+
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                api_key: "test".into(),
+                base_url: None,
+            },
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: None,
+            max_output_tokens: None,
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            root_session_id: None,
+        };
+        let mut messages = vec![Message::user("question")];
+        let directory = TempDir::new().unwrap();
+        let mut store = SessionStore::new_in(&config, SessionId::new(), directory.path());
+        store.append_message(&messages[0]).await.unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let error = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            SessionId::new(),
+            &FailingAdapter,
+            Some(&mut store),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ash_core::AshError::Protocol(_)));
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [
+                    ContentBlock::Thought { text, .. },
+                    ContentBlock::Text(answer),
+                ] if text == "checking" && answer == "partial")
+        ));
+        let persisted = tokio::fs::read_to_string(store.path()).await.unwrap();
+        assert!(persisted.contains("checking"));
+        assert!(persisted.contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_completes_an_active_tool_call() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                StreamItem::ToolCall {
+                    id: ToolCallId::from_provider("call_1"),
+                    name: "blocking".into(),
+                    arguments: serde_json::json!({}),
+                },
+                StreamItem::Stop(StopReason::EndTurn),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = AgentConfig {
+            provider: ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                api_key: "test".into(),
+                base_url: None,
+            },
+            system_prompt: None,
+            tools: vec![Arc::new(BlockingTool)],
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: None,
+            max_output_tokens: None,
+            max_tool_duration: Duration::from_secs(30),
+            agent_path: "/root".to_string(),
+            root_session_id: None,
+        };
+        let mut messages = vec![Message::user("use a tool")];
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let reason = {
+            let turn = run_with_adapter(
+                &config,
+                &mut messages,
+                tx,
+                cancel.clone(),
+                SessionId::new(),
+                &adapter,
+                None,
+            );
+            tokio::pin!(turn);
+
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
+            };
+            assert!(matches!(event, Some(Event::ToolCallStart { .. })));
+            cancel.cancel();
+            (&mut turn).await.unwrap()
+        };
+
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[2].content,
+            MessageContent::ToolResult { result: Err(error), .. } if error == "cancelled"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(Event::ToolCallEnd { is_error: true, .. })
+        ));
     }
 
     #[test]

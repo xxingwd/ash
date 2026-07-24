@@ -11,6 +11,7 @@ path = "src/main.rs"
 ash-core = { workspace = true }
 ash-tools = { workspace = true }
 ash-agent = { workspace = true }
+ash-orchestrator = { workspace = true }
 ash-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

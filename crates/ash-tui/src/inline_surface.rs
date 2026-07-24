@@ -1,14 +1,18 @@
 use std::io::{self, Stdout, Write};
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use crossterm::{
-    cursor::{MoveTo, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    cursor::Show,
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute, queue,
     style::{Attribute, ResetColor, SetAttribute},
-    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
+    terminal::{
+        self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     buffer::Buffer,
     layout::{Position, Rect},
     Terminal,
@@ -69,32 +73,30 @@ impl Write for FrameWriter {
 
 type FullscreenTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 
-/// Owns the entire visible primary screen. Rows leave this surface only through
-/// `insert_history`, which moves them into the terminal's scrollback buffer.
-pub(crate) struct InlineSurface {
+/// Owns the alternate screen for the lifetime of the interactive UI.
+pub(crate) struct AlternateScreen {
     terminal: FullscreenTerminal,
-    pending_resize: Option<Rect>,
-    _guard: TerminalGuard,
+    guard: TerminalGuard,
 }
 
-impl InlineSurface {
+impl AlternateScreen {
     pub(crate) fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        let guard = TerminalGuard;
+        let guard = TerminalGuard::enter()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnableBracketedPaste, Show)?;
-        take_over_visible_screen(&mut stdout)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            Show
+        )?;
 
         let backend = CrosstermBackend::new(FrameWriter::new(stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
         terminal.force_redraw();
 
-        Ok(Self {
-            terminal,
-            pending_resize: None,
-            _guard: guard,
-        })
+        Ok(Self { terminal, guard })
     }
 
     pub(crate) fn begin_synchronized(&mut self) -> io::Result<()> {
@@ -109,19 +111,20 @@ impl InlineSurface {
         writer.commit_frame()
     }
 
-    pub(crate) fn resize(&mut self, width: u16, height: u16) {
-        self.pending_resize = Some(Rect::new(0, 0, width.max(1), height.max(1)));
+    pub(crate) fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.terminal
+            .resize(Rect::new(0, 0, width.max(1), height.max(1)))?;
+        self.terminal.force_redraw();
+        Ok(())
     }
 
     pub(crate) fn reset(&mut self) -> io::Result<()> {
-        self.apply_pending_resize()?;
         self.terminal.clear()?;
         self.terminal.force_redraw();
         Ok(())
     }
 
     pub(crate) fn render_frame(&mut self, frame: &ViewportFrame) -> io::Result<()> {
-        self.apply_pending_resize()?;
         self.terminal.draw(|terminal_frame| {
             let cursor = render_fullscreen(terminal_frame.buffer_mut(), frame);
             terminal_frame.set_cursor_position(cursor);
@@ -129,139 +132,78 @@ impl InlineSurface {
         Ok(())
     }
 
-    pub(crate) fn insert_history(
-        &mut self,
-        buffer: &Buffer,
-        leading_blank: bool,
-    ) -> io::Result<()> {
-        self.apply_pending_resize()?;
-        let width = self.terminal.current_buffer_mut().area.width.max(1);
-        let mut history = Buffer::empty(Rect::new(
-            0,
-            0,
-            width,
-            buffer.area.height.saturating_add(u16::from(leading_blank)),
-        ));
-        let target_y = u16::from(leading_blank);
-        copy_buffer(buffer, &mut history, 0, target_y, buffer.area.height);
-
-        // This is the full-screen case of Ratatui's inline `insert_before`:
-        // borrow the top row, draw one history row into it, then scroll that
-        // one-row region into the primary screen's scrollback.
-        for y in 0..history.area.height {
-            let backend = self.terminal.backend_mut();
-            backend
-                .draw((0..width).filter_map(|x| history.cell((x, y)).map(|cell| (x, 0, cell))))?;
-            backend.scroll_region_up(0..1, 1)?;
-        }
-        self.terminal.force_redraw();
-        Ok(())
+    pub(crate) fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let writer = self.terminal.backend_mut().writer_mut();
+        writer.write_all(osc52_sequence(text).as_bytes())?;
+        writer.flush()
     }
 
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
-        self.apply_pending_resize()?;
-        let height = self.terminal.current_buffer_mut().area.height.max(1);
-        let writer = self.terminal.backend_mut().writer_mut();
-        queue!(
-            writer,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            MoveTo(0, height.saturating_sub(1)),
-            Clear(ClearType::CurrentLine)
-        )?;
-        write!(writer, "\r\n")
+        self.terminal.show_cursor()?;
+        self.guard.restore()
     }
-
-    fn apply_pending_resize(&mut self) -> io::Result<()> {
-        let Some(area) = self.pending_resize.take() else {
-            return Ok(());
-        };
-        self.terminal.resize(area)?;
-        self.terminal.force_redraw();
-        Ok(())
-    }
-}
-
-fn take_over_visible_screen(stdout: &mut Stdout) -> io::Result<()> {
-    let (_, height) = terminal::size()?;
-    let height = height.max(1);
-    queue!(
-        stdout,
-        BeginSynchronizedUpdate,
-        MoveTo(0, height.saturating_sub(1))
-    )?;
-    // Preserve the shell's current screen by moving it into scrollback once.
-    // After this point every visible row belongs to Ash.
-    for _ in 0..height {
-        write!(stdout, "\r\n")?;
-    }
-    queue!(
-        stdout,
-        Clear(ClearType::All),
-        MoveTo(0, 0),
-        EndSynchronizedUpdate
-    )?;
-    stdout.flush()
 }
 
 fn render_fullscreen(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
     let visible_rows = frame.buffer.area.height.min(screen.area.height);
-    let hidden_rows = frame.buffer.area.height.saturating_sub(visible_rows);
-    copy_buffer(&frame.buffer, screen, hidden_rows, 0, visible_rows);
+    crate::buffer::copy_rows(
+        &frame.buffer,
+        screen,
+        0,
+        Rect::new(
+            screen.area.x,
+            screen.area.y,
+            screen.area.width,
+            visible_rows,
+        ),
+    );
 
     Position::new(
         frame.cursor_column.min(screen.area.width.saturating_sub(1)),
-        frame
-            .cursor_row
-            .saturating_sub(hidden_rows)
-            .min(screen.area.height.saturating_sub(1)),
+        frame.cursor_row.min(screen.area.height.saturating_sub(1)),
     )
 }
 
-fn copy_buffer(
-    source: &Buffer,
-    destination: &mut Buffer,
-    source_y: u16,
-    target_y: u16,
-    row_count: u16,
-) {
-    let height = row_count.min(source.area.height.saturating_sub(source_y));
-    let width = source.area.width.min(destination.area.width);
-    for y in 0..height {
-        let destination_y = target_y.saturating_add(y);
-        if destination_y >= destination.area.height {
-            break;
-        }
-        for x in 0..width {
-            let Some(cell) = source.cell((
-                source.area.x.saturating_add(x),
-                source.area.y.saturating_add(source_y).saturating_add(y),
-            )) else {
-                continue;
-            };
-            *destination
-                .cell_mut((
-                    destination.area.x.saturating_add(x),
-                    destination.area.y.saturating_add(destination_y),
-                ))
-                .expect("destination cell is in bounds") = cell.clone();
-        }
-    }
+fn osc52_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    active: bool,
+}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self { active: true })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
         let mut stdout = io::stdout();
-        let _ = execute!(
+        let screen_result = execute!(
             stdout,
+            DisableMouseCapture,
             DisableBracketedPaste,
             ResetColor,
             SetAttribute(Attribute::Reset),
-            Show
+            Show,
+            LeaveAlternateScreen
         );
-        let _ = terminal::disable_raw_mode();
+        let raw_mode_result = terminal::disable_raw_mode();
+        if screen_result.is_ok() && raw_mode_result.is_ok() {
+            self.active = false;
+        }
+        screen_result.and(raw_mode_result)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -280,7 +222,10 @@ mod tests {
             buffer: source,
             cursor_row: 1,
             cursor_column: 2,
-            total_rows: 2,
+            scroll_top: 0,
+            max_scroll_top: 0,
+            page_rows: 2,
+            thought_hits: Vec::new(),
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
@@ -292,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_render_keeps_only_the_bottom_rows() {
+    fn fullscreen_render_clips_rows_below_the_screen() {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 4));
         for (row, text) in ["one", "two", "three", "four"].into_iter().enumerate() {
             source.set_string(0, row as u16, text, Style::default());
@@ -301,14 +246,17 @@ mod tests {
             buffer: source,
             cursor_row: 3,
             cursor_column: 1,
-            total_rows: 4,
+            scroll_top: 0,
+            max_scroll_top: 0,
+            page_rows: 2,
+            thought_hits: Vec::new(),
         };
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
         let cursor = render_fullscreen(&mut screen, &frame);
 
-        assert_eq!(row_text(&screen, 0), "three");
-        assert_eq!(row_text(&screen, 1), "four");
+        assert_eq!(row_text(&screen, 0), "one");
+        assert_eq!(row_text(&screen, 1), "two");
         assert_eq!(cursor, Position::new(1, 1));
     }
 
@@ -320,6 +268,11 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(writer.frame.as_deref(), Some(b"first\r\nsecond".as_slice()));
+    }
+
+    #[test]
+    fn osc52_copies_utf8_text_through_the_terminal() {
+        assert_eq!(osc52_sequence("你好"), "\x1b]52;c;5L2g5aW9\x07");
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {

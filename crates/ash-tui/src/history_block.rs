@@ -6,14 +6,9 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    palette::Rgb,
-    scrollback::{sanitize_terminal_text, wrap_text},
-};
+use crate::scrollback::{sanitize_terminal_text, wrap_text};
 
 const USER_HORIZONTAL_INSET: u16 = 2;
-const USER_RIGHT_PADDING: u16 = 1;
-const USER_VERTICAL_PADDING: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HistoryBlock {
@@ -40,9 +35,9 @@ impl HistoryBlock {
         Self::Worked(elapsed)
     }
 
-    pub(crate) fn render(&self, width: u16, composer_background: Option<Rgb>) -> Buffer {
+    pub(crate) fn render(&self, width: u16) -> Buffer {
         match self {
-            Self::User(text) => render_user(text, width.max(1), composer_background),
+            Self::User(text) => render_user(text, width.max(1)),
             Self::Info(message) => render_info(message, width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
             Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
@@ -56,44 +51,31 @@ fn normalize_multiline(text: &str) -> String {
         .replace('\r', "\n")
 }
 
-fn render_user(text: &str, width: u16, composer_background: Option<Rgb>) -> Buffer {
+fn render_user(text: &str, width: u16) -> Buffer {
     let show_prefix = width > USER_HORIZONTAL_INSET;
     let content_x = if show_prefix {
         USER_HORIZONTAL_INSET
     } else {
         0
     };
-    let content_width = width
-        .saturating_sub(content_x)
-        .saturating_sub(u16::from(show_prefix) * USER_RIGHT_PADDING)
-        .max(1);
+    let content_width = width.saturating_sub(content_x).max(1);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     let content_height = u16::try_from(paragraph.line_count(content_width))
-        .unwrap_or(u16::MAX.saturating_sub(USER_VERTICAL_PADDING * 2))
+        .unwrap_or(u16::MAX)
         .max(1);
-    let height = content_height.saturating_add(USER_VERTICAL_PADDING * 2);
-    let area = Rect::new(0, 0, width, height);
-    let background = composer_background.map_or(Color::Reset, |(red, green, blue)| {
-        Color::Rgb(red, green, blue)
-    });
+    let area = Rect::new(0, 0, width, content_height);
     let mut buffer = Buffer::empty(area);
-    buffer.set_style(area, Style::default().bg(background));
 
     if show_prefix {
         buffer.set_string(
             0,
-            USER_VERTICAL_PADDING,
+            0,
             "›",
             Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
         );
     }
     paragraph.render(
-        Rect::new(
-            content_x,
-            USER_VERTICAL_PADDING,
-            content_width,
-            content_height,
-        ),
+        Rect::new(content_x, 0, content_width, content_height),
         &mut buffer,
     );
     buffer
@@ -200,34 +182,29 @@ mod tests {
     }
 
     #[test]
-    fn user_block_owns_padding_and_hanging_indent() {
-        let buffer = HistoryBlock::user("abcdefghij").render(9, Some((30, 30, 30)));
+    fn user_block_uses_content_height_and_hanging_indent() {
+        let buffer = HistoryBlock::user("abcdefghij").render(9);
 
-        assert_eq!(buffer.area.height, 4);
-        assert_eq!(row_text(&buffer, 0), "");
-        assert_eq!(row_text(&buffer, 1), "› abcdef");
-        assert_eq!(row_text(&buffer, 2), "  ghij");
-        assert_eq!(row_text(&buffer, 3), "");
-        assert_eq!(
-            buffer.cell((8, 1)).expect("cell").bg,
-            Color::Rgb(30, 30, 30)
-        );
+        assert_eq!(buffer.area.height, 2);
+        assert_eq!(row_text(&buffer, 0), "› abcdefg");
+        assert_eq!(row_text(&buffer, 1), "  hij");
+        assert_eq!(buffer.cell((8, 0)).expect("cell").bg, Color::Reset);
     }
 
     #[test]
     fn long_user_block_can_be_taller_than_the_terminal() {
-        let buffer = HistoryBlock::user(&"word ".repeat(100)).render(10, None);
+        let buffer = HistoryBlock::user(&"word ".repeat(100)).render(10);
 
         assert!(buffer.area.height > 24);
     }
 
     #[test]
     fn tiny_width_falls_back_to_content_without_a_prefix() {
-        let buffer = HistoryBlock::user("ash").render(1, None);
+        let buffer = HistoryBlock::user("ash").render(1);
 
-        assert_eq!(row_text(&buffer, 1), "a");
-        assert_eq!(row_text(&buffer, 2), "s");
-        assert_eq!(row_text(&buffer, 3), "h");
+        assert_eq!(row_text(&buffer, 0), "a");
+        assert_eq!(row_text(&buffer, 1), "s");
+        assert_eq!(row_text(&buffer, 2), "h");
     }
 
     #[test]
@@ -239,7 +216,7 @@ mod tests {
 
     #[test]
     fn info_block_preserves_bullet_wrap_and_continuation_indent() {
-        let buffer = HistoryBlock::info("abcdefghij").render(12, None);
+        let buffer = HistoryBlock::info("abcdefghij").render(12);
 
         assert_eq!(buffer.area.height, 2);
         assert_eq!(row_text(&buffer, 0), "• abcdefgh");
@@ -253,7 +230,7 @@ mod tests {
 
     #[test]
     fn error_block_preserves_label_and_error_style() {
-        let buffer = HistoryBlock::error("abcdefghijklmnop").render(20, None);
+        let buffer = HistoryBlock::error("abcdefghijklmnop").render(20);
 
         assert_eq!(buffer.area.height, 2);
         assert_eq!(row_text(&buffer, 0), "• Error: abcdefghijk");
@@ -270,7 +247,7 @@ mod tests {
 
     #[test]
     fn worked_block_fills_or_truncates_to_the_terminal_width() {
-        let buffer = HistoryBlock::worked("2m 05s".to_string()).render(32, None);
+        let buffer = HistoryBlock::worked("2m 05s".to_string()).render(32);
         let separator = row_text(&buffer, 0);
 
         assert!(separator.starts_with("─ Worked for 2m 05s ─"));
@@ -281,7 +258,7 @@ mod tests {
             .modifier
             .contains(Modifier::DIM));
         assert_eq!(
-            row_text(&HistoryBlock::worked("0s".to_string()).render(10, None), 0),
+            row_text(&HistoryBlock::worked("0s".to_string()).render(10), 0),
             "─ Worked f"
         );
     }

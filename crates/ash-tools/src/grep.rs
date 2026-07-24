@@ -1,170 +1,229 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{define_tool, Tool, ToolError};
-use globset::{GlobBuilder, GlobMatcher};
-use regex::RegexBuilder;
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::truncate::{self, DEFAULT_MAX_BYTES};
+use crate::path::SearchPath;
 
-const DEFAULT_LIMIT: usize = 100;
+const MAX_MATCHES: usize = 100;
+const MAX_LINE_CHARS: usize = 500;
+const MAX_SEARCH_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 struct GrepArgs {
-    /// Search pattern, interpreted as a regular expression unless literal is true
+    /// Regular expression used to search file contents
     pattern: String,
     /// File or directory to search; defaults to the working directory
     path: Option<String>,
-    /// Glob used to filter files, for example *.ts or **/*.spec.ts
-    glob: Option<String>,
-    /// Perform a case-insensitive search
-    ignore_case: Option<bool>,
-    /// Treat pattern as literal text instead of a regular expression
-    literal: Option<bool>,
-    /// Number of context lines before and after each match
-    context: Option<usize>,
-    /// Maximum number of matches; defaults to 100
-    limit: Option<usize>,
+    /// Glob pattern used to include files, such as *.rs or *.{ts,tsx}
+    include: Option<String>,
+}
+
+#[derive(Debug)]
+struct Match {
+    path: PathBuf,
+    line: usize,
+    text: String,
 }
 
 pub fn tool() -> Arc<dyn Tool> {
     define_tool(
         "grep",
-        "Search file contents by regex or literal text. Respects .gitignore and returns matching paths, line numbers, and optional context. Output is limited by match count and 50KB.",
+        "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
         |ctx, args: GrepArgs| async move {
-            let root = crate::path::existing(
-                &ctx.working_dir,
-                args.path.as_deref().unwrap_or("."),
-            )?;
-            tokio::task::spawn_blocking(move || search(&root, &args))
-                .await
-                .map_err(|error| ToolError::Execution(format!("grep task failed: {error}")))?
+            let root = ctx.working_dir;
+            crate::path::run_blocking(move || {
+                search(
+                    &root,
+                    args.path.as_deref().unwrap_or("."),
+                    &args.pattern,
+                    args.include.as_deref(),
+                )
+            })
+            .await
         },
     )
 }
 
-fn search(root: &Path, args: &GrepArgs) -> Result<String, ToolError> {
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
-    if limit == 0 {
-        return Err(ToolError::Execution("limit must be at least 1".into()));
+fn search(
+    root: &Path,
+    requested: &str,
+    pattern: &str,
+    include: Option<&str>,
+) -> Result<String, ToolError> {
+    if pattern.is_empty() {
+        return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
-    let pattern = if args.literal.unwrap_or(false) {
-        regex::escape(&args.pattern)
-    } else {
-        args.pattern.clone()
-    };
-    let regex = RegexBuilder::new(&pattern)
-        .case_insensitive(args.ignore_case.unwrap_or(false))
-        .build()
-        .map_err(|error| ToolError::Execution(format!("invalid regex: {error}")))?;
-    let glob = args.glob.as_deref().map(build_glob).transpose()?;
-    let root_is_file = root.is_file();
-    let mut matches = 0;
-    let mut limit_reached = false;
-    let mut lines_truncated = false;
-    let mut output = Vec::new();
+    let regex = Regex::new(pattern)
+        .map_err(|error| ToolError::Execution(format!("invalid regular expression: {error}")))?;
+    let search = SearchPath::new(root, requested)?;
+    let mut matches = Vec::new();
+    let mut truncated = false;
 
-    'files: for path in crate::path::files(root) {
-        if !matches_glob(&path, root, glob.as_ref()) {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+    if search.full_path().is_file() {
+        let included = match include {
+            Some(pattern) => file_matches(search.full_path(), pattern)?,
+            None => true,
         };
-        let lines = content.lines().collect::<Vec<_>>();
-        for (line_index, line) in lines.iter().enumerate() {
-            if !regex.is_match(line) {
+        if included {
+            truncated = search_file(&search, search.full_path(), &regex, &mut matches)?;
+        }
+    } else if search.full_path().is_dir() {
+        let mut builder = WalkBuilder::new(search.full_path());
+        builder
+            .follow_links(false)
+            .require_git(false)
+            .sort_by_file_path(|left, right| left.cmp(right));
+        let include = if let Some(pattern) = include {
+            let mut overrides = OverrideBuilder::new(search.full_path());
+            overrides.add(pattern).map_err(|error| {
+                ToolError::Execution(format!("invalid include pattern: {error}"))
+            })?;
+            Some(overrides.build().map_err(|error| {
+                ToolError::Execution(format!("invalid include pattern: {error}"))
+            })?)
+        } else {
+            None
+        };
+        for entry in builder.build() {
+            let entry = entry
+                .map_err(|error| ToolError::Execution(format!("cannot search files: {error}")))?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
-            if matches >= limit {
-                limit_reached = true;
-                break 'files;
+            if include
+                .as_ref()
+                .is_some_and(|matcher| !matcher.matched(entry.path(), false).is_whitelist())
+            {
+                continue;
             }
-            matches += 1;
-            append_match(
-                &mut output,
-                display_path(&path, root, root_is_file),
-                &lines,
-                line_index,
-                args.context.unwrap_or(0),
-                &mut lines_truncated,
-            );
+            if search_file(&search, entry.path(), &regex, &mut matches)? {
+                truncated = true;
+                break;
+            }
         }
+    } else {
+        return Err(ToolError::Execution(format!(
+            "grep path is not a file or directory: {}",
+            search.full_path().display()
+        )));
     }
 
-    if output.is_empty() {
+    if matches.is_empty() {
         return Ok("No matches found".into());
     }
-    let truncated = truncate::head(&output.join("\n"), usize::MAX);
-    let mut rendered = truncated.content;
-    let mut notices = Vec::new();
-    if limit_reached {
-        notices.push(format!(
-            "{limit} matches limit reached; increase limit or refine the pattern"
-        ));
+    matches.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    let mut output = format!(
+        "Found {} matching lines{}",
+        matches.len(),
+        if truncated { " (more available)" } else { "" }
+    );
+    let mut current = None;
+    for found in matches {
+        if current.as_ref() != Some(&found.path) {
+            output.push_str(&format!("\n\n{}:", found.path.display()));
+            current = Some(found.path.clone());
+        }
+        output.push_str(&format!("\n  Line {}: {}", found.line, found.text));
     }
-    if truncated.truncated {
-        notices.push(format!(
-            "{} output limit reached",
-            truncate::format_size(DEFAULT_MAX_BYTES)
-        ));
+    if truncated {
+        output.push_str(
+            "\n\n[Results truncated at 100 matching lines. Use a narrower path, pattern, or include glob.]",
+        );
     }
-    if lines_truncated {
-        notices.push("some lines were truncated; use read for the full line".into());
-    }
-    if !notices.is_empty() {
-        rendered.push_str(&format!("\n\n[{}]", notices.join(". ")));
-    }
-    Ok(rendered)
+    Ok(output)
 }
 
-fn build_glob(pattern: &str) -> Result<GlobMatcher, ToolError> {
-    GlobBuilder::new(pattern)
-        .literal_separator(true)
+fn file_matches(path: &Path, pattern: &str) -> Result<bool, ToolError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut overrides = OverrideBuilder::new(parent);
+    overrides
+        .add(pattern)
+        .map_err(|error| ToolError::Execution(format!("invalid include pattern: {error}")))?;
+    let overrides = overrides
         .build()
-        .map(|glob| glob.compile_matcher())
-        .map_err(|error| ToolError::Execution(format!("invalid glob: {error}")))
+        .map_err(|error| ToolError::Execution(format!("invalid include pattern: {error}")))?;
+    Ok(overrides.matched(path, false).is_whitelist())
 }
 
-fn matches_glob(path: &Path, root: &Path, glob: Option<&GlobMatcher>) -> bool {
-    let Some(glob) = glob else {
-        return true;
-    };
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    glob.is_match(relative) || path.file_name().is_some_and(|name| glob.is_match(name))
+fn search_file(
+    search: &SearchPath,
+    path: &Path,
+    regex: &Regex,
+    matches: &mut Vec<Match>,
+) -> Result<bool, ToolError> {
+    let file = File::open(path).map_err(|error| {
+        ToolError::Execution(format!("cannot read {}: {error}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    let mut line = 0;
+    loop {
+        let Some(truncated) = read_line(&mut reader, &mut buffer).map_err(|error| {
+            ToolError::Execution(format!("cannot read {}: {error}", path.display()))
+        })?
+        else {
+            return Ok(false);
+        };
+        if buffer.contains(&0) {
+            return Ok(false);
+        }
+        line += 1;
+        if truncated {
+            continue;
+        }
+        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+            buffer.pop();
+        }
+        let text = String::from_utf8_lossy(&buffer);
+        if !regex.is_match(&text) {
+            continue;
+        }
+        if matches.len() == MAX_MATCHES {
+            return Ok(true);
+        }
+        let text = text.chars().take(MAX_LINE_CHARS).collect::<String>();
+        matches.push(Match {
+            path: search.relative(path),
+            line,
+            text,
+        });
+    }
 }
 
-fn display_path(path: &Path, root: &Path, root_is_file: bool) -> String {
-    let display = if root_is_file {
-        path.file_name().map(Path::new).unwrap_or(path)
-    } else {
-        path.strip_prefix(root).unwrap_or(path)
-    };
-    display
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-}
-
-fn append_match(
-    output: &mut Vec<String>,
-    path: String,
-    lines: &[&str],
-    line_index: usize,
-    context: usize,
-    lines_truncated: &mut bool,
-) {
-    let start = line_index.saturating_sub(context);
-    let end = line_index
-        .saturating_add(context)
-        .saturating_add(1)
-        .min(lines.len());
-    for (index, source) in lines.iter().enumerate().take(end).skip(start) {
-        let (line, truncated) = truncate::truncate_line(source);
-        *lines_truncated |= truncated;
-        let separator = if index == line_index { ':' } else { '-' };
-        output.push(format!("{path}{separator}{}{separator} {line}", index + 1));
+fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    output.clear();
+    let mut read_any = false;
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(read_any.then_some(truncated));
+        }
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let content = newline.map_or(consumed, |index| index);
+        let remaining = MAX_SEARCH_LINE_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&available[..content.min(remaining)]);
+        truncated |= content > remaining;
+        let complete = newline.is_some();
+        reader.consume(consumed);
+        if complete {
+            return Ok(Some(truncated));
+        }
     }
 }
 
@@ -172,44 +231,78 @@ fn append_match(
 mod tests {
     use super::*;
 
-    fn args(pattern: &str) -> GrepArgs {
-        GrepArgs {
-            pattern: pattern.into(),
-            path: None,
-            glob: None,
-            ignore_case: None,
-            literal: None,
-            context: None,
-            limit: None,
-        }
+    #[test]
+    fn searches_regexes_and_filters_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "first\nneedle 1\nneedle 2\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.txt"), "needle 3\n").unwrap();
+
+        let output = search(root.path(), "src", r"needle \d", Some("*.rs")).unwrap();
+
+        assert!(output.contains("Found 2 matching lines"));
+        assert!(output.contains("src/lib.rs:"));
+        assert!(output.contains("Line 2: needle 1"));
+        assert!(!output.contains("needle 3"));
     }
 
     #[test]
-    fn respects_gitignore_and_reports_relative_paths() {
+    fn supports_exact_file_paths_and_rejects_invalid_regexes() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        std::fs::write(root.path().join("ignored.txt"), "needle\n").unwrap();
-        std::fs::write(root.path().join("kept.txt"), "needle\n").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\n").unwrap();
 
-        let output = search(root.path(), &args("needle")).unwrap();
+        let output = search(root.path(), "notes.txt", "two", None).unwrap();
 
-        assert!(output.contains("kept.txt:1: needle"));
-        assert!(!output.contains("ignored.txt"));
+        assert!(output.contains("notes.txt:"));
+        assert!(output.contains("Line 2: two"));
+        assert!(search(root.path(), ".", "[", None).is_err());
     }
 
     #[test]
-    fn supports_literal_case_insensitive_search_with_context() {
+    fn truncates_large_match_sets() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file.txt"), "before\nA.B\nafter\n").unwrap();
-        let mut args = args("a.b");
-        args.literal = Some(true);
-        args.ignore_case = Some(true);
-        args.context = Some(1);
+        let content = (0..=MAX_MATCHES)
+            .map(|index| format!("match {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.path().join("matches.txt"), content).unwrap();
 
-        let output = search(root.path(), &args).unwrap();
+        let output = search(root.path(), ".", "match", None).unwrap();
 
-        assert!(output.contains("file.txt-1- before"));
-        assert!(output.contains("file.txt:2: A.B"));
-        assert!(output.contains("file.txt-3- after"));
+        assert!(output.starts_with("Found 100 matching lines (more available)"));
+        assert_eq!(
+            output.lines().filter(|line| line.contains("Line ")).count(),
+            MAX_MATCHES
+        );
+        assert!(output.contains("Results truncated at 100 matching lines"));
+    }
+
+    #[test]
+    fn skips_oversized_lines_without_hiding_later_matches() {
+        let input = format!("{}\nneedle\n", "x".repeat(MAX_SEARCH_LINE_BYTES + 1));
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut buffer = Vec::new();
+
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap(), Some(true));
+        assert!(buffer.len() <= MAX_SEARCH_LINE_BYTES);
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap(), Some(false));
+        assert_eq!(buffer, b"needle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
+
+        let output = search(root.path(), ".", "needle", None).unwrap();
+
+        assert_eq!(output, "No matches found");
     }
 }

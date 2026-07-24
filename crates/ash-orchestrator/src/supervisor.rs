@@ -784,18 +784,7 @@ fn fork_messages(messages: &[Message], mode: ForkMode) -> Vec<Message> {
     if mode == ForkMode::None {
         return Vec::new();
     }
-    let current_turn_has_tool_call = messages.last().is_some_and(|message| {
-        matches!(
-            &message.content,
-            MessageContent::Assistant(blocks)
-                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolCall { .. }))
-        )
-    });
-    let end = if current_turn_has_tool_call {
-        messages.len().saturating_sub(1)
-    } else {
-        messages.len()
-    };
+    let end = complete_history_end(messages);
     let messages = &messages[..end];
     let start = match mode {
         ForkMode::None => messages.len(),
@@ -810,6 +799,43 @@ fn fork_messages(messages: &[Message], mode: ForkMode) -> Vec<Message> {
             .unwrap_or(0),
     };
     messages[start..].to_vec()
+}
+
+fn complete_history_end(messages: &[Message]) -> usize {
+    let Some((call_index, call_ids)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let MessageContent::Assistant(blocks) = &message.content else {
+                    return None;
+                };
+                let ids = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall { id, .. } => Some(id),
+                        ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                (!ids.is_empty()).then_some((index, ids))
+            })
+    else {
+        return messages.len();
+    };
+    let result_ids = messages[call_index + 1..]
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::ToolResult { id, .. } => Some(id),
+            MessageContent::User(_) | MessageContent::Assistant(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    if call_ids.iter().all(|call_id| result_ids.contains(call_id)) {
+        messages.len()
+    } else {
+        call_index
+    }
 }
 
 fn subagent_system_prompt(
@@ -841,7 +867,9 @@ fn final_assistant_message(messages: &[Message]) -> Option<String> {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text(text) if !text.trim().is_empty() => Some(text.as_str()),
-                ContentBlock::Text(_) | ContentBlock::ToolCall { .. } => None,
+                ContentBlock::Text(_)
+                | ContentBlock::Thought { .. }
+                | ContentBlock::ToolCall { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -966,6 +994,59 @@ mod tests {
         let recent = fork_messages(&messages, ForkMode::Last(1));
         assert_eq!(recent.len(), 2);
         assert!(matches!(recent[0].content, MessageContent::User(_)));
+    }
+
+    #[test]
+    fn excludes_an_entire_tool_group_until_every_result_exists() {
+        let first_call = ash_core::ToolCallId::from_provider("first");
+        let second_call = ash_core::ToolCallId::from_provider("second");
+        let messages = vec![
+            Message::user("first turn"),
+            Message::assistant_text("first answer"),
+            Message::user("second turn"),
+            Message {
+                id: ash_core::MessageId::new(),
+                role: ash_core::Role::Assistant,
+                content: MessageContent::Assistant(vec![
+                    ContentBlock::ToolCall {
+                        id: first_call.clone(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: second_call.clone(),
+                        name: "spawn_agent".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ]),
+            },
+            Message {
+                id: ash_core::MessageId::new(),
+                role: ash_core::Role::User,
+                content: MessageContent::ToolResult {
+                    id: first_call,
+                    result: Ok("done".to_string()),
+                    attachments: Vec::new(),
+                },
+            },
+        ];
+
+        let forked = fork_messages(&messages, ForkMode::All);
+
+        assert_eq!(forked.len(), 3);
+        assert!(matches!(forked[2].content, MessageContent::User(_)));
+
+        let mut complete = messages;
+        complete.push(Message {
+            id: ash_core::MessageId::new(),
+            role: ash_core::Role::User,
+            content: MessageContent::ToolResult {
+                id: second_call,
+                result: Ok("spawned".to_string()),
+                attachments: Vec::new(),
+            },
+        });
+        assert_eq!(fork_messages(&complete, ForkMode::All).len(), 6);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
+    build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
 };
 use ash_core::{Message, ModelId, Protocol, ProviderConfig, SessionId};
 use futures::StreamExt;
@@ -11,7 +11,7 @@ use crate::Cli;
 
 enum AfterTurn {
     None,
-    Undo,
+    Rollback,
     Exit,
 }
 
@@ -51,7 +51,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     };
     let base_url = cli.base_url.clone().or_else(|| env_value("ASH_BASE_URL"));
     let working_dir = std::env::current_dir()?;
-    let skills = Skill::load_from_dir(&working_dir.join("skills"))?;
+    let skills = Skill::discover(&working_dir)?;
     let active_skill = cli
         .skill
         .as_ref()
@@ -64,11 +64,12 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         })
         .transpose()?;
     let system_prompt = build_system_prompt(&working_dir, &skills, active_skill.as_ref())?;
-    let tools = ash_tools::tools(
+    let mut tools = ash_tools::tools(
         active_skill
             .as_ref()
             .and_then(|skill| skill.tools.as_deref()),
-    );
+    )?;
+    tools.push(skill_tool(skills.clone()));
 
     let mut config = AgentConfig {
         provider: ProviderConfig {
@@ -91,6 +92,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     if let Some(skill) = active_skill {
         skill.apply_overrides(&mut config);
     }
+    ash_orchestrator::install_subagent_tools(&mut config);
 
     Ok(config)
 }
@@ -177,12 +179,19 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                     tokio::select! {
                         _ = &mut turn => break AfterTurn::None,
                         command = command_rx.recv() => match command {
-                            Some(ash_tui::UiCommand::CancelAndUndo) => {
+                            Some(ash_tui::UiCommand::Cancel) => {
                                 cancel.cancel();
                                 let _ = (&mut turn).await;
-                                break AfterTurn::Undo;
+                                pending_input = None;
+                                break AfterTurn::None;
+                            }
+                            Some(ash_tui::UiCommand::CancelAndRollback) => {
+                                cancel.cancel();
+                                let _ = (&mut turn).await;
+                                break AfterTurn::Rollback;
                             }
                             Some(ash_tui::UiCommand::NewSession)
+                            | Some(ash_tui::UiCommand::Rollback)
                             | Some(ash_tui::UiCommand::ListSessions)
                             | Some(ash_tui::UiCommand::ResumeSession(_)) => {
                                 let _ = event_tx
@@ -205,14 +214,19 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                 drop(turn);
                 match after_turn {
                     AfterTurn::None => {}
-                    AfterTurn::Undo => {
+                    AfterTurn::Rollback => {
                         pending_input = None;
                         rollback_last_turn(&mut session, &event_tx, &history_store).await;
                     }
                     AfterTurn::Exit => break 'controller,
                 }
             }
-            ash_tui::UiCommand::CancelAndUndo => {
+            ash_tui::UiCommand::CancelAndRollback => {
+                pending_input = None;
+                rollback_last_turn(&mut session, &event_tx, &history_store).await;
+            }
+            ash_tui::UiCommand::Cancel => {}
+            ash_tui::UiCommand::Rollback => {
                 pending_input = None;
                 rollback_last_turn(&mut session, &event_tx, &history_store).await;
             }
@@ -242,13 +256,14 @@ async fn rollback_last_turn(
     history_store: &MessageHistoryStore,
 ) {
     let event = match session.rollback_last_turn().await {
-        Some(prompt) => {
+        Ok(Some(prompt)) => {
             if let Err(error) = history_store.undo(session.id(), &prompt).await {
                 tracing::warn!(%error, "failed to undo input history entry");
             }
             ash_core::Event::TurnRolledBack { prompt }
         }
-        None => ash_core::Event::Error("No submitted turn is available to undo.".to_string()),
+        Ok(None) => ash_core::Event::Error("No submitted turn is available to undo.".to_string()),
+        Err(error) => ash_core::Event::Error(format!("Failed to undo the last turn: {error}")),
     };
     let _ = event_tx.send(event).await;
 }

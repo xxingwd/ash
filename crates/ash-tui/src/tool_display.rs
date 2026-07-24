@@ -3,6 +3,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::text_width::truncate_end;
 
+const GROUP_DETAIL_LIMIT: usize = 4;
+
+pub(crate) fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
+    (name == "read").then(|| path_argument(arguments))
+}
+
 pub(crate) fn tool_activity_summary(name: &str, arguments: &Value, max_width: u16) -> String {
     let phrase = tool_phrase(name, arguments);
     truncate_end(
@@ -26,13 +32,22 @@ pub(crate) fn tool_call_summary(
     fit_action_and_detail(action, &detail, usize::from(max_width.max(1)))
 }
 
-pub(crate) fn read_group_summary(arguments: &[Value], max_width: u16) -> (String, String) {
-    let detail = arguments
-        .iter()
-        .map(|arguments| tool_phrase("read", arguments).detail)
-        .filter(|detail| !detail.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ");
+pub(crate) fn read_group_summary(details: &[String], max_width: u16) -> (String, String) {
+    let mut unique = details.iter().filter(|detail| !detail.is_empty()).fold(
+        Vec::new(),
+        |mut unique, detail| {
+            if !unique.contains(&detail.as_str()) {
+                unique.push(detail.as_str());
+            }
+            unique
+        },
+    );
+    let hidden = unique.len().saturating_sub(GROUP_DETAIL_LIMIT);
+    unique.truncate(GROUP_DETAIL_LIMIT);
+    let mut detail = unique.join(", ");
+    if hidden > 0 {
+        detail.push_str(&format!(" +{hidden}"));
+    }
     fit_action_and_detail("Read", &detail, usize::from(max_width.max(1)))
 }
 
@@ -48,18 +63,30 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
         "read" => phrase("Reading", "Read", "reading", path_argument(arguments)),
         "write" => phrase("Writing", "Wrote", "writing", path_argument(arguments)),
         "edit" => phrase("Editing", "Edited", "editing", path_argument(arguments)),
+        "glob" => phrase(
+            "Finding",
+            "Found",
+            "finding",
+            string_argument(arguments, "pattern"),
+        ),
         "grep" => phrase(
             "Searching",
             "Searched",
             "searching",
-            search_detail(arguments),
+            string_argument(arguments, "pattern"),
         ),
-        "find" => phrase("Listing", "Listed", "listing", search_detail(arguments)),
+        "webfetch" => phrase("Fetching", "Fetched", "fetching", url_argument(arguments)),
         "bash" => phrase(
             "Running",
             "Ran",
             "running",
             string_argument(arguments, "command"),
+        ),
+        "skill" => phrase(
+            "Loading",
+            "Loaded",
+            "loading",
+            string_argument(arguments, "name"),
         ),
         "spawn_agent" => phrase(
             "Spawning",
@@ -110,29 +137,6 @@ fn phrase(
     }
 }
 
-fn search_detail(arguments: &Value) -> String {
-    let pattern = string_argument(arguments, "pattern");
-    append_short_path(pattern, arguments)
-}
-
-fn append_short_path(mut detail: String, arguments: &Value) -> String {
-    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-        return detail;
-    };
-    let path = path.trim();
-    if path.is_empty() || path == "." {
-        return detail;
-    }
-    let path = short_display_path(path);
-    if detail.is_empty() {
-        path
-    } else {
-        detail.push_str(" in ");
-        detail.push_str(&path);
-        detail
-    }
-}
-
 fn path_argument(arguments: &Value) -> String {
     arguments
         .get("path")
@@ -147,6 +151,24 @@ fn string_argument(arguments: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .map(sanitize_single_line)
         .unwrap_or_default()
+}
+
+fn url_argument(arguments: &Value) -> String {
+    let url = string_argument(arguments, "url");
+    let without_fragment = url.split('#').next().unwrap_or(&url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let Some((scheme, rest)) = without_query.split_once("://") else {
+        return without_query.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
 }
 
 fn short_display_path(path: &str) -> String {
@@ -195,22 +217,44 @@ mod tests {
     #[test]
     fn renders_builtin_tools_as_semantic_summaries() {
         assert_eq!(
-            tool_call_summary(
-                "bash",
-                &json!({"command": "cargo test", "cwd": "/tmp/project"}),
-                false,
-                80,
-            ),
+            tool_call_summary("bash", &json!({"command": "cargo test"}), false, 80,),
             ("Ran".to_string(), "cargo test".to_string())
         );
         assert_eq!(
             tool_call_summary(
-                "grep",
-                &json!({"pattern": "reasoning", "path": "/work/ash/crates/ash-tui/src"}),
+                "bash",
+                &json!({"command": "rg reasoning /work/ash/crates/ash-tui/src"}),
                 false,
                 80,
             ),
-            ("Searched".to_string(), "reasoning in src".to_string())
+            (
+                "Ran".to_string(),
+                "rg reasoning /work/ash/crates/ash-tui/src".to_string()
+            )
+        );
+        assert_eq!(
+            tool_call_summary(
+                "webfetch",
+                &json!({"url": "https://user:secret@example.com/docs?q=token#section"}),
+                false,
+                80,
+            ),
+            (
+                "Fetched".to_string(),
+                "https://example.com/docs".to_string()
+            )
+        );
+        assert_eq!(
+            tool_call_summary("glob", &json!({"pattern": "**/*.rs"}), false, 80),
+            ("Found".to_string(), "**/*.rs".to_string())
+        );
+        assert_eq!(
+            tool_call_summary("grep", &json!({"pattern": "TODO|FIXME"}), false, 80),
+            ("Searched".to_string(), "TODO|FIXME".to_string())
+        );
+        assert_eq!(
+            tool_call_summary("skill", &json!({"name": "review"}), false, 80),
+            ("Loaded".to_string(), "review".to_string())
         );
     }
 
@@ -244,16 +288,28 @@ mod tests {
     }
 
     #[test]
-    fn groups_read_paths_behind_one_action() {
+    fn groups_matching_tools_behind_one_action() {
         assert_eq!(
-            read_group_summary(
-                &[
-                    json!({"path": "/workspace/src/inline.rs"}),
-                    json!({"path": "/workspace/src/viewport.rs"}),
-                ],
-                80,
-            ),
+            read_group_summary(&["inline.rs".to_string(), "viewport.rs".to_string()], 80,),
             ("Read".to_string(), "inline.rs, viewport.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn group_summaries_cap_visible_details() {
+        let details = ["a", "b", "c", "d", "e", "f"].map(str::to_string);
+
+        assert_eq!(
+            read_group_summary(&details, 80),
+            ("Read".to_string(), "a, b, c, d +2".to_string())
+        );
+    }
+
+    #[test]
+    fn group_summaries_deduplicate_details() {
+        assert_eq!(
+            read_group_summary(&["app.rs".to_string(), "app.rs".to_string()], 80,),
+            ("Read".to_string(), "app.rs".to_string())
         );
     }
 

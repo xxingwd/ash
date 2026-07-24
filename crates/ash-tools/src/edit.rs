@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Read, path::Path, sync::Arc};
 
 use ash_core::{define_tool, Tool, ToolError};
 use schemars::JsonSchema;
@@ -26,42 +26,86 @@ pub fn tool() -> Arc<dyn Tool> {
         "edit",
         "Edit one file using one or more exact replacements. Every edits[].oldText must be unique and non-overlapping in the original file; replacements are not applied incrementally.",
         |ctx, args: EditArgs| async move {
-            let path = crate::path::existing(&ctx.working_dir, &args.path)?;
-            let raw = tokio::fs::read_to_string(&path).await.map_err(|error| {
-                ToolError::Execution(format!("cannot read {}: {error}", path.display()))
-            })?;
-            let (bom, content) = raw
-                .strip_prefix('\u{feff}')
-                .map_or(("", raw.as_str()), |content| ("\u{feff}", content));
-            let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
-            let normalized = normalize_newlines(content);
-            let edits = args
-                .edits
-                .iter()
-                .map(|edit| Replacement {
-                    old_text: normalize_newlines(&edit.old_text),
-                    new_text: normalize_newlines(&edit.new_text),
-                })
-                .collect::<Vec<_>>();
-            let edited = apply_edits(&normalized, &edits)?;
-            let edited = if line_ending == "\r\n" {
-                edited.replace('\n', "\r\n")
-            } else {
-                edited
-            };
-            tokio::fs::write(&path, format!("{bom}{edited}"))
-                .await
-                .map_err(|error| {
-                    ToolError::Execution(format!("cannot write {}: {error}", path.display()))
-                })?;
-
+            let count = args.edits.len();
+            let path = edit_file(&ctx.working_dir, &args.path, args.edits).await?;
             Ok(format!(
                 "Successfully replaced {} block(s) in {}.",
-                edits.len(),
-                args.path
+                count,
+                path.display()
             ))
         },
     )
+}
+
+async fn edit_file(
+    root: &Path,
+    requested: &str,
+    edits: Vec<Replacement>,
+) -> Result<std::path::PathBuf, ToolError> {
+    let root = root.to_path_buf();
+    let requested = requested.to_string();
+    crate::path::run_blocking(move || {
+        let path = crate::path::WorkspacePath::new(&root, &requested)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        let mut file = path.open_with(&options).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot open {}: {error}",
+                path.full_path().display()
+            ))
+        })?;
+
+        let mut raw = String::new();
+        let permissions = file
+            .metadata()
+            .map_err(|error| {
+                ToolError::Execution(format!(
+                    "cannot inspect {}: {error}",
+                    path.full_path().display()
+                ))
+            })?
+            .permissions();
+        file.read_to_string(&mut raw).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot read {}: {error}",
+                path.full_path().display()
+            ))
+        })?;
+        let (bom, content) = raw
+            .strip_prefix('\u{feff}')
+            .map_or(("", raw.as_str()), |content| ("\u{feff}", content));
+        let line_ending = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let normalized = normalize_newlines(content);
+        let edits = edits
+            .iter()
+            .map(|edit| Replacement {
+                old_text: normalize_newlines(&edit.old_text),
+                new_text: normalize_newlines(&edit.new_text),
+            })
+            .collect::<Vec<_>>();
+        let edited = apply_edits(&normalized, &edits)?;
+        let edited = if line_ending == "\r\n" {
+            edited.replace('\n', "\r\n")
+        } else {
+            edited
+        };
+        let content = format!("{bom}{edited}");
+
+        path.atomic_replace(content.as_bytes(), permissions)
+            .map_err(|error| {
+                ToolError::Execution(format!(
+                    "cannot write {}: {error}",
+                    path.full_path().display()
+                ))
+            })?;
+
+        Ok(path.full_path().to_path_buf())
+    })
+    .await
 }
 
 fn normalize_newlines(text: &str) -> String {
@@ -158,5 +202,44 @@ mod tests {
         let edited = apply_edits(&content, &[replacement("one\ntwo", "three")]).unwrap();
 
         assert_eq!(edited, "three\n");
+    }
+
+    #[tokio::test]
+    async fn edits_files_through_the_workspace_capability() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input.txt"), "one\r\ntwo\r\n").unwrap();
+
+        edit_file(
+            root.path(),
+            "input.txt",
+            vec![replacement("one\ntwo", "three")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("input.txt")).unwrap(),
+            "three\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_file_permissions_during_atomic_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("script.sh");
+        std::fs::write(&path, "echo old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        edit_file(root.path(), "script.sh", vec![replacement("old", "new")])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 }

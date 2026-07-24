@@ -7,8 +7,6 @@ use crate::{
     scrollback::sanitize_terminal_text,
 };
 
-const REASONING_VIEW_ROWS: usize = 4;
-
 #[derive(Debug, Default)]
 pub(crate) struct StreamState {
     mode: StreamMode,
@@ -36,6 +34,7 @@ pub(crate) enum FinishedStream {
         block_id: Option<u64>,
     },
     Thought {
+        source: String,
         elapsed_seconds: u64,
     },
 }
@@ -124,14 +123,6 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn clear_block_id(&mut self, id: u64) {
-        if let StreamMode::Assistant { block_id, .. } = &mut self.mode {
-            if *block_id == Some(id) {
-                *block_id = None;
-            }
-        }
-    }
-
     pub(crate) fn active_lines(&self) -> &[RenderedLine] {
         match &self.mode {
             StreamMode::Reasoning { lines, .. } => lines,
@@ -141,6 +132,14 @@ impl StreamState {
 
     pub(crate) fn is_reasoning(&self) -> bool {
         matches!(self.mode, StreamMode::Reasoning { .. })
+    }
+
+    pub(crate) fn has_content(&self) -> bool {
+        match &self.mode {
+            StreamMode::Assistant { pending, .. } => !pending.is_empty(),
+            StreamMode::Reasoning { source, .. } => !source.trim().is_empty(),
+            StreamMode::Idle => false,
+        }
     }
 
     pub(crate) fn finish(&mut self) -> Option<FinishedStream> {
@@ -153,6 +152,7 @@ impl StreamState {
             StreamMode::Reasoning {
                 source, started_at, ..
             } if !source.trim().is_empty() => Some(FinishedStream::Thought {
+                source,
                 elapsed_seconds: started_at.elapsed().as_secs(),
             }),
             StreamMode::Reasoning { .. } => None,
@@ -187,12 +187,6 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     for line in &mut header {
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
-    header.truncate(REASONING_VIEW_ROWS);
-    let remaining_rows = REASONING_VIEW_ROWS.saturating_sub(header.len());
-    if remaining_rows == 0 {
-        return header;
-    }
-
     let mut body = render_markdown(source, width);
     while body.first().is_some_and(RenderedLine::is_blank) {
         body.remove(0);
@@ -203,8 +197,7 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     for line in &mut body {
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
-    let keep_from = body.len().saturating_sub(remaining_rows);
-    header.extend(body.into_iter().skip(keep_from));
+    header.extend(body);
     header
 }
 
@@ -220,16 +213,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_view_keeps_a_timed_header_and_the_latest_three_lines() {
+    fn reasoning_view_keeps_a_timed_header_and_all_streamed_lines() {
         let lines = render_reasoning_view("one\ntwo\nthree\nfour\nfive", 3, 80);
         let text = lines
             .iter()
             .map(RenderedLine::plain_text)
             .collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), REASONING_VIEW_ROWS);
+        assert_eq!(lines.len(), 6);
         assert_eq!(text[0], "Thinking (3s)");
-        assert_eq!(&text[1..], ["three", "four", "five"]);
+        assert_eq!(&text[1..], ["one", "two", "three", "four", "five"]);
     }
 
     #[test]
@@ -247,8 +240,10 @@ mod tests {
     #[test]
     fn stream_modes_cannot_overlap() {
         let mut stream = StreamState::default();
+        assert!(!stream.has_content());
         assert!(stream.start_assistant().is_none());
         stream.push_assistant("answer");
+        assert!(stream.has_content());
         let finished = stream.start_reasoning();
 
         assert!(matches!(
@@ -257,5 +252,17 @@ mod tests {
         ));
         assert!(stream.is_reasoning());
         assert!(stream.active_lines().is_empty());
+    }
+
+    #[test]
+    fn finished_reasoning_retains_the_full_source() {
+        let mut stream = StreamState::default();
+        stream.start_reasoning();
+        stream.push_reasoning("first\nsecond");
+
+        assert!(matches!(
+            stream.finish(),
+            Some(FinishedStream::Thought { source, .. }) if source == "first\nsecond"
+        ));
     }
 }

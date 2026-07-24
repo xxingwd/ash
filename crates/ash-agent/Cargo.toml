@@ -12,7 +12,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 smart-default = { workspace = true }
 rmcp = { workspace = true }
 tiktoken-rs = { workspace = true }
+schemars = { workspace = true }
 
 [dev-dependencies]
 secrecy = { workspace = true }

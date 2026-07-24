@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use ash_core::SessionId;
-use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -9,12 +8,41 @@ use tracing::warn;
 const MAX_LOADED_ENTRIES: usize = 1000;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct MessageHistoryEntry {
-    timestamp: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessageHistoryRecord {
+    Submitted { session_id: SessionId, text: String },
+    Undone { session_id: SessionId, text: String },
+}
+
+#[derive(Deserialize)]
+struct LegacyMessageHistoryRecord {
     session_id: SessionId,
     text: String,
     #[serde(default)]
     undone: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredMessageHistoryRecord {
+    Current(MessageHistoryRecord),
+    Legacy(LegacyMessageHistoryRecord),
+}
+
+impl StoredMessageHistoryRecord {
+    fn into_current(self) -> MessageHistoryRecord {
+        match self {
+            Self::Current(record) => record,
+            Self::Legacy(record) if record.undone => MessageHistoryRecord::Undone {
+                session_id: record.session_id,
+                text: record.text,
+            },
+            Self::Legacy(record) => MessageHistoryRecord::Submitted {
+                session_id: record.session_id,
+                text: record.text,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -41,26 +69,22 @@ impl MessageHistoryStore {
         if text.trim().is_empty() {
             return Ok(());
         }
-        let entry = MessageHistoryEntry {
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        let entry = MessageHistoryRecord::Submitted {
             session_id,
             text: text.to_string(),
-            undone: false,
         };
         self.append_entry(&entry).await
     }
 
     pub async fn undo(&self, session_id: SessionId, text: &str) -> Result<(), ash_core::AshError> {
-        let entry = MessageHistoryEntry {
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        let entry = MessageHistoryRecord::Undone {
             session_id,
             text: text.to_string(),
-            undone: true,
         };
         self.append_entry(&entry).await
     }
 
-    async fn append_entry(&self, entry: &MessageHistoryEntry) -> Result<(), ash_core::AshError> {
+    async fn append_entry(&self, entry: &MessageHistoryRecord) -> Result<(), ash_core::AshError> {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -89,15 +113,22 @@ impl MessageHistoryStore {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<MessageHistoryEntry>(&line) {
-                Ok(entry) if entry.undone => {
+            match serde_json::from_str::<StoredMessageHistoryRecord>(&line)
+                .map(StoredMessageHistoryRecord::into_current)
+            {
+                Ok(MessageHistoryRecord::Undone {
+                    session_id: undone_session,
+                    text: undone_text,
+                }) => {
                     if let Some(index) = entries.iter().rposition(|(session_id, text)| {
-                        *session_id == entry.session_id && *text == entry.text
+                        *session_id == undone_session && *text == undone_text
                     }) {
                         entries.remove(index);
                     }
                 }
-                Ok(entry) => entries.push((entry.session_id, entry.text)),
+                Ok(MessageHistoryRecord::Submitted { session_id, text }) => {
+                    entries.push((session_id, text))
+                }
                 Err(error) => warn!(%error, "skipping malformed input history line"),
             }
         }
@@ -128,6 +159,9 @@ mod tests {
             .append(SessionId::new(), "second prompt")
             .await
             .unwrap();
+        let contents = tokio::fs::read_to_string(&store.path).await.unwrap();
+        assert!(contents.contains(r#""type":"submitted""#));
+        assert!(!contents.contains("timestamp"));
         assert_eq!(
             store.load().await.unwrap(),
             vec!["first prompt", "second prompt"]
@@ -146,5 +180,25 @@ mod tests {
         store.undo(session_id, "second prompt").await.unwrap();
 
         assert_eq!(store.load().await.unwrap(), vec!["first prompt"]);
+    }
+
+    #[tokio::test]
+    async fn loads_legacy_boolean_history_records() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let session_id = SessionId::new();
+        tokio::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"first\",\"undone\":false}}\n\
+                 {{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"second\",\"undone\":false}}\n\
+                 {{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"second\",\"undone\":true}}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let store = MessageHistoryStore { path };
+
+        assert_eq!(store.load().await.unwrap(), vec!["first"]);
     }
 }

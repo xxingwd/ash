@@ -1,5 +1,6 @@
 /target/
 /codex/
+/opencode/
 /.env
 /.env.*
 !/.env.example

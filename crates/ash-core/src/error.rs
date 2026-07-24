@@ -26,6 +26,8 @@ pub enum ProtocolError {
     Upstream { status: u16, message: String },
     #[error("request failed: {0}")]
     Request(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("invalid upstream response: {0}")]
     InvalidResponse(String),
 }

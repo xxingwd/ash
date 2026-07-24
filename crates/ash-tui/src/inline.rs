@@ -7,50 +7,71 @@ use std::{
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, SessionSummary};
 use crossterm::terminal;
+use ratatui::layout::Position;
 use serde_json::Value;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    block_layout::StackBoundary,
     history_block::HistoryBlock,
-    inline_surface::InlineSurface,
+    inline_surface::AlternateScreen,
     input::InputState,
     live_block::LiveBlock,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
     stream_state::{format_elapsed, FinishedStream, StreamRefresh, StreamState},
     tool_display::tool_activity_summary,
-    viewport::{self, drawable_width, ViewportInput, COMPOSER_TEXT_COLUMN},
+    viewport::{self, ViewportInput, COMPOSER_TEXT_COLUMN},
 };
 
 const CONTENT_PREFIX_COLUMNS: u16 = 2;
 const TERMINAL_SAFE_COLUMN: u16 = 1;
 
 #[derive(Debug)]
-struct PromptSnapshot {
+struct SessionView {
     protocol: String,
     model: String,
     working_dir: PathBuf,
-    text: String,
-    cursor_column: u16,
 }
 
-impl PromptSnapshot {
+impl SessionView {
     fn new(protocol: &str, model: &str, working_dir: &Path) -> Self {
         Self {
             protocol: protocol.to_string(),
             model: model.to_string(),
             working_dir: working_dir.to_path_buf(),
-            text: String::new(),
-            cursor_column: 0,
         }
     }
 
-    fn set_context(&mut self, protocol: &str, model: &str, working_dir: &Path) {
+    fn update(&mut self, protocol: &str, model: &str, working_dir: &Path) {
         self.protocol = protocol.to_string();
         self.model = model.to_string();
         self.working_dir = working_dir.to_path_buf();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ComposerState {
+    lines: Vec<String>,
+    cursor_row: u16,
+    cursor_column: u16,
+}
+
+pub(crate) struct TerminalView<'a> {
+    pub(crate) input: &'a InputState,
+    pub(crate) commands: &'a [CommandCompletion],
+    pub(crate) selected_command: usize,
+    pub(crate) sessions: &'a [SessionSummary],
+    pub(crate) selected_session: usize,
+    pub(crate) busy: bool,
+    pub(crate) queued_messages: usize,
+}
+
+impl ComposerState {
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.cursor_row = 0;
+        self.cursor_column = 0;
     }
 }
 
@@ -59,7 +80,21 @@ struct StatusState {
     header: String,
     started_at: Option<Instant>,
     frame: usize,
-    queued_messages: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextSelection {
+    anchor: Position,
+    focus: Position,
+}
+
+impl TextSelection {
+    fn new(position: Position) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+        }
+    }
 }
 
 impl StatusState {
@@ -84,13 +119,9 @@ impl StatusState {
         self.started_at
             .map_or(0, |started| started.elapsed().as_secs())
     }
-
-    fn is_busy(&self) -> bool {
-        self.started_at.is_some()
-    }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 enum ActiveMenu {
     #[default]
     None,
@@ -104,94 +135,84 @@ enum ActiveMenu {
     },
 }
 
-#[derive(Debug, Default)]
-struct MenuState {
-    active: ActiveMenu,
-    dirty: bool,
-}
-
-impl MenuState {
+impl ActiveMenu {
     fn set_commands(&mut self, items: &[CommandCompletion], selected: usize) {
-        if matches!(self.active, ActiveMenu::Sessions { .. }) {
-            return;
-        }
         let selected = selected.min(items.len().saturating_sub(1));
-        let active = if items.is_empty() {
-            ActiveMenu::None
+        *self = if items.is_empty() {
+            Self::None
         } else {
-            ActiveMenu::Commands {
+            Self::Commands {
                 items: items.to_vec(),
                 selected,
             }
         };
-        if self.active != active {
-            self.active = active;
-            self.dirty = true;
-        }
     }
 
     fn set_sessions(&mut self, items: &[SessionSummary], selected: usize) {
         let selected = selected.min(items.len().saturating_sub(1));
-        let active = if items.is_empty() {
-            ActiveMenu::None
+        *self = if items.is_empty() {
+            Self::None
         } else {
-            ActiveMenu::Sessions {
+            Self::Sessions {
                 items: items.to_vec(),
                 selected,
             }
         };
-        if self.active != active {
-            self.active = active;
-            self.dirty = true;
-        }
     }
 
     fn commands(&self) -> (&[CommandCompletion], usize) {
-        match &self.active {
-            ActiveMenu::Commands { items, selected } => (items, *selected),
-            ActiveMenu::None | ActiveMenu::Sessions { .. } => (&[], 0),
+        match self {
+            Self::Commands { items, selected } => (items, *selected),
+            Self::None | Self::Sessions { .. } => (&[], 0),
         }
     }
 
     fn sessions(&self) -> (&[SessionSummary], usize) {
-        match &self.active {
-            ActiveMenu::Sessions { items, selected } => (items, *selected),
-            ActiveMenu::None | ActiveMenu::Commands { .. } => (&[], 0),
+        match self {
+            Self::Sessions { items, selected } => (items, *selected),
+            Self::None | Self::Commands { .. } => (&[], 0),
         }
     }
 
     fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self::None;
     }
 }
 
-pub(crate) struct InlineTerminal {
-    surface: InlineSurface,
-    composer_background: Option<crate::palette::Rgb>,
-    prompt: PromptSnapshot,
-    history_boundary: StackBoundary,
-    live_blocks: Vec<LiveBlock>,
-    next_live_block_id: u64,
+#[derive(Debug, Default)]
+struct ViewState {
+    composer: ComposerState,
+    menu: ActiveMenu,
+    busy: bool,
+    queued_messages: usize,
+}
+
+pub(crate) struct TerminalUi {
+    surface: AlternateScreen,
+    session: SessionView,
+    view: ViewState,
+    transcript: Vec<LiveBlock>,
+    scroll_top: Option<u16>,
+    next_block_id: u64,
     status: StatusState,
-    menus: MenuState,
+    selection: Option<TextSelection>,
     stream: StreamState,
     current_turn_id: Option<u64>,
     next_turn_id: u64,
 }
 
-impl InlineTerminal {
+impl TerminalUi {
     pub fn enter(protocol: &str, model: &str, working_dir: &Path) -> io::Result<Self> {
-        let surface = InlineSurface::enter()?;
-        let composer_background = crate::palette::composer_background_color();
+        let surface = AlternateScreen::enter()?;
         Ok(Self {
             surface,
-            composer_background,
-            prompt: PromptSnapshot::new(protocol, model, working_dir),
-            history_boundary: StackBoundary::default(),
-            live_blocks: Vec::new(),
-            next_live_block_id: 1,
+            session: SessionView::new(protocol, model, working_dir),
+            view: ViewState::default(),
+            transcript: Vec::new(),
+            scroll_top: None,
+            next_block_id: 1,
             status: StatusState::default(),
-            menus: MenuState::default(),
+            selection: None,
             stream: StreamState::default(),
             current_turn_id: None,
             next_turn_id: 1,
@@ -204,20 +225,30 @@ impl InlineTerminal {
     }
 
     fn enqueue_welcome(&mut self) {
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::welcome(id, self.prompt.working_dir.clone()));
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::welcome(id, self.session.working_dir.clone()));
     }
 
     pub fn command_output(&mut self, message: &str) -> io::Result<()> {
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
+        self.view.composer.clear();
+        self.scroll_top = None;
         self.push_history_block(HistoryBlock::info(message));
         self.redraw()
     }
 
+    pub fn show_session_status(&mut self) -> io::Result<()> {
+        let status = format!(
+            "Model: {}\nProtocol: {}\nDirectory: {}",
+            self.session.model,
+            self.session.protocol,
+            self.session.working_dir.display()
+        );
+        self.command_output(&status)
+    }
+
     pub fn command_error(&mut self, message: &str) -> io::Result<()> {
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
+        self.view.composer.clear();
+        self.scroll_top = None;
         self.push_history_block(HistoryBlock::error(message));
         self.redraw()
     }
@@ -230,24 +261,26 @@ impl InlineTerminal {
 
     fn begin_fresh_viewport(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
-            terminal.flush_all_live_blocks()?;
-            terminal.reset_inline_state()?;
-            terminal.history_boundary = StackBoundary::default();
+            terminal.transcript.clear();
+            terminal.scroll_top = None;
+            terminal.reset_ui_state()?;
             Ok(())
         })
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
-        let turn_id = self.current_turn_id;
+        let turn_id = self
+            .current_turn_id
+            .or_else(|| self.transcript.iter().rev().find_map(LiveBlock::turn_id));
         let (width, height) = terminal_size()?;
         self.synchronized(|terminal| {
             if let Some(turn_id) = turn_id {
                 terminal
-                    .live_blocks
+                    .transcript
                     .retain(|block| !block.belongs_to_turn(turn_id));
             }
+            terminal.scroll_top = None;
             terminal.reset_turn_state();
-            terminal.flush_live_overflow(width, height)?;
             terminal.render_viewport(width, height)
         })
     }
@@ -260,49 +293,62 @@ impl InlineTerminal {
         working_dir: &Path,
     ) -> io::Result<()> {
         self.begin_fresh_viewport()?;
-        self.prompt.set_context(protocol, model, working_dir);
+        self.session.update(protocol, model, working_dir);
         self.enqueue_welcome();
         self.push_restored_messages(messages);
         self.redraw()
     }
 
     pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
+        self.view.composer.clear();
         self.status.header = format!("/{command} unavailable while working");
         self.refresh_status()
     }
 
-    pub fn set_command_menu(&mut self, items: &[CommandCompletion], selected: usize) {
-        self.menus.set_commands(items, selected);
-    }
-
-    pub fn set_session_menu(&mut self, items: &[SessionSummary], selected: usize) {
-        self.menus.set_sessions(items, selected);
-    }
-
-    pub fn prompt(&mut self, input: &InputState) -> io::Result<()> {
+    pub fn sync_view(&mut self, view: TerminalView<'_>) -> io::Result<()> {
         let (width, height) = terminal_size()?;
-        self.prompt_at(input, width, height)
+        self.sync_view_at(view, width, height)
     }
 
-    fn prompt_at(&mut self, input: &InputState, width: u16, height: u16) -> io::Result<()> {
+    fn sync_view_at(&mut self, view: TerminalView<'_>, width: u16, height: u16) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        let input_width = width
-            .saturating_sub(COMPOSER_TEXT_COLUMN)
-            .saturating_sub(TERMINAL_SAFE_COLUMN);
-        let view = input.view(input_width);
-        self.prompt.text = view.text;
-        self.prompt.cursor_column = view.cursor_column;
-        self.menus.dirty = false;
+        let input = view.input.view(composer_text_width(width));
+        self.view.composer.lines = input.lines;
+        self.view.composer.cursor_row = input.cursor_row;
+        self.view.composer.cursor_column = input.cursor_column;
+        if view.sessions.is_empty() {
+            self.view
+                .menu
+                .set_commands(view.commands, view.selected_command);
+        } else {
+            self.view
+                .menu
+                .set_sessions(view.sessions, view.selected_session);
+        }
+        self.view.busy = view.busy;
+        self.view.queued_messages = view.queued_messages;
         self.redraw_at(width, height)
+    }
+
+    pub fn composer_text_width(&self) -> io::Result<u16> {
+        Ok(composer_text_width(terminal_size()?.0))
+    }
+
+    pub fn has_response_block(&self) -> bool {
+        self.stream.has_content()
+            || self.current_turn_id.is_some_and(|turn_id| {
+                self.transcript
+                    .iter()
+                    .any(|block| block.is_response_for_turn(turn_id))
+            })
     }
 
     pub fn commit_input(&mut self, input: &str) -> io::Result<()> {
         let turn_id = self.next_turn_id;
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.current_turn_id = Some(turn_id);
+        self.scroll_top = None;
         self.status.start("Working");
         self.commit_user_message(input)
     }
@@ -314,16 +360,15 @@ impl InlineTerminal {
     }
 
     fn commit_user_message(&mut self, input: &str) -> io::Result<()> {
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
+        self.view.composer.clear();
         self.stream.reset();
-        self.menus.clear();
+        self.view.menu.clear();
         self.push_history_block(HistoryBlock::user(input));
         self.redraw()
     }
 
     pub fn agent_started(&mut self) -> io::Result<()> {
-        if !self.status.is_busy() {
+        if self.status.started_at.is_none() {
             self.status.start("Working");
             self.redraw()?;
         }
@@ -400,23 +445,130 @@ impl InlineTerminal {
         self.redraw()
     }
 
-    pub fn set_queued_messages(&mut self, queued_messages: usize) {
-        self.status.queued_messages = queued_messages;
-    }
-
-    pub fn resize(&mut self, input: &InputState, width: u16, height: u16) -> io::Result<()> {
+    pub fn resize_view(
+        &mut self,
+        view: TerminalView<'_>,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        self.surface.resize(width, height);
+        self.selection = None;
+        self.surface.resize(width, height)?;
         if self.stream.is_reasoning() {
             self.stream
                 .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
         }
-        self.prompt_at(input, width, height)
+        self.sync_view_at(view, width, height)
+    }
+
+    pub fn scroll_page_up(&mut self) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        let rows = self.viewport_frame(width, height).page_rows;
+        self.scroll_up(rows, width, height)
+    }
+
+    pub fn scroll_page_down(&mut self) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        let rows = self.viewport_frame(width, height).page_rows;
+        self.scroll_down(rows, width, height)
+    }
+
+    pub fn scroll_lines_up(&mut self, rows: u16) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        self.scroll_up(rows, width, height)
+    }
+
+    pub fn scroll_lines_down(&mut self, rows: u16) -> io::Result<()> {
+        let (width, height) = terminal_size()?;
+        self.scroll_down(rows, width, height)
+    }
+
+    pub fn scroll_to_top(&mut self) -> io::Result<()> {
+        self.scroll_top = Some(0);
+        self.redraw()
+    }
+
+    pub fn scroll_to_bottom(&mut self) -> io::Result<()> {
+        self.scroll_top = None;
+        self.redraw()
+    }
+
+    pub fn toggle_latest_thought(&mut self) -> io::Result<()> {
+        self.selection = None;
+        let Some(block) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|block| block.is_thought())
+        else {
+            return Ok(());
+        };
+        if block.toggle_thought() {
+            self.redraw()?;
+        }
+        Ok(())
+    }
+
+    pub fn toggle_thought_at(&mut self, row: u16) -> io::Result<()> {
+        self.selection = None;
+        let (width, height) = terminal_size()?;
+        let Some(block_id) = self.viewport_frame(width, height).thought_at(row) else {
+            return Ok(());
+        };
+        let Some(block) = self
+            .transcript
+            .iter_mut()
+            .find(|block| block.id() == block_id)
+        else {
+            return Ok(());
+        };
+        if block.toggle_thought() {
+            self.redraw_at(width, height)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
+        self.selection = Some(TextSelection::new(Position::new(column, row)));
+        self.redraw()
+    }
+
+    pub fn drag_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
+        let Some(selection) = &mut self.selection else {
+            return Ok(());
+        };
+        selection.focus = Position::new(column, row);
+        self.redraw()
+    }
+
+    pub fn finish_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
+        let Some(mut selection) = self.selection else {
+            return Ok(());
+        };
+        selection.focus = Position::new(column, row);
+        if selection.anchor == selection.focus {
+            self.selection = None;
+            return self.toggle_thought_at(row);
+        }
+
+        self.selection = Some(selection);
+        let (width, height) = terminal_size()?;
+        let text = self
+            .viewport_frame(width, height)
+            .selection_text(selection.anchor, selection.focus);
+        let copy_result = if text.is_empty() {
+            Ok(())
+        } else {
+            self.surface.copy_to_clipboard(&text)
+        };
+        self.selection = None;
+        let redraw_result = self.redraw_at(width, height);
+        copy_result.and(redraw_result)
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
-        if !self.status.is_busy() {
+        if !self.view.busy {
             return Ok(());
         }
         self.status.frame = self.status.frame.wrapping_add(1);
@@ -430,14 +582,9 @@ impl InlineTerminal {
         self.redraw()
     }
 
-    pub fn leave_line(&mut self) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
-        self.synchronized(|terminal| {
-            terminal.finish_stream();
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)?;
-            terminal.surface.leave_screen()
-        })
+    pub fn leave(&mut self) -> io::Result<()> {
+        self.finish_stream();
+        self.surface.leave_screen()
     }
 
     fn finish_stream(&mut self) {
@@ -450,9 +597,10 @@ impl InlineTerminal {
             Some(FinishedStream::Assistant { pending, block_id }) => {
                 let _ = self.append_assistant(pending, block_id);
             }
-            Some(FinishedStream::Thought { elapsed_seconds }) => {
-                self.push_thought_block(format!("Thought for {}", format_elapsed(elapsed_seconds)))
-            }
+            Some(FinishedStream::Thought {
+                source,
+                elapsed_seconds,
+            }) => self.push_thought_block(source, elapsed_seconds),
             None => {}
         }
     }
@@ -462,21 +610,20 @@ impl InlineTerminal {
             return block_id;
         }
         if let Some(id) = block_id {
-            if let Some(block) = self.live_blocks.iter_mut().find(|block| block.id() == id) {
+            if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
                 let _ = block.append_markdown_source(&source);
                 return Some(id);
             }
         }
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::assistant(id, source));
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::assistant(id, source));
         Some(id)
     }
 
-    fn reset_inline_state(&mut self) -> io::Result<()> {
+    fn reset_ui_state(&mut self) -> io::Result<()> {
         self.surface.reset()?;
-        self.prompt.text.clear();
-        self.prompt.cursor_column = 0;
-        self.menus.clear();
+        self.view = ViewState::default();
+        self.selection = None;
         self.reset_turn_state();
         Ok(())
     }
@@ -500,10 +647,25 @@ impl InlineTerminal {
     }
 
     fn redraw_at(&mut self, width: u16, height: u16) -> io::Result<()> {
-        self.synchronized(|terminal| {
-            terminal.flush_live_overflow(width, height)?;
-            terminal.render_viewport(width, height)
-        })
+        self.synchronized(|terminal| terminal.render_viewport(width, height))
+    }
+
+    fn scroll_up(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
+        self.selection = None;
+        let frame = self.viewport_frame(width, height);
+        if frame.max_scroll_top == 0 {
+            return Ok(());
+        }
+        self.scroll_top = Some(frame.scroll_top.saturating_sub(rows));
+        self.redraw_at(width, height)
+    }
+
+    fn scroll_down(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
+        self.selection = None;
+        let frame = self.viewport_frame(width, height);
+        let next = frame.scroll_top.saturating_add(rows);
+        self.scroll_top = (next < frame.max_scroll_top).then_some(next);
+        self.redraw_at(width, height)
     }
 
     fn synchronized(
@@ -517,45 +679,49 @@ impl InlineTerminal {
     }
 
     fn render_viewport(&mut self, width: u16, height: u16) -> io::Result<()> {
-        let frame = self.viewport_frame(width, height);
+        let mut frame = self.viewport_frame(width, height);
+        normalize_scroll_top(&mut self.scroll_top, frame.scroll_top);
+        if let Some(selection) = self.selection {
+            frame.highlight_selection(selection.anchor, selection.focus);
+        }
         self.surface.render_frame(&frame)
     }
 
-    fn allocate_live_id(&mut self) -> u64 {
-        let id = self.next_live_block_id;
-        self.next_live_block_id = self.next_live_block_id.saturating_add(1);
+    fn allocate_block_id(&mut self) -> u64 {
+        let id = self.next_block_id;
+        self.next_block_id = self.next_block_id.saturating_add(1);
         id
     }
 
-    fn push_live(&mut self, block: LiveBlock) {
-        self.live_blocks.push(block.with_turn(self.current_turn_id));
+    fn push_block(&mut self, block: LiveBlock) {
+        self.transcript.push(block.with_turn(self.current_turn_id));
     }
 
     fn push_history_block(&mut self, block: HistoryBlock) {
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::history(id, block));
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::history(id, block));
     }
 
     fn push_assistant_block(&mut self, source: String) {
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::assistant(id, source));
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::assistant(id, source));
     }
 
-    fn push_thought_block(&mut self, source: String) {
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::thought(id, source));
+    fn push_thought_block(&mut self, source: String, elapsed_seconds: u64) {
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::thought(id, source, elapsed_seconds));
     }
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
         if self
-            .live_blocks
+            .transcript
             .last_mut()
-            .is_some_and(|block| block.try_append_read(&name, &arguments, is_error))
+            .is_some_and(|block| block.try_append_tool(&name, &arguments, is_error))
         {
             return;
         }
-        let id = self.allocate_live_id();
-        self.push_live(LiveBlock::tool(id, name, arguments, output, is_error));
+        let id = self.allocate_block_id();
+        self.push_block(LiveBlock::tool(id, name, arguments, output, is_error));
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
@@ -575,6 +741,9 @@ impl InlineTerminal {
         for message in messages {
             match &message.content {
                 MessageContent::User(contents) => {
+                    let turn_id = self.next_turn_id;
+                    self.next_turn_id = self.next_turn_id.saturating_add(1);
+                    self.current_turn_id = Some(turn_id);
                     let text = contents
                         .iter()
                         .map(|content| match content {
@@ -593,6 +762,12 @@ impl InlineTerminal {
                             ContentBlock::Text(text) if !text.is_empty() => {
                                 self.push_assistant_block(text.clone());
                             }
+                            ContentBlock::Thought {
+                                text,
+                                elapsed_seconds,
+                            } if !text.is_empty() => {
+                                self.push_thought_block(text.clone(), *elapsed_seconds);
+                            }
                             ContentBlock::ToolCall {
                                 id,
                                 name,
@@ -609,72 +784,45 @@ impl InlineTerminal {
                                     is_error,
                                 );
                             }
-                            ContentBlock::Text(_) => {}
+                            ContentBlock::Text(_) | ContentBlock::Thought { .. } => {}
                         }
                     }
                 }
                 MessageContent::ToolResult { .. } => {}
             }
         }
-    }
-
-    fn flush_live_overflow(&mut self, width: u16, height: u16) -> io::Result<()> {
-        while !self.live_blocks.is_empty() && self.viewport_frame(width, height).total_rows > height
-        {
-            let block = self.live_blocks.remove(0);
-            self.flush_live_block(&block, width)?;
-        }
-        Ok(())
-    }
-
-    fn flush_all_live_blocks(&mut self) -> io::Result<()> {
-        let width = terminal::size()?.0.max(1);
-        while !self.live_blocks.is_empty() {
-            let block = self.live_blocks.remove(0);
-            self.flush_live_block(&block, width)?;
-        }
-        Ok(())
-    }
-
-    fn flush_live_block(&mut self, block: &LiveBlock, terminal_width: u16) -> io::Result<()> {
-        let width = drawable_width(terminal_width);
-        let buffer = block.render(width, self.composer_background);
-        self.surface
-            .insert_history(&buffer, self.history_boundary.has_block())?;
-        self.history_boundary = self.history_boundary.after_block();
-        self.stream.clear_block_id(block.id());
-        Ok(())
+        self.current_turn_id = None;
     }
 
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
         let elapsed = format_elapsed(self.status.elapsed_seconds());
         let status_header = sanitize_single_line(&self.status.header);
-        let queued = queued_status(self.status.queued_messages);
-        let model = sanitize_single_line(&self.prompt.model);
-        let protocol = sanitize_single_line(&self.prompt.protocol);
-        let (command_menu, command_menu_selected) = self.menus.commands();
-        let (session_menu, session_menu_selected) = self.menus.sessions();
+        let queued = queued_status(self.view.queued_messages);
+        let model = sanitize_single_line(&self.session.model);
+        let protocol = sanitize_single_line(&self.session.protocol);
+        let (command_menu, command_menu_selected) = self.view.menu.commands();
+        let (session_menu, session_menu_selected) = self.view.menu.sessions();
         viewport::render(ViewportInput {
             terminal_width: width,
             terminal_height: height,
-            history_boundary: self.history_boundary,
-            live_blocks: &self.live_blocks,
-            busy: self.status.is_busy(),
+            transcript: &self.transcript,
+            scroll_top: self.scroll_top,
+            busy: self.view.busy,
             active_lines: self.stream.active_lines(),
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
             queued: &queued,
-            prompt: &self.prompt.text,
-            prompt_cursor_column: self.prompt.cursor_column,
-            composer_background: self.composer_background,
+            prompt_lines: &self.view.composer.lines,
+            prompt_cursor_row: self.view.composer.cursor_row,
+            prompt_cursor_column: self.view.composer.cursor_column,
             command_menu,
             command_menu_selected,
             session_menu,
             session_menu_selected,
             model: &model,
             protocol: &protocol,
-            working_dir: &self.prompt.working_dir,
+            working_dir: &self.session.working_dir,
         })
     }
 }
@@ -684,9 +832,22 @@ fn status_dots(frame: usize) -> &'static str {
     FRAMES[frame % FRAMES.len()]
 }
 
+fn normalize_scroll_top(scroll_top: &mut Option<u16>, rendered_top: u16) {
+    if scroll_top.is_some() {
+        *scroll_top = Some(rendered_top);
+    }
+}
+
 fn terminal_size() -> io::Result<(u16, u16)> {
     let (width, height) = terminal::size()?;
     Ok((width.max(1), height.max(1)))
+}
+
+fn composer_text_width(terminal_width: u16) -> u16 {
+    terminal_width
+        .saturating_sub(COMPOSER_TEXT_COLUMN)
+        .saturating_sub(TERMINAL_SAFE_COLUMN)
+        .max(1)
 }
 
 fn queued_status(queued_messages: usize) -> String {
@@ -712,15 +873,20 @@ mod tests {
     }
 
     #[test]
-    fn reserves_one_row_per_command_completion() {
-        assert_eq!(viewport::command_menu_rows(0), 0);
-        assert_eq!(viewport::command_menu_rows(3), 3);
-    }
-
-    #[test]
     fn formats_queued_message_status() {
         assert_eq!(queued_status(0), "");
         assert_eq!(queued_status(1), " · 1 queued");
         assert_eq!(queued_status(3), " · 3 queued");
+    }
+
+    #[test]
+    fn explicit_scroll_position_tracks_the_rendered_position() {
+        let mut scroll_top = Some(20);
+        normalize_scroll_top(&mut scroll_top, 8);
+        assert_eq!(scroll_top, Some(8));
+
+        let mut follow_bottom = None;
+        normalize_scroll_top(&mut follow_bottom, 8);
+        assert_eq!(follow_bottom, None);
     }
 }

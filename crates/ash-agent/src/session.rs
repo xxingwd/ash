@@ -1,13 +1,10 @@
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::time::Duration;
 
 use ash_core::{
-    CancellationToken, Content, Event, Message, MessageContent, ModelId, Protocol, SessionId,
-    SessionSummary, StopReason,
+    CancellationToken, Content, Event, Message, MessageContent, SessionId, SessionSummary,
+    StopReason,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::agent::run_agent_turn_persisted;
 use crate::session_store::{SessionStore, StoredSession};
@@ -71,33 +68,9 @@ impl AgentSession {
         &mut self,
         stored: StoredSession,
     ) -> Result<ResumedSession, ash_core::AshError> {
-        let protocol = Protocol::from_str(&stored.metadata.protocol).map_err(|error| {
-            ash_core::AshError::Config(format!(
-                "invalid protocol '{}' in {}: {error}",
-                stored.metadata.protocol,
-                stored.path.display()
-            ))
-        })?;
-        if !stored.metadata.working_dir.is_dir() {
-            return Err(ash_core::AshError::Config(format!(
-                "saved working directory no longer exists: {}",
-                stored.metadata.working_dir.display()
-            )));
-        }
+        // Saved sessions replay history; the current runtime configuration stays indivisible.
         let store = SessionStore::resume(&stored).await?;
         self.id = stored.metadata.session_id;
-        self.config.provider.protocol = protocol;
-        self.config.model = ModelId::new(&stored.metadata.model);
-        self.config
-            .working_dir
-            .clone_from(&stored.metadata.working_dir);
-        self.config
-            .system_prompt
-            .clone_from(&stored.metadata.system_prompt);
-        self.config.max_turns = stored.metadata.max_turns;
-        self.config.max_context_tokens = stored.metadata.max_context_tokens;
-        self.config.max_output_tokens = stored.metadata.max_output_tokens;
-        self.config.max_tool_duration = Duration::from_millis(stored.metadata.tool_timeout_ms);
         self.messages = stored.messages;
         self.store = store;
 
@@ -117,10 +90,15 @@ impl AgentSession {
     ) -> Result<StopReason, ash_core::AshError> {
         let input = input.into();
         let user_message = Message::user(&input);
-        persist_or_warn(
-            self.store.append_message(&user_message).await,
-            self.store.path(),
-        );
+        if let Err(error) = self.store.append_message(&user_message).await {
+            let _ = events.send(Event::Error(error.to_string())).await;
+            let _ = events
+                .send(Event::AgentFinished {
+                    reason: StopReason::Aborted,
+                })
+                .await;
+            return Err(error);
+        }
         self.messages.push(user_message);
         run_agent_turn_persisted(
             &self.config,
@@ -133,14 +111,13 @@ impl AgentSession {
         .await
     }
 
-    pub async fn rollback_last_turn(&mut self) -> Option<String> {
-        let (turn_start, prompt) = last_user_turn(&self.messages)?;
+    pub async fn rollback_last_turn(&mut self) -> Result<Option<String>, ash_core::AshError> {
+        let Some((turn_start, prompt)) = last_user_turn(&self.messages) else {
+            return Ok(None);
+        };
+        self.store.truncate_last_turn().await?;
         self.messages.truncate(turn_start);
-        persist_or_warn(
-            self.store.append_turn_rolled_back(1).await,
-            self.store.path(),
-        );
-        Some(prompt)
+        Ok(Some(prompt))
     }
 }
 
@@ -164,17 +141,38 @@ fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
     Some((index, prompt))
 }
 
-fn persist_or_warn(result: Result<(), ash_core::AshError>, path: &std::path::Path) {
-    if let Err(error) = result {
-        warn!(path = %path.display(), %error, "failed to persist session history");
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use ash_core::{ContentBlock, MessageContent, MessageId, Role, ToolCallId};
+    use std::time::Duration;
+
+    use ash_core::{
+        ContentBlock, MessageContent, MessageId, ModelId, Protocol, ProviderConfig, Role,
+        ToolCallId,
+    };
+    use secrecy::SecretString;
+    use tempfile::TempDir;
 
     use super::*;
+
+    fn config(working_dir: PathBuf) -> AgentConfig {
+        AgentConfig {
+            provider: ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                api_key: SecretString::from("test"),
+                base_url: None,
+            },
+            system_prompt: Some("current prompt".to_string()),
+            tools: Vec::new(),
+            model: ModelId::new("current-model"),
+            max_turns: 10,
+            working_dir,
+            max_context_tokens: Some(1000),
+            max_output_tokens: Some(200),
+            max_tool_duration: Duration::from_secs(5),
+            agent_path: "/root".to_string(),
+            root_session_id: None,
+        }
+    }
 
     #[test]
     fn finds_the_latest_real_user_turn_after_tool_results() {
@@ -206,5 +204,93 @@ mod tests {
         let (turn_start, prompt) = last_user_turn(&messages).unwrap();
         assert_eq!(turn_start, 2);
         assert_eq!(prompt, "second");
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_the_current_runtime_configuration() {
+        let directory = TempDir::new().unwrap();
+        let current_dir = directory.path().join("current");
+        tokio::fs::create_dir(&current_dir).await.unwrap();
+        let mut session = AgentSession::new(config(current_dir.clone()));
+        let saved_path = directory.path().join("saved.jsonl");
+        tokio::fs::write(&saved_path, b"\n").await.unwrap();
+        let saved_id = SessionId::new();
+        let stored = StoredSession {
+            path: saved_path,
+            metadata: crate::session_store::SessionMetadata {
+                format_version: 1,
+                session_id: saved_id,
+                created_at: "2026-01-01T00:00:00.000Z".to_string(),
+                protocol: "invalid-old-protocol".to_string(),
+                model: "old-model".to_string(),
+                working_dir: directory.path().join("missing-old-directory"),
+                system_prompt: Some("old prompt".to_string()),
+                max_turns: 1,
+                max_context_tokens: None,
+                max_output_tokens: None,
+                tool_timeout_ms: 1,
+            },
+            messages: vec![Message::user("saved question")],
+        };
+
+        let restored = session.restore(stored).await.unwrap();
+
+        assert_eq!(session.id(), saved_id);
+        assert_eq!(session.config.model.as_str(), "current-model");
+        assert!(matches!(
+            session.config.provider.protocol,
+            Protocol::OpenaiResponses
+        ));
+        assert_eq!(
+            session.config.system_prompt.as_deref(),
+            Some("current prompt")
+        );
+        assert_eq!(session.config.working_dir, current_dir);
+        assert_eq!(restored.model, "current-model");
+        assert_eq!(restored.protocol, "openai-responses");
+        assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_memory_when_persistence_fails() {
+        let directory = TempDir::new().unwrap();
+        let mut session = AgentSession::new(config(directory.path().to_path_buf()));
+        session.messages.push(Message::user("unpersisted"));
+
+        let result = session.rollback_last_turn().await;
+
+        assert!(result.is_err());
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_keeps_memory_clean_when_persistence_fails() {
+        let directory = TempDir::new().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        tokio::fs::write(&blocked_parent, b"file").await.unwrap();
+        let config = config(directory.path().to_path_buf());
+        let id = SessionId::new();
+        let store = SessionStore::new_in(&config, id, &blocked_parent);
+        let mut session = AgentSession {
+            id,
+            config,
+            messages: Vec::new(),
+            store,
+        };
+        let (events, mut received) = mpsc::channel(4);
+
+        let result = session
+            .submit("unpersisted", events, CancellationToken::new())
+            .await;
+
+        assert!(result.is_err());
+        assert!(session.messages.is_empty());
+        assert!(matches!(received.recv().await, Some(Event::Error(_))));
+        assert!(matches!(
+            received.recv().await,
+            Some(Event::AgentFinished {
+                reason: StopReason::Aborted
+            })
+        ));
     }
 }

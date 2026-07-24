@@ -1,28 +1,29 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use ash_core::SessionSummary;
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Padding, Widget},
+    widgets::{Block, Clear, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    block_layout::{layout_stack, stack_height, StackBoundary, StackItem},
+    block_layout::{layout_stack, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
-    palette::Rgb,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left},
     text_width::truncate_end,
 };
 
-const STATUS_ROWS: u16 = 1;
-const COMPOSER_ROWS: u16 = 3;
 const FOOTER_ROWS: u16 = 1;
+const MAX_COMPOSER_ROWS: u16 = 8;
+const SCREEN_SPACING: u16 = 1;
+const POPUP_BORDER_ROWS: u16 = 2;
+const POPUP_MIN_ROWS: u16 = 3;
 const SESSION_MENU_MAX_ROWS: usize = 8;
 const COMPACT_STATUS_WIDTH: u16 = 32;
 const FOOTER_SIDE_PADDING: u16 = 2;
@@ -32,7 +33,6 @@ const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
 const MENU_COLUMN_GAP: usize = 2;
 const MENU_PREFIX_COLUMNS: usize = 2;
 const SESSION_CREATED_MIN_LEFT_COLUMNS: usize = 8;
-const COMPOSER_PADDING: Padding = Padding::new(0, 0, 1, 1);
 pub(crate) const COMPOSER_TEXT_COLUMN: u16 = 2;
 
 pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
@@ -44,17 +44,17 @@ pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
 pub(crate) struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
-    pub(crate) history_boundary: StackBoundary,
-    pub(crate) live_blocks: &'a [LiveBlock],
+    pub(crate) transcript: &'a [LiveBlock],
+    pub(crate) scroll_top: Option<u16>,
     pub(crate) busy: bool,
     pub(crate) active_lines: &'a [RenderedLine],
     pub(crate) status_header: &'a str,
     pub(crate) status_dots: &'a str,
     pub(crate) elapsed: &'a str,
     pub(crate) queued: &'a str,
-    pub(crate) prompt: &'a str,
+    pub(crate) prompt_lines: &'a [String],
+    pub(crate) prompt_cursor_row: u16,
     pub(crate) prompt_cursor_column: u16,
-    pub(crate) composer_background: Option<Rgb>,
     pub(crate) command_menu: &'a [CommandCompletion],
     pub(crate) command_menu_selected: usize,
     pub(crate) session_menu: &'a [SessionSummary],
@@ -68,133 +68,416 @@ pub(crate) struct ViewportFrame {
     pub(crate) buffer: Buffer,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_column: u16,
-    pub(crate) total_rows: u16,
+    pub(crate) scroll_top: u16,
+    pub(crate) max_scroll_top: u16,
+    pub(crate) page_rows: u16,
+    pub(crate) thought_hits: Vec<ThoughtHit>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ThoughtHit {
+    row: u16,
+    block_id: u64,
+}
+
+impl ViewportFrame {
+    pub(crate) fn thought_at(&self, row: u16) -> Option<u64> {
+        self.thought_hits
+            .iter()
+            .find(|hit| hit.row == row)
+            .map(|hit| hit.block_id)
+    }
+
+    pub(crate) fn selection_text(&self, anchor: Position, focus: Position) -> String {
+        let Some((start, end)) = selection_bounds(&self.buffer, anchor, focus) else {
+            return String::new();
+        };
+        let mut lines = Vec::with_capacity(usize::from(end.y.saturating_sub(start.y)) + 1);
+        for row in start.y..=end.y {
+            let start_column = if row == start.y {
+                start.x
+            } else {
+                self.buffer.area.x
+            };
+            let end_column = if row == end.y {
+                end.x
+            } else {
+                self.buffer.area.right().saturating_sub(1)
+            };
+            let mut line = String::new();
+            let mut hidden_columns = 0;
+            for column in self.buffer.area.x..=end_column {
+                let Some(cell) = self.buffer.cell((column, row)) else {
+                    continue;
+                };
+                if hidden_columns > 0 {
+                    hidden_columns -= 1;
+                    continue;
+                }
+                hidden_columns = UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
+                if column >= start_column && !cell.skip {
+                    line.push_str(cell.symbol());
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n").trim_end_matches('\n').to_string()
+    }
+
+    pub(crate) fn highlight_selection(&mut self, anchor: Position, focus: Position) {
+        let Some((start, end)) = selection_bounds(&self.buffer, anchor, focus) else {
+            return;
+        };
+        for row in start.y..=end.y {
+            let start_column = if row == start.y {
+                start.x
+            } else {
+                self.buffer.area.x
+            };
+            let end_column = if row == end.y {
+                end.x
+            } else {
+                self.buffer.area.right().saturating_sub(1)
+            };
+            for column in start_column..=end_column {
+                if let Some(cell) = self.buffer.cell_mut((column, row)) {
+                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+}
+
+fn selection_bounds(
+    buffer: &Buffer,
+    anchor: Position,
+    focus: Position,
+) -> Option<(Position, Position)> {
+    if buffer.area.is_empty() || anchor == focus {
+        return None;
+    }
+    let clamp = |position: Position| {
+        Position::new(
+            position
+                .x
+                .clamp(buffer.area.x, buffer.area.right().saturating_sub(1)),
+            position
+                .y
+                .clamp(buffer.area.y, buffer.area.bottom().saturating_sub(1)),
+        )
+    };
+    let anchor = clamp(anchor);
+    let focus = clamp(focus);
+    if (anchor.y, anchor.x) <= (focus.y, focus.x) {
+        Some((anchor, focus))
+    } else {
+        Some((focus, anchor))
+    }
 }
 
 pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
+    let terminal_width = input.terminal_width.max(1);
+    let terminal_height = input.terminal_height.max(1);
     let width = drawable_width(input.terminal_width);
-    let menu_rows = if input.session_menu.is_empty() {
-        command_menu_rows(input.command_menu.len())
-    } else {
-        session_menu_rows(input.session_menu.len())
-    };
-    let live = input
-        .live_blocks
-        .iter()
-        .map(|block| RenderedLiveBlock {
-            buffer: block.render(width, input.composer_background),
-        })
-        .collect::<Vec<_>>();
-    let active = active_window(
-        input.active_lines,
-        input.terminal_height,
-        input.history_boundary,
-        &live,
-        input.busy,
-        menu_rows,
-    );
-    let active_rows = active
-        .as_ref()
-        .map(|active| u16::try_from(active.lines.len()).unwrap_or(u16::MAX));
-    let regions = viewport_regions(&live, active_rows, input.busy, menu_rows);
-    let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
-    let layout = layout_stack(width, input.history_boundary, &items);
-    let area = Rect::new(0, 0, width, layout.height);
-    let mut buffer = Buffer::empty(area);
-    let mut composer_input_area = Rect::default();
+    let requested_composer_rows = u16::try_from(input.prompt_lines.len())
+        .unwrap_or(u16::MAX)
+        .clamp(1, MAX_COMPOSER_ROWS);
 
-    for (region, area) in regions.iter().zip(&layout.areas) {
-        match region.kind {
-            ViewportRegion::Live(index) => {
-                if let Some(block) = live.get(index) {
-                    blit_buffer(&mut buffer, *area, &block.buffer);
-                }
-            }
-            ViewportRegion::Active => {
-                if let Some(active) = &active {
-                    render_active(*area, active, &mut buffer);
-                }
-            }
-            ViewportRegion::Status => render_status(*area, &input, &mut buffer),
-            ViewportRegion::Composer => {
-                let (input_area, bottom_area) = composer_areas(*area, menu_rows);
-                composer_input_area = input_area;
-                render_composer(input_area, &input, &mut buffer);
-                if !input.session_menu.is_empty() {
-                    render_session_menu(bottom_area, &input, &mut buffer);
-                } else if input.command_menu.is_empty() {
-                    render_footer(bottom_area, &input, &mut buffer);
-                } else {
-                    render_command_menu(bottom_area, &input, &mut buffer);
-                }
-            }
-        }
+    let rendered_blocks = input
+        .transcript
+        .iter()
+        .map(|block| block.render(width))
+        .collect::<Vec<_>>();
+    let active = (!input.active_lines.is_empty()).then_some(input.active_lines);
+    let active_rows = active.map(|lines| u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let regions = transcript_regions(&rendered_blocks, active_rows);
+    let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
+    let layout = layout_stack(width, &items);
+    let screen_rows = fit_screen_rows(
+        ScreenRows {
+            transcript: layout.height,
+            status: u16::from(input.busy),
+            composer: requested_composer_rows,
+            footer: FOOTER_ROWS,
+        },
+        terminal_height,
+    );
+    let screen = layout_screen(width, screen_rows);
+    let transcript_view_rows = screen.transcript.height;
+
+    let max_scroll_top = layout.height.saturating_sub(transcript_view_rows);
+    let scroll_top = input
+        .scroll_top
+        .unwrap_or(max_scroll_top)
+        .min(max_scroll_top);
+    let thought_hits = visible_thought_hits(
+        input.transcript,
+        &layout.areas,
+        scroll_top,
+        transcript_view_rows,
+    );
+    let mut buffer = Buffer::empty(Rect::new(0, 0, terminal_width, terminal_height));
+    render_transcript(
+        &regions,
+        &layout.areas,
+        &rendered_blocks,
+        active,
+        scroll_top,
+        transcript_view_rows,
+        &mut buffer,
+    );
+
+    if !screen.status.is_empty() {
+        render_status(screen.status, &input, &mut buffer);
     }
+
+    let prompt = prompt_window(&input, screen.composer.height);
+    render_composer(screen.composer, &prompt, &mut buffer);
+    render_footer(screen.footer, &input, &mut buffer);
+    render_menu_popup(
+        screen.composer,
+        Rect::new(0, 0, width, terminal_height),
+        &input,
+        &mut buffer,
+    );
 
     ViewportFrame {
         buffer,
-        cursor_row: composer_input_area.y.saturating_add(COMPOSER_PADDING.top),
+        cursor_row: screen.composer.y.saturating_add(prompt.cursor_row),
         cursor_column: COMPOSER_TEXT_COLUMN
-            .saturating_add(input.prompt_cursor_column)
+            .saturating_add(prompt.cursor_column)
             .min(input.terminal_width.saturating_sub(1)),
-        total_rows: layout.height,
+        scroll_top,
+        max_scroll_top,
+        page_rows: transcript_view_rows.max(1),
+        thought_hits,
     }
 }
 
-struct ActiveWindow<'a> {
-    start: usize,
-    lines: &'a [RenderedLine],
+#[derive(Clone, Copy)]
+struct ScreenRows {
+    transcript: u16,
+    status: u16,
+    composer: u16,
+    footer: u16,
 }
 
-struct RenderedLiveBlock {
-    buffer: Buffer,
+#[derive(Default)]
+struct ScreenAreas {
+    transcript: Rect,
+    status: Rect,
+    composer: Rect,
+    footer: Rect,
 }
 
-fn active_window<'a>(
-    active_lines: &'a [RenderedLine],
-    terminal_height: u16,
-    history_boundary: StackBoundary,
-    live: &[RenderedLiveBlock],
-    busy: bool,
-    menu_rows: u16,
-) -> Option<ActiveWindow<'a>> {
-    if active_lines.is_empty() {
-        return None;
+#[derive(Clone, Copy)]
+enum ScreenRegion {
+    Transcript,
+    Status,
+    Composer,
+    Footer,
+}
+
+fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> ScreenRows {
+    let overflow = screen_overflow(rows, height);
+    rows.transcript = rows
+        .transcript
+        .saturating_sub(overflow.min(rows.transcript.saturating_sub(1)));
+
+    let overflow = screen_overflow(rows, height);
+    rows.footer = rows
+        .footer
+        .saturating_sub(overflow.min(rows.footer.saturating_sub(1)));
+
+    let overflow = screen_overflow(rows, height);
+    rows.composer = rows
+        .composer
+        .saturating_sub(overflow.min(rows.composer.saturating_sub(1)));
+
+    if screen_height(rows) > u32::from(height) {
+        rows.status = 0;
     }
-
-    let overhead = active_overhead(history_boundary, live, busy, menu_rows);
-    let max_lines = usize::from(terminal_height.saturating_sub(overhead));
-    let skip = active_lines.len().saturating_sub(max_lines);
-    Some(ActiveWindow {
-        start: skip,
-        lines: &active_lines[skip..],
-    })
+    if screen_height(rows) > u32::from(height) {
+        rows.transcript = 0;
+    }
+    if screen_height(rows) > u32::from(height) {
+        rows.footer = 0;
+    }
+    rows
 }
 
-fn render_active(area: Rect, active: &ActiveWindow<'_>, buffer: &mut Buffer) {
-    let mut y = area.y;
-    for (offset, rendered) in active.lines.iter().enumerate() {
-        if y >= area.bottom() {
-            break;
+fn screen_overflow(rows: ScreenRows, height: u16) -> u16 {
+    u16::try_from(screen_height(rows).saturating_sub(u32::from(height))).unwrap_or(u16::MAX)
+}
+
+fn screen_height(rows: ScreenRows) -> u32 {
+    let values = [rows.transcript, rows.status, rows.composer, rows.footer];
+    let content = values
+        .iter()
+        .fold(0_u32, |total, rows| total + u32::from(*rows));
+    let gaps = u32::try_from(
+        values
+            .iter()
+            .filter(|rows| **rows > 0)
+            .count()
+            .saturating_sub(1),
+    )
+    .unwrap_or(u32::MAX);
+    content + gaps * u32::from(SCREEN_SPACING)
+}
+
+fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
+    let mut regions = Vec::with_capacity(4);
+    let mut constraints = Vec::with_capacity(4);
+    for (region, rows) in [
+        (ScreenRegion::Transcript, rows.transcript),
+        (ScreenRegion::Status, rows.status),
+        (ScreenRegion::Composer, rows.composer),
+        (ScreenRegion::Footer, rows.footer),
+    ] {
+        if rows > 0 {
+            regions.push(region);
+            constraints.push(Constraint::Length(rows));
         }
-        let index = active.start + offset;
+    }
+
+    let layout = Layout::vertical(constraints)
+        .flex(Flex::Start)
+        .spacing(SCREEN_SPACING)
+        .split(Rect::new(
+            0,
+            0,
+            width,
+            u16::try_from(screen_height(rows)).unwrap_or(u16::MAX),
+        ));
+    let mut areas = ScreenAreas::default();
+    for (region, area) in regions.into_iter().zip(layout.iter().copied()) {
+        match region {
+            ScreenRegion::Transcript => areas.transcript = area,
+            ScreenRegion::Status => areas.status = area,
+            ScreenRegion::Composer => areas.composer = area,
+            ScreenRegion::Footer => areas.footer = area,
+        }
+    }
+    areas
+}
+
+struct PromptWindow<'a> {
+    lines: &'a [String],
+    cursor_row: u16,
+    cursor_column: u16,
+}
+
+fn prompt_window<'a>(input: &'a ViewportInput<'_>, rows: u16) -> PromptWindow<'a> {
+    let total = input.prompt_lines.len();
+    if total == 0 {
+        return PromptWindow {
+            lines: &[],
+            cursor_row: 0,
+            cursor_column: 0,
+        };
+    }
+
+    let visible = usize::from(rows.max(1)).min(total);
+    let cursor = usize::from(input.prompt_cursor_row).min(total - 1);
+    let start = cursor
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(total - visible);
+    PromptWindow {
+        lines: &input.prompt_lines[start..start + visible],
+        cursor_row: u16::try_from(cursor - start).unwrap_or(u16::MAX),
+        cursor_column: input.prompt_cursor_column,
+    }
+}
+
+fn render_active(area: Rect, lines: &[RenderedLine], source_y: u16, buffer: &mut Buffer) {
+    let source_y = usize::from(source_y);
+    for (offset, rendered) in lines
+        .iter()
+        .skip(source_y)
+        .take(usize::from(area.height))
+        .enumerate()
+    {
+        let index = source_y + offset;
         let mut spans = vec![if index == 0 {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::raw("  ")
         }];
         spans.extend(rendered.ratatui_line().spans);
-        buffer.set_line(area.x, y, &Line::from(spans), area.width);
-        y = y.saturating_add(1);
+        buffer.set_line(
+            area.x,
+            area.y.saturating_add(offset as u16),
+            &Line::from(spans),
+            area.width,
+        );
     }
+}
+
+fn render_transcript(
+    regions: &[RegionSpec],
+    areas: &[Rect],
+    blocks: &[Arc<Buffer>],
+    active: Option<&[RenderedLine]>,
+    scroll_top: u16,
+    visible_rows: u16,
+    buffer: &mut Buffer,
+) {
+    let visible_bottom = scroll_top.saturating_add(visible_rows);
+    for (region, area) in regions.iter().zip(areas) {
+        let top = area.y.max(scroll_top);
+        let bottom = area.bottom().min(visible_bottom);
+        if top >= bottom {
+            continue;
+        }
+        let target = Rect::new(
+            area.x,
+            top.saturating_sub(scroll_top),
+            area.width,
+            bottom.saturating_sub(top),
+        );
+        let source_y = top.saturating_sub(area.y);
+        match region.kind {
+            ViewportRegion::Live(index) => {
+                if let Some(block) = blocks.get(index) {
+                    crate::buffer::copy_rows(block, buffer, source_y, target);
+                }
+            }
+            ViewportRegion::Active => {
+                if let Some(active) = active {
+                    render_active(target, active, source_y, buffer);
+                }
+            }
+        }
+    }
+}
+
+fn visible_thought_hits(
+    blocks: &[LiveBlock],
+    areas: &[Rect],
+    scroll_top: u16,
+    visible_rows: u16,
+) -> Vec<ThoughtHit> {
+    let visible_bottom = scroll_top.saturating_add(visible_rows);
+    blocks
+        .iter()
+        .zip(areas)
+        .filter_map(|(block, area)| {
+            (block.is_thought() && area.y >= scroll_top && area.y < visible_bottom).then_some(
+                ThoughtHit {
+                    row: area.y.saturating_sub(scroll_top),
+                    block_id: block.id(),
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewportRegion {
     Live(usize),
     Active,
-    Status,
-    Composer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,28 +486,12 @@ struct RegionSpec {
     item: StackItem,
 }
 
-fn active_overhead(
-    history_boundary: StackBoundary,
-    live: &[RenderedLiveBlock],
-    busy: bool,
-    menu_rows: u16,
-) -> u16 {
-    let regions = viewport_regions(live, Some(0), busy, menu_rows);
-    let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
-    stack_height(history_boundary, &items)
-}
-
-fn viewport_regions(
-    live: &[RenderedLiveBlock],
-    active_rows: Option<u16>,
-    busy: bool,
-    menu_rows: u16,
-) -> Vec<RegionSpec> {
-    let mut regions = Vec::with_capacity(live.len().saturating_add(3));
-    for (index, block) in live.iter().enumerate() {
+fn transcript_regions(blocks: &[Arc<Buffer>], active_rows: Option<u16>) -> Vec<RegionSpec> {
+    let mut regions = Vec::with_capacity(blocks.len().saturating_add(1));
+    for (index, block) in blocks.iter().enumerate() {
         regions.push(RegionSpec {
             kind: ViewportRegion::Live(index),
-            item: StackItem::block(block.buffer.area.height),
+            item: StackItem::block(block.area.height),
         });
     }
     if let Some(height) = active_rows {
@@ -233,56 +500,7 @@ fn viewport_regions(
             item: StackItem::block(height),
         });
     }
-    if busy {
-        regions.push(RegionSpec {
-            kind: ViewportRegion::Status,
-            item: StackItem::block(STATUS_ROWS),
-        });
-    }
-    regions.push(RegionSpec {
-        kind: ViewportRegion::Composer,
-        item: StackItem::block(composer_block_rows(menu_rows)),
-    });
     regions
-}
-
-fn blit_buffer(destination: &mut Buffer, area: Rect, source: &Buffer) {
-    let height = area.height.min(source.area.height);
-    let width = area.width.min(source.area.width);
-    for y in 0..height {
-        for x in 0..width {
-            let Some(cell) = source.cell((source.area.x + x, source.area.y + y)) else {
-                continue;
-            };
-            *destination
-                .cell_mut((area.x + x, area.y + y))
-                .expect("in bounds") = cell.clone();
-        }
-    }
-}
-
-fn composer_block_rows(menu_rows: u16) -> u16 {
-    COMPOSER_ROWS.saturating_add(if menu_rows == 0 {
-        FOOTER_ROWS
-    } else {
-        menu_rows
-    })
-}
-
-fn composer_areas(area: Rect, menu_rows: u16) -> (Rect, Rect) {
-    let bottom_rows = if menu_rows == 0 {
-        FOOTER_ROWS
-    } else {
-        menu_rows
-    };
-    let areas = Layout::vertical([
-        Constraint::Length(COMPOSER_ROWS),
-        Constraint::Length(bottom_rows),
-    ])
-    .flex(Flex::Start)
-    .spacing(0)
-    .split(area);
-    (areas[0], areas[1])
 }
 
 fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -320,24 +538,39 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     buffer.set_line(area.x, area.y, &line, area.width);
 }
 
-fn render_composer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let background = input
-        .composer_background
-        .map_or(Color::Reset, |(r, g, b)| Color::Rgb(r, g, b));
-    let block = Block::default()
-        .style(Style::default().bg(background))
-        .padding(COMPOSER_PADDING);
-    let inner = block.inner(area);
-    block.render(area, buffer);
-    if inner.is_empty() {
+fn render_composer(area: Rect, prompt: &PromptWindow<'_>, buffer: &mut Buffer) {
+    if area.is_empty() {
         return;
     }
-    let line = Line::from(vec![
-        Span::styled("›", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        Span::raw(input.prompt.to_string()),
-    ]);
-    buffer.set_line(inner.x, inner.y, &line, inner.width);
+
+    if prompt.lines.is_empty() {
+        buffer.set_string(
+            area.x,
+            area.y,
+            "›",
+            Style::default().add_modifier(Modifier::BOLD),
+        );
+        return;
+    }
+
+    for (index, text) in prompt
+        .lines
+        .iter()
+        .take(usize::from(area.height))
+        .enumerate()
+    {
+        let prefix = if index == 0 {
+            Span::styled("› ", Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        buffer.set_line(
+            area.x,
+            area.y.saturating_add(index as u16),
+            &Line::from(vec![prefix, Span::raw(text)]),
+            area.width,
+        );
+    }
 }
 
 fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -378,7 +611,71 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     }
 }
 
+fn render_menu_popup(composer: Rect, bounds: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
+    let content_rows = if input.session_menu.is_empty() {
+        menu_rows(input.command_menu.len())
+    } else {
+        session_menu_rows(input.session_menu.len())
+    };
+    let Some(area) = menu_popup_area(composer, bounds, content_rows) else {
+        return;
+    };
+
+    Clear.render(area, buffer);
+    let popup = Block::bordered().border_style(Style::default().add_modifier(Modifier::DIM));
+    let content = popup.inner(area);
+    popup.render(area, buffer);
+    if input.session_menu.is_empty() {
+        render_command_menu(content, input, buffer);
+    } else {
+        render_session_menu(content, input, buffer);
+    }
+}
+
+fn menu_popup_area(composer: Rect, bounds: Rect, content_rows: u16) -> Option<Rect> {
+    if content_rows == 0 || bounds.width < 3 {
+        return None;
+    }
+    let desired = content_rows
+        .saturating_add(POPUP_BORDER_ROWS)
+        .min(bounds.height);
+    let above = composer.y.saturating_sub(bounds.y);
+    let below = bounds.bottom().saturating_sub(composer.bottom());
+    let gap = SCREEN_SPACING;
+
+    if above >= POPUP_MIN_ROWS.saturating_add(gap) {
+        let height = desired.min(above.saturating_sub(gap));
+        return Some(Rect::new(
+            bounds.x,
+            composer.y.saturating_sub(gap).saturating_sub(height),
+            bounds.width,
+            height,
+        ));
+    }
+    if below >= POPUP_MIN_ROWS.saturating_add(gap) {
+        let height = desired.min(below.saturating_sub(gap));
+        return Some(Rect::new(
+            bounds.x,
+            composer.bottom().saturating_add(gap),
+            bounds.width,
+            height,
+        ));
+    }
+    None
+}
+
 fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
+    let visible = usize::from(area.height).min(input.command_menu.len());
+    if visible == 0 {
+        return;
+    }
+    let selected = input
+        .command_menu_selected
+        .min(input.command_menu.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(input.command_menu.len().saturating_sub(visible));
     let name_width = input
         .command_menu
         .iter()
@@ -388,8 +685,12 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     let description_column = COMMAND_NAME_PREFIX_COLUMNS
         .saturating_add(name_width)
         .saturating_add(MENU_COLUMN_GAP);
-    for (index, item) in input.command_menu.iter().enumerate() {
-        let Ok(offset) = u16::try_from(index) else {
+    for (offset, item) in input.command_menu[start..start + visible]
+        .iter()
+        .enumerate()
+    {
+        let index = start + offset;
+        let Ok(offset) = u16::try_from(offset) else {
             break;
         };
         let y = area.y.saturating_add(offset);
@@ -486,11 +787,11 @@ fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     }
 }
 
-pub(crate) fn command_menu_rows(item_count: usize) -> u16 {
+fn menu_rows(item_count: usize) -> u16 {
     u16::try_from(item_count).unwrap_or(u16::MAX)
 }
 
-pub(crate) fn session_menu_rows(item_count: usize) -> u16 {
+fn session_menu_rows(item_count: usize) -> u16 {
     u16::try_from(item_count.min(SESSION_MENU_MAX_ROWS)).unwrap_or(u16::MAX)
 }
 
@@ -513,31 +814,39 @@ mod tests {
             .to_string()
     }
 
-    fn welcome_boundary() -> StackBoundary {
-        StackBoundary::default().after_block()
-    }
+    #[test]
+    fn screen_layout_handles_saturated_transcript_heights() {
+        let rows = fit_screen_rows(
+            ScreenRows {
+                transcript: u16::MAX,
+                status: 1,
+                composer: 1,
+                footer: 1,
+            },
+            24,
+        );
 
-    fn user_boundary() -> StackBoundary {
-        StackBoundary::default().after_block()
+        assert_eq!(rows.transcript, 18);
+        assert_eq!(screen_height(rows), 24);
     }
 
     #[test]
-    fn lays_out_active_status_composer_and_footer_once() {
+    fn places_status_composer_and_footer_after_short_content() {
         let active = render_markdown("answer", 80);
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: user_boundary(),
-            live_blocks: &[],
+            transcript: &[],
+            scroll_top: None,
             busy: true,
             active_lines: &active,
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
             queued: "",
-            prompt: "draft",
+            prompt_lines: &["draft".to_string()],
+            prompt_cursor_row: 0,
             prompt_cursor_column: 5,
-            composer_background: Some((30, 30, 30)),
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -547,44 +856,70 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(frame.total_rows, 9);
-        assert_eq!(row_text(&frame.buffer, 1), "• answer");
-        assert!(row_text(&frame.buffer, 3).contains("Working..."));
+        assert_eq!(frame.buffer.area, Rect::new(0, 0, 80, 24));
+        assert_eq!(row_text(&frame.buffer, 0), "• answer");
+        assert!(row_text(&frame.buffer, 2).contains("Working..."));
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
+        assert_eq!(frame.cursor_row, 4);
+        assert_eq!(
+            frame
+                .buffer
+                .cell((0, frame.cursor_row))
+                .expect("composer")
+                .bg,
+            Color::Reset
+        );
     }
 
     #[test]
-    fn completion_menu_replaces_the_footer_without_changing_composer_spacing() {
+    fn completion_menu_overlays_without_reflowing_the_screen() {
         let menu = [CommandCompletion {
             name: "clear",
             description: "start a new chat",
         }];
-        let frame = render(ViewportInput {
+        let blocks = (0..8)
+            .map(|index| {
+                LiveBlock::history(
+                    index + 1,
+                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = ViewportInput {
             terminal_width: 80,
-            terminal_height: 24,
-            history_boundary: welcome_boundary(),
-            live_blocks: &[],
+            terminal_height: 12,
+            transcript: &blocks,
+            scroll_top: None,
             busy: false,
             active_lines: &[],
             status_header: "",
             status_dots: "",
             elapsed: "0s",
             queued: "",
-            prompt: "/cl",
+            prompt_lines: &["/cl".to_string()],
+            prompt_cursor_row: 0,
             prompt_cursor_column: 3,
-            composer_background: None,
-            command_menu: &menu,
+            command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+        };
+        let baseline = render(input);
+        let frame = render(ViewportInput {
+            command_menu: &menu,
+            ..input
         });
 
-        assert_eq!(frame.total_rows, 5);
+        assert_eq!(frame.cursor_row, baseline.cursor_row);
+        assert_eq!(frame.page_rows, baseline.page_rows);
+        assert_eq!(frame.scroll_top, baseline.scroll_top);
+        assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
-        assert!(row_text(&frame.buffer, frame.total_rows - 1).contains("/clear"));
+        assert!((0..frame.cursor_row).any(|row| row_text(&frame.buffer, row).contains("/clear")));
+        assert!(row_text(&frame.buffer, 11).contains("mock"));
     }
 
     #[test]
@@ -594,52 +929,72 @@ mod tests {
             title: "Inspect the session picker".to_string(),
             created_at: "2026-07-15 12:30".to_string(),
         }];
-        let frame = render(ViewportInput {
+        let blocks = (0..8)
+            .map(|index| {
+                LiveBlock::history(
+                    index + 1,
+                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: welcome_boundary(),
-            live_blocks: &[],
+            transcript: &blocks,
+            scroll_top: None,
             busy: false,
             active_lines: &[],
             status_header: "",
             status_dots: "",
             elapsed: "0s",
             queued: "",
-            prompt: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
-            session_menu: &sessions,
+            session_menu: &[],
             session_menu_selected: 0,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+        };
+        let baseline = render(input);
+        let frame = render(ViewportInput {
+            session_menu: &sessions,
+            ..input
         });
 
-        let menu = row_text(&frame.buffer, frame.total_rows - 1);
+        let menu = (0..frame.buffer.area.height)
+            .map(|row| row_text(&frame.buffer, row))
+            .find(|row| row.contains("Inspect the session picker"))
+            .expect("session popup row");
         assert!(menu.contains("Inspect the session picker"));
         assert!(menu.contains("2026-07-15 12:30"));
+        assert_eq!(frame.cursor_row, baseline.cursor_row);
+        assert_eq!(frame.page_rows, baseline.page_rows);
+        assert_eq!(frame.scroll_top, baseline.scroll_top);
+        assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(session_menu_rows(20), 8);
     }
 
     #[test]
-    fn flex_owns_the_gap_before_the_first_active_block() {
+    fn active_output_starts_at_the_top_of_the_transcript() {
         let active = render_markdown("Thinking (0s)", 80);
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: user_boundary(),
-            live_blocks: &[],
+            transcript: &[],
+            scroll_top: None,
             busy: true,
             active_lines: &active,
             status_header: "Thinking",
             status_dots: "...",
             elapsed: "0s",
             queued: "",
-            prompt: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -649,11 +1004,11 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
         });
 
-        assert_eq!(row_text(&frame.buffer, 1), "• Thinking (0s)");
+        assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
     }
 
     #[test]
-    fn live_blocks_share_the_viewport_with_the_composer() {
+    fn transcript_blocks_share_the_screen_with_the_composer() {
         let blocks = [LiveBlock::history(
             1,
             crate::history_block::HistoryBlock::info("restored output"),
@@ -661,17 +1016,17 @@ mod tests {
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            history_boundary: StackBoundary::default(),
-            live_blocks: &blocks,
+            transcript: &blocks,
+            scroll_top: None,
             busy: false,
             active_lines: &[],
             status_header: "",
             status_dots: "",
             elapsed: "0s",
             queued: "",
-            prompt: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            composer_background: None,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -683,5 +1038,312 @@ mod tests {
 
         assert_eq!(row_text(&frame.buffer, 0), "• restored output");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
+        assert_eq!(frame.cursor_row, 2);
+        assert_eq!(row_text(&frame.buffer, 1), "");
+        assert_eq!(row_text(&frame.buffer, 3), "");
+    }
+
+    #[test]
+    fn submitted_input_uses_content_height_and_shared_block_spacing() {
+        let blocks = [
+            LiveBlock::history(1, crate::history_block::HistoryBlock::user("hello")),
+            LiveBlock::history(2, crate::history_block::HistoryBlock::info("after")),
+        ];
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 16,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        assert_eq!(row_text(&frame.buffer, 0), "› hello");
+        assert_eq!(row_text(&frame.buffer, 1), "");
+        assert_eq!(row_text(&frame.buffer, 2), "• after");
+        assert_eq!(row_text(&frame.buffer, 3), "");
+        assert_eq!(frame.cursor_row, 4);
+    }
+
+    #[test]
+    fn multiline_composer_grows_between_the_transcript_and_footer() {
+        let blocks = [LiveBlock::history(
+            1,
+            crate::history_block::HistoryBlock::info("before"),
+        )];
+        let prompt = ["one".to_string(), "two".to_string(), "three".to_string()];
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 16,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &prompt,
+            prompt_cursor_row: 2,
+            prompt_cursor_column: 5,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        assert_eq!(row_text(&frame.buffer, 0), "• before");
+        assert_eq!(row_text(&frame.buffer, 1), "");
+        assert_eq!(row_text(&frame.buffer, 2), "› one");
+        assert_eq!(row_text(&frame.buffer, 3), "  two");
+        assert_eq!(row_text(&frame.buffer, 4), "  three");
+        assert_eq!(row_text(&frame.buffer, 5), "");
+        assert_eq!(frame.cursor_row, 4);
+        assert_eq!(frame.cursor_column, 7);
+    }
+
+    #[test]
+    fn multiline_composer_follows_the_cursor_after_eight_rows() {
+        let prompt = (0..10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 16,
+            transcript: &[],
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &prompt,
+            prompt_cursor_row: 9,
+            prompt_cursor_column: 6,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        assert_eq!(row_text(&frame.buffer, 0), "› line 2");
+        assert_eq!(row_text(&frame.buffer, 7), "  line 9");
+        assert_eq!(row_text(&frame.buffer, 8), "");
+        assert_eq!(frame.cursor_row, 7);
+        assert_eq!(frame.cursor_column, 8);
+    }
+
+    #[test]
+    fn transcript_follows_the_bottom_and_keeps_the_composer_fixed() {
+        let blocks = (0..10)
+            .map(|index| {
+                LiveBlock::history(
+                    index + 1,
+                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 10,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &["draft".to_string()],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 5,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        assert_eq!(frame.scroll_top, 13);
+        assert_eq!(frame.max_scroll_top, 13);
+        assert_eq!(frame.page_rows, 6);
+        assert_eq!(row_text(&frame.buffer, 0), "");
+        assert_eq!(row_text(&frame.buffer, 1), "• entry 7");
+        assert_eq!(row_text(&frame.buffer, 5), "• entry 9");
+        assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
+        assert_eq!(frame.cursor_row, 7);
+    }
+
+    #[test]
+    fn explicit_scroll_top_keeps_older_transcript_rows_visible() {
+        let blocks = (0..10)
+            .map(|index| {
+                LiveBlock::history(
+                    index + 1,
+                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 10,
+            transcript: &blocks,
+            scroll_top: Some(4),
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        assert_eq!(frame.scroll_top, 4);
+        assert_eq!(row_text(&frame.buffer, 0), "• entry 2");
+        assert_eq!(row_text(&frame.buffer, 4), "• entry 4");
+        assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
+    }
+
+    #[test]
+    fn completed_thought_title_is_clickable_after_scrolling() {
+        let mut blocks = (0..8)
+            .map(|index| {
+                LiveBlock::history(
+                    index + 1,
+                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let thought_id = 99;
+        blocks.push(LiveBlock::thought(
+            thought_id,
+            "reasoning detail".to_string(),
+            3,
+        ));
+
+        let frame = render(ViewportInput {
+            terminal_width: 40,
+            terminal_height: 10,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            command_menu: &[],
+            command_menu_selected: 0,
+            session_menu: &[],
+            session_menu_selected: 0,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+        });
+
+        let title_row = (0..frame.buffer.area.height)
+            .find(|row| row_text(&frame.buffer, *row).contains("Thought for 3s"))
+            .expect("visible thought title");
+        assert_eq!(frame.thought_at(title_row), Some(thought_id));
+        assert_eq!(frame.thought_at(title_row.saturating_sub(1)), None);
+    }
+
+    #[test]
+    fn selection_extracts_and_highlights_visible_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        buffer.set_string(0, 0, "hello", Style::default());
+        buffer.set_string(0, 1, "world", Style::default());
+        let mut frame = ViewportFrame {
+            buffer,
+            cursor_row: 0,
+            cursor_column: 0,
+            scroll_top: 0,
+            max_scroll_top: 0,
+            page_rows: 2,
+            thought_hits: Vec::new(),
+        };
+        let anchor = Position::new(2, 1);
+        let focus = Position::new(1, 0);
+
+        assert_eq!(frame.selection_text(anchor, focus), "ello\nwor");
+        frame.highlight_selection(anchor, focus);
+
+        assert!(frame
+            .buffer
+            .cell((1, 0))
+            .expect("selection start")
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(frame
+            .buffer
+            .cell((2, 1))
+            .expect("selection end")
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(!frame
+            .buffer
+            .cell((0, 0))
+            .expect("outside selection")
+            .modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selection_omits_wide_character_placeholder_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        buffer.set_string(0, 0, "你好abc", Style::default());
+        let frame = ViewportFrame {
+            buffer,
+            cursor_row: 0,
+            cursor_column: 0,
+            scroll_top: 0,
+            max_scroll_top: 0,
+            page_rows: 1,
+            thought_hits: Vec::new(),
+        };
+
+        assert_eq!(
+            frame.selection_text(Position::new(0, 0), Position::new(6, 0)),
+            "你好abc"
+        );
+        assert_eq!(
+            frame.selection_text(Position::new(1, 0), Position::new(6, 0)),
+            "好abc"
+        );
     }
 }

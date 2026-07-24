@@ -1,46 +1,55 @@
 mod bash;
 mod edit;
-mod find;
+mod glob;
 mod grep;
-mod ls;
 mod path;
 mod read;
 mod truncate;
+mod webfetch;
 mod write;
 
-use ash_core::Tool;
+use ash_core::{Tool, ToolError};
 use std::sync::Arc;
 
-pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
-    all_tools()
-}
-
-pub fn default_tools() -> Vec<Arc<dyn Tool>> {
-    tools(None)
-}
-
-pub fn tools(enabled: Option<&[String]>) -> Vec<Arc<dyn Tool>> {
-    let default = ["read", "bash", "edit", "write"];
-    all_tools()
+pub fn tools(enabled: Option<&[String]>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+    let tools = all_tools();
+    let Some(names) = enabled else {
+        return Ok(tools);
+    };
+    let unknown = names
+        .iter()
+        .filter(|name| !tools.iter().any(|tool| tool.name() == name.as_str()))
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let available = tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ToolError::Execution(format!(
+            "unknown tool(s): {}; available tools: {available}",
+            unknown
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(tools
         .into_iter()
-        .filter(|tool| {
-            enabled.map_or_else(
-                || default.contains(&tool.name()),
-                |enabled| enabled.iter().any(|name| name == tool.name()),
-            )
-        })
-        .collect()
+        .filter(|tool| names.iter().any(|name| name == tool.name()))
+        .collect())
 }
 
 fn all_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         read::tool(),
+        glob::tool(),
+        grep::tool(),
         bash::tool(),
         edit::tool(),
         write::tool(),
-        grep::tool(),
-        find::tool(),
-        ls::tool(),
+        webfetch::tool(),
     ]
 }
 
@@ -51,42 +60,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_only_the_seven_supported_builtin_tools() {
-        let names = builtin_tools()
+    fn exposes_the_supported_tools_by_default() {
+        let names = tools(None)
+            .unwrap()
             .into_iter()
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(
             names,
-            ["read", "bash", "edit", "write", "grep", "find", "ls"]
+            ["read", "glob", "grep", "bash", "edit", "write", "webfetch"]
         );
     }
 
     #[test]
-    fn enables_only_coding_tools_by_default() {
-        let names = default_tools()
+    fn selects_explicit_optional_tools_without_a_second_filtering_step() {
+        let enabled = vec!["read".to_string(), "webfetch".to_string()];
+        let names = tools(Some(&enabled))
+            .unwrap()
             .into_iter()
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["read", "bash", "edit", "write"]);
+        assert_eq!(names, ["read", "webfetch"]);
     }
 
     #[test]
-    fn selects_explicit_optional_tools_without_a_second_filtering_step() {
-        let enabled = vec!["read".to_string(), "grep".to_string(), "ls".to_string()];
-        let names = tools(Some(&enabled))
-            .into_iter()
-            .map(|tool| tool.name().to_string())
-            .collect::<Vec<_>>();
+    fn rejects_unknown_tool_names() {
+        let error = tools(Some(&["read".into(), "reed".into()])).err().unwrap();
 
-        assert_eq!(names, ["read", "grep", "ls"]);
+        assert!(error.to_string().contains("unknown tool(s): reed"));
+        assert!(error.to_string().contains("available tools: read, glob"));
     }
 
     #[test]
     fn builtin_schemas_expose_only_the_supported_arguments() {
-        let definitions = builtin_tools()
+        let definitions = tools(None)
+            .unwrap()
             .into_iter()
             .map(|tool| (tool.name().to_string(), tool.definition()))
             .collect::<BTreeMap<_, _>>();
@@ -95,33 +105,22 @@ mod tests {
             property_names(&definitions["read"]),
             ["limit", "offset", "path"]
         );
+        assert_eq!(property_names(&definitions["glob"]), ["path", "pattern"]);
+        assert_eq!(
+            property_names(&definitions["grep"]),
+            ["include", "path", "pattern"]
+        );
         assert_eq!(property_names(&definitions["bash"]), ["command", "timeout"]);
         assert_eq!(property_names(&definitions["edit"]), ["edits", "path"]);
         assert_eq!(property_names(&definitions["write"]), ["content", "path"]);
-        assert_eq!(
-            property_names(&definitions["grep"]),
-            [
-                "context",
-                "glob",
-                "ignoreCase",
-                "limit",
-                "literal",
-                "path",
-                "pattern",
-            ]
-        );
-        assert_eq!(
-            property_names(&definitions["find"]),
-            ["limit", "path", "pattern"]
-        );
-        assert_eq!(property_names(&definitions["ls"]), ["limit", "path"]);
+        assert_eq!(property_names(&definitions["webfetch"]), ["timeout", "url"]);
         assert_eq!(required_names(&definitions["read"]), ["path"]);
+        assert_eq!(required_names(&definitions["glob"]), ["pattern"]);
+        assert_eq!(required_names(&definitions["grep"]), ["pattern"]);
         assert_eq!(required_names(&definitions["bash"]), ["command"]);
         assert_eq!(required_names(&definitions["edit"]), ["edits", "path"]);
         assert_eq!(required_names(&definitions["write"]), ["content", "path"]);
-        assert_eq!(required_names(&definitions["grep"]), ["pattern"]);
-        assert_eq!(required_names(&definitions["find"]), ["pattern"]);
-        assert!(required_names(&definitions["ls"]).is_empty());
+        assert_eq!(required_names(&definitions["webfetch"]), ["url"]);
 
         let edit_schema = &definitions["edit"].parameters_schema;
         let edit_items = &edit_schema["properties"]["edits"]["items"];
