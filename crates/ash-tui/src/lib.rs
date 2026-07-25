@@ -8,6 +8,7 @@ mod input;
 mod live_block;
 mod markdown;
 mod scrollback;
+mod selection;
 mod session_picker;
 mod slash_command;
 mod status_line;

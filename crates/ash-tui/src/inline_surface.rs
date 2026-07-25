@@ -218,15 +218,7 @@ mod tests {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 2));
         source.set_string(0, 0, "first", Style::default());
         source.set_string(0, 1, "last", Style::default());
-        let frame = ViewportFrame {
-            buffer: source,
-            cursor_row: 1,
-            cursor_column: 2,
-            scroll_top: 0,
-            max_scroll_top: 0,
-            page_rows: 2,
-            thought_hits: Vec::new(),
-        };
+        let frame = ViewportFrame::for_test(source, Position::new(2, 1));
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
         let cursor = render_fullscreen(&mut screen, &frame);
@@ -242,15 +234,7 @@ mod tests {
         for (row, text) in ["one", "two", "three", "four"].into_iter().enumerate() {
             source.set_string(0, row as u16, text, Style::default());
         }
-        let frame = ViewportFrame {
-            buffer: source,
-            cursor_row: 3,
-            cursor_column: 1,
-            scroll_top: 0,
-            max_scroll_top: 0,
-            page_rows: 2,
-            thought_hits: Vec::new(),
-        };
+        let frame = ViewportFrame::for_test(source, Position::new(1, 3));
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
         let cursor = render_fullscreen(&mut screen, &frame);

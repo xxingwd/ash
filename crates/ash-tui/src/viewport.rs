@@ -14,6 +14,7 @@ use crate::{
     block_layout::{layout_stack, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
+    selection::SelectableText,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left},
     text_width::truncate_end,
@@ -72,6 +73,8 @@ pub(crate) struct ViewportFrame {
     pub(crate) max_scroll_top: u16,
     pub(crate) page_rows: u16,
     pub(crate) thought_hits: Vec<ThoughtHit>,
+    transcript_area: Rect,
+    selectable_text: SelectableText,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +84,24 @@ pub(crate) struct ThoughtHit {
 }
 
 impl ViewportFrame {
+    #[cfg(test)]
+    pub(crate) fn for_test(buffer: Buffer, cursor: Position) -> Self {
+        let area = buffer.area;
+        let mut selectable_text = SelectableText::new(area.height);
+        selectable_text.push(0, Arc::new(buffer.clone()));
+        Self {
+            buffer,
+            cursor_row: cursor.y,
+            cursor_column: cursor.x,
+            scroll_top: 0,
+            max_scroll_top: 0,
+            page_rows: area.height.max(1),
+            thought_hits: Vec::new(),
+            transcript_area: area,
+            selectable_text,
+        }
+    }
+
     pub(crate) fn thought_at(&self, row: u16) -> Option<u64> {
         self.thought_hits
             .iter()
@@ -89,89 +110,73 @@ impl ViewportFrame {
     }
 
     pub(crate) fn selection_text(&self, anchor: Position, focus: Position) -> String {
-        let Some((start, end)) = selection_bounds(&self.buffer, anchor, focus) else {
-            return String::new();
-        };
-        let mut lines = Vec::with_capacity(usize::from(end.y.saturating_sub(start.y)) + 1);
-        for row in start.y..=end.y {
-            let start_column = if row == start.y {
-                start.x
-            } else {
-                self.buffer.area.x
-            };
-            let end_column = if row == end.y {
-                end.x
-            } else {
-                self.buffer.area.right().saturating_sub(1)
-            };
-            let mut line = String::new();
-            let mut hidden_columns = 0;
-            for column in self.buffer.area.x..=end_column {
-                let Some(cell) = self.buffer.cell((column, row)) else {
-                    continue;
-                };
-                if hidden_columns > 0 {
-                    hidden_columns -= 1;
-                    continue;
-                }
-                hidden_columns = UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
-                if column >= start_column && !cell.skip {
-                    line.push_str(cell.symbol());
-                }
-            }
-            lines.push(line.trim_end().to_string());
-        }
-        lines.join("\n").trim_end_matches('\n').to_string()
+        self.selectable_text.text(anchor, focus)
     }
 
     pub(crate) fn highlight_selection(&mut self, anchor: Position, focus: Position) {
-        let Some((start, end)) = selection_bounds(&self.buffer, anchor, focus) else {
-            return;
-        };
-        for row in start.y..=end.y {
-            let start_column = if row == start.y {
-                start.x
-            } else {
-                self.buffer.area.x
-            };
-            let end_column = if row == end.y {
-                end.x
-            } else {
-                self.buffer.area.right().saturating_sub(1)
-            };
-            for column in start_column..=end_column {
-                if let Some(cell) = self.buffer.cell_mut((column, row)) {
-                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-                }
-            }
-        }
+        self.selectable_text.highlight(
+            &mut self.buffer,
+            self.transcript_area,
+            self.scroll_top,
+            anchor,
+            focus,
+        );
     }
-}
 
-fn selection_bounds(
-    buffer: &Buffer,
-    anchor: Position,
-    focus: Position,
-) -> Option<(Position, Position)> {
-    if buffer.area.is_empty() || anchor == focus {
-        return None;
+    pub(crate) fn selection_start(&self, column: u16, row: u16) -> Option<Position> {
+        let position = Position::new(column, row);
+        if !self.transcript_area.contains(position) {
+            return None;
+        }
+        self.selectable_text.point(self.content_position(position))
     }
-    let clamp = |position: Position| {
+
+    pub(crate) fn selection_focus(
+        &self,
+        anchor: Position,
+        column: u16,
+        row: u16,
+    ) -> Option<Position> {
+        if self.transcript_area.is_empty() {
+            return None;
+        }
+        let position = Position::new(
+            column.clamp(
+                self.transcript_area.x,
+                self.transcript_area.right().saturating_sub(1),
+            ),
+            row.clamp(
+                self.transcript_area.y,
+                self.transcript_area.bottom().saturating_sub(1),
+            ),
+        );
+        self.selectable_text
+            .focus(anchor, self.content_position(position))
+    }
+
+    pub(crate) fn scroll_top_for_drag(&self, row: u16, anchor: Position, focus: Position) -> u16 {
+        if self.transcript_area.is_empty() {
+            return self.scroll_top;
+        }
+        let selection_reaches_below_top = anchor.y.max(focus.y) > self.scroll_top;
+        let next = if row <= self.transcript_area.y && selection_reaches_below_top {
+            self.scroll_top
+                .saturating_sub(self.transcript_area.y.saturating_sub(row).max(1))
+        } else if row >= self.transcript_area.bottom() {
+            self.scroll_top
+                .saturating_add(row.saturating_sub(self.transcript_area.bottom()) + 1)
+        } else {
+            self.scroll_top
+        };
+        next.min(self.max_scroll_top)
+    }
+
+    fn content_position(&self, position: Position) -> Position {
         Position::new(
-            position
-                .x
-                .clamp(buffer.area.x, buffer.area.right().saturating_sub(1)),
-            position
-                .y
-                .clamp(buffer.area.y, buffer.area.bottom().saturating_sub(1)),
+            position.x.saturating_sub(self.transcript_area.x),
+            self.scroll_top
+                .saturating_add(position.y.saturating_sub(self.transcript_area.y)),
         )
-    };
-    let anchor = clamp(anchor);
-    let focus = clamp(focus);
-    if (anchor.y, anchor.x) <= (focus.y, focus.x) {
-        Some((anchor, focus))
-    } else {
-        Some((focus, anchor))
     }
 }
 
@@ -188,8 +193,9 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .iter()
         .map(|block| block.render(width))
         .collect::<Vec<_>>();
-    let active = (!input.active_lines.is_empty()).then_some(input.active_lines);
-    let active_rows = active.map(|lines| u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let active =
+        (!input.active_lines.is_empty()).then(|| render_active_buffer(width, input.active_lines));
+    let active_rows = active.as_ref().map(|buffer| buffer.area.height);
     let regions = transcript_regions(&rendered_blocks, active_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
@@ -216,12 +222,19 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         scroll_top,
         transcript_view_rows,
     );
+    let selectable_text = selectable_transcript(
+        &regions,
+        &layout.areas,
+        &rendered_blocks,
+        active.as_ref(),
+        layout.height,
+    );
     let mut buffer = Buffer::empty(Rect::new(0, 0, terminal_width, terminal_height));
     render_transcript(
         &regions,
         &layout.areas,
         &rendered_blocks,
-        active,
+        active.as_ref(),
         scroll_top,
         transcript_view_rows,
         &mut buffer,
@@ -251,6 +264,8 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         max_scroll_top,
         page_rows: transcript_view_rows.max(1),
         thought_hits,
+        transcript_area: screen.transcript,
+        selectable_text,
     }
 }
 
@@ -391,15 +406,10 @@ fn prompt_window<'a>(input: &'a ViewportInput<'_>, rows: u16) -> PromptWindow<'a
     }
 }
 
-fn render_active(area: Rect, lines: &[RenderedLine], source_y: u16, buffer: &mut Buffer) {
-    let source_y = usize::from(source_y);
-    for (offset, rendered) in lines
-        .iter()
-        .skip(source_y)
-        .take(usize::from(area.height))
-        .enumerate()
-    {
-        let index = source_y + offset;
+fn render_active_buffer(width: u16, lines: &[RenderedLine]) -> Arc<Buffer> {
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    for (index, rendered) in lines.iter().take(usize::from(height)).enumerate() {
         let mut spans = vec![if index == 0 {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
@@ -407,19 +417,20 @@ fn render_active(area: Rect, lines: &[RenderedLine], source_y: u16, buffer: &mut
         }];
         spans.extend(rendered.ratatui_line().spans);
         buffer.set_line(
-            area.x,
-            area.y.saturating_add(offset as u16),
+            0,
+            u16::try_from(index).unwrap_or(u16::MAX),
             &Line::from(spans),
-            area.width,
+            width,
         );
     }
+    Arc::new(buffer)
 }
 
 fn render_transcript(
     regions: &[RegionSpec],
     areas: &[Rect],
     blocks: &[Arc<Buffer>],
-    active: Option<&[RenderedLine]>,
+    active: Option<&Arc<Buffer>>,
     scroll_top: u16,
     visible_rows: u16,
     buffer: &mut Buffer,
@@ -445,12 +456,32 @@ fn render_transcript(
                 }
             }
             ViewportRegion::Active => {
-                if let Some(active) = active {
-                    render_active(target, active, source_y, buffer);
+                if let Some(block) = active {
+                    crate::buffer::copy_rows(block, buffer, source_y, target);
                 }
             }
         }
     }
+}
+
+fn selectable_transcript(
+    regions: &[RegionSpec],
+    areas: &[Rect],
+    blocks: &[Arc<Buffer>],
+    active: Option<&Arc<Buffer>>,
+    height: u16,
+) -> SelectableText {
+    let mut text = SelectableText::new(height);
+    for (region, area) in regions.iter().zip(areas) {
+        let buffer = match region.kind {
+            ViewportRegion::Live(index) => blocks.get(index),
+            ViewportRegion::Active => active,
+        };
+        if let Some(buffer) = buffer {
+            text.push(area.y, Arc::clone(buffer));
+        }
+    }
+    text
 }
 
 fn visible_thought_hits(
@@ -1288,15 +1319,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
         buffer.set_string(0, 0, "hello", Style::default());
         buffer.set_string(0, 1, "world", Style::default());
-        let mut frame = ViewportFrame {
-            buffer,
-            cursor_row: 0,
-            cursor_column: 0,
-            scroll_top: 0,
-            max_scroll_top: 0,
-            page_rows: 2,
-            thought_hits: Vec::new(),
-        };
+        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
         let anchor = Position::new(2, 1);
         let focus = Position::new(1, 0);
 
@@ -1327,15 +1350,7 @@ mod tests {
     fn selection_omits_wide_character_placeholder_cells() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
         buffer.set_string(0, 0, "你好abc", Style::default());
-        let frame = ViewportFrame {
-            buffer,
-            cursor_row: 0,
-            cursor_column: 0,
-            scroll_top: 0,
-            max_scroll_top: 0,
-            page_rows: 1,
-            thought_hits: Vec::new(),
-        };
+        let frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
 
         assert_eq!(
             frame.selection_text(Position::new(0, 0), Position::new(6, 0)),
@@ -1344,6 +1359,39 @@ mod tests {
         assert_eq!(
             frame.selection_text(Position::new(1, 0), Position::new(6, 0)),
             "好abc"
+        );
+    }
+
+    #[test]
+    fn selection_starts_only_on_transcript_text() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        buffer.set_string(2, 0, "answer", Style::default());
+        buffer.set_string(0, 2, "input", Style::default());
+        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 2));
+        frame.transcript_area = Rect::new(0, 0, 12, 2);
+
+        assert_eq!(frame.selection_start(0, 0), Some(Position::new(2, 0)));
+        assert_eq!(frame.selection_start(0, 1), None);
+        assert_eq!(frame.selection_start(0, 2), None);
+    }
+
+    #[test]
+    fn dragging_past_transcript_edges_advances_its_scroll_position() {
+        let buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
+        frame.transcript_area = Rect::new(0, 0, 12, 2);
+        frame.scroll_top = 3;
+        frame.max_scroll_top = 10;
+        let anchor = Position::new(0, 5);
+        let focus = Position::new(0, 4);
+
+        assert_eq!(frame.scroll_top_for_drag(1, anchor, focus), 3);
+        assert_eq!(frame.scroll_top_for_drag(0, anchor, focus), 2);
+        assert_eq!(frame.scroll_top_for_drag(2, anchor, focus), 4);
+        assert_eq!(frame.scroll_top_for_drag(4, anchor, focus), 6);
+        assert_eq!(
+            frame.scroll_top_for_drag(0, Position::new(0, 3), Position::new(5, 3)),
+            3
         );
     }
 }

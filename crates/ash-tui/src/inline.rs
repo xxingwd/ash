@@ -530,33 +530,48 @@ impl TerminalUi {
     }
 
     pub fn start_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
-        self.selection = Some(TextSelection::new(Position::new(column, row)));
-        self.redraw()
+        let (width, height) = terminal_size()?;
+        self.selection = self
+            .viewport_frame(width, height)
+            .selection_start(column, row)
+            .map(TextSelection::new);
+        Ok(())
     }
 
     pub fn drag_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
-        let Some(selection) = &mut self.selection else {
+        let Some(mut selection) = self.selection else {
             return Ok(());
         };
-        selection.focus = Position::new(column, row);
-        self.redraw()
+        let (width, height) = terminal_size()?;
+        let frame = self.viewport_frame(width, height);
+        let next_scroll_top = frame.scroll_top_for_drag(row, selection.anchor, selection.focus);
+        if next_scroll_top != frame.scroll_top {
+            self.scroll_top = (next_scroll_top < frame.max_scroll_top).then_some(next_scroll_top);
+        }
+        let frame = self.viewport_frame(width, height);
+        if let Some(focus) = frame.selection_focus(selection.anchor, column, row) {
+            selection.focus = focus;
+        }
+        self.selection = Some(selection);
+        self.redraw_at(width, height)
     }
 
     pub fn finish_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
         let Some(mut selection) = self.selection else {
             return Ok(());
         };
-        selection.focus = Position::new(column, row);
+        let (width, height) = terminal_size()?;
+        let frame = self.viewport_frame(width, height);
+        if let Some(focus) = frame.selection_focus(selection.anchor, column, row) {
+            selection.focus = focus;
+        }
         if selection.anchor == selection.focus {
             self.selection = None;
             return self.toggle_thought_at(row);
         }
 
         self.selection = Some(selection);
-        let (width, height) = terminal_size()?;
-        let text = self
-            .viewport_frame(width, height)
-            .selection_text(selection.anchor, selection.focus);
+        let text = frame.selection_text(selection.anchor, selection.focus);
         let copy_result = if text.is_empty() {
             Ok(())
         } else {
