@@ -78,24 +78,25 @@
 
 ### `ash-tui`
 
-交互界面是由 Ratatui 管理的 alternate-screen 全屏 TUI：
+交互界面是由 Ratatui 管理的 inline TUI：
 
-- 进入时启用 raw mode、alternate screen、bracketed paste 和鼠标捕获；正常退出、错误与
-  Drop 路径使用同一个幂等 Guard 恢复终端
-- UI 持有完整的语义 transcript，并在缩放后按当前宽度重新渲染，不依赖 shell scrollback
-- transcript 使用独立的滚动位置；默认跟随底部，用户滚动后保持绝对行位置
-- 状态栏、Composer、命令补全、Session 菜单和 footer 紧跟 transcript；内容填满可用
-  高度后自然位于屏幕底部
-- `/new`、`/clear` 和 `/resume` 替换当前 transcript；跨会话恢复仍以 JSONL 为准
-- 已完成的语义块按宽度缓存渲染结果，viewport 只复制当前可见的 transcript 行
+- 进入时启用 raw mode 和 bracketed paste，不进入 alternate screen，也不捕获鼠标；正常
+  退出、错误与 Drop 路径使用同一个幂等 Guard 恢复终端
+- UI 只持有当前 turn 的 live transcript；viewport 按实际内容高度动态伸缩，最大为首屏
+- live transcript 使用独立滚动位置并默认跟随底部；已完成历史交给终端原生 scrollback
+- `AgentFinished` 是唯一的正常 turn 提交边界：先收缩到 Composer，再在一次同步更新中把
+  用户消息、Thought、工具、回答和 Worked 块写到 scrollback，随后释放语义块和渲染缓存
+- `/new` 和 `/clear` 清空模型历史、可见屏幕与 scrollback；`/resume` 从 JSONL 重放历史
+- 已完成历史不再由 Ash 重绘；终端模拟器负责其缩放重排、滚动、选择与复制
 - Agent 工作期间 `Ctrl-C` 不发送取消命令；状态栏提示 `esc to interrupt`，第一次按
   `Esc` 不展示额外状态
 - Agent 工作期间按一次 `Esc` 会取消并回退当前轮，将问题恢复为草稿
 - `Esc` 会先在 UI 侧立即移除当前 turn 并恢复 Composer；后端确认回退前到达的旧
   Thinking、工具和文本事件不再参与渲染，确认事件也不会重复清除同一区域
-- 回退按 turn ID 从 transcript 中移除当前轮，并从模型上下文移除同一轮
+- 回退按 turn ID 从 live transcript 和模型上下文移除当前轮；已经提交的终端历史不可变，
+  `/undo` 不尝试从 scrollback 删除文字
 - 流式思考摘要显示带耗时的 `Thinking` 标题和完整正文，并随 transcript 向下滚动；
-  切换到回答、工具或完成状态时折叠为单行耗时摘要，正文保留在可点击展开的 Thought 块中
+  切换到回答、工具或完成状态时折叠为单行耗时摘要，提交前可通过 `Ctrl-O` 展开
 - 工具历史按工具语义生成单行摘要，隐藏内容参数和默认参数，并把绝对路径缩短为
   可辨识的文件名或末级目录；不把原始工具参数 JSON 加入 transcript
 - TUI 只聚合连续的原生 `read` 调用；`bash` 始终显示实际命令，不做 Shell 意图猜测，
@@ -110,8 +111,8 @@
 - `block_layout`：完整块、continuation 与 Ratatui Flex spacing
 - `input`：Unicode 安全的编辑、历史和可视窗口
 - `viewport`：transcript 窗口、Composer 组件、行高、间距和 Buffer 渲染
-- `inline`：UI transcript、滚动位置、流状态和 viewport 生命周期
-- `inline_surface`：alternate screen、raw mode、鼠标捕获和终端恢复
+- `inline`：live turn、提交边界、滚动位置、流状态和 viewport 生命周期
+- `inline_surface`：动态 inline viewport、scrollback 插入、raw mode 和终端恢复
 
 输入框的跨进程历史使用独立的 `history.jsonl`；它只负责上下键召回，不参与模型
 上下文恢复。恢复会话时 UI 根据语义消息重新渲染对话，不解析终端输出。
@@ -155,7 +156,7 @@ AgentSession ── LlmRequest ──→ ProtocolAdapter ──→ SSE
     │                                  ↓ StreamItem
     ├── tool execution ──→ ash-orchestrator ──→ child Agent turns
     │
-    └── Event ──→ alternate-screen TUI ──→ Ratatui viewport
+    └── Event ──→ inline TUI ──→ Ratatui viewport / terminal scrollback
 ```
 
 ## 错误和取消

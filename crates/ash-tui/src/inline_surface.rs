@@ -2,20 +2,17 @@ use std::io::{self, Stdout, Write};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use crossterm::{
-    cursor::Show,
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    cursor::{MoveTo, Show},
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{Attribute, ResetColor, SetAttribute},
-    terminal::{
-        self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     buffer::Buffer,
     layout::{Position, Rect},
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
 };
 
 use crate::viewport::ViewportFrame;
@@ -71,32 +68,41 @@ impl Write for FrameWriter {
     }
 }
 
-type FullscreenTerminal = Terminal<CrosstermBackend<FrameWriter>>;
+type InlineTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 
-/// Owns the alternate screen for the lifetime of the interactive UI.
-pub(crate) struct AlternateScreen {
-    terminal: FullscreenTerminal,
+/// Owns an inline viewport while preserving the terminal's native scrollback.
+pub(crate) struct InlineScreen {
+    terminal: InlineTerminal,
+    viewport_area: Rect,
     guard: TerminalGuard,
 }
 
-impl AlternateScreen {
+impl InlineScreen {
     pub(crate) fn enter() -> io::Result<Self> {
         let guard = TerminalGuard::enter()?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture,
-            Show
-        )?;
+        execute!(stdout, EnableBracketedPaste, Show)?;
 
+        let (width, height) = terminal::size()?;
+        if width == 0 || height == 0 {
+            return Err(io::Error::other("terminal reported a zero-sized viewport"));
+        }
         let backend = CrosstermBackend::new(FrameWriter::new(stdout));
-        let mut terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height.max(1)),
+            },
+        )?;
         terminal.clear()?;
         terminal.force_redraw();
+        let viewport_area = terminal.get_frame().area();
 
-        Ok(Self { terminal, guard })
+        Ok(Self {
+            terminal,
+            viewport_area,
+            guard,
+        })
     }
 
     pub(crate) fn begin_synchronized(&mut self) -> io::Result<()> {
@@ -114,21 +120,46 @@ impl AlternateScreen {
     pub(crate) fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
         self.terminal
             .resize(Rect::new(0, 0, width.max(1), height.max(1)))?;
+        self.viewport_area = self.terminal.get_frame().area();
         self.terminal.force_redraw();
         Ok(())
     }
 
     pub(crate) fn reset(&mut self) -> io::Result<()> {
+        let writer = self.terminal.backend_mut().writer_mut();
+        queue!(
+            writer,
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        writer.flush()?;
+        self.viewport_area.y = 0;
+        self.terminal.set_viewport_area(self.viewport_area);
         self.terminal.clear()?;
         self.terminal.force_redraw();
         Ok(())
     }
 
     pub(crate) fn render_frame(&mut self, frame: &ViewportFrame) -> io::Result<()> {
+        self.set_viewport_height(
+            frame.buffer.area.width,
+            frame.buffer.area.height,
+            frame.viewport_height,
+        )?;
         self.terminal.draw(|terminal_frame| {
-            let cursor = render_fullscreen(terminal_frame.buffer_mut(), frame);
+            let cursor = render_inline(terminal_frame.buffer_mut(), frame);
             terminal_frame.set_cursor_position(cursor);
         })?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_buffer(&mut self, buffer: &Buffer, gap_after: u16) -> io::Result<()> {
+        let height = buffer.area.height.saturating_add(gap_after).max(1);
+        self.terminal.insert_before(height, |target| {
+            crate::buffer::copy_rows(buffer, target, 0, target.area);
+        })?;
+        self.viewport_area = self.terminal.get_frame().area();
         Ok(())
     }
 
@@ -139,12 +170,52 @@ impl AlternateScreen {
     }
 
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
+        self.terminal.clear()?;
         self.terminal.show_cursor()?;
         self.guard.restore()
     }
+
+    fn set_viewport_height(
+        &mut self,
+        width: u16,
+        screen_height: u16,
+        viewport_height: u16,
+    ) -> io::Result<()> {
+        let (area, scroll_by) =
+            resized_viewport_area(self.viewport_area, width, screen_height, viewport_height);
+        if scroll_by > 0 {
+            self.terminal
+                .backend_mut()
+                .scroll_region_up(0..self.viewport_area.top(), scroll_by)?;
+        }
+        if area != self.viewport_area {
+            self.terminal.set_viewport_area(area);
+            self.terminal.clear()?;
+            self.terminal.force_redraw();
+            self.viewport_area = area;
+        }
+        Ok(())
+    }
 }
 
-fn render_fullscreen(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
+fn resized_viewport_area(
+    current: Rect,
+    width: u16,
+    screen_height: u16,
+    viewport_height: u16,
+) -> (Rect, u16) {
+    let screen_height = screen_height.max(1);
+    let mut area = current;
+    area.width = width.max(1);
+    area.height = viewport_height.clamp(1, screen_height);
+    let scroll_by = area.bottom().saturating_sub(screen_height);
+    if scroll_by > 0 {
+        area.y = screen_height - area.height;
+    }
+    (area, scroll_by)
+}
+
+fn render_inline(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
     let visible_rows = frame.buffer.area.height.min(screen.area.height);
     crate::buffer::copy_rows(
         &frame.buffer,
@@ -159,8 +230,8 @@ fn render_fullscreen(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
     );
 
     Position::new(
-        frame.cursor_column.min(screen.area.width.saturating_sub(1)),
-        frame.cursor_row.min(screen.area.height.saturating_sub(1)),
+        screen.area.x + frame.cursor_column.min(screen.area.width.saturating_sub(1)),
+        screen.area.y + frame.cursor_row.min(screen.area.height.saturating_sub(1)),
     )
 }
 
@@ -186,12 +257,10 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         let screen_result = execute!(
             stdout,
-            DisableMouseCapture,
             DisableBracketedPaste,
             ResetColor,
             SetAttribute(Attribute::Reset),
-            Show,
-            LeaveAlternateScreen
+            Show
         );
         let raw_mode_result = terminal::disable_raw_mode();
         if screen_result.is_ok() && raw_mode_result.is_ok() {
@@ -214,14 +283,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fullscreen_render_top_aligns_the_viewport() {
+    fn inline_render_top_aligns_the_viewport() {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 2));
         source.set_string(0, 0, "first", Style::default());
         source.set_string(0, 1, "last", Style::default());
         let frame = ViewportFrame::for_test(source, Position::new(2, 1));
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 5));
 
-        let cursor = render_fullscreen(&mut screen, &frame);
+        let cursor = render_inline(&mut screen, &frame);
 
         assert_eq!(row_text(&screen, 0), "first");
         assert_eq!(row_text(&screen, 1), "last");
@@ -229,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_render_clips_rows_below_the_screen() {
+    fn inline_render_clips_rows_below_the_screen() {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 4));
         for (row, text) in ["one", "two", "three", "four"].into_iter().enumerate() {
             source.set_string(0, row as u16, text, Style::default());
@@ -237,11 +306,38 @@ mod tests {
         let frame = ViewportFrame::for_test(source, Position::new(1, 3));
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));
 
-        let cursor = render_fullscreen(&mut screen, &frame);
+        let cursor = render_inline(&mut screen, &frame);
 
         assert_eq!(row_text(&screen, 0), "one");
         assert_eq!(row_text(&screen, 1), "two");
         assert_eq!(cursor, Position::new(1, 1));
+    }
+
+    #[test]
+    fn inline_render_offsets_the_cursor_to_the_viewport_origin() {
+        let source = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let frame = ViewportFrame::for_test(source, Position::new(2, 1));
+        let mut screen = Buffer::empty(Rect::new(3, 4, 6, 2));
+
+        let cursor = render_inline(&mut screen, &frame);
+
+        assert_eq!(cursor, Position::new(5, 5));
+    }
+
+    #[test]
+    fn shrinking_the_viewport_keeps_history_above_it_visible() {
+        let (area, scroll_by) = resized_viewport_area(Rect::new(0, 8, 80, 16), 80, 24, 3);
+
+        assert_eq!(area, Rect::new(0, 8, 80, 3));
+        assert_eq!(scroll_by, 0);
+    }
+
+    #[test]
+    fn expanding_the_viewport_scrolls_only_the_rows_it_needs() {
+        let (area, scroll_by) = resized_viewport_area(Rect::new(0, 8, 80, 3), 80, 24, 24);
+
+        assert_eq!(area, Rect::new(0, 0, 80, 24));
+        assert_eq!(scroll_by, 8);
     }
 
     #[test]

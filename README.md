@@ -7,7 +7,7 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 - 连续对话与工具调用历史
 - 默认启用 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`webfetch` 七个内置工具
 - Codex 风格的 `default`、`explorer`、`worker` 子 Agent
-- alternate-screen 全屏 TUI
+- 保留终端原生 scrollback 的 inline TUI
 
 ## 运行
 
@@ -66,7 +66,7 @@ cargo run -p ash-cli -- \
 token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地估算值。
 
 估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文，并持久化一条
-隐藏的 compaction checkpoint。原始消息、TUI transcript 和会话标题保持不变。压缩器
+隐藏的 compaction checkpoint。原始消息、终端 scrollback 和会话标题保持不变。压缩器
 保留最近两个完整用户轮次，让同一个模型在禁用工具的独立请求中把更早历史整理为结构化
 摘要；再次压缩会更新已有摘要。摘要输入中的旧工具输出最多保留 2,000 字符，图片只保留
 媒体类型和大小。模型调用前还会保护最近两个轮次及约 40K token 的近期工具结果；更旧
@@ -129,8 +129,8 @@ session-2026-07-14T16-30-25.123-<session-id>.jsonl
 恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。API Key、
 访问令牌和自定义接口地址内容不会写入文件。
 
-`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史、建立新的 Session，并重置当前
-全屏 transcript。`/resume` 会用所选 JSONL 重建模型上下文和当前可见 transcript。
+`/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
+Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
 `/undo` 会从内存历史和 Session JSONL 中直接截断最后一轮，并把该轮输入恢复到输入框。
 新 Session 会立即获得 ID 和创建时间，但在第一条用户消息发出前不会创建文件；会话名称
 取第一条有效用户消息。
@@ -166,19 +166,18 @@ explorer，边界清晰的代码改动优先交给 worker。简单任务和紧�
 
 ## 终端行为
 
-交互界面使用 alternate screen，并在正常退出、错误和 Drop 路径中恢复主屏、光标、
-鼠标捕获和 raw mode。Ratatui 接管整个可见区域：状态栏、输入框、命令补全和底栏紧跟在
-transcript 后面；内容填满可用高度后，它们自然位于屏幕底部。完整用户消息、Thought、
-工具与回答都由 UI 保存在语义块中，终端缩放后按新宽度重新排版，不依赖 shell scrollback。
+交互界面使用 Ratatui inline viewport，不进入 alternate screen，也不捕获鼠标。终端原生
+滚动、选择和复制因此保持可用。当前用户消息、流式 Thought、工具与回答只存在于本轮 live
+viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随最新内容。
 
-transcript 默认跟随最新内容。用户滚动到旧内容后，流式更新保持当前绝对行位置；提交新
-问题、切换会话或跳到底部后恢复自动跟随。历史区中的完整块只负责内容和内部 padding，
-父级 Stack 使用 `Flex::Start` 与统一 spacing 排列；输入框和模型、路径或补全 footer
-组成固定的 ComposerBlock。
+收到 `AgentFinished` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
+随后清空本轮 transcript 和渲染缓存。完成历史不再由 Ash 保存或逐帧重绘；终端缩放后的
+历史重排、滚动和复制由终端模拟器负责。`/new`、`/clear` 会清除可见屏幕和 scrollback，
+`/resume` 则从 JSONL 重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
-正文、工具调用或本轮结束后，思考区折叠为一行 `Thought for Xs`，正文仍保留在 UI
-状态中；鼠标左键点击该块可以展开或再次折叠。OpenAI Chat
+正文、工具调用或本轮结束后，思考区折叠为一行 `Thought for Xs`。本轮提交前可在空输入
+时按 `Ctrl-O` 展开或再次折叠；进入终端 scrollback 后就是不可变的折叠摘要。OpenAI Chat
 Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinking` 字段，
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
@@ -192,18 +191,19 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - 补全菜单中 `↑` / `↓`（或 `Ctrl-P` / `Ctrl-N`）：切换选择
 - 补全菜单中 `Tab`：补全命令；`Enter`：执行当前选择；`Esc`：关闭菜单
 - `↑` / `↓`：输入历史
-- `PageUp` / `PageDown`：按页浏览 transcript
-- `Ctrl-Home` / `Ctrl-End`：跳到 transcript 顶部或底部
-- 鼠标滚轮：逐行浏览 transcript
-- 鼠标左键点击 Thought：展开或折叠完整思考正文
+- `PageUp` / `PageDown`：按页浏览当前 live turn
+- `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
+- 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
+- 空输入时 `Ctrl-O`：展开或折叠本轮最新 Thought
 - 任务运行时按一次 `Esc`：取消并撤销当前一轮，将原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求
 - 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出
 
-按下 `Esc` 会从模型会话历史和 UI transcript 中移除当前轮，并把问题恢复到输入框；
-它不会反向撤销已经由工具写入文件系统的修改。
+按下 `Esc` 会从模型会话历史和 live viewport 中移除当前轮，并把问题恢复到输入框；它不会
+反向撤销已经由工具写入文件系统的修改。`/undo` 会回滚模型与 Session JSONL 并恢复问题，
+但已经提交到终端 scrollback 的文字作为终端历史保留，直到 `/new` 或 `/clear`。
 
 ## 开发检查
 

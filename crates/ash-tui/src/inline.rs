@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     history_block::HistoryBlock,
-    inline_surface::AlternateScreen,
+    inline_surface::InlineScreen,
     input::InputState,
     live_block::LiveBlock,
     scrollback::sanitize_single_line,
@@ -239,7 +239,7 @@ struct ViewState {
 }
 
 pub(crate) struct TerminalUi {
-    surface: AlternateScreen,
+    surface: InlineScreen,
     session: SessionView,
     view: ViewState,
     transcript: Vec<LiveBlock>,
@@ -260,7 +260,7 @@ impl TerminalUi {
         working_dir: &Path,
         context_limit: Option<u64>,
     ) -> io::Result<Self> {
-        let surface = AlternateScreen::enter()?;
+        let surface = InlineScreen::enter()?;
         Ok(Self {
             surface,
             session: SessionView::new(protocol, model, working_dir, context_limit),
@@ -279,7 +279,7 @@ impl TerminalUi {
 
     pub fn welcome(&mut self) -> io::Result<()> {
         self.enqueue_welcome();
-        self.redraw()
+        self.commit_transcript_to_scrollback()
     }
 
     fn enqueue_welcome(&mut self) {
@@ -291,7 +291,7 @@ impl TerminalUi {
         self.view.composer.clear();
         self.scroll_top = None;
         self.push_history_block(HistoryBlock::info(message));
-        self.redraw()
+        self.commit_transcript_to_scrollback()
     }
 
     pub fn show_session_status(&mut self) -> io::Result<()> {
@@ -308,7 +308,7 @@ impl TerminalUi {
         self.view.composer.clear();
         self.scroll_top = None;
         self.push_history_block(HistoryBlock::error(message));
-        self.redraw()
+        self.commit_transcript_to_scrollback()
     }
 
     pub fn start_compaction(&mut self) -> io::Result<()> {
@@ -344,7 +344,7 @@ impl TerminalUi {
     pub fn start_new_session(&mut self) -> io::Result<()> {
         self.begin_fresh_viewport()?;
         self.enqueue_welcome();
-        self.redraw()
+        self.commit_transcript_to_scrollback()
     }
 
     fn begin_fresh_viewport(&mut self) -> io::Result<()> {
@@ -384,7 +384,7 @@ impl TerminalUi {
         self.session.update(protocol, model, working_dir);
         self.enqueue_welcome();
         self.push_restored_messages(messages);
-        self.redraw()
+        self.commit_transcript_to_scrollback()
     }
 
     pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
@@ -443,9 +443,12 @@ impl TerminalUi {
     }
 
     pub fn commit_exit(&mut self, input: &str) -> io::Result<()> {
+        self.finish_stream();
         self.current_turn_id = None;
         self.status.stop();
-        self.commit_user_message(input)
+        self.view.busy = false;
+        self.commit_user_message(input)?;
+        self.commit_transcript_to_scrollback()
     }
 
     fn commit_user_message(&mut self, input: &str) -> io::Result<()> {
@@ -517,7 +520,11 @@ impl TerminalUi {
         self.finish_stream();
         self.status.header = "Failed".to_string();
         self.push_history_block(HistoryBlock::error(error));
-        self.redraw()
+        if self.current_turn_id.is_some() {
+            self.redraw()
+        } else {
+            self.commit_transcript_to_scrollback()
+        }
     }
 
     pub fn finish_response(&mut self) -> io::Result<()> {
@@ -525,15 +532,15 @@ impl TerminalUi {
         let elapsed_seconds = self.status.elapsed_seconds();
         let usage = self.usage.finish_turn();
         self.status.stop();
+        self.view.busy = false;
         self.push_history_block(HistoryBlock::worked(
             format_elapsed(elapsed_seconds),
             usage.input_tokens,
             usage.output_tokens,
             usage.generation_ms,
         ));
-        let result = self.redraw();
         self.current_turn_id = None;
-        result
+        self.commit_transcript_to_scrollback()
     }
 
     pub fn refresh_content(&mut self) -> io::Result<()> {
@@ -706,6 +713,10 @@ impl TerminalUi {
 
     pub fn leave(&mut self) -> io::Result<()> {
         self.finish_stream();
+        self.status.stop();
+        self.view.busy = false;
+        self.current_turn_id = None;
+        self.commit_transcript_to_scrollback()?;
         self.surface.leave_screen()
     }
 
@@ -771,6 +782,33 @@ impl TerminalUi {
 
     fn redraw_at(&mut self, width: u16, height: u16) -> io::Result<()> {
         self.synchronized(|terminal| terminal.render_viewport(width, height))
+    }
+
+    fn commit_transcript_to_scrollback(&mut self) -> io::Result<()> {
+        if self.transcript.is_empty() {
+            return self.redraw();
+        }
+
+        let (width, height) = terminal_size()?;
+        let render_width = viewport::drawable_width(width);
+        let rendered = self
+            .transcript
+            .iter()
+            .map(|block| block.render(render_width))
+            .collect::<Vec<_>>();
+        self.synchronized(move |terminal| {
+            terminal.transcript.clear();
+            terminal.scroll_top = None;
+            terminal.selection = None;
+
+            // Shrink the live viewport before inserting history so committed rows remain visible
+            // directly above the composer instead of disappearing above a full-screen viewport.
+            terminal.render_viewport(width, height)?;
+            for buffer in rendered {
+                terminal.surface.insert_buffer(&buffer, 1)?;
+            }
+            terminal.render_viewport(width, height)
+        })
     }
 
     fn scroll_up(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {

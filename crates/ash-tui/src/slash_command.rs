@@ -61,7 +61,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "undo",
         aliases: &[],
-        description: "remove the last turn and restore its prompt",
+        description: "roll back the last turn and restore its prompt",
         command: SlashCommand::Undo,
     },
     CommandSpec {

@@ -71,6 +71,7 @@ pub(crate) struct ViewportInput<'a> {
 
 pub(crate) struct ViewportFrame {
     pub(crate) buffer: Buffer,
+    pub(crate) viewport_height: u16,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_column: u16,
     pub(crate) scroll_top: u16,
@@ -94,6 +95,7 @@ impl ViewportFrame {
         let mut selectable_text = SelectableText::new(area.height);
         selectable_text.push(0, Arc::new(buffer.clone()));
         Self {
+            viewport_height: area.height.max(1),
             buffer,
             cursor_row: cursor.y,
             cursor_column: cursor.x,
@@ -260,6 +262,14 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     ViewportFrame {
         buffer,
+        viewport_height: if input.command_menu.is_empty() && input.session_menu.is_empty() {
+            u16::try_from(screen_height(screen_rows))
+                .unwrap_or(u16::MAX)
+                .min(terminal_height)
+                .max(1)
+        } else {
+            terminal_height
+        },
         cursor_row: screen.composer.y.saturating_add(prompt.cursor_row),
         cursor_column: COMPOSER_TEXT_COLUMN
             .saturating_add(prompt.cursor_column)
@@ -1009,6 +1019,7 @@ mod tests {
         });
 
         assert_eq!(frame.buffer.area, Rect::new(0, 0, 80, 24));
+        assert_eq!(frame.viewport_height, 7);
         assert_eq!(row_text(&frame.buffer, 0), "• answer");
         assert!(row_text(&frame.buffer, 2).contains("Working..."));
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
@@ -1072,6 +1083,7 @@ mod tests {
         assert_eq!(frame.page_rows, baseline.page_rows);
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
+        assert_eq!(frame.viewport_height, 12);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
         assert!((0..frame.cursor_row).any(|row| row_text(&frame.buffer, row).contains("/clear")));
         assert!(row_text(&frame.buffer, 11).contains("mock"));
@@ -1129,6 +1141,7 @@ mod tests {
             .expect("session popup row");
         assert!(menu.contains("Inspect the session picker"));
         assert!(menu.contains("2026-07-15 12:30"));
+        assert_eq!(frame.viewport_height, 24);
         assert_eq!(frame.cursor_row, baseline.cursor_row);
         assert_eq!(frame.page_rows, baseline.page_rows);
         assert_eq!(frame.scroll_top, baseline.scroll_top);
@@ -1203,6 +1216,7 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, 0), "• restored output");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
         assert_eq!(frame.cursor_row, 2);
+        assert_eq!(frame.viewport_height, 5);
         assert_eq!(row_text(&frame.buffer, 1), "");
         assert_eq!(row_text(&frame.buffer, 3), "");
     }
