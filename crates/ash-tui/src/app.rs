@@ -26,6 +26,7 @@ pub enum UiCommand {
     Cancel,
     CancelAndRollback,
     Rollback,
+    Compact,
     NewSession,
     ListSessions,
     ResumeSession(SessionId),
@@ -46,6 +47,7 @@ enum PendingAction {
     },
     ListSessions,
     Resume,
+    Compact,
 }
 
 impl TurnPhase {
@@ -81,14 +83,18 @@ impl TurnPhase {
             Self::Pending(PendingAction::Rollback {
                 turn_finished: false,
                 ..
-            }) | Self::Pending(PendingAction::ListSessions | PendingAction::Resume)
+            }) | Self::Pending(
+                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
+            )
         )
     }
 
     fn ignores_turn_finished(&self) -> bool {
         matches!(
             self,
-            Self::Pending(PendingAction::ListSessions | PendingAction::Resume)
+            Self::Pending(
+                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
+            )
         )
     }
 
@@ -98,7 +104,9 @@ impl TurnPhase {
             Self::Pending(PendingAction::Rollback {
                 turn_finished: true,
                 ..
-            }) | Self::Pending(PendingAction::ListSessions | PendingAction::Resume)
+            }) | Self::Pending(
+                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
+            )
         )
     }
 
@@ -189,6 +197,7 @@ pub struct App {
     protocol: String,
     model: String,
     working_dir: PathBuf,
+    context_limit: Option<u64>,
     input_history: Vec<String>,
 }
 
@@ -198,8 +207,14 @@ impl App {
             protocol,
             model,
             working_dir,
+            context_limit: None,
             input_history: Vec::new(),
         }
+    }
+
+    pub fn with_context_limit(mut self, context_limit: Option<u64>) -> Self {
+        self.context_limit = context_limit;
+        self
     }
 
     pub fn with_input_history(mut self, input_history: Vec<String>) -> Self {
@@ -212,7 +227,12 @@ impl App {
         mut events: impl futures::Stream<Item = Event> + Unpin,
         commands: tokio::sync::mpsc::Sender<UiCommand>,
     ) -> anyhow::Result<()> {
-        let mut terminal = TerminalUi::enter(&self.protocol, &self.model, &self.working_dir)?;
+        let mut terminal = TerminalUi::enter(
+            &self.protocol,
+            &self.model,
+            &self.working_dir,
+            self.context_limit,
+        )?;
         let mut state = AppState::new(std::mem::take(&mut self.input_history));
         let mut keys = EventStream::new();
         let mut render_tick =
@@ -367,6 +387,21 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
+        Event::ContextCompacted {
+            before_tokens,
+            after_tokens,
+            dropped_messages,
+            automatic,
+        } => {
+            if automatic {
+                terminal.record_automatic_compaction(after_tokens)?;
+            } else {
+                state.phase = TurnPhase::Idle;
+                terminal.finish_compaction(before_tokens, after_tokens, dropped_messages)?;
+            }
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
         Event::SessionRestored {
             model,
             protocol,
@@ -391,9 +426,16 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::Usage { .. } | Event::ChildSpawned { .. } | Event::ChildCompleted { .. } => {
+        Event::Usage {
+            input_tokens,
+            output_tokens,
+            generation_ms,
+            estimated,
+        } => {
+            terminal.record_usage(input_tokens, output_tokens, generation_ms, estimated)?;
             Ok(LoopAction::Continue)
         }
+        Event::ChildSpawned { .. } | Event::ChildCompleted { .. } => Ok(LoopAction::Continue),
     }
 }
 
@@ -768,6 +810,11 @@ async fn run_command(
                 turn_finished: true,
             });
             Some(UiCommand::Rollback)
+        }
+        SlashCommand::Compact => {
+            state.phase = TurnPhase::Pending(PendingAction::Compact);
+            terminal.start_compaction()?;
+            Some(UiCommand::Compact)
         }
         SlashCommand::Status => {
             terminal.show_session_status()?;

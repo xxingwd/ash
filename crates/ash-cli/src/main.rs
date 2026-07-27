@@ -28,6 +28,10 @@ struct Cli {
     /// Base URL override
     #[arg(long)]
     base_url: Option<String>,
+
+    /// Maximum model input tokens before output generation
+    #[arg(long)]
+    max_input_tokens: Option<usize>,
 }
 
 #[tokio::main]

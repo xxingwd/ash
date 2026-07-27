@@ -32,14 +32,16 @@ struct SessionView {
     protocol: String,
     model: String,
     working_dir: PathBuf,
+    context_limit: Option<u64>,
 }
 
 impl SessionView {
-    fn new(protocol: &str, model: &str, working_dir: &Path) -> Self {
+    fn new(protocol: &str, model: &str, working_dir: &Path, context_limit: Option<u64>) -> Self {
         Self {
             protocol: protocol.to_string(),
             model: model.to_string(),
             working_dir: working_dir.to_path_buf(),
+            context_limit,
         }
     }
 
@@ -47,6 +49,55 @@ impl SessionView {
         self.protocol = protocol.to_string();
         self.model = model.to_string();
         self.working_dir = working_dir.to_path_buf();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    generation_ms: u64,
+}
+
+impl TurnUsage {
+    fn add(&mut self, input_tokens: u64, output_tokens: u64, generation_ms: u64) {
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.generation_ms = self.generation_ms.saturating_add(generation_ms);
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageState {
+    context_tokens: Option<u64>,
+    context_estimated: bool,
+    turn: TurnUsage,
+}
+
+impl UsageState {
+    fn begin_turn(&mut self) {
+        self.turn = TurnUsage::default();
+    }
+
+    fn record(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        generation_ms: u64,
+        estimated: bool,
+    ) {
+        self.context_tokens = Some(input_tokens.saturating_add(output_tokens));
+        self.context_estimated = estimated;
+        self.turn.add(input_tokens, output_tokens, generation_ms);
+    }
+
+    fn finish_turn(&mut self) -> TurnUsage {
+        std::mem::take(&mut self.turn)
+    }
+
+    fn set_compacted_context(&mut self, tokens: u64) {
+        self.context_tokens = Some(tokens);
+        self.context_estimated = true;
     }
 }
 
@@ -195,6 +246,7 @@ pub(crate) struct TerminalUi {
     scroll_top: Option<u16>,
     next_block_id: u64,
     status: StatusState,
+    usage: UsageState,
     selection: Option<TextSelection>,
     stream: StreamState,
     current_turn_id: Option<u64>,
@@ -202,16 +254,22 @@ pub(crate) struct TerminalUi {
 }
 
 impl TerminalUi {
-    pub fn enter(protocol: &str, model: &str, working_dir: &Path) -> io::Result<Self> {
+    pub fn enter(
+        protocol: &str,
+        model: &str,
+        working_dir: &Path,
+        context_limit: Option<u64>,
+    ) -> io::Result<Self> {
         let surface = AlternateScreen::enter()?;
         Ok(Self {
             surface,
-            session: SessionView::new(protocol, model, working_dir),
+            session: SessionView::new(protocol, model, working_dir, context_limit),
             view: ViewState::default(),
             transcript: Vec::new(),
             scroll_top: None,
             next_block_id: 1,
             status: StatusState::default(),
+            usage: UsageState::default(),
             selection: None,
             stream: StreamState::default(),
             current_turn_id: None,
@@ -250,6 +308,36 @@ impl TerminalUi {
         self.view.composer.clear();
         self.scroll_top = None;
         self.push_history_block(HistoryBlock::error(message));
+        self.redraw()
+    }
+
+    pub fn start_compaction(&mut self) -> io::Result<()> {
+        self.view.composer.clear();
+        self.scroll_top = None;
+        self.status.start("Compacting");
+        self.redraw()
+    }
+
+    pub fn finish_compaction(
+        &mut self,
+        before_tokens: u64,
+        after_tokens: u64,
+        dropped_messages: u64,
+    ) -> io::Result<()> {
+        self.status.stop();
+        self.usage.set_compacted_context(after_tokens);
+        let message = if dropped_messages == 0 {
+            "Model context is already compact; no new summary was created.".to_string()
+        } else {
+            format!(
+                "Compacted model context from {before_tokens} to {after_tokens} tokens; summarized {dropped_messages} earlier messages. Full history remains visible."
+            )
+        };
+        self.command_output(&message)
+    }
+
+    pub fn record_automatic_compaction(&mut self, after_tokens: u64) -> io::Result<()> {
+        self.usage.set_compacted_context(after_tokens);
         self.redraw()
     }
 
@@ -349,6 +437,7 @@ impl TerminalUi {
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.current_turn_id = Some(turn_id);
         self.scroll_top = None;
+        self.usage.begin_turn();
         self.status.start("Working");
         self.commit_user_message(input)
     }
@@ -412,6 +501,18 @@ impl TerminalUi {
         self.redraw()
     }
 
+    pub fn record_usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        generation_ms: u64,
+        estimated: bool,
+    ) -> io::Result<()> {
+        self.usage
+            .record(input_tokens, output_tokens, generation_ms, estimated);
+        self.redraw()
+    }
+
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
         self.status.header = "Failed".to_string();
@@ -422,8 +523,14 @@ impl TerminalUi {
     pub fn finish_response(&mut self) -> io::Result<()> {
         self.finish_stream();
         let elapsed_seconds = self.status.elapsed_seconds();
+        let usage = self.usage.finish_turn();
         self.status.stop();
-        self.push_history_block(HistoryBlock::worked(format_elapsed(elapsed_seconds)));
+        self.push_history_block(HistoryBlock::worked(
+            format_elapsed(elapsed_seconds),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.generation_ms,
+        ));
         let result = self.redraw();
         self.current_turn_id = None;
         result
@@ -638,6 +745,7 @@ impl TerminalUi {
     fn reset_ui_state(&mut self) -> io::Result<()> {
         self.surface.reset()?;
         self.view = ViewState::default();
+        self.usage = UsageState::default();
         self.selection = None;
         self.reset_turn_state();
         Ok(())
@@ -838,6 +946,9 @@ impl TerminalUi {
             model: &model,
             protocol: &protocol,
             working_dir: &self.session.working_dir,
+            context_tokens: self.usage.context_tokens,
+            context_estimated: self.usage.context_estimated,
+            context_limit: self.session.context_limit,
         })
     }
 }
@@ -885,6 +996,21 @@ mod tests {
         assert_eq!(status_dots(3), ".. ");
         assert_eq!(status_dots(4), ".  ");
         assert!((0..8).all(|frame| UnicodeWidthStr::width(status_dots(frame)) == 3));
+    }
+
+    #[test]
+    fn usage_sums_model_calls_and_keeps_the_latest_context_size() {
+        let mut usage = UsageState::default();
+        usage.begin_turn();
+        usage.record(100, 20, 400, false);
+        usage.record(150, 30, 600, true);
+
+        assert_eq!(usage.context_tokens, Some(180));
+        assert!(usage.context_estimated);
+        let turn = usage.finish_turn();
+        assert_eq!(turn.input_tokens, 250);
+        assert_eq!(turn.output_tokens, 50);
+        assert_eq!(turn.generation_ms, 1_000);
     }
 
     #[test]

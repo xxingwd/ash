@@ -16,7 +16,7 @@ use crate::{
     markdown::RenderedLine,
     selection::SelectableText,
     slash_command::CommandCompletion,
-    status_line::{compact_path, fit_status_left},
+    status_line::{compact_path, fit_status_left, format_token_count},
     text_width::truncate_end,
 };
 
@@ -30,6 +30,7 @@ const COMPACT_STATUS_WIDTH: u16 = 32;
 const FOOTER_SIDE_PADDING: u16 = 2;
 const FOOTER_COLUMN_GAP: u16 = 3;
 const FOOTER_MIN_LEFT_WIDTH: u16 = 3;
+const CONTEXT_BAR_COLUMNS: usize = 8;
 const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
 const MENU_COLUMN_GAP: usize = 2;
 const MENU_PREFIX_COLUMNS: usize = 2;
@@ -63,6 +64,9 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) model: &'a str,
     pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
+    pub(crate) context_tokens: Option<u64>,
+    pub(crate) context_estimated: bool,
+    pub(crate) context_limit: Option<u64>,
 }
 
 pub(crate) struct ViewportFrame {
@@ -609,13 +613,36 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         return;
     }
     let path = compact_path(input.working_dir);
-    let protocol_width = UnicodeWidthStr::width(input.protocol) as u16;
-    let right_x = area
-        .width
-        .saturating_sub(protocol_width.saturating_add(FOOTER_SIDE_PADDING));
-    let show_protocol = protocol_width > 0 && right_x > FOOTER_MIN_LEFT_WIDTH;
-    let left_width = if show_protocol {
-        right_x.saturating_sub(FOOTER_COLUMN_GAP)
+    let protocol = (!input.protocol.is_empty()).then_some(input.protocol);
+    let detailed_context = context_display(
+        input.context_tokens,
+        input.context_limit,
+        input.context_estimated,
+        true,
+    );
+    let compact_context = context_display(
+        input.context_tokens,
+        input.context_limit,
+        input.context_estimated,
+        false,
+    );
+    let candidates = [
+        (detailed_context.clone(), protocol),
+        (compact_context.clone(), protocol),
+        (detailed_context, None),
+        (compact_context, None),
+        (None, protocol),
+    ];
+    let (context, protocol) = candidates
+        .into_iter()
+        .find(|(context, protocol)| footer_right_fits(area, context.as_ref(), *protocol))
+        .unwrap_or((None, None));
+    let right_width = footer_right_width(context.as_ref(), protocol);
+    let left_width = if right_width > 0 {
+        area.width
+            .saturating_sub(right_width)
+            .saturating_sub(FOOTER_SIDE_PADDING)
+            .saturating_sub(FOOTER_COLUMN_GAP)
     } else {
         area.width.saturating_sub(FOOTER_SIDE_PADDING * 2)
     };
@@ -632,14 +659,105 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         spans.push(Span::styled(path, Style::default().fg(Color::Green)));
     }
     buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
-    if show_protocol {
-        buffer.set_line(
-            area.x.saturating_add(right_x),
-            area.y,
-            &Line::styled(input.protocol.to_string(), Style::default().fg(Color::Cyan)),
-            protocol_width,
+    if right_width > 0 {
+        let mut spans = Vec::new();
+        let has_context = context.is_some();
+        if let Some(context) = context {
+            spans.push(Span::styled(
+                context.text,
+                Style::default().fg(context.color),
+            ));
+        }
+        if has_context && protocol.is_some() {
+            spans.push(Span::styled(
+                " · ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        if let Some(protocol) = protocol {
+            spans.push(Span::styled(protocol, Style::default().fg(Color::Cyan)));
+        }
+        let right_x = area.x.saturating_add(
+            area.width
+                .saturating_sub(right_width.saturating_add(FOOTER_SIDE_PADDING)),
         );
+        buffer.set_line(right_x, area.y, &Line::from(spans), right_width);
     }
+}
+
+#[derive(Clone)]
+struct ContextDisplay {
+    text: String,
+    color: Color,
+}
+
+fn context_display(
+    context_tokens: Option<u64>,
+    context_limit: Option<u64>,
+    estimated: bool,
+    detailed: bool,
+) -> Option<ContextDisplay> {
+    let tokens = context_tokens?;
+    let estimate = if estimated { "~" } else { "" };
+    let Some(limit) = context_limit.filter(|limit| *limit > 0) else {
+        return Some(ContextDisplay {
+            text: format!("ctx {estimate}{}", format_token_count(tokens)),
+            color: Color::Green,
+        });
+    };
+    let percent = tokens.saturating_mul(100) / limit;
+    let percent_text = if percent > 100 {
+        "100%+".to_string()
+    } else {
+        format!("{percent}%")
+    };
+    let color = match percent {
+        0..=69 => Color::Green,
+        70..=84 => Color::Yellow,
+        _ => Color::Red,
+    };
+    let text = if detailed {
+        let filled = usize::try_from(
+            tokens
+                .saturating_mul(CONTEXT_BAR_COLUMNS as u64)
+                .saturating_add(limit.saturating_sub(1))
+                / limit,
+        )
+        .unwrap_or(CONTEXT_BAR_COLUMNS)
+        .min(CONTEXT_BAR_COLUMNS);
+        format!(
+            "ctx {}{} {estimate}{percent_text}",
+            "█".repeat(filled),
+            "░".repeat(CONTEXT_BAR_COLUMNS - filled),
+        )
+    } else {
+        format!("ctx {estimate}{percent_text}")
+    };
+    Some(ContextDisplay { text, color })
+}
+
+fn footer_right_fits(area: Rect, context: Option<&ContextDisplay>, protocol: Option<&str>) -> bool {
+    let right_width = footer_right_width(context, protocol);
+    right_width > 0
+        && area.width
+            >= right_width
+                .saturating_add(FOOTER_SIDE_PADDING)
+                .saturating_add(FOOTER_COLUMN_GAP)
+                .saturating_add(FOOTER_MIN_LEFT_WIDTH)
+}
+
+fn footer_right_width(context: Option<&ContextDisplay>, protocol: Option<&str>) -> u16 {
+    let context_width = context
+        .map(|context| {
+            u16::try_from(UnicodeWidthStr::width(context.text.as_str())).unwrap_or(u16::MAX)
+        })
+        .unwrap_or(0);
+    let protocol_width = protocol
+        .map(|protocol| u16::try_from(UnicodeWidthStr::width(protocol)).unwrap_or(u16::MAX))
+        .unwrap_or(0);
+    context_width
+        .saturating_add(protocol_width)
+        .saturating_add(u16::from(context_width > 0 && protocol_width > 0) * 3)
 }
 
 fn render_menu_popup(composer: Rect, bounds: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -885,6 +1003,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(frame.buffer.area, Rect::new(0, 0, 80, 24));
@@ -937,6 +1058,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
@@ -989,6 +1113,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
@@ -1033,6 +1160,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
@@ -1065,6 +1195,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• restored output");
@@ -1101,6 +1234,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "› hello");
@@ -1138,6 +1274,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• before");
@@ -1176,6 +1315,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "› line 2");
@@ -1216,6 +1358,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(frame.scroll_top, 13);
@@ -1259,6 +1404,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         assert_eq!(frame.scroll_top, 4);
@@ -1305,6 +1453,9 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
         });
 
         let title_row = (0..frame.buffer.area.height)
@@ -1393,5 +1544,19 @@ mod tests {
             frame.scroll_top_for_drag(0, Position::new(0, 3), Position::new(5, 3)),
             3
         );
+    }
+
+    #[test]
+    fn context_display_uses_a_fixed_bar_and_compact_fallback() {
+        let detailed = context_display(Some(50), Some(100), false, true).expect("detailed meter");
+        assert_eq!(detailed.text, "ctx ████░░░░ 50%");
+        assert_eq!(detailed.color, Color::Green);
+
+        let compact = context_display(Some(85), Some(100), true, false).expect("compact meter");
+        assert_eq!(compact.text, "ctx ~85%");
+        assert_eq!(compact.color, Color::Red);
+
+        let unknown = context_display(Some(12_345), None, true, true).expect("token display");
+        assert_eq!(unknown.text, "ctx ~12.3k");
     }
 }

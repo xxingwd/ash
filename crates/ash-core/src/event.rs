@@ -33,6 +33,10 @@ pub enum Event {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        generation_ms: u64,
+        #[serde(default)]
+        estimated: bool,
     },
     AgentStarted {
         session_id: SessionId,
@@ -51,6 +55,13 @@ pub enum Event {
     },
     TurnRolledBack {
         prompt: String,
+    },
+    ContextCompacted {
+        before_tokens: u64,
+        after_tokens: u64,
+        dropped_messages: u64,
+        #[serde(default)]
+        automatic: bool,
     },
     ChildSpawned {
         agent_id: AgentId,
@@ -112,5 +123,22 @@ mod tests {
         };
         assert!(name.is_empty());
         assert_eq!(arguments, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn old_compaction_events_default_to_manual() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "ContextCompacted": {
+                "before_tokens": 100,
+                "after_tokens": 50,
+                "dropped_messages": 4
+            }
+        }))
+        .expect("legacy compaction event should deserialize");
+
+        let Event::ContextCompacted { automatic, .. } = event else {
+            panic!("expected context compaction event");
+        };
+        assert!(!automatic);
     }
 }

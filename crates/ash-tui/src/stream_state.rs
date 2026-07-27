@@ -7,6 +7,8 @@ use crate::{
     scrollback::sanitize_terminal_text,
 };
 
+const MAX_VISIBLE_REASONING_LINES: usize = 5;
+
 #[derive(Debug, Default)]
 pub(crate) struct StreamState {
     mode: StreamMode,
@@ -194,6 +196,7 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     while body.last().is_some_and(RenderedLine::is_blank) {
         body.pop();
     }
+    body = body.split_off(body.len().saturating_sub(MAX_VISIBLE_REASONING_LINES));
     for line in &mut body {
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
@@ -213,8 +216,8 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_view_keeps_a_timed_header_and_all_streamed_lines() {
-        let lines = render_reasoning_view("one\ntwo\nthree\nfour\nfive", 3, 80);
+    fn reasoning_view_keeps_a_timed_header_and_scrolls_the_latest_five_lines() {
+        let lines = render_reasoning_view("one\ntwo\nthree\nfour\nfive\nsix", 3, 80);
         let text = lines
             .iter()
             .map(RenderedLine::plain_text)
@@ -222,7 +225,18 @@ mod tests {
 
         assert_eq!(lines.len(), 6);
         assert_eq!(text[0], "Thinking (3s)");
-        assert_eq!(&text[1..], ["one", "two", "three", "four", "five"]);
+        assert_eq!(&text[1..], ["two", "three", "four", "five", "six"]);
+    }
+
+    #[test]
+    fn reasoning_view_counts_wrapped_rows_toward_the_five_line_window() {
+        let lines = render_reasoning_view("12345\n67890\nabc\ndef", 3, 3);
+        let text = lines
+            .iter()
+            .map(RenderedLine::plain_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(&text[text.len() - 5..], ["45", "678", "90", "abc", "def"]);
     }
 
     #[test]

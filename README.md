@@ -60,6 +60,20 @@ cargo run -p ash-cli -- \
 写入请求 body；`model`、`messages`、`input`、`tools`、`stream`、`system` 和
 `instructions` 等请求结构字段不能覆盖。
 
+模型最大输入默认是 200K token，可用 `--max-input-tokens` 或
+`ASH_MAX_INPUT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
+1 token 的轻量估算，不引入 tokenizer 依赖。每轮结束后的 `Worked` 行显示输入、输出
+token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地估算值。
+
+估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文，并持久化一条
+隐藏的 compaction checkpoint。原始消息、TUI transcript 和会话标题保持不变。压缩器
+保留最近两个完整用户轮次，让同一个模型在禁用工具的独立请求中把更早历史整理为结构化
+摘要；再次压缩会更新已有摘要。摘要输入中的旧工具输出最多保留 2,000 字符，图片只保留
+媒体类型和大小。模型调用前还会保护最近两个轮次及约 40K token 的近期工具结果；更旧
+结果累计可释放超过 20K token 时会先清理，清理后仍达到 80% 才生成摘要。工具刚执行完
+写入会话前仍有 64 KiB 的运行时上限。交互模式下可用 `/compact` 随时主动更新隐藏的
+模型上下文。
+
 单次输出模式：
 
 ```bash
@@ -111,8 +125,9 @@ session-2026-07-14T16-30-25.123-<session-id>.jsonl
 
 文件第一次提交消息时才会创建。首行保存格式版本、Session ID、模型、协议、工作
 目录、最终系统提示词、工具定义和上下文限制等配置快照；后续按顺序追加完整用户
-消息、Assistant 消息、工具结果和 Turn 结束状态。API Key、访问令牌和自定义接口
-地址内容不会写入文件。
+消息、Assistant 消息、工具结果和 Turn 结束状态。压缩时只追加摘要和近期历史起点；
+恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。API Key、
+访问令牌和自定义接口地址内容不会写入文件。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史、建立新的 Session，并重置当前
 全屏 transcript。`/resume` 会用所选 JSONL 重建模型上下文和当前可见 transcript。

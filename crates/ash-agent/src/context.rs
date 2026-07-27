@@ -1,132 +1,441 @@
-use ash_core::{Content, ContentBlock, Message, MessageContent, Role};
-use tiktoken_rs::CoreBPE;
-use tracing::debug;
+use std::collections::HashSet;
 
+use ash_core::{Content, ContentBlock, Message, MessageContent, Role, ToolCallId, ToolDefinition};
+
+use crate::config::COMPACTION_TRIGGER_PERCENT;
+
+const CHARS_PER_TOKEN: usize = 4;
 const TOKENS_PER_MESSAGE_OVERHEAD: usize = 4;
+const DEFAULT_TAIL_TURNS: usize = 2;
+const MIN_PRESERVE_RECENT_TOKENS: usize = 2_000;
+const MAX_PRESERVE_RECENT_TOKENS: usize = 8_000;
+const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+const PRUNE_MINIMUM_TOKENS: usize = 20_000;
+const PRUNE_PROTECT_TOKENS: usize = 40_000;
+const PRUNED_TOOL_OUTPUT: &str = "[Old tool output cleared to reduce context]";
+pub(crate) const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 4_096;
+const SUMMARY_PREFIX: &str = "<context-summary>\n";
+const SUMMARY_SUFFIX: &str = "\n</context-summary>";
+const OMITTED_HISTORY_MARKER: &str = "\n\n[older serialized history omitted]\n\n";
 
-pub fn count_tokens(messages: &[Message], bpe: &CoreBPE) -> usize {
-    let mut total = 0;
-    for msg in messages {
-        total += TOKENS_PER_MESSAGE_OVERHEAD;
-        total += count_message_tokens(msg, bpe);
-    }
-    total += 3;
-    total
+const SUMMARY_TEMPLATE: &str = r#"Output exactly this Markdown structure and keep the section order unchanged.
+
+## Objective
+- [what the user is trying to accomplish]
+
+## Important Details
+- [constraints, decisions, assumptions, exact identifiers, or "(none)"]
+
+## Work State
+### Completed
+- [finished work and verified facts, or "(none)"]
+
+### Active
+- [current work and partial changes, or "(none)"]
+
+### Blocked
+- [blockers and unknowns, or "(none)"]
+
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [next action if known, or "(none)"]
+
+## Relevant Files
+- [exact path and why it matters, or "(none)"]
+
+Keep every section. Use terse bullets. Preserve exact paths, symbols, commands, errors, URLs, and identifiers. Do not mention compaction or the summary process."#;
+
+#[derive(Debug)]
+pub(crate) struct CompactionPlan {
+    pub(crate) summary_prompt: String,
+    pub(crate) tail: Vec<Message>,
+    pub(crate) compacted_messages: usize,
 }
 
-fn count_message_tokens(msg: &Message, bpe: &CoreBPE) -> usize {
-    match &msg.content {
-        MessageContent::User(contents) => contents
-            .iter()
-            .map(|c| match c {
-                Content::Text(t) => bpe.encode_ordinary(t).len(),
-                Content::Image { .. } => 0,
-            })
-            .sum(),
-        MessageContent::Assistant(blocks) => blocks
-            .iter()
-            .map(|b| match b {
-                ContentBlock::Text(t) => bpe.encode_ordinary(t).len(),
-                ContentBlock::Thought { .. } => 0,
-                ContentBlock::ToolCall {
-                    arguments, name, ..
-                } => {
-                    bpe.encode_ordinary(name).len()
-                        + bpe.encode_ordinary(&arguments.to_string()).len()
-                }
-            })
-            .sum(),
-        MessageContent::ToolResult { result, .. } => {
-            let text = match result {
-                Ok(s) => s.as_str(),
-                Err(s) => s.as_str(),
-            };
-            bpe.encode_ordinary(text).len()
-        }
-    }
+pub fn estimate_tokens(input: &str) -> usize {
+    estimate_character_count(character_units(input))
 }
 
-pub fn compress_if_needed(
-    messages: Vec<Message>,
-    bpe: &CoreBPE,
-    max_tokens: usize,
-) -> Vec<Message> {
-    let total = count_tokens(&messages, bpe);
-    if total <= max_tokens {
-        return messages;
-    }
+fn estimate_character_count(characters: usize) -> usize {
+    characters.saturating_add(CHARS_PER_TOKEN / 2) / CHARS_PER_TOKEN
+}
 
-    debug!(total_tokens = total, max_tokens, "compressing context");
+fn character_units(input: &str) -> usize {
+    input.encode_utf16().count()
+}
 
-    let system_msgs: Vec<_> = messages
+pub fn count_tokens(messages: &[Message]) -> usize {
+    let content = messages
         .iter()
-        .filter(|m| m.role == Role::System)
-        .cloned()
-        .collect();
-    let non_system: Vec<_> = messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .cloned()
-        .collect();
+        .map(|message| message_characters(message, false))
+        .fold(0usize, usize::saturating_add);
+    estimate_character_count(content)
+        .saturating_add(messages.len().saturating_mul(TOKENS_PER_MESSAGE_OVERHEAD))
+        .saturating_add(3)
+}
 
-    let system_tokens: usize = system_msgs
-        .iter()
-        .map(|m| TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(m, bpe))
-        .sum();
+pub fn count_output_tokens(message: &Message) -> usize {
+    estimate_character_count(message_characters(message, true))
+}
 
-    let budget = max_tokens.saturating_sub(system_tokens + 3);
+pub(crate) fn estimate_request_tokens(
+    system_prompt: Option<&str>,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> usize {
+    let system_tokens = system_prompt.map_or(0, estimate_tokens);
+    let tool_tokens = serde_json::to_string(tools)
+        .ok()
+        .map_or(0, |tools| estimate_tokens(&tools));
+    count_tokens(messages)
+        .saturating_add(system_tokens)
+        .saturating_add(tool_tokens)
+}
 
-    let mut turns = Vec::new();
-    for message in non_system {
-        if matches!(&message.content, MessageContent::User(_)) || turns.is_empty() {
-            turns.push(Vec::new());
-        }
-        turns.last_mut().expect("turn exists").push(message);
-    }
+pub(crate) fn compaction_threshold(max_input_tokens: usize) -> usize {
+    max_input_tokens.saturating_mul(COMPACTION_TRIGGER_PERCENT) / 100
+}
 
-    let mut kept_turns = Vec::new();
-    let mut used = 0;
+pub(crate) fn summary_output_tokens(max_input_tokens: usize) -> u32 {
+    let input_fraction = u32::try_from(max_input_tokens / 5).unwrap_or(u32::MAX);
+    SUMMARY_MAX_OUTPUT_TOKENS.min(input_fraction.max(1))
+}
 
-    for turn in turns.iter().rev() {
-        let turn_tokens = turn
-            .iter()
-            .map(|message| TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(message, bpe))
-            .sum::<usize>();
-        if used + turn_tokens > budget {
+pub(crate) fn needs_compaction(estimated_tokens: usize, max_input_tokens: usize) -> bool {
+    estimated_tokens >= compaction_threshold(max_input_tokens)
+}
+
+pub(crate) fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
+    let protected = protected_tool_calls(messages);
+    let mut turns = 0usize;
+    let mut retained_tokens = 0usize;
+    let mut pruned_tokens = 0usize;
+    let mut candidates = Vec::new();
+
+    for (index, message) in messages.iter().enumerate().rev() {
+        if extract_summary(message).is_some() {
             break;
         }
-        used += turn_tokens;
-        kept_turns.push(turn);
+        if message.role == Role::User && matches!(&message.content, MessageContent::User(_)) {
+            turns = turns.saturating_add(1);
+        }
+        if turns < DEFAULT_TAIL_TURNS {
+            continue;
+        }
+        let MessageContent::ToolResult { id, result, .. } = &message.content else {
+            continue;
+        };
+        if protected.contains(id) || result.is_err() {
+            continue;
+        }
+        let tokens = count_tokens(std::slice::from_ref(message));
+        retained_tokens = retained_tokens.saturating_add(tokens);
+        if retained_tokens <= PRUNE_PROTECT_TOKENS {
+            continue;
+        }
+        pruned_tokens = pruned_tokens.saturating_add(tokens);
+        candidates.push(index);
     }
 
-    kept_turns.reverse();
-    let kept = kept_turns
-        .into_iter()
-        .flat_map(|turn| turn.iter().cloned())
+    if pruned_tokens <= PRUNE_MINIMUM_TOKENS {
+        return None;
+    }
+    let mut pruned = messages.to_vec();
+    for index in candidates {
+        let MessageContent::ToolResult {
+            result,
+            attachments,
+            ..
+        } = &mut pruned[index].content
+        else {
+            continue;
+        };
+        *result = Ok(PRUNED_TOOL_OUTPUT.to_string());
+        attachments.clear();
+    }
+    Some(pruned)
+}
+
+fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Assistant(blocks) => Some(blocks),
+            MessageContent::User(_) | MessageContent::ToolResult { .. } => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall { id, name, .. } if name == "skill" => Some(id.clone()),
+            ContentBlock::Text(_)
+            | ContentBlock::Thought { .. }
+            | ContentBlock::ToolCall { .. } => None,
+        })
+        .collect()
+}
+
+pub(crate) fn plan_compaction(
+    messages: &[Message],
+    max_input_tokens: usize,
+) -> Option<CompactionPlan> {
+    let mut previous_summary = None;
+    let history = messages
+        .iter()
+        .filter_map(|message| {
+            if let Some(summary) = extract_summary(message) {
+                previous_summary = Some(summary.to_string());
+                None
+            } else {
+                Some(message.clone())
+            }
+        })
         .collect::<Vec<_>>();
 
-    let non_system_count = turns.iter().map(Vec::len).sum::<usize>();
-    let dropped = non_system_count - kept.len();
-    if dropped > 0 {
-        debug!(dropped_messages = dropped, "truncated old messages");
-        let summary = Message::assistant_text(&format!(
-            "[{dropped} earlier messages truncated to fit context window]"
-        ));
-        let mut result = system_msgs;
-        result.push(summary);
-        result.extend(kept);
-        result
-    } else {
-        messages
+    let turns = user_turns(&history);
+    let recent_budget = preserve_recent_budget(max_input_tokens);
+    let mut used = 0usize;
+    let mut tail_start = None;
+    for (position, (start, end)) in turns.iter().rev().take(DEFAULT_TAIL_TURNS).enumerate() {
+        let turn_tokens = count_tokens(&history[*start..*end]);
+        if position > 0 && used.saturating_add(turn_tokens) > recent_budget {
+            break;
+        }
+        used = used.saturating_add(turn_tokens);
+        tail_start = Some(*start);
+    }
+
+    let split = tail_start.unwrap_or(history.len());
+    let head = &history[..split];
+    if head.is_empty() {
+        return None;
+    }
+    let serialized = serialize_messages(head);
+    if serialized.trim().is_empty() && previous_summary.is_none() {
+        return None;
+    }
+    let summary_prompt =
+        fit_summary_prompt(previous_summary.as_deref(), &serialized, max_input_tokens);
+
+    Some(CompactionPlan {
+        summary_prompt,
+        tail: history[split..].to_vec(),
+        compacted_messages: head.len(),
+    })
+}
+
+pub(crate) fn apply_summary(summary: &str, tail: Vec<Message>) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(tail.len() + 1);
+    messages.push(Message::assistant_text(&format!(
+        "{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}",
+        summary.trim()
+    )));
+    messages.extend(tail);
+    messages
+}
+
+fn extract_summary(message: &Message) -> Option<&str> {
+    let MessageContent::Assistant(blocks) = &message.content else {
+        return None;
+    };
+    let [ContentBlock::Text(text)] = blocks.as_slice() else {
+        return None;
+    };
+    text.strip_prefix(SUMMARY_PREFIX)?
+        .strip_suffix(SUMMARY_SUFFIX)
+}
+
+fn preserve_recent_budget(max_input_tokens: usize) -> usize {
+    (compaction_threshold(max_input_tokens) / 4)
+        .clamp(MIN_PRESERVE_RECENT_TOKENS, MAX_PRESERVE_RECENT_TOKENS)
+}
+
+fn user_turns(messages: &[Message]) -> Vec<(usize, usize)> {
+    let mut turns = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.role == Role::User && matches!(&message.content, MessageContent::User(_)))
+                .then_some((index, messages.len()))
+        })
+        .collect::<Vec<_>>();
+    for index in 0..turns.len().saturating_sub(1) {
+        turns[index].1 = turns[index + 1].0;
+    }
+    turns
+}
+
+fn fit_summary_prompt(
+    previous_summary: Option<&str>,
+    serialized_history: &str,
+    max_input_tokens: usize,
+) -> String {
+    let prompt = build_summary_prompt(previous_summary, serialized_history);
+    let output_reserve =
+        usize::try_from(summary_output_tokens(max_input_tokens)).unwrap_or(usize::MAX);
+    let prompt_budget = max_input_tokens.saturating_sub(output_reserve);
+    if estimate_tokens(&prompt) <= prompt_budget {
+        return prompt;
+    }
+
+    let fixed = build_summary_prompt(previous_summary, "");
+    let fixed_tokens = estimate_tokens(&fixed);
+    let history_char_budget = prompt_budget
+        .saturating_sub(fixed_tokens)
+        .saturating_mul(CHARS_PER_TOKEN);
+    build_summary_prompt(
+        previous_summary,
+        &truncate_middle(serialized_history, history_char_budget),
+    )
+}
+
+fn build_summary_prompt(previous_summary: Option<&str>, serialized_history: &str) -> String {
+    let instruction = previous_summary.map_or_else(
+        || "Create a new anchored summary from the conversation history.".to_string(),
+        |summary| {
+            format!(
+                "Update the anchored summary below. Preserve still-true details, remove stale details, and merge new facts.\n\n<previous-summary>\n{summary}\n</previous-summary>"
+            )
+        },
+    );
+    format!(
+        "{instruction}\n\n{SUMMARY_TEMPLATE}\n\n<conversation-history>\n{serialized_history}\n</conversation-history>"
+    )
+}
+
+fn serialize_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(serialize_message)
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn serialize_message(message: &Message) -> String {
+    match &message.content {
+        MessageContent::User(contents) => {
+            let label = if message.role == Role::System {
+                "System update"
+            } else {
+                "User"
+            };
+            format!("[{label}]: {}", serialize_contents(contents, false))
+        }
+        MessageContent::Assistant(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(format!("[Assistant]: {text}")),
+                ContentBlock::Thought { text, .. } if !text.is_empty() => {
+                    Some(format!("[Assistant reasoning]: {text}"))
+                }
+                ContentBlock::Thought { .. } => None,
+                ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => Some(format!("[Assistant tool call]: {name}({arguments})")),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        MessageContent::ToolResult {
+            result,
+            attachments,
+            ..
+        } => {
+            let (label, output) = match result {
+                Ok(output) => ("Tool result", output),
+                Err(error) => ("Tool error", error),
+            };
+            let output = truncate_chars(output, TOOL_OUTPUT_MAX_CHARS);
+            let attachments = serialize_contents(attachments, true);
+            if attachments.is_empty() {
+                format!("[{label}]: {output}")
+            } else {
+                format!("[{label}]: {output}\n{attachments}")
+            }
+        }
     }
 }
 
-pub fn get_bpe_for_model(model: &str) -> CoreBPE {
-    if model.contains("gpt-4o") || model.contains("o1") || model.contains("gpt-4.1") {
-        tiktoken_rs::o200k_base().unwrap_or_else(|_| tiktoken_rs::cl100k_base().unwrap())
-    } else {
-        tiktoken_rs::cl100k_base().unwrap()
+fn serialize_contents(contents: &[Content], truncate_text: bool) -> String {
+    contents
+        .iter()
+        .map(|content| match content {
+            Content::Text(text) if truncate_text => truncate_chars(text, TOOL_OUTPUT_MAX_CHARS),
+            Content::Text(text) => text.clone(),
+            Content::Image { media_type, data } => {
+                format!("[Attached {media_type}: {} bytes omitted]", data.len())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
     }
+    let mut result = value.chars().take(max_chars).collect::<String>();
+    result.push_str("\n[truncated]");
+    result
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= OMITTED_HISTORY_MARKER.chars().count() {
+        return value.chars().take(max_chars).collect();
+    }
+    let content = max_chars - OMITTED_HISTORY_MARKER.chars().count();
+    let head = content / 4;
+    let tail = content - head;
+    let prefix = value.chars().take(head).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}{OMITTED_HISTORY_MARKER}{suffix}")
+}
+
+fn message_characters(message: &Message, include_thoughts: bool) -> usize {
+    match &message.content {
+        MessageContent::User(contents) => content_characters(contents),
+        MessageContent::Assistant(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => character_units(text),
+                ContentBlock::Thought { text, .. } if include_thoughts => character_units(text),
+                ContentBlock::Thought { .. } => 0,
+                ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => character_units(name).saturating_add(character_units(&arguments.to_string())),
+            })
+            .fold(0usize, usize::saturating_add),
+        MessageContent::ToolResult {
+            result,
+            attachments,
+            ..
+        } => result
+            .as_ref()
+            .map_or_else(
+                |error| character_units(error),
+                |output| character_units(output),
+            )
+            .saturating_add(content_characters(attachments)),
+    }
+}
+
+fn content_characters(contents: &[Content]) -> usize {
+    contents
+        .iter()
+        .map(|content| match content {
+            Content::Text(text) => character_units(text),
+            Content::Image { media_type, data } => character_units(media_type)
+                .saturating_add(data.len().saturating_mul(4).saturating_add(2) / 3),
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 #[cfg(test)]
@@ -147,56 +456,179 @@ mod tests {
         }
     }
 
-    fn tool_result(id: ToolCallId) -> Message {
+    fn tool_result(id: ToolCallId, output: String, attachments: Vec<Content>) -> Message {
         Message {
             id: MessageId::new(),
             role: Role::User,
             content: MessageContent::ToolResult {
                 id,
-                result: Ok("contents".to_string()),
-                attachments: Vec::new(),
+                result: Ok(output),
+                attachments,
             },
         }
     }
 
     #[test]
-    fn compression_keeps_complete_turns_with_tool_results() {
-        let bpe = get_bpe_for_model("test-model");
+    fn estimates_one_token_per_four_characters() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("12345"), 1);
+        assert_eq!(estimate_tokens("123456"), 2);
+        assert_eq!(estimate_tokens("你好世界"), 1);
+        assert_eq!(estimate_tokens("😀"), 1);
+    }
+
+    #[test]
+    fn compaction_starts_at_eighty_percent() {
+        assert_eq!(compaction_threshold(200_000), 160_000);
+        assert!(!needs_compaction(159_999, 200_000));
+        assert!(needs_compaction(160_000, 200_000));
+    }
+
+    #[test]
+    fn compaction_plan_keeps_two_recent_complete_turns() {
         let first_call = ToolCallId::from_provider("first");
         let second_call = ToolCallId::from_provider("second");
-        let first_turn = vec![
+        let messages = vec![
             Message::user("old request"),
-            tool_call(&first_call),
-            tool_result(first_call),
             Message::assistant_text("old answer"),
-        ];
-        let second_turn = vec![
+            Message::user("middle request"),
+            tool_call(&first_call),
+            tool_result(first_call, "middle output".into(), Vec::new()),
+            Message::assistant_text("middle answer"),
             Message::user("new request"),
             tool_call(&second_call),
-            tool_result(second_call),
+            tool_result(second_call, "new output".into(), Vec::new()),
             Message::assistant_text("new answer"),
         ];
-        let latest_tokens = second_turn
-            .iter()
-            .map(|message| TOKENS_PER_MESSAGE_OVERHEAD + count_message_tokens(message, &bpe))
-            .sum::<usize>();
-        let messages = first_turn.into_iter().chain(second_turn).collect();
 
-        let compressed = compress_if_needed(messages, &bpe, latest_tokens + 3);
+        let plan = plan_compaction(&messages, 200_000).unwrap();
 
-        assert_eq!(compressed.len(), 5);
-        assert!(matches!(compressed[1].content, MessageContent::User(_)));
+        assert_eq!(plan.compacted_messages, 2);
+        assert_eq!(plan.tail.len(), 8);
+        assert!(matches!(plan.tail[0].content, MessageContent::User(_)));
         assert!(matches!(
-            compressed[2].content,
-            MessageContent::Assistant(_)
-        ));
-        assert!(matches!(
-            compressed[3].content,
+            plan.tail[2].content,
             MessageContent::ToolResult { .. }
         ));
+        assert!(matches!(plan.tail[4].content, MessageContent::User(_)));
         assert!(matches!(
-            compressed[4].content,
-            MessageContent::Assistant(_)
+            plan.tail[6].content,
+            MessageContent::ToolResult { .. }
         ));
+    }
+
+    #[test]
+    fn compaction_plan_always_keeps_the_latest_user_turn() {
+        let messages = vec![
+            Message::user("old request"),
+            Message::assistant_text("old answer"),
+            Message::user(&"x".repeat(20_000)),
+        ];
+
+        let plan = plan_compaction(&messages, 1_000).unwrap();
+
+        assert_eq!(plan.compacted_messages, 2);
+        assert_eq!(plan.tail.len(), 1);
+        assert!(matches!(&plan.tail[0].content, MessageContent::User(_)));
+    }
+
+    #[test]
+    fn summary_prompt_truncates_tool_output_and_strips_images() {
+        let call = ToolCallId::from_provider("call");
+        let marker = "SECRET_END";
+        let messages = vec![
+            Message::user("old"),
+            tool_result(
+                call,
+                format!("{}{marker}", "x".repeat(3_000)),
+                vec![Content::Image {
+                    media_type: "image/png".into(),
+                    data: vec![7; 4096],
+                }],
+            ),
+            Message::user("recent one"),
+            Message::assistant_text("answer one"),
+            Message::user("recent two"),
+            Message::assistant_text("answer two"),
+        ];
+
+        let plan = plan_compaction(&messages, 200_000).unwrap();
+
+        assert!(!plan.summary_prompt.contains(marker));
+        assert!(!plan.summary_prompt.contains("7,7,7"));
+        assert!(plan
+            .summary_prompt
+            .contains("[Attached image/png: 4096 bytes omitted]"));
+        assert!(plan.summary_prompt.contains("[truncated]"));
+    }
+
+    #[test]
+    fn pruning_protects_recent_tool_output_and_clears_large_older_results() {
+        let mut messages = Vec::new();
+        for turn in 0..7 {
+            let call = ToolCallId::from_provider(format!("call-{turn}"));
+            messages.push(Message::user(&format!("request {turn}")));
+            messages.push(tool_call(&call));
+            messages.push(tool_result(call, "x".repeat(64_000), Vec::new()));
+            messages.push(Message::assistant_text(&format!("answer {turn}")));
+        }
+
+        let pruned = prune_tool_outputs(&messages).unwrap();
+        let outputs = pruned
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::ToolResult {
+                    result: Ok(output), ..
+                } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(outputs.len(), 7);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| **output == PRUNED_TOOL_OUTPUT)
+                .count(),
+            3
+        );
+        assert_eq!(outputs[5].len(), 64_000);
+        assert_eq!(outputs[6].len(), 64_000);
+    }
+
+    #[test]
+    fn repeated_compaction_updates_the_previous_summary() {
+        let messages = vec![
+            apply_summary("previous facts", Vec::new()).remove(0),
+            Message::user("older turn"),
+            Message::assistant_text("older answer"),
+            Message::user("recent one"),
+            Message::assistant_text("one"),
+            Message::user("recent two"),
+            Message::assistant_text("two"),
+        ];
+
+        let plan = plan_compaction(&messages, 200_000).unwrap();
+
+        assert!(plan.summary_prompt.contains("<previous-summary>"));
+        assert!(plan.summary_prompt.contains("previous facts"));
+        assert_eq!(plan.tail.len(), 4);
+    }
+
+    #[test]
+    fn output_estimate_includes_visible_reasoning() {
+        let message = Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: MessageContent::Assistant(vec![
+                ContentBlock::Thought {
+                    text: "reasoning".to_string(),
+                    elapsed_seconds: 0,
+                },
+                ContentBlock::Text("answer".to_string()),
+            ]),
+        };
+
+        assert!(count_output_tokens(&message) >= 3);
     }
 }

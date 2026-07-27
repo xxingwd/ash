@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ash_core::{Content, Message, MessageContent, SessionId, SessionSummary};
+use ash_core::{Content, Message, MessageContent, MessageId, SessionId, SessionSummary};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -20,6 +20,9 @@ pub(crate) struct SessionMetadata {
     pub working_dir: PathBuf,
     pub system_prompt: Option<String>,
     pub max_turns: u32,
+    #[serde(default)]
+    pub max_input_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<usize>,
     pub max_output_tokens: Option<u32>,
     pub tool_timeout_ms: u64,
@@ -36,7 +39,8 @@ impl SessionMetadata {
             working_dir: config.working_dir.clone(),
             system_prompt: config.system_prompt.clone(),
             max_turns: config.max_turns,
-            max_context_tokens: config.max_context_tokens,
+            max_input_tokens: Some(config.max_input_tokens),
+            max_context_tokens: None,
             max_output_tokens: config.max_output_tokens,
             tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
@@ -50,6 +54,12 @@ struct TurnRolledBackRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContextCompactedRecord {
+    summary: Message,
+    tail_start_id: Option<MessageId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum SessionRecord {
     SessionMeta(SessionMetadata),
@@ -59,6 +69,7 @@ enum SessionRecord {
     TurnFinished(serde_json::Value),
     TurnFailed(serde_json::Value),
     TurnRolledBack(TurnRolledBackRecord),
+    ContextCompacted(ContextCompactedRecord),
 }
 
 impl SessionRecord {
@@ -78,7 +89,8 @@ impl SessionRecord {
             Self::SessionMeta(_)
             | Self::TurnFinished(_)
             | Self::TurnFailed(_)
-            | Self::TurnRolledBack(_) => None,
+            | Self::TurnRolledBack(_)
+            | Self::ContextCompacted(_) => None,
         }
     }
 }
@@ -104,6 +116,7 @@ pub(crate) struct StoredSession {
     pub(crate) path: PathBuf,
     pub(crate) metadata: SessionMetadata,
     pub(crate) messages: Vec<Message>,
+    pub(crate) model_messages: Vec<Message>,
 }
 
 impl StoredSession {
@@ -152,6 +165,21 @@ impl SessionStore {
     ) -> Result<(), ash_core::AshError> {
         self.append_record(SessionRecord::from_message(message))
             .await
+    }
+
+    pub(crate) async fn append_compaction(
+        &mut self,
+        compacted_messages: &[Message],
+    ) -> Result<(), ash_core::AshError> {
+        let summary = compacted_messages.first().cloned().ok_or_else(|| {
+            ash_core::AshError::Config("compacted context has no summary message".to_string())
+        })?;
+        let tail_start_id = compacted_messages.get(1).map(|message| message.id);
+        self.append_record(SessionRecord::ContextCompacted(ContextCompactedRecord {
+            summary,
+            tail_start_id,
+        }))
+        .await
     }
 
     async fn append_record(&mut self, record: SessionRecord) -> Result<(), ash_core::AshError> {
@@ -204,6 +232,10 @@ impl SessionStore {
             .map_err(|_| ash_core::AshError::Config("session file is too large".to_string()))?;
         file.set_len(length).await?;
         Ok(())
+    }
+
+    pub(crate) async fn load(&self) -> Result<StoredSession, ash_core::AshError> {
+        read_session(&self.path).await
     }
 
     pub(crate) async fn summaries_except(
@@ -270,18 +302,23 @@ impl SessionStore {
     }
 
     pub(crate) async fn resume(stored: &StoredSession) -> Result<Self, ash_core::AshError> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&stored.path)
-            .await?;
-        ensure_newline_terminated(&mut file).await?;
+        let file = open_session_for_append(&stored.path).await?;
         Ok(Self {
             path: stored.path.clone(),
             metadata: stored.metadata.clone(),
             file: Some(file),
         })
     }
+}
+
+async fn open_session_for_append(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .await?;
+    ensure_newline_terminated(&mut file).await?;
+    Ok(file)
 }
 
 fn session_summary(stored: &StoredSession) -> SessionSummary {
@@ -353,7 +390,8 @@ fn last_active_turn_offset(contents: &str) -> Option<usize> {
                 | SessionRecord::AssistantMessage(_)
                 | SessionRecord::ToolResult(_)
                 | SessionRecord::TurnFinished(_)
-                | SessionRecord::TurnFailed(_) => {}
+                | SessionRecord::TurnFailed(_)
+                | SessionRecord::ContextCompacted(_) => {}
             }
         }
         offset += line.len();
@@ -366,6 +404,7 @@ async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> 
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut metadata = None;
     let mut messages = Vec::new();
+    let mut model_messages = Vec::new();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -381,11 +420,16 @@ async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> 
         match parsed.record {
             SessionRecord::SessionMeta(value) if metadata.is_none() => metadata = Some(value),
             SessionRecord::TurnRolledBack(record) => {
-                rollback_messages(&mut messages, record.num_turns)
+                rollback_messages(&mut messages, record.num_turns);
+                rollback_messages(&mut model_messages, record.num_turns);
+            }
+            SessionRecord::ContextCompacted(record) => {
+                model_messages = apply_compaction(&messages, record);
             }
             record => {
                 if let Some(message) = record.into_message() {
-                    messages.push(message);
+                    messages.push(message.clone());
+                    model_messages.push(message);
                 }
             }
         }
@@ -408,7 +452,23 @@ async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> 
         path: path.to_path_buf(),
         metadata,
         messages,
+        model_messages,
     })
+}
+
+fn apply_compaction(messages: &[Message], record: ContextCompactedRecord) -> Vec<Message> {
+    let mut model_messages = vec![record.summary];
+    let Some(tail_start_id) = record.tail_start_id else {
+        return model_messages;
+    };
+    let Some(tail_start) = messages
+        .iter()
+        .position(|message| message.id == tail_start_id)
+    else {
+        return model_messages;
+    };
+    model_messages.extend_from_slice(&messages[tail_start..]);
+    model_messages
 }
 
 fn rollback_messages(messages: &mut Vec<Message>, num_turns: u32) {
@@ -462,7 +522,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 10,
             working_dir,
-            max_context_tokens: Some(1000),
+            max_input_tokens: 1000,
             max_output_tokens: Some(200),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
@@ -519,6 +579,7 @@ mod tests {
         let loaded = read_session(store.path()).await.unwrap();
         assert_eq!(loaded.metadata.session_id, session_id);
         assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.model_messages.len(), 1);
     }
 
     #[tokio::test]
@@ -582,6 +643,88 @@ mod tests {
         let contents = format!("{}\n", lines.join("\n"));
 
         assert_eq!(last_active_turn_offset(&contents), Some(lines[0].len() + 1));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_full_history_and_rebuilds_only_model_context() {
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let mut store = SessionStore::new_in(
+            &config(directory.path().to_path_buf()),
+            session_id,
+            directory.path(),
+        );
+        store
+            .append_message(&Message::user("old request"))
+            .await
+            .unwrap();
+        store
+            .append_message(&Message::assistant_text("old answer"))
+            .await
+            .unwrap();
+        let recent_request = Message::user("recent request");
+        let recent_answer = Message::assistant_text("recent answer");
+        store.append_message(&recent_request).await.unwrap();
+        store.append_message(&recent_answer).await.unwrap();
+        let compacted = vec![
+            Message::assistant_text("<context-summary>\nold facts\n</context-summary>"),
+            recent_request,
+            recent_answer,
+        ];
+
+        store.append_compaction(&compacted).await.unwrap();
+
+        let loaded = read_session(store.path()).await.unwrap();
+        assert_eq!(loaded.metadata.session_id, session_id);
+        assert_eq!(loaded.messages.len(), 4);
+        assert_eq!(loaded.model_messages.len(), compacted.len());
+        assert_eq!(session_title(&loaded.messages), "old request");
+        let summaries = SessionStore::stored_sessions_in(directory.path().to_path_buf(), None)
+            .await
+            .unwrap()
+            .iter()
+            .map(session_summary)
+            .collect::<Vec<_>>();
+        assert_eq!(summaries[0].title, "old request");
+        let contents = tokio::fs::read_to_string(store.path()).await.unwrap();
+        assert!(contents.contains("old request"));
+        assert!(contents.contains("old facts"));
+        assert!(contents.contains("recent request"));
+
+        let later_request = Message::user("later request");
+        let later_answer = Message::assistant_text("later answer");
+        store.append_message(&later_request).await.unwrap();
+        store.append_message(&later_answer).await.unwrap();
+        let second_compaction = vec![
+            Message::assistant_text("<context-summary>\nnew facts\n</context-summary>"),
+            later_request,
+            later_answer,
+        ];
+        store.append_compaction(&second_compaction).await.unwrap();
+
+        let loaded = read_session(store.path()).await.unwrap();
+        assert_eq!(loaded.messages.len(), 6);
+        assert_eq!(loaded.model_messages.len(), 3);
+        assert!(matches!(
+            &loaded.model_messages[0].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("new facts"))
+        ));
+
+        store.truncate_last_turn().await.unwrap();
+        let rolled_back = read_session(store.path()).await.unwrap();
+        assert_eq!(rolled_back.messages.len(), 4);
+        assert_eq!(rolled_back.model_messages.len(), 3);
+        assert!(matches!(
+            &rolled_back.model_messages[0].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("old facts"))
+        ));
+
+        store.truncate_last_turn().await.unwrap();
+        let rolled_back = read_session(store.path()).await.unwrap();
+        assert_eq!(rolled_back.messages.len(), 2);
+        assert_eq!(rolled_back.model_messages.len(), 2);
     }
 
     #[tokio::test]

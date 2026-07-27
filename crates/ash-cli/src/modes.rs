@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
+    DEFAULT_MAX_INPUT_TOKENS,
 };
 use ash_core::{Message, ModelId, Protocol, ProviderConfig, SessionId};
 use futures::StreamExt;
@@ -50,6 +51,14 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         None => anyhow::bail!("set ASH_MODEL in .env or pass --model"),
     };
     let base_url = cli.base_url.clone().or_else(|| env_value("ASH_BASE_URL"));
+    let configured_max_input_tokens = match cli.max_input_tokens {
+        Some(value) => Some(value),
+        None => match env_usize("ASH_MAX_INPUT_TOKENS")? {
+            Some(value) => Some(value),
+            None => env_usize("ASH_MAX_CONTEXT_TOKENS")?,
+        },
+    };
+    let max_input_tokens = resolve_max_input_tokens(configured_max_input_tokens)?;
     let working_dir = std::env::current_dir()?;
     let skills = Skill::discover(&working_dir)?;
     let active_skill = cli
@@ -82,7 +91,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         tools,
         max_turns: 100,
         working_dir,
-        max_context_tokens: None,
+        max_input_tokens,
         max_output_tokens: None,
         max_tool_duration: std::time::Duration::from_secs(120),
         agent_path: "/root".to_string(),
@@ -101,6 +110,28 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn env_usize(name: &str) -> Result<Option<usize>> {
+    env_value(name)
+        .map(|value| {
+            let parsed = value
+                .parse::<usize>()
+                .with_context(|| format!("{name} must be a positive integer"))?;
+            if parsed == 0 {
+                anyhow::bail!("{name} must be a positive integer");
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+fn resolve_max_input_tokens(configured: Option<usize>) -> Result<usize> {
+    let value = configured.unwrap_or(DEFAULT_MAX_INPUT_TOKENS);
+    if value == 0 {
+        anyhow::bail!("maximum input tokens must be a positive integer");
+    }
+    Ok(value)
 }
 
 async fn run_print(config: AgentConfig, prompt: Option<String>) -> Result<()> {
@@ -142,6 +173,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
     let protocol = config.provider.protocol.as_cli_name().to_string();
     let model = config.model.as_str().to_string();
     let working_dir = config.working_dir.clone();
+    let context_limit = Some(u64::try_from(config.max_input_tokens).unwrap_or(u64::MAX));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ash_tui::UiCommand>(16);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
@@ -156,7 +188,9 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
         }
     };
     let mut session = AgentSession::new(config);
-    let app = ash_tui::App::new(protocol, model, working_dir).with_input_history(input_history);
+    let app = ash_tui::App::new(protocol, model, working_dir)
+        .with_context_limit(context_limit)
+        .with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
     let mut pending_input = None;
 
@@ -192,6 +226,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
                             }
                             Some(ash_tui::UiCommand::NewSession)
                             | Some(ash_tui::UiCommand::Rollback)
+                            | Some(ash_tui::UiCommand::Compact)
                             | Some(ash_tui::UiCommand::ListSessions)
                             | Some(ash_tui::UiCommand::ResumeSession(_)) => {
                                 let _ = event_tx
@@ -229,6 +264,10 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
             ash_tui::UiCommand::Rollback => {
                 pending_input = None;
                 rollback_last_turn(&mut session, &event_tx, &history_store).await;
+            }
+            ash_tui::UiCommand::Compact => {
+                pending_input = None;
+                compact_session(&mut session, &event_tx).await;
             }
             ash_tui::UiCommand::NewSession => {
                 session.reset();
@@ -268,6 +307,22 @@ async fn rollback_last_turn(
     let _ = event_tx.send(event).await;
 }
 
+async fn compact_session(
+    session: &mut AgentSession,
+    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
+) {
+    let event = match session.compact().await {
+        Ok(result) => ash_core::Event::ContextCompacted {
+            before_tokens: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
+            after_tokens: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
+            dropped_messages: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
+            automatic: false,
+        },
+        Err(error) => ash_core::Event::Error(format!("Failed to compact context: {error}")),
+    };
+    let _ = event_tx.send(event).await;
+}
+
 async fn list_sessions(
     session: &AgentSession,
     event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
@@ -295,4 +350,16 @@ async fn resume_session(
         Err(error) => ash_core::Event::Error(format!("Failed to resume saved chat: {error}")),
     };
     let _ = event_tx.send(event).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_input_limit_defaults_to_200k() {
+        assert_eq!(resolve_max_input_tokens(None).unwrap(), 200_000);
+        assert_eq!(resolve_max_input_tokens(Some(64_000)).unwrap(), 64_000);
+        assert!(resolve_max_input_tokens(Some(0)).is_err());
+    }
 }

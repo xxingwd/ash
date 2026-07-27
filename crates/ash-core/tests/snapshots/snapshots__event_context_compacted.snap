@@ -1,0 +1,12 @@
+---
+source: crates/ash-core/tests/snapshots.rs
+expression: event
+---
+{
+  "ContextCompacted": {
+    "before_tokens": 180000,
+    "after_tokens": 12000,
+    "dropped_messages": 42,
+    "automatic": false
+  }
+}

@@ -3,6 +3,7 @@ pub(crate) enum SlashCommand {
     New,
     Clear,
     Undo,
+    Compact,
     Resume,
     Status,
     Help,
@@ -62,6 +63,12 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         description: "remove the last turn and restore its prompt",
         command: SlashCommand::Undo,
+    },
+    CommandSpec {
+        name: "compact",
+        aliases: &[],
+        description: "compact earlier conversation history",
+        command: SlashCommand::Compact,
     },
     CommandSpec {
         name: "status",
@@ -234,6 +241,10 @@ mod tests {
     fn parses_commands_and_aliases() {
         assert_eq!(parse("/new"), ParsedInput::Command(SlashCommand::New));
         assert_eq!(parse("/undo"), ParsedInput::Command(SlashCommand::Undo));
+        assert_eq!(
+            parse("/compact"),
+            ParsedInput::Command(SlashCommand::Compact)
+        );
         assert_eq!(parse(" /quit "), ParsedInput::Command(SlashCommand::Exit));
         assert_eq!(parse("/commands"), ParsedInput::Command(SlashCommand::Help));
     }
@@ -256,6 +267,7 @@ mod tests {
         assert!(!SlashCommand::Clear.available_during_task());
         assert!(!SlashCommand::Resume.available_during_task());
         assert!(!SlashCommand::Undo.available_during_task());
+        assert!(!SlashCommand::Compact.available_during_task());
     }
 
     #[test]

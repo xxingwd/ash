@@ -88,9 +88,6 @@ regex = "1"
 # MCP
 rmcp = { version = "0.1", features = ["client", "transport-io", "transport-child-process"] }
 
-# Token counting
-tiktoken-rs = "0.6"
-
 # Testing
 insta = { version = "1", features = ["json", "redactions"] }
 pretty_assertions = "1"

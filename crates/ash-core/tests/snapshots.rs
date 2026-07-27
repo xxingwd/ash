@@ -109,8 +109,21 @@ fn test_event_usage_snapshot() {
     let event = Event::Usage {
         input_tokens: 100,
         output_tokens: 50,
+        generation_ms: 1_250,
+        estimated: false,
     };
     assert_json_snapshot!("event_usage", event);
+}
+
+#[test]
+fn test_event_context_compacted_snapshot() {
+    let event = Event::ContextCompacted {
+        before_tokens: 180_000,
+        after_tokens: 12_000,
+        dropped_messages: 42,
+        automatic: false,
+    };
+    assert_json_snapshot!("event_context_compacted", event);
 }
 
 #[test]

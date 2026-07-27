@@ -6,7 +6,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::scrollback::{sanitize_terminal_text, wrap_text};
+use crate::{
+    scrollback::{sanitize_terminal_text, wrap_text},
+    status_line::{format_token_count, format_token_rate},
+};
 
 const USER_HORIZONTAL_INSET: u16 = 2;
 
@@ -15,7 +18,15 @@ pub(crate) enum HistoryBlock {
     User(String),
     Info(String),
     Error(String),
-    Worked(String),
+    Worked(Worked),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Worked {
+    elapsed: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    generation_ms: u64,
 }
 
 impl HistoryBlock {
@@ -31,8 +42,18 @@ impl HistoryBlock {
         Self::Error(normalize_multiline(error))
     }
 
-    pub(crate) fn worked(elapsed: String) -> Self {
-        Self::Worked(elapsed)
+    pub(crate) fn worked(
+        elapsed: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        generation_ms: u64,
+    ) -> Self {
+        Self::Worked(Worked {
+            elapsed,
+            input_tokens,
+            output_tokens,
+            generation_ms,
+        })
     }
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
@@ -40,7 +61,7 @@ impl HistoryBlock {
             Self::User(text) => render_user(text, width.max(1)),
             Self::Info(message) => render_info(message, width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
-            Self::Worked(elapsed) => render_worked(elapsed, width.max(1)),
+            Self::Worked(worked) => render_worked(worked, width.max(1)),
         }
     }
 }
@@ -146,8 +167,8 @@ fn render_error(error: &str, width: u16) -> Buffer {
     buffer
 }
 
-fn render_worked(elapsed: &str, width: u16) -> Buffer {
-    let separator = worked_separator(elapsed, width);
+fn render_worked(worked: &Worked, width: u16) -> Buffer {
+    let separator = worked_separator(worked, width);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
     buffer.set_string(
         0,
@@ -158,8 +179,19 @@ fn render_worked(elapsed: &str, width: u16) -> Buffer {
     buffer
 }
 
-fn worked_separator(elapsed: &str, width: u16) -> String {
-    let label = format!("─ Worked for {elapsed} ─");
+fn worked_separator(worked: &Worked, width: u16) -> String {
+    let mut label = format!("─ Worked for {}", worked.elapsed);
+    if worked.input_tokens > 0 || worked.output_tokens > 0 {
+        label.push_str(&format!(
+            " · {} in / {} out",
+            format_token_count(worked.input_tokens),
+            format_token_count(worked.output_tokens),
+        ));
+        if let Some(rate) = format_token_rate(worked.output_tokens, worked.generation_ms) {
+            label.push_str(&format!(" · {rate}"));
+        }
+    }
+    label.push_str(" ─");
     let width = usize::from(width);
     let label_width = UnicodeWidthStr::width(label.as_str());
     if label_width >= width {
@@ -247,18 +279,21 @@ mod tests {
 
     #[test]
     fn worked_block_fills_or_truncates_to_the_terminal_width() {
-        let buffer = HistoryBlock::worked("2m 05s".to_string()).render(32);
+        let buffer = HistoryBlock::worked("2m 05s".to_string(), 1_200, 345, 1_500).render(64);
         let separator = row_text(&buffer, 0);
 
-        assert!(separator.starts_with("─ Worked for 2m 05s ─"));
-        assert_eq!(UnicodeWidthStr::width(separator.as_str()), 32);
+        assert!(separator.starts_with("─ Worked for 2m 05s · 1.2k in / 345 out · 230 tok/s ─"));
+        assert_eq!(UnicodeWidthStr::width(separator.as_str()), 64);
         assert!(buffer
             .cell((0, 0))
             .expect("separator")
             .modifier
             .contains(Modifier::DIM));
         assert_eq!(
-            row_text(&HistoryBlock::worked("0s".to_string()).render(10), 0),
+            row_text(
+                &HistoryBlock::worked("0s".to_string(), 0, 0, 0).render(10),
+                0
+            ),
             "─ Worked f"
         );
     }

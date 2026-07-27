@@ -5,6 +5,8 @@ expression: event
 {
   "Usage": {
     "input_tokens": 100,
-    "output_tokens": 50
+    "output_tokens": 50,
+    "generation_ms": 1250,
+    "estimated": false
   }
 }

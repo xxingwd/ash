@@ -32,7 +32,7 @@ pub struct AgentToolContext {
     pub tools: Vec<Arc<dyn Tool>>,
     pub model: ModelId,
     pub max_turns: u32,
-    pub max_context_tokens: Option<usize>,
+    pub max_input_tokens: usize,
     pub max_output_tokens: Option<u32>,
 }
 
