@@ -1,15 +1,19 @@
-use std::io::{self, Stdout, Write};
+use std::{
+    fmt,
+    io::{self, Stdout, Write},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
-    style::{Attribute, ResetColor, SetAttribute},
+    style::{Attribute, Print, ResetColor, SetAttribute},
     terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
+    Command,
 };
 use ratatui::{
-    backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
+    backend::{Backend, CrosstermBackend},
     buffer::Buffer,
     layout::{Position, Rect},
     Terminal, TerminalOptions, Viewport,
@@ -155,11 +159,8 @@ impl InlineScreen {
     }
 
     pub(crate) fn insert_buffer(&mut self, buffer: &Buffer, gap_after: u16) -> io::Result<()> {
-        let height = buffer.area.height.saturating_add(gap_after).max(1);
-        self.terminal.insert_before(height, |target| {
-            crate::buffer::copy_rows_for_direct_draw(buffer, target, 0, target.area);
-        })?;
-        self.viewport_area = self.terminal.get_frame().area();
+        self.viewport_area =
+            insert_finalized_buffer(&mut self.terminal, self.viewport_area, buffer, gap_after)?;
         Ok(())
     }
 
@@ -185,58 +186,206 @@ impl InlineScreen {
         let (area, scroll_by) =
             resized_viewport_area(previous_area, width, screen_height, viewport_height);
         if scroll_by > 0 {
-            // Newlines at the bottom of the primary screen enter native scrollback reliably.
-            // Region-scrolling sequences can discard those rows in multiplexers such as Zellij.
-            append_native_scrollback(&mut self.terminal, screen_height, scroll_by)?;
+            scroll_history_for_viewport_expansion(&mut self.terminal, previous_area, scroll_by)?;
         }
         if area != previous_area {
-            apply_viewport_resize(&mut self.terminal, area, previous_area, scroll_by > 0)?;
+            apply_viewport_resize(&mut self.terminal, area, previous_area)?;
             self.viewport_area = area;
         }
         Ok(())
     }
 }
 
+/// Finalized history and live viewport movement deliberately use different terminal operations.
+/// A CRLF at the bottom of a top-anchored scroll region enters native scrollback in terminals and
+/// multiplexers where an explicit `CSI S` region scroll only changes the visible grid.
+fn insert_finalized_buffer<B: Backend + Write>(
+    terminal: &mut Terminal<B>,
+    mut viewport: Rect,
+    buffer: &Buffer,
+    gap_after: u16,
+) -> io::Result<Rect> {
+    let screen = terminal.size()?;
+    let inserted_height = buffer.area.height.saturating_add(gap_after).max(1);
+
+    if viewport.top() == 0 && viewport.height == screen.height {
+        insert_finalized_buffer_at_screen_bottom(
+            terminal.backend_mut(),
+            screen.width,
+            screen.height,
+            buffer,
+            inserted_height,
+        )?;
+        terminal.force_redraw();
+        return Ok(viewport);
+    }
+
+    let space_below = screen.height.saturating_sub(viewport.bottom());
+    let move_down = inserted_height.min(space_below);
+    if move_down > 0 {
+        let backend = terminal.backend_mut();
+        queue!(
+            backend,
+            SetScrollRegion::new(viewport.top().saturating_add(1), screen.height),
+            MoveTo(0, viewport.top())
+        )?;
+        for _ in 0..move_down {
+            queue!(backend, Print("\x1bM"))?;
+        }
+        queue!(backend, ResetScrollRegion)?;
+        viewport.y = viewport.y.saturating_add(move_down);
+    }
+
+    let history_bottom = viewport.top();
+    if history_bottom == 0 {
+        return Err(io::Error::other(
+            "inline viewport leaves no row available for finalized history",
+        ));
+    }
+
+    let target_y = history_bottom - 1;
+    let backend = terminal.backend_mut();
+    queue!(
+        backend,
+        SetScrollRegion::new(1, history_bottom),
+        MoveTo(0, target_y)
+    )?;
+    for row in 0..inserted_height {
+        queue!(backend, Print("\r\n"))?;
+        draw_finalized_row(backend, buffer, row, target_y, screen.width)?;
+    }
+    queue!(backend, ResetScrollRegion)?;
+    Backend::flush(backend)?;
+
+    terminal.set_viewport_area(viewport);
+    terminal.force_redraw();
+    Ok(viewport)
+}
+
+fn insert_finalized_buffer_at_screen_bottom<B: Backend + Write>(
+    backend: &mut B,
+    screen_width: u16,
+    screen_height: u16,
+    buffer: &Buffer,
+    inserted_height: u16,
+) -> io::Result<()> {
+    let bottom = screen_height.saturating_sub(1);
+    let mut target_y = 0u16;
+    queue!(
+        backend,
+        ResetScrollRegion,
+        MoveTo(0, 0),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    for row in 0..inserted_height {
+        if row > 0 {
+            queue!(backend, Print("\r\n"))?;
+            target_y = target_y.saturating_add(1).min(bottom);
+        }
+        draw_finalized_row(backend, buffer, row, target_y, screen_width)?;
+    }
+    for _ in 0..screen_height {
+        queue!(backend, Print("\r\n"), Clear(ClearType::CurrentLine))?;
+    }
+    Backend::flush(backend)
+}
+
+fn draw_finalized_row<B: Backend + Write>(
+    backend: &mut B,
+    source: &Buffer,
+    source_row: u16,
+    target_y: u16,
+    screen_width: u16,
+) -> io::Result<()> {
+    queue!(backend, Clear(ClearType::CurrentLine))?;
+
+    let width = source.area.width.min(screen_width).max(1);
+    let area = Rect::new(0, target_y, width, 1);
+    let empty = Buffer::empty(area);
+    let mut row = Buffer::empty(area);
+    if source_row < source.area.height {
+        crate::buffer::copy_rows_for_direct_draw(source, &mut row, source_row, area);
+    }
+    backend.draw(empty.diff(&row).into_iter())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SetScrollRegion {
+    top: u16,
+    bottom: u16,
+}
+
+impl SetScrollRegion {
+    const fn new(top: u16, bottom: u16) -> Self {
+        Self { top, bottom }
+    }
+}
+
+impl Command for SetScrollRegion {
+    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        write!(output, "\x1b[{};{}r", self.top, self.bottom)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scroll regions require ANSI terminal support",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResetScrollRegion;
+
+impl Command for ResetScrollRegion {
+    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        write!(output, "\x1b[r")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scroll regions require ANSI terminal support",
+        ))
+    }
+}
+
+fn scroll_history_for_viewport_expansion<B: Backend>(
+    terminal: &mut Terminal<B>,
+    viewport: Rect,
+    rows: u16,
+) -> io::Result<()> {
+    terminal
+        .backend_mut()
+        .scroll_region_up(0..viewport.top(), rows)
+}
+
 fn apply_viewport_resize<B: Backend>(
     terminal: &mut Terminal<B>,
     current: Rect,
     previous: Rect,
-    contents_moved: bool,
 ) -> io::Result<()> {
-    clear_removed_rows(terminal, current, previous)?;
+    // The rows exposed by a viewport move are not represented in Ratatui's diff buffers.
+    // Clear the old managed area before changing coordinates so blank cells in the next frame
+    // cannot reveal stale terminal contents.
+    clear_viewport_rows(terminal, previous)?;
     terminal.set_viewport_area(current);
-
-    let cell_positions_changed =
-        current.x != previous.x || current.y != previous.y || current.width != previous.width;
-    if contents_moved || cell_positions_changed {
-        terminal.force_redraw();
-    }
+    terminal.force_redraw();
     Ok(())
 }
 
-fn clear_removed_rows<B: Backend>(
-    terminal: &mut Terminal<B>,
-    current: Rect,
-    previous: Rect,
-) -> io::Result<()> {
-    for y in current.bottom()..previous.bottom() {
+fn clear_viewport_rows<B: Backend>(terminal: &mut Terminal<B>, area: Rect) -> io::Result<()> {
+    for y in area.top()..area.bottom() {
         terminal
             .backend_mut()
-            .set_cursor_position(Position::new(0, y))?;
+            .set_cursor_position(Position::new(area.left(), y))?;
         terminal
             .backend_mut()
-            .clear_region(BackendClearType::CurrentLine)?;
+            .clear_region(ratatui::backend::ClearType::CurrentLine)?;
     }
     Ok(())
-}
-
-fn append_native_scrollback<B: Backend>(
-    terminal: &mut Terminal<B>,
-    screen_height: u16,
-    rows: u16,
-) -> io::Result<()> {
-    terminal.set_cursor_position(Position::new(0, screen_height.saturating_sub(1)))?;
-    terminal.backend_mut().append_lines(rows)
 }
 
 fn resized_viewport_area(
@@ -320,14 +469,105 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use ratatui::{
-        backend::TestBackend,
-        buffer::Buffer,
-        layout::Rect,
+        backend::{TestBackend, WindowSize},
+        buffer::{Buffer, Cell},
+        layout::{Rect, Size},
         style::Style,
         widgets::{Paragraph, Widget},
     };
 
     use super::*;
+
+    struct RecordingBackend {
+        size: Size,
+        cursor: Position,
+        output: Vec<u8>,
+        scroll_region_up_calls: usize,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                size: Size::new(width, height),
+                cursor: Position::ORIGIN,
+                output: Vec::new(),
+                scroll_region_up_calls: 0,
+            }
+        }
+    }
+
+    impl Write for RecordingBackend {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::default(),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn scroll_region_up(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _line_count: u16,
+        ) -> io::Result<()> {
+            self.scroll_region_up_calls += 1;
+            Ok(())
+        }
+
+        fn scroll_region_down(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _line_count: u16,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn inline_render_top_aligns_the_viewport() {
@@ -388,25 +628,84 @@ mod tests {
     }
 
     #[test]
-    fn viewport_expansion_moves_rows_into_native_scrollback() {
-        let backend = TestBackend::new(8, 3);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn viewport_expansion_scrolls_only_the_history_above_it() {
+        let previous = Rect::new(0, 2, 8, 2);
+        let current = Rect::new(0, 1, 8, 3);
+        let backend = TestBackend::with_lines(["history1", "history2", "stale1", "stale2"]);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(previous),
+            },
+        )
+        .unwrap();
+
+        scroll_history_for_viewport_expansion(&mut terminal, previous, 1).unwrap();
+        apply_viewport_resize(&mut terminal, current, previous).unwrap();
         terminal
             .draw(|frame| {
-                Paragraph::new("first\nsecond\nthird").render(frame.area(), frame.buffer_mut());
+                Paragraph::new("live\n\ninput").render(frame.area(), frame.buffer_mut());
             })
             .unwrap();
 
-        append_native_scrollback(&mut terminal, 3, 2).unwrap();
-
-        let scrollback = terminal.backend().scrollback();
-        assert_eq!(scrollback.area.height, 2);
-        assert_eq!(row_text(scrollback, 0), "first");
-        assert_eq!(row_text(scrollback, 1), "second");
+        let screen = terminal.backend().buffer();
+        assert_eq!(row_text(screen, 0), "history2");
+        assert_eq!(row_text(screen, 1), "live");
+        assert_eq!(row_text(screen, 2), "");
+        assert_eq!(row_text(screen, 3), "input");
     }
 
     #[test]
-    fn shrinking_a_viewport_clears_only_the_removed_rows() {
+    fn finalized_history_uses_crlf_instead_of_explicit_region_scroll() {
+        let viewport = Rect::new(0, 0, 8, 2);
+        let backend = RecordingBackend::new(8, 4);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(viewport),
+            },
+        )
+        .unwrap();
+        let mut history = Buffer::empty(Rect::new(0, 0, 7, 2));
+        history.set_string(0, 0, "first", Style::default());
+        history.set_string(0, 1, "second", Style::default());
+
+        let next = insert_finalized_buffer(&mut terminal, viewport, &history, 1).unwrap();
+
+        let backend = terminal.backend();
+        let output = String::from_utf8_lossy(&backend.output);
+        assert_eq!(next, Rect::new(0, 2, 8, 2));
+        assert_eq!(output.matches("\r\n").count(), 3);
+        assert_eq!(backend.scroll_region_up_calls, 0);
+        assert!(!output.contains("\x1b[1S"));
+    }
+
+    #[test]
+    fn finalized_history_clears_a_full_screen_viewport_before_scrolling() {
+        let viewport = Rect::new(0, 0, 8, 4);
+        let backend = RecordingBackend::new(8, 4);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(viewport),
+            },
+        )
+        .unwrap();
+        let mut history = Buffer::empty(Rect::new(0, 0, 7, 1));
+        history.set_string(0, 0, "history", Style::default());
+
+        let next = insert_finalized_buffer(&mut terminal, viewport, &history, 1).unwrap();
+
+        let backend = terminal.backend();
+        let output = String::from_utf8_lossy(&backend.output);
+        assert_eq!(next, viewport);
+        assert!(output.starts_with("\x1b[r\x1b[1;1H\x1b[J"));
+        assert_eq!(output.matches("\r\n").count(), 5);
+        assert_eq!(backend.scroll_region_up_calls, 0);
+    }
+
+    #[test]
+    fn shrinking_a_viewport_clears_the_removed_rows() {
         let backend = TestBackend::new(8, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -415,7 +714,13 @@ mod tests {
             })
             .unwrap();
 
-        clear_removed_rows(&mut terminal, Rect::new(0, 0, 8, 1), Rect::new(0, 0, 8, 3)).unwrap();
+        let previous = Rect::new(0, 0, 8, 3);
+        apply_viewport_resize(&mut terminal, Rect::new(0, 0, 8, 1), previous).unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("first").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
 
         let screen = terminal.backend().buffer();
         assert_eq!(row_text(screen, 0), "first");
@@ -442,7 +747,7 @@ mod tests {
             })
             .unwrap();
 
-        apply_viewport_resize(&mut terminal, current, previous, false).unwrap();
+        apply_viewport_resize(&mut terminal, current, previous).unwrap();
         terminal
             .draw(|frame| {
                 Paragraph::new("input\n\nmodel").render(frame.area(), frame.buffer_mut());
