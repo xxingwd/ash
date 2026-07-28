@@ -242,6 +242,7 @@ pub(crate) struct TerminalUi {
     surface: InlineScreen,
     session: SessionView,
     view: ViewState,
+    history: Vec<LiveBlock>,
     transcript: Vec<LiveBlock>,
     scroll_top: Option<u16>,
     next_block_id: u64,
@@ -265,6 +266,7 @@ impl TerminalUi {
             surface,
             session: SessionView::new(protocol, model, working_dir, context_limit),
             view: ViewState::default(),
+            history: Vec::new(),
             transcript: Vec::new(),
             scroll_top: None,
             next_block_id: 1,
@@ -349,6 +351,7 @@ impl TerminalUi {
 
     fn begin_fresh_viewport(&mut self) -> io::Result<()> {
         self.synchronized(|terminal| {
+            terminal.history.clear();
             terminal.transcript.clear();
             terminal.scroll_top = None;
             terminal.reset_ui_state()?;
@@ -357,20 +360,16 @@ impl TerminalUi {
     }
 
     pub fn rollback_turn(&mut self) -> io::Result<()> {
-        let turn_id = self
-            .current_turn_id
-            .or_else(|| self.transcript.iter().rev().find_map(LiveBlock::turn_id));
+        let turn_id = latest_turn_id(self.current_turn_id, &self.transcript, &self.history);
         let (width, height) = terminal_size()?;
-        self.synchronized(|terminal| {
-            if let Some(turn_id) = turn_id {
-                terminal
-                    .transcript
-                    .retain(|block| !block.belongs_to_turn(turn_id));
-            }
-            terminal.scroll_top = None;
-            terminal.reset_turn_state();
-            terminal.render_viewport(width, height)
-        })
+        if let Some(turn_id) = turn_id {
+            self.history.retain(|block| !block.belongs_to_turn(turn_id));
+            self.transcript
+                .retain(|block| !block.belongs_to_turn(turn_id));
+        }
+        self.scroll_top = None;
+        self.reset_turn_state();
+        self.rebuild_scrollback_at(width, height, false)
     }
 
     pub fn restore_session(
@@ -401,6 +400,11 @@ impl TerminalUi {
     fn sync_view_at(&mut self, view: TerminalView<'_>, width: u16, height: u16) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
+        self.apply_view(view, width);
+        self.redraw_at(width, height)
+    }
+
+    fn apply_view(&mut self, view: TerminalView<'_>, width: u16) {
         let input = view.input.view(composer_text_width(width));
         self.view.composer.lines = input.lines;
         self.view.composer.cursor_row = input.cursor_row;
@@ -416,7 +420,6 @@ impl TerminalUi {
         }
         self.view.busy = view.busy;
         self.view.queued_messages = view.queued_messages;
-        self.redraw_at(width, height)
     }
 
     pub fn composer_text_width(&self) -> io::Result<u16> {
@@ -569,11 +572,13 @@ impl TerminalUi {
         let height = height.max(1);
         self.selection = None;
         self.surface.resize(width, height)?;
+        self.surface.reset()?;
         if self.stream.is_reasoning() {
             self.stream
                 .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
         }
-        self.sync_view_at(view, width, height)
+        self.apply_view(view, width);
+        self.rebuild_scrollback_at(width, height, true)
     }
 
     pub fn scroll_page_up(&mut self) -> io::Result<()> {
@@ -791,24 +796,55 @@ impl TerminalUi {
 
         let (width, height) = terminal_size()?;
         let render_width = viewport::drawable_width(width);
-        let rendered = self
-            .transcript
-            .iter()
-            .map(|block| block.render(render_width))
-            .collect::<Vec<_>>();
-        self.synchronized(move |terminal| {
-            terminal.transcript.clear();
+        let committed = std::mem::take(&mut self.transcript);
+        let result = self.synchronized(|terminal| {
             terminal.scroll_top = None;
             terminal.selection = None;
 
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
             terminal.render_viewport(width, height)?;
-            for buffer in rendered {
+            for block in &committed {
+                let buffer = block.render(render_width);
                 terminal.surface.insert_buffer(&buffer, 1)?;
+                block.clear_render_cache();
             }
             terminal.render_viewport(width, height)
-        })
+        });
+        if result.is_ok() {
+            self.history.extend(committed);
+        } else {
+            self.transcript = committed;
+        }
+        result
+    }
+
+    fn rebuild_scrollback_at(
+        &mut self,
+        width: u16,
+        height: u16,
+        scrollback_already_cleared: bool,
+    ) -> io::Result<()> {
+        let render_width = viewport::drawable_width(width);
+        let history = std::mem::take(&mut self.history);
+        let result = self.synchronized(|terminal| {
+            if !scrollback_already_cleared {
+                terminal.surface.reset()?;
+            }
+            terminal.selection = None;
+            terminal.render_viewport(width, height)?;
+            for block in &history {
+                let buffer = block.render(render_width);
+                terminal.surface.insert_buffer(&buffer, 1)?;
+                block.clear_render_cache();
+            }
+            terminal.render_viewport(width, height)
+        });
+        for block in &history {
+            block.clear_render_cache();
+        }
+        self.history = history;
+        result
     }
 
     fn scroll_up(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
@@ -1022,6 +1058,16 @@ fn queued_status(queued_messages: usize) -> String {
     }
 }
 
+fn latest_turn_id(
+    current_turn_id: Option<u64>,
+    transcript: &[LiveBlock],
+    history: &[LiveBlock],
+) -> Option<u64> {
+    current_turn_id
+        .or_else(|| transcript.iter().rev().find_map(LiveBlock::turn_id))
+        .or_else(|| history.iter().rev().find_map(LiveBlock::turn_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,5 +1113,16 @@ mod tests {
         let mut follow_bottom = None;
         normalize_scroll_top(&mut follow_bottom, 8);
         assert_eq!(follow_bottom, None);
+    }
+
+    #[test]
+    fn undo_finds_the_latest_committed_turn_behind_non_turn_history() {
+        let history = [
+            LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(7)),
+            LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(7)),
+            LiveBlock::history(3, HistoryBlock::info("status")),
+        ];
+
+        assert_eq!(latest_turn_id(None, &[], &history), Some(7));
     }
 }

@@ -82,19 +82,22 @@
 
 - 进入时启用 raw mode 和 bracketed paste，不进入 alternate screen，也不捕获鼠标；正常
   退出、错误与 Drop 路径使用同一个幂等 Guard 恢复终端
-- UI 只持有当前 turn 的 live transcript；viewport 按实际内容高度动态伸缩，最大为首屏
+- UI 持有当前 turn 的 live transcript，以及不含 Ratatui Buffer 的已完成语义历史；
+  viewport 按实际内容高度动态伸缩，最大为首屏
 - live transcript 使用独立滚动位置并默认跟随底部；已完成历史交给终端原生 scrollback
 - `AgentFinished` 是唯一的正常 turn 提交边界：先收缩到 Composer，再在一次同步更新中把
-  用户消息、Thought、工具、回答和 Worked 块写到 scrollback，随后释放语义块和渲染缓存
+  用户消息、Thought、工具、回答和 Worked 块写到 scrollback，随后转存语义块并释放缓存
 - `/new` 和 `/clear` 清空模型历史、可见屏幕与 scrollback；`/resume` 从 JSONL 重放历史
-- 已完成历史不再由 Ash 重绘；终端模拟器负责其缩放重排、滚动、选择与复制
+- resize 与 `/undo` 先清空可见屏幕和 scrollback，再从语义历史按当前宽度完整重放；重放
+  每次只构建一个块的 Buffer，插入后立即释放
+- 除全量重放边界外，终端模拟器负责历史滚动、选择与复制
 - Agent 工作期间 `Ctrl-C` 不发送取消命令；状态栏提示 `esc to interrupt`，第一次按
   `Esc` 不展示额外状态
 - Agent 工作期间按一次 `Esc` 会取消并回退当前轮，将问题恢复为草稿
 - `Esc` 会先在 UI 侧立即移除当前 turn 并恢复 Composer；后端确认回退前到达的旧
   Thinking、工具和文本事件不再参与渲染，确认事件也不会重复清除同一区域
-- 回退按 turn ID 从 live transcript 和模型上下文移除当前轮；已经提交的终端历史不可变，
-  `/undo` 不尝试从 scrollback 删除文字
+- 回退按 turn ID 从 live transcript、已完成语义历史和模型上下文移除当前轮，然后清空并
+  重放终端历史
 - 流式思考摘要显示带耗时的 `Thinking` 标题和完整正文，并随 transcript 向下滚动；
   切换到回答、工具或完成状态时折叠为单行耗时摘要，提交前可通过 `Ctrl-O` 展开
 - 工具历史按工具语义生成单行摘要，隐藏内容参数和默认参数，并把绝对路径缩短为

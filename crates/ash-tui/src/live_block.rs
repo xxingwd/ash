@@ -193,6 +193,10 @@ impl LiveBlock {
         buffer
     }
 
+    pub(crate) fn clear_render_cache(&self) {
+        self.cache.replace(None);
+    }
+
     fn render_uncached(&self, width: u16) -> Buffer {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
@@ -473,6 +477,18 @@ mod tests {
         assert!(block.append_markdown_source(" world"));
         let updated = block.render(40);
         assert!(!std::sync::Arc::ptr_eq(&first, &updated));
+    }
+
+    #[test]
+    fn committed_blocks_can_drop_their_render_cache_before_replay() {
+        let block = LiveBlock::assistant(1, "hello".to_string());
+
+        let committed = block.render(40);
+        block.clear_render_cache();
+        let replayed = block.render(40);
+
+        assert!(!std::sync::Arc::ptr_eq(&committed, &replayed));
+        assert_eq!(row_text(&committed, 0), row_text(&replayed, 0));
     }
 
     #[test]

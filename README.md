@@ -171,9 +171,11 @@ explorer，边界清晰的代码改动优先交给 worker。简单任务和紧�
 viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随最新内容。
 
 收到 `AgentFinished` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
-随后清空本轮 transcript 和渲染缓存。完成历史不再由 Ash 保存或逐帧重绘；终端缩放后的
-历史重排、滚动和复制由终端模拟器负责。`/new`、`/clear` 会清除可见屏幕和 scrollback，
-`/resume` 则从 JSONL 重新渲染历史。
+随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
+resize 和 `/undo` 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并
+立即释放 Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。
+`/new`、`/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 则从 JSONL
+重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
 正文、工具调用或本轮结束后，思考区折叠为一行 `Thought for Xs`。本轮提交前可在空输入
@@ -203,7 +205,7 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
 按下 `Esc` 会从模型会话历史和 live viewport 中移除当前轮，并把问题恢复到输入框；它不会
 反向撤销已经由工具写入文件系统的修改。`/undo` 会回滚模型与 Session JSONL 并恢复问题，
-但已经提交到终端 scrollback 的文字作为终端历史保留，直到 `/new` 或 `/clear`。
+然后清空 scrollback 并重放删除该轮后的完整语义历史。
 
 ## 开发检查
 
