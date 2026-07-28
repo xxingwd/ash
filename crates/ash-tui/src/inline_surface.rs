@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
     buffer::Buffer,
     layout::{Position, Rect},
     Terminal, TerminalOptions, Viewport,
@@ -181,21 +181,38 @@ impl InlineScreen {
         screen_height: u16,
         viewport_height: u16,
     ) -> io::Result<()> {
+        let previous_area = self.viewport_area;
         let (area, scroll_by) =
-            resized_viewport_area(self.viewport_area, width, screen_height, viewport_height);
+            resized_viewport_area(previous_area, width, screen_height, viewport_height);
         if scroll_by > 0 {
             // Newlines at the bottom of the primary screen enter native scrollback reliably.
             // Region-scrolling sequences can discard those rows in multiplexers such as Zellij.
             append_native_scrollback(&mut self.terminal, screen_height, scroll_by)?;
         }
-        if area != self.viewport_area {
+        if area != previous_area {
+            clear_removed_rows(&mut self.terminal, area, previous_area)?;
             self.terminal.set_viewport_area(area);
-            self.terminal.clear()?;
             self.terminal.force_redraw();
             self.viewport_area = area;
         }
         Ok(())
     }
+}
+
+fn clear_removed_rows<B: Backend>(
+    terminal: &mut Terminal<B>,
+    current: Rect,
+    previous: Rect,
+) -> io::Result<()> {
+    for y in current.bottom()..previous.bottom() {
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(0, y))?;
+        terminal
+            .backend_mut()
+            .clear_region(BackendClearType::CurrentLine)?;
+    }
+    Ok(())
 }
 
 fn append_native_scrollback<B: Backend>(
@@ -371,6 +388,24 @@ mod tests {
         assert_eq!(scrollback.area.height, 2);
         assert_eq!(row_text(scrollback, 0), "first");
         assert_eq!(row_text(scrollback, 1), "second");
+    }
+
+    #[test]
+    fn shrinking_a_viewport_clears_only_the_removed_rows() {
+        let backend = TestBackend::new(8, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("first\nsecond\nthird").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        clear_removed_rows(&mut terminal, Rect::new(0, 0, 8, 1), Rect::new(0, 0, 8, 3)).unwrap();
+
+        let screen = terminal.backend().buffer();
+        assert_eq!(row_text(screen, 0), "first");
+        assert_eq!(row_text(screen, 1), "");
+        assert_eq!(row_text(screen, 2), "");
     }
 
     #[test]
