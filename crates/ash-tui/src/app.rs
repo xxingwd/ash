@@ -12,6 +12,10 @@ use futures::StreamExt;
 use crate::{
     inline::{TerminalUi, TerminalView},
     input::InputState,
+    operation::{
+        BackgroundAction, Cancellation, EventRoute, OperationState, SubmissionPolicy,
+        TurnCompletion,
+    },
     session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
 };
@@ -33,114 +37,9 @@ pub enum UiCommand {
     Exit,
 }
 
-enum TurnPhase {
-    Idle,
-    Running { prompt: Option<String> },
-    Pending(PendingAction),
-}
-
-enum PendingAction {
-    Cancelling,
-    Rollback {
-        viewport_removed: bool,
-        turn_finished: bool,
-    },
-    ListSessions,
-    Resume,
-    Compact,
-}
-
-impl TurnPhase {
-    fn is_busy(&self) -> bool {
-        !matches!(self, Self::Idle)
-    }
-
-    fn shows_activity(&self) -> bool {
-        !matches!(
-            self,
-            Self::Idle | Self::Pending(PendingAction::ListSessions | PendingAction::Resume)
-        )
-    }
-
-    fn is_rolling_back(&self) -> bool {
-        matches!(self, Self::Pending(PendingAction::Rollback { .. }))
-    }
-
-    fn is_running(&self) -> bool {
-        matches!(self, Self::Running { .. })
-    }
-
-    fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending(_))
-    }
-
-    fn is_cancelling(&self) -> bool {
-        matches!(self, Self::Pending(PendingAction::Cancelling))
-    }
-
-    fn mark_turn_finished(&mut self) {
-        if let Self::Pending(PendingAction::Rollback { turn_finished, .. }) = self {
-            *turn_finished = true;
-        }
-    }
-
-    fn ignores_turn_events(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending(PendingAction::Rollback {
-                turn_finished: false,
-                ..
-            }) | Self::Pending(
-                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
-            )
-        )
-    }
-
-    fn ignores_turn_finished(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending(
-                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
-            )
-        )
-    }
-
-    fn accepts_action_result(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending(PendingAction::Rollback {
-                turn_finished: true,
-                ..
-            }) | Self::Pending(
-                PendingAction::ListSessions | PendingAction::Resume | PendingAction::Compact
-            )
-        )
-    }
-
-    fn ignores_action_error(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending(PendingAction::Rollback {
-                turn_finished: false,
-                ..
-            })
-        )
-    }
-
-    fn viewport_was_removed(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending(PendingAction::Rollback {
-                viewport_removed: true,
-                ..
-            })
-        )
-    }
-}
-
 struct AppState {
     input: InputState,
-    phase: TurnPhase,
+    operation: OperationState,
     completion: CommandCompletionState,
     sessions: SessionPickerState,
     queue: VecDeque<String>,
@@ -156,7 +55,7 @@ impl AppState {
     fn new(input_history: Vec<String>) -> Self {
         Self {
             input: InputState::with_history(input_history),
-            phase: TurnPhase::Idle,
+            operation: OperationState::default(),
             completion: CommandCompletionState::default(),
             sessions: SessionPickerState::default(),
             queue: VecDeque::new(),
@@ -164,21 +63,23 @@ impl AppState {
     }
 
     fn view(&mut self) -> TerminalView<'_> {
-        self.completion
-            .sync(self.input.text(), self.input.cursor(), self.phase.is_busy());
+        self.completion.sync(
+            self.input.text(),
+            self.input.cursor(),
+            self.operation.is_busy(),
+        );
         TerminalView {
             input: &self.input,
             commands: self.completion.items(),
             selected_command: self.completion.selected_index(),
             sessions: self.sessions.sessions(),
             selected_session: self.sessions.selected_index(),
-            busy: self.phase.shows_activity(),
+            busy: self.operation.shows_activity(),
             queued_messages: self.queue.len(),
         }
     }
 
     fn finish_cancellation(&mut self) {
-        self.phase = TurnPhase::Idle;
         if self.input.is_empty() {
             if let Some(input) = self.queue.pop_front() {
                 self.input.set_text(input);
@@ -255,12 +156,17 @@ impl App {
 
         loop {
             tokio::select! {
-                _ = render_tick.tick(), if state.phase.shows_activity() => terminal.refresh_content()?,
-                _ = status_tick.tick(), if state.phase.shows_activity() => terminal.refresh_status()?,
+                _ = render_tick.tick(), if state.operation.shows_activity() => terminal.refresh_content()?,
+                _ = status_tick.tick(), if state.operation.shows_activity() => terminal.refresh_status()?,
                 event = events.next() => {
                     let Some(event) = event else { break };
-                    if state.phase.ignores_turn_events() && is_turn_output_event(&event) {
-                        continue;
+                    match state.operation.route_event(&event) {
+                        EventRoute::Handle => {}
+                        EventRoute::Ignore => continue,
+                        EventRoute::StateChanged => {
+                            state.render(&mut terminal)?;
+                            continue;
+                        }
                     }
                     match handle_agent_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
@@ -299,10 +205,7 @@ async fn handle_agent_event(
 ) -> anyhow::Result<LoopAction> {
     match event {
         Event::AgentStarted { .. } => {
-            let reset_timers = !state.phase.is_busy();
-            if reset_timers {
-                state.phase = TurnPhase::Running { prompt: None };
-            }
+            let reset_timers = state.operation.agent_started();
             terminal.agent_started()?;
             state.render(terminal)?;
             Ok(if reset_timers {
@@ -335,56 +238,36 @@ async fn handle_agent_event(
             terminal.tool_end(&name, &arguments, &output, is_error)?;
             Ok(LoopAction::Continue)
         }
-        Event::Error(_) if state.phase.ignores_action_error() => Ok(LoopAction::Continue),
         Event::Error(error) => {
             terminal.error(&error)?;
-            if state.phase.accepts_action_result() {
-                state.phase = TurnPhase::Idle;
+            if state.operation.complete_failed_action() {
                 state.sessions.close();
                 state.render(terminal)?;
             }
             Ok(LoopAction::Continue)
         }
-        Event::AgentFinished { .. } if state.phase.is_rolling_back() => {
-            state.phase.mark_turn_finished();
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        Event::AgentFinished { .. } if state.phase.is_cancelling() => {
-            terminal.finish_response()?;
-            state.finish_cancellation();
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        Event::AgentFinished { .. } if state.phase.ignores_turn_finished() => {
-            Ok(LoopAction::Continue)
-        }
         Event::AgentFinished { .. } => {
-            terminal.finish_response()?;
-            let action = if let Some(input) = state.queue.pop_front() {
-                state.phase = TurnPhase::Running {
-                    prompt: Some(input.clone()),
-                };
-                terminal.commit_input(&input)?;
-                if commands
-                    .send(UiCommand::Submit(input.clone()))
-                    .await
-                    .is_err()
-                {
-                    return Ok(LoopAction::Exit);
-                }
-                state.input.record_submission(&input);
-                LoopAction::ResetTimers
-            } else {
-                state.phase = TurnPhase::Idle;
-                LoopAction::Continue
+            let Some(completion) = state.operation.complete_turn() else {
+                return Ok(LoopAction::Continue);
             };
-            state.render(terminal)?;
-            Ok(action)
+            terminal.finish_response()?;
+            match completion {
+                TurnCompletion::Cancelled => {
+                    state.finish_cancellation();
+                    state.render(terminal)?;
+                    Ok(LoopAction::Continue)
+                }
+                TurnCompletion::Completed => match state.queue.pop_front() {
+                    Some(input) => start_message(state, terminal, commands, input).await,
+                    None => {
+                        state.render(terminal)?;
+                        Ok(LoopAction::Continue)
+                    }
+                },
+            }
         }
         Event::TurnRolledBack { prompt } => {
-            let already_rolled_back = state.phase.viewport_was_removed();
-            state.phase = TurnPhase::Idle;
+            let already_rolled_back = state.operation.finish_rollback();
             if state.input.text() != prompt {
                 state.input.restore_submission(prompt);
             }
@@ -403,7 +286,7 @@ async fn handle_agent_event(
             if automatic {
                 terminal.record_automatic_compaction(after_tokens)?;
             } else {
-                state.phase = TurnPhase::Idle;
+                state.operation.finish();
                 terminal.finish_compaction(before_tokens, after_tokens, dropped_messages)?;
             }
             state.render(terminal)?;
@@ -416,15 +299,15 @@ async fn handle_agent_event(
             messages,
         } => {
             state.sessions.close();
-            state.phase = TurnPhase::Idle;
+            state.operation.finish();
             terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
         Event::SessionsListed { sessions } => {
-            if matches!(state.phase, TurnPhase::Pending(PendingAction::ListSessions)) {
-                state.phase = TurnPhase::Idle;
-            }
+            state
+                .operation
+                .finish_background(BackgroundAction::ListSessions);
             if sessions.is_empty() {
                 terminal.command_output("No saved chats are available to resume.")?;
             } else {
@@ -556,7 +439,7 @@ async fn handle_key(
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.input.is_empty() {
-                return Ok(if state.phase.is_busy() {
+                return Ok(if state.operation.is_busy() {
                     LoopAction::Continue
                 } else {
                     let _ = commands.send(UiCommand::Exit).await;
@@ -625,7 +508,7 @@ async fn handle_session_key(
             let selected = state.sessions.selected_session_id();
             state.sessions.close();
             if selected.is_some() {
-                state.phase = TurnPhase::Pending(PendingAction::Resume);
+                state.operation.start_background(BackgroundAction::Resume);
             }
             selected
         }
@@ -680,7 +563,7 @@ fn handle_completion_key(
 }
 
 fn is_cancel_key(state: &AppState, key: &KeyEvent) -> bool {
-    state.phase.is_running()
+    state.operation.can_cancel()
         && state.input.is_empty()
         && key.code == KeyCode::Esc
         && key.kind == KeyEventKind::Press
@@ -692,28 +575,21 @@ async fn cancel_turn(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    if !state.phase.is_running() {
+    let Some(cancellation) = state
+        .operation
+        .begin_cancellation(terminal.has_response_block())
+    else {
         return Ok(LoopAction::Continue);
-    }
-    let command = if terminal.has_response_block() {
-        state.phase = TurnPhase::Pending(PendingAction::Cancelling);
-        UiCommand::Cancel
-    } else {
-        let prompt = match std::mem::replace(
-            &mut state.phase,
-            TurnPhase::Pending(PendingAction::Rollback {
-                viewport_removed: true,
-                turn_finished: false,
-            }),
-        ) {
-            TurnPhase::Running { prompt } => prompt,
-            TurnPhase::Idle | TurnPhase::Pending(_) => None,
-        };
-        if let Some(prompt) = prompt {
-            state.input.restore_submission(prompt);
+    };
+    let command = match cancellation {
+        Cancellation::KeepResponse => UiCommand::Cancel,
+        Cancellation::RemoveTurn { prompt } => {
+            if let Some(prompt) = prompt {
+                state.input.restore_submission(prompt);
+            }
+            terminal.rollback_turn()?;
+            UiCommand::CancelAndRollback
         }
-        terminal.rollback_turn()?;
-        UiCommand::CancelAndRollback
     };
     state.render(terminal)?;
     Ok(if commands.send(command).await.is_err() {
@@ -728,7 +604,7 @@ async fn submit_input(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    if state.phase.is_pending() {
+    if state.operation.submission_policy() == SubmissionPolicy::Block {
         terminal.command_blocked("input")?;
         state.render(terminal)?;
         return Ok(LoopAction::Continue);
@@ -747,7 +623,7 @@ async fn submit_input(
     match slash_command::parse(&input) {
         ParsedInput::Message => submit_message(state, terminal, commands, input).await,
         ParsedInput::Invalid(error) => {
-            if state.phase.is_busy() {
+            if state.operation.is_busy() {
                 terminal.command_blocked("command")?;
             } else {
                 terminal.command_error(&error)?;
@@ -767,14 +643,28 @@ async fn submit_message(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     input: String,
 ) -> anyhow::Result<LoopAction> {
-    if state.phase.is_busy() {
-        state.queue.push_back(input);
-        state.render(terminal)?;
-        return Ok(LoopAction::Continue);
+    match state.operation.submission_policy() {
+        SubmissionPolicy::Queue => {
+            state.queue.push_back(input);
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
+        SubmissionPolicy::Start => start_message(state, terminal, commands, input).await,
+        SubmissionPolicy::Block => {
+            terminal.command_blocked("input")?;
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
     }
-    state.phase = TurnPhase::Running {
-        prompt: Some(input.clone()),
-    };
+}
+
+async fn start_message(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    input: String,
+) -> anyhow::Result<LoopAction> {
+    state.operation.start_turn(Some(input.clone()));
     terminal.commit_input(&input)?;
     if commands
         .send(UiCommand::Submit(input.clone()))
@@ -795,7 +685,7 @@ async fn run_command(
     command: SlashCommand,
     input: &str,
 ) -> anyhow::Result<LoopAction> {
-    if state.phase.is_busy() && !command.available_during_task() {
+    if state.operation.is_busy() && !command.available_during_task() {
         terminal.command_blocked(command.name())?;
         state.render(terminal)?;
         return Ok(LoopAction::Continue);
@@ -808,18 +698,17 @@ async fn run_command(
             Some(UiCommand::NewSession)
         }
         SlashCommand::Resume => {
-            state.phase = TurnPhase::Pending(PendingAction::ListSessions);
+            state
+                .operation
+                .start_background(BackgroundAction::ListSessions);
             Some(UiCommand::ListSessions)
         }
         SlashCommand::Undo => {
-            state.phase = TurnPhase::Pending(PendingAction::Rollback {
-                viewport_removed: false,
-                turn_finished: true,
-            });
+            state.operation.start_rollback();
             Some(UiCommand::Rollback)
         }
         SlashCommand::Compact => {
-            state.phase = TurnPhase::Pending(PendingAction::Compact);
+            state.operation.start_background(BackgroundAction::Compact);
             terminal.start_compaction()?;
             Some(UiCommand::Compact)
         }
@@ -854,31 +743,15 @@ fn inserts_newline(key: &KeyEvent) -> bool {
         || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn is_turn_output_event(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::AgentStarted { .. }
-            | Event::TextDelta(_)
-            | Event::Thinking(_)
-            | Event::ToolCallStart { .. }
-            | Event::ToolCallEnd { .. }
-            | Event::Usage { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use ash_core::StopReason;
-
     use super::*;
 
     #[test]
     fn derives_terminal_view_from_one_app_state() {
         let mut state = AppState::new(Vec::new());
         state.input.set_text("/");
-        state.phase = TurnPhase::Running {
-            prompt: Some("question".into()),
-        };
+        state.operation.start_turn(Some("question".into()));
         state.queue.push_back("next".into());
 
         let view = state.view();
@@ -896,53 +769,20 @@ mod tests {
     }
 
     #[test]
-    fn identifies_turn_output_without_hiding_action_results() {
-        assert!(is_turn_output_event(&Event::TextDelta("late".into())));
-        assert!(is_turn_output_event(&Event::Thinking("late".into())));
-        assert!(!is_turn_output_event(&Event::Error("cancelled".into())));
-        assert!(!is_turn_output_event(&Event::AgentFinished {
-            reason: StopReason::Aborted,
-        }));
-        assert!(!is_turn_output_event(&Event::TurnRolledBack {
-            prompt: "draft".into(),
-        }));
-    }
-
-    #[test]
-    fn pending_actions_ignore_late_turn_events_until_their_result() {
-        let list = TurnPhase::Pending(PendingAction::ListSessions);
-        assert!(list.ignores_turn_events());
-        assert!(list.ignores_turn_finished());
-        assert!(list.accepts_action_result());
-        assert!(!list.shows_activity());
-
-        let resume = TurnPhase::Pending(PendingAction::Resume);
-        assert!(!resume.shows_activity());
-
-        let mut rollback = TurnPhase::Pending(PendingAction::Rollback {
-            viewport_removed: true,
-            turn_finished: false,
-        });
-        assert!(rollback.ignores_turn_events());
-        assert!(!rollback.accepts_action_result());
-        assert!(rollback.ignores_action_error());
-
-        rollback.mark_turn_finished();
-        assert!(!rollback.ignores_turn_events());
-        assert!(rollback.accepts_action_result());
-        assert!(!rollback.ignores_action_error());
-    }
-
-    #[test]
     fn cancellation_restores_the_next_queued_prompt_without_losing_the_rest() {
         let mut state = AppState::new(Vec::new());
-        state.phase = TurnPhase::Pending(PendingAction::Cancelling);
+        state.operation.start_turn(None);
+        state.operation.begin_cancellation(true);
         state.queue.push_back("next".into());
         state.queue.push_back("later".into());
 
+        assert_eq!(
+            state.operation.complete_turn(),
+            Some(TurnCompletion::Cancelled)
+        );
         state.finish_cancellation();
 
-        assert!(matches!(state.phase, TurnPhase::Idle));
+        assert!(!state.operation.is_busy());
         assert_eq!(state.input.text(), "next");
         assert_eq!(state.queue, VecDeque::from(["later".to_string()]));
     }

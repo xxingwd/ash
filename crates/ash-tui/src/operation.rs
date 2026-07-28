@@ -1,0 +1,331 @@
+use ash_core::Event;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackgroundAction {
+    ListSessions,
+    Resume,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubmissionPolicy {
+    Start,
+    Queue,
+    Block,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Cancellation {
+    KeepResponse,
+    RemoveTurn { prompt: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnCompletion {
+    Completed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventRoute {
+    Handle,
+    Ignore,
+    StateChanged,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OperationState {
+    current: Operation,
+}
+
+#[derive(Debug, Default)]
+enum Operation {
+    #[default]
+    Idle,
+    Turn(TurnOperation),
+    Background(BackgroundAction),
+}
+
+#[derive(Debug)]
+enum TurnOperation {
+    Running { prompt: Option<String> },
+    Cancelling,
+    RollingBack(Rollback),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackOrigin {
+    Command,
+    CancelledTurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackStage {
+    AwaitingTurn,
+    AwaitingResult,
+}
+
+#[derive(Debug)]
+struct Rollback {
+    origin: RollbackOrigin,
+    stage: RollbackStage,
+}
+
+impl OperationState {
+    pub(crate) fn is_busy(&self) -> bool {
+        !matches!(self.current, Operation::Idle)
+    }
+
+    pub(crate) fn shows_activity(&self) -> bool {
+        matches!(
+            self.current,
+            Operation::Turn(_) | Operation::Background(BackgroundAction::Compact)
+        )
+    }
+
+    pub(crate) fn submission_policy(&self) -> SubmissionPolicy {
+        match self.current {
+            Operation::Idle => SubmissionPolicy::Start,
+            Operation::Turn(TurnOperation::Running { .. }) => SubmissionPolicy::Queue,
+            Operation::Turn(TurnOperation::Cancelling | TurnOperation::RollingBack(_))
+            | Operation::Background(_) => SubmissionPolicy::Block,
+        }
+    }
+
+    pub(crate) fn can_cancel(&self) -> bool {
+        matches!(self.current, Operation::Turn(TurnOperation::Running { .. }))
+    }
+
+    pub(crate) fn start_turn(&mut self, prompt: Option<String>) {
+        self.current = Operation::Turn(TurnOperation::Running { prompt });
+    }
+
+    pub(crate) fn agent_started(&mut self) -> bool {
+        if self.is_busy() {
+            false
+        } else {
+            self.start_turn(None);
+            true
+        }
+    }
+
+    pub(crate) fn start_background(&mut self, action: BackgroundAction) {
+        self.current = Operation::Background(action);
+    }
+
+    pub(crate) fn start_rollback(&mut self) {
+        self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
+            origin: RollbackOrigin::Command,
+            stage: RollbackStage::AwaitingResult,
+        }));
+    }
+
+    pub(crate) fn begin_cancellation(&mut self, has_response: bool) -> Option<Cancellation> {
+        let current = std::mem::take(&mut self.current);
+        let Operation::Turn(TurnOperation::Running { prompt }) = current else {
+            self.current = current;
+            return None;
+        };
+
+        if has_response {
+            self.current = Operation::Turn(TurnOperation::Cancelling);
+            Some(Cancellation::KeepResponse)
+        } else {
+            self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
+                origin: RollbackOrigin::CancelledTurn,
+                stage: RollbackStage::AwaitingTurn,
+            }));
+            Some(Cancellation::RemoveTurn { prompt })
+        }
+    }
+
+    pub(crate) fn route_event(&mut self, event: &Event) -> EventRoute {
+        match (&mut self.current, event) {
+            (
+                Operation::Turn(TurnOperation::RollingBack(rollback)),
+                Event::AgentFinished { .. },
+            ) => {
+                rollback.stage = RollbackStage::AwaitingResult;
+                EventRoute::StateChanged
+            }
+            (
+                Operation::Turn(TurnOperation::RollingBack(Rollback {
+                    stage: RollbackStage::AwaitingTurn,
+                    ..
+                })),
+                Event::Error(_),
+            ) => EventRoute::Ignore,
+            (Operation::Background(_), Event::AgentFinished { .. }) => EventRoute::Ignore,
+            (operation, event)
+                if suppresses_turn_output(operation) && is_turn_output_event(event) =>
+            {
+                EventRoute::Ignore
+            }
+            _ => EventRoute::Handle,
+        }
+    }
+
+    pub(crate) fn complete_turn(&mut self) -> Option<TurnCompletion> {
+        let current = std::mem::take(&mut self.current);
+        match current {
+            Operation::Idle | Operation::Turn(TurnOperation::Running { .. }) => {
+                Some(TurnCompletion::Completed)
+            }
+            Operation::Turn(TurnOperation::Cancelling) => Some(TurnCompletion::Cancelled),
+            current @ (Operation::Turn(TurnOperation::RollingBack(_))
+            | Operation::Background(_)) => {
+                self.current = current;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn complete_failed_action(&mut self) -> bool {
+        let is_action_result = matches!(
+            self.current,
+            Operation::Background(_)
+                | Operation::Turn(TurnOperation::RollingBack(Rollback {
+                    stage: RollbackStage::AwaitingResult,
+                    ..
+                }))
+        );
+        if is_action_result {
+            self.finish();
+        }
+        is_action_result
+    }
+
+    pub(crate) fn finish_background(&mut self, action: BackgroundAction) {
+        if matches!(self.current, Operation::Background(current) if current == action) {
+            self.finish();
+        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.current = Operation::Idle;
+    }
+
+    pub(crate) fn finish_rollback(&mut self) -> bool {
+        let viewport_removed = matches!(
+            self.current,
+            Operation::Turn(TurnOperation::RollingBack(Rollback {
+                origin: RollbackOrigin::CancelledTurn,
+                ..
+            }))
+        );
+        self.finish();
+        viewport_removed
+    }
+}
+
+fn suppresses_turn_output(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Background(_)
+            | Operation::Turn(TurnOperation::RollingBack(Rollback {
+                stage: RollbackStage::AwaitingTurn,
+                ..
+            }))
+    )
+}
+
+fn is_turn_output_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::AgentStarted { .. }
+            | Event::TextDelta(_)
+            | Event::Thinking(_)
+            | Event::ToolCallStart { .. }
+            | Event::ToolCallEnd { .. }
+            | Event::Usage { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use ash_core::StopReason;
+
+    use super::*;
+
+    #[test]
+    fn submission_policy_follows_the_active_operation() {
+        let mut state = OperationState::default();
+        assert_eq!(state.submission_policy(), SubmissionPolicy::Start);
+
+        state.start_turn(Some("question".into()));
+        assert_eq!(state.submission_policy(), SubmissionPolicy::Queue);
+
+        assert_eq!(
+            state.begin_cancellation(true),
+            Some(Cancellation::KeepResponse)
+        );
+        assert_eq!(state.submission_policy(), SubmissionPolicy::Block);
+    }
+
+    #[test]
+    fn rollback_waits_for_the_turn_before_accepting_its_result() {
+        let mut state = OperationState::default();
+        state.start_turn(Some("question".into()));
+        assert_eq!(
+            state.begin_cancellation(false),
+            Some(Cancellation::RemoveTurn {
+                prompt: Some("question".into())
+            })
+        );
+
+        assert_eq!(
+            state.route_event(&Event::TextDelta("late".into())),
+            EventRoute::Ignore
+        );
+        assert_eq!(
+            state.route_event(&Event::Error("cancelled".into())),
+            EventRoute::Ignore
+        );
+        assert_eq!(
+            state.route_event(&Event::AgentFinished {
+                reason: StopReason::Aborted,
+            }),
+            EventRoute::StateChanged
+        );
+        assert_eq!(
+            state.route_event(&Event::TextDelta("rollback result".into())),
+            EventRoute::Handle
+        );
+        assert!(state.complete_failed_action());
+        assert!(!state.is_busy());
+    }
+
+    #[test]
+    fn background_actions_hide_late_turn_events() {
+        let mut state = OperationState::default();
+        state.start_background(BackgroundAction::ListSessions);
+
+        assert!(!state.shows_activity());
+        assert_eq!(
+            state.route_event(&Event::Thinking("late".into())),
+            EventRoute::Ignore
+        );
+        assert_eq!(
+            state.route_event(&Event::AgentFinished {
+                reason: StopReason::EndTurn,
+            }),
+            EventRoute::Ignore
+        );
+        assert_eq!(
+            state.route_event(&Event::Error("list failed".into())),
+            EventRoute::Handle
+        );
+        assert!(state.complete_failed_action());
+    }
+
+    #[test]
+    fn rollback_origin_records_whether_the_viewport_was_already_removed() {
+        let mut state = OperationState::default();
+        state.start_rollback();
+        assert!(!state.finish_rollback());
+
+        state.start_turn(None);
+        state.begin_cancellation(false);
+        assert!(state.finish_rollback());
+    }
+}

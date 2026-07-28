@@ -7,6 +7,7 @@ mod inline_surface;
 mod input;
 mod live_block;
 mod markdown;
+mod operation;
 mod scrollback;
 mod selection;
 mod session_picker;

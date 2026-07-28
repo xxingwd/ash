@@ -3,16 +3,27 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
     DEFAULT_MAX_INPUT_TOKENS,
 };
-use ash_core::{Message, ModelId, Protocol, ProviderConfig, SessionId};
+use ash_core::{CancellationToken, Event, Message, ModelId, Protocol, ProviderConfig, SessionId};
+use ash_tui::UiCommand;
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
 
 use crate::Cli;
 
-enum AfterTurn {
-    None,
+#[derive(Debug, Eq, PartialEq)]
+enum TurnOutcome {
+    Completed,
     Rollback,
+    Exit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ActiveTurnCommand {
+    Defer(String),
+    Cancel,
+    CancelAndRollback,
+    Reject,
     Exit,
 }
 
@@ -174,7 +185,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
     let model = config.model.as_str().to_string();
     let working_dir = config.working_dir.clone();
     let context_limit = Some(u64::try_from(config.max_input_tokens).unwrap_or(u64::MAX));
-    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ash_tui::UiCommand>(16);
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
     let event_rx = tokio_stream::wrappers::ReceiverStream::new(event_rx);
@@ -192,101 +203,139 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
         .with_context_limit(context_limit)
         .with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
-    let mut pending_input = None;
+
+    run_controller(&mut session, &event_tx, &mut command_rx, &history_store).await;
+
+    drop(event_tx);
+    app_handle.await??;
+    Ok(())
+}
+
+async fn run_controller(
+    session: &mut AgentSession,
+    event_tx: &tokio::sync::mpsc::Sender<Event>,
+    command_rx: &mut tokio::sync::mpsc::Receiver<UiCommand>,
+    history_store: &MessageHistoryStore,
+) {
+    let mut deferred_submission = None;
 
     'controller: loop {
-        let command = match pending_input.take() {
-            Some(input) => ash_tui::UiCommand::Submit(input),
+        let command = match deferred_submission.take() {
+            Some(input) => UiCommand::Submit(input),
             None => match command_rx.recv().await {
                 Some(command) => command,
                 None => break,
             },
         };
         match command {
-            ash_tui::UiCommand::Submit(input) => {
+            UiCommand::Submit(input) => {
                 if let Err(error) = history_store.append(session.id(), &input).await {
                     tracing::warn!(%error, "failed to persist input history");
                 }
-                let cancel = ash_core::CancellationToken::new();
-                let mut turn = Box::pin(session.submit(input, event_tx.clone(), cancel.clone()));
-                let after_turn = loop {
-                    tokio::select! {
-                        _ = &mut turn => break AfterTurn::None,
-                        command = command_rx.recv() => match command {
-                            Some(ash_tui::UiCommand::Cancel) => {
-                                cancel.cancel();
-                                let _ = (&mut turn).await;
-                                pending_input = None;
-                                break AfterTurn::None;
-                            }
-                            Some(ash_tui::UiCommand::CancelAndRollback) => {
-                                cancel.cancel();
-                                let _ = (&mut turn).await;
-                                break AfterTurn::Rollback;
-                            }
-                            Some(ash_tui::UiCommand::NewSession)
-                            | Some(ash_tui::UiCommand::Rollback)
-                            | Some(ash_tui::UiCommand::Compact)
-                            | Some(ash_tui::UiCommand::ListSessions)
-                            | Some(ash_tui::UiCommand::ResumeSession(_)) => {
-                                let _ = event_tx
-                                    .send(ash_core::Event::Error(
-                                        "That command is unavailable while working.".to_string(),
-                                    ))
-                                    .await;
-                            }
-                            Some(ash_tui::UiCommand::Exit) | None => {
-                                cancel.cancel();
-                                let _ = (&mut turn).await;
-                                break AfterTurn::Exit;
-                            }
-                            Some(ash_tui::UiCommand::Submit(input)) => {
-                                pending_input = Some(input);
-                            }
-                        }
+                match run_active_turn(
+                    session,
+                    input,
+                    event_tx,
+                    command_rx,
+                    &mut deferred_submission,
+                )
+                .await
+                {
+                    TurnOutcome::Completed => {}
+                    TurnOutcome::Rollback => {
+                        deferred_submission = None;
+                        rollback_last_turn(session, event_tx, history_store).await;
                     }
-                };
-                drop(turn);
-                match after_turn {
-                    AfterTurn::None => {}
-                    AfterTurn::Rollback => {
-                        pending_input = None;
-                        rollback_last_turn(&mut session, &event_tx, &history_store).await;
-                    }
-                    AfterTurn::Exit => break 'controller,
+                    TurnOutcome::Exit => break 'controller,
                 }
             }
-            ash_tui::UiCommand::CancelAndRollback => {
-                pending_input = None;
-                rollback_last_turn(&mut session, &event_tx, &history_store).await;
+            UiCommand::CancelAndRollback => {
+                deferred_submission = None;
+                rollback_last_turn(session, event_tx, history_store).await;
             }
-            ash_tui::UiCommand::Cancel => {}
-            ash_tui::UiCommand::Rollback => {
-                pending_input = None;
-                rollback_last_turn(&mut session, &event_tx, &history_store).await;
+            UiCommand::Cancel => {}
+            UiCommand::Rollback => {
+                deferred_submission = None;
+                rollback_last_turn(session, event_tx, history_store).await;
             }
-            ash_tui::UiCommand::Compact => {
-                pending_input = None;
-                compact_session(&mut session, &event_tx).await;
+            UiCommand::Compact => {
+                deferred_submission = None;
+                compact_session(session, event_tx).await;
             }
-            ash_tui::UiCommand::NewSession => {
+            UiCommand::NewSession => {
                 session.reset();
-                pending_input = None;
+                deferred_submission = None;
             }
-            ash_tui::UiCommand::ListSessions => {
-                list_sessions(&session, &event_tx).await;
+            UiCommand::ListSessions => {
+                list_sessions(session, event_tx).await;
             }
-            ash_tui::UiCommand::ResumeSession(session_id) => {
-                pending_input = None;
-                resume_session(&mut session, session_id, &event_tx).await;
+            UiCommand::ResumeSession(session_id) => {
+                deferred_submission = None;
+                resume_session(session, session_id, event_tx).await;
             }
-            ash_tui::UiCommand::Exit => break,
+            UiCommand::Exit => break,
         }
     }
+}
 
-    drop(event_tx);
-    app_handle.await??;
-    Ok(())
+async fn run_active_turn(
+    session: &mut AgentSession,
+    input: String,
+    event_tx: &tokio::sync::mpsc::Sender<Event>,
+    command_rx: &mut tokio::sync::mpsc::Receiver<UiCommand>,
+    deferred_submission: &mut Option<String>,
+) -> TurnOutcome {
+    let cancel = CancellationToken::new();
+    let mut turn = Box::pin(session.submit(input, event_tx.clone(), cancel.clone()));
+    let outcome = loop {
+        tokio::select! {
+            _ = &mut turn => break TurnOutcome::Completed,
+            command = command_rx.recv() => match classify_active_command(command) {
+                ActiveTurnCommand::Defer(input) => *deferred_submission = Some(input),
+                ActiveTurnCommand::Reject => {
+                    let _ = event_tx
+                        .send(Event::Error(
+                            "That command is unavailable while working.".to_string(),
+                        ))
+                        .await;
+                }
+                ActiveTurnCommand::Cancel => {
+                    cancel.cancel();
+                    let _ = (&mut turn).await;
+                    *deferred_submission = None;
+                    break TurnOutcome::Completed;
+                }
+                ActiveTurnCommand::CancelAndRollback => {
+                    cancel.cancel();
+                    let _ = (&mut turn).await;
+                    break TurnOutcome::Rollback;
+                }
+                ActiveTurnCommand::Exit => {
+                    cancel.cancel();
+                    let _ = (&mut turn).await;
+                    break TurnOutcome::Exit;
+                }
+            }
+        }
+    };
+    drop(turn);
+    outcome
+}
+
+fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
+    match command {
+        Some(UiCommand::Submit(input)) => ActiveTurnCommand::Defer(input),
+        Some(UiCommand::Cancel) => ActiveTurnCommand::Cancel,
+        Some(UiCommand::CancelAndRollback) => ActiveTurnCommand::CancelAndRollback,
+        Some(
+            UiCommand::NewSession
+            | UiCommand::Rollback
+            | UiCommand::Compact
+            | UiCommand::ListSessions
+            | UiCommand::ResumeSession(_),
+        ) => ActiveTurnCommand::Reject,
+        Some(UiCommand::Exit) | None => ActiveTurnCommand::Exit,
+    }
 }
 
 async fn rollback_last_turn(
@@ -361,5 +410,46 @@ mod tests {
         assert_eq!(resolve_max_input_tokens(None).unwrap(), 200_000);
         assert_eq!(resolve_max_input_tokens(Some(64_000)).unwrap(), 64_000);
         assert!(resolve_max_input_tokens(Some(0)).is_err());
+    }
+
+    #[test]
+    fn active_turn_commands_have_one_explicit_policy() {
+        assert_eq!(
+            classify_active_command(Some(UiCommand::Submit("next".into()))),
+            ActiveTurnCommand::Defer("next".into())
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::Cancel)),
+            ActiveTurnCommand::Cancel
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::CancelAndRollback)),
+            ActiveTurnCommand::CancelAndRollback
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::NewSession)),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::Rollback)),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::Compact)),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::ListSessions)),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::ResumeSession(SessionId::new()))),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::Exit)),
+            ActiveTurnCommand::Exit
+        );
+        assert_eq!(classify_active_command(None), ActiveTurnCommand::Exit);
     }
 }
