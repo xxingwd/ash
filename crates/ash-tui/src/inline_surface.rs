@@ -157,7 +157,7 @@ impl InlineScreen {
     pub(crate) fn insert_buffer(&mut self, buffer: &Buffer, gap_after: u16) -> io::Result<()> {
         let height = buffer.area.height.saturating_add(gap_after).max(1);
         self.terminal.insert_before(height, |target| {
-            crate::buffer::copy_rows(buffer, target, 0, target.area);
+            crate::buffer::copy_rows_for_direct_draw(buffer, target, 0, target.area);
         })?;
         self.viewport_area = self.terminal.get_frame().area();
         Ok(())
