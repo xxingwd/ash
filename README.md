@@ -178,8 +178,7 @@ resize 和 `/undo` 会先清空可见屏幕与 scrollback，再按当前宽度�
 重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
-正文、工具调用或本轮结束后，思考区折叠为一行 `Thought for Xs`。本轮提交前可在空输入
-时按 `Ctrl-O` 展开或再次折叠；进入终端 scrollback 后就是不可变的折叠摘要。OpenAI Chat
+正文、工具调用或本轮结束后，思考区折叠为不可展开的一行 `• Thought for Xs`。OpenAI Chat
 Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinking` 字段，
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
@@ -196,7 +195,6 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `PageUp` / `PageDown`：按页浏览当前 live turn
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
-- 空输入时 `Ctrl-O`：展开或折叠本轮最新 Thought
 - 任务运行时按一次 `Esc`：取消并撤销当前一轮，将原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求

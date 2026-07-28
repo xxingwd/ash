@@ -40,9 +40,7 @@ enum LiveBlockKind {
     History(HistoryBlock),
     Assistant(String),
     Thought {
-        source: String,
         elapsed_seconds: u64,
-        expanded: bool,
     },
     ReadGroup(Vec<String>),
     Tool {
@@ -66,15 +64,8 @@ impl LiveBlock {
         Self::new(id, LiveBlockKind::Assistant(source))
     }
 
-    pub(crate) fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
-        Self::new(
-            id,
-            LiveBlockKind::Thought {
-                source,
-                elapsed_seconds,
-                expanded: false,
-            },
-        )
+    pub(crate) fn thought(id: u64, elapsed_seconds: u64) -> Self {
+        Self::new(id, LiveBlockKind::Thought { elapsed_seconds })
     }
 
     pub(crate) fn tool(
@@ -129,19 +120,6 @@ impl LiveBlock {
     pub(crate) fn is_response_for_turn(&self, turn_id: u64) -> bool {
         self.belongs_to_turn(turn_id)
             && !matches!(self.kind, LiveBlockKind::History(HistoryBlock::User(_)))
-    }
-
-    pub(crate) fn is_thought(&self) -> bool {
-        matches!(self.kind, LiveBlockKind::Thought { .. })
-    }
-
-    pub(crate) fn toggle_thought(&mut self) -> bool {
-        let LiveBlockKind::Thought { expanded, .. } = &mut self.kind else {
-            return false;
-        };
-        *expanded = !*expanded;
-        self.invalidate();
-        true
     }
 
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
@@ -204,11 +182,7 @@ impl LiveBlock {
             LiveBlockKind::Assistant(source) => {
                 render_markdown_block(source, Style::default(), width)
             }
-            LiveBlockKind::Thought {
-                source,
-                elapsed_seconds,
-                expanded,
-            } => render_thought(source, *elapsed_seconds, *expanded, width),
+            LiveBlockKind::Thought { elapsed_seconds } => render_thought(*elapsed_seconds, width),
             LiveBlockKind::ReadGroup(details) => render_read_group(details, width),
             LiveBlockKind::Tool {
                 name,
@@ -224,46 +198,21 @@ impl LiveBlock {
     }
 }
 
-fn render_thought(source: &str, elapsed_seconds: u64, expanded: bool, width: u16) -> Buffer {
+fn render_thought(elapsed_seconds: u64, width: u16) -> Buffer {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
-    let content_x = if width > BULLET_PREFIX_COLUMNS {
-        BULLET_PREFIX_COLUMNS
-    } else {
-        0
-    };
-    let content_width = width.saturating_sub(content_x).max(1);
-    let mut body = if expanded {
-        render_markdown(source, content_width)
-    } else {
-        Vec::new()
-    };
-    for line in &mut body {
-        line.patch_style(style);
-    }
-
-    let height = u16::try_from(body.len().saturating_add(1))
-        .unwrap_or(u16::MAX)
-        .max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
-    let marker = if expanded { "▾ " } else { "▸ " };
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), 1));
     buffer.set_line(
         0,
         0,
         &Line::styled(
             format!(
-                "{marker}Thought for {}",
+                "• Thought for {}",
                 crate::stream_state::format_elapsed(elapsed_seconds)
             ),
             style,
         ),
         width,
     );
-    for (index, line) in body.iter().enumerate() {
-        let Ok(y) = u16::try_from(index.saturating_add(1)) else {
-            break;
-        };
-        buffer.set_line(content_x, y, &line.ratatui_line(), content_width);
-    }
     buffer
 }
 
@@ -502,23 +451,12 @@ mod tests {
     }
 
     #[test]
-    fn completed_thoughts_toggle_between_summary_and_full_source() {
-        let mut block = LiveBlock::thought(1, "first\nsecond".to_string(), 3);
+    fn completed_thoughts_render_as_a_single_summary_line() {
+        let block = LiveBlock::thought(1, 3);
+        let rendered = block.render(40);
 
-        let collapsed = block.render(40);
-        assert!(block.is_thought());
-        assert_eq!(collapsed.area.height, 1);
-        assert!(row_text(&collapsed, 0).contains("▸ Thought for 3s"));
-
-        assert!(block.toggle_thought());
-        let expanded = block.render(40);
-        assert_eq!(expanded.area.height, 3);
-        assert!(row_text(&expanded, 0).contains("▾ Thought for 3s"));
-        assert_eq!(row_text(&expanded, 1), "  first");
-        assert_eq!(row_text(&expanded, 2), "  second");
-
-        assert!(block.toggle_thought());
-        assert_eq!(block.render(40).area.height, 1);
+        assert_eq!(rendered.area.height, 1);
+        assert_eq!(row_text(&rendered, 0), "• Thought for 3s");
     }
 
     #[test]

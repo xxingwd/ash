@@ -92,6 +92,7 @@ rmcp = { version = "0.1", features = ["client", "transport-io", "transport-child
 # Testing
 insta = { version = "1", features = ["json", "redactions"] }
 pretty_assertions = "1"
+vt100 = "0.16.2"
 
 [patch.crates-io]
 crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }

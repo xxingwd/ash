@@ -36,7 +36,6 @@ pub(crate) enum FinishedStream {
         block_id: Option<u64>,
     },
     Thought {
-        source: String,
         elapsed_seconds: u64,
     },
 }
@@ -154,7 +153,6 @@ impl StreamState {
             StreamMode::Reasoning {
                 source, started_at, ..
             } if !source.trim().is_empty() => Some(FinishedStream::Thought {
-                source,
                 elapsed_seconds: started_at.elapsed().as_secs(),
             }),
             StreamMode::Reasoning { .. } => None,
@@ -269,14 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn finished_reasoning_retains_the_full_source() {
+    fn finished_reasoning_produces_a_summary() {
         let mut stream = StreamState::default();
         stream.start_reasoning();
         stream.push_reasoning("first\nsecond");
 
         assert!(matches!(
             stream.finish(),
-            Some(FinishedStream::Thought { source, .. }) if source == "first\nsecond"
+            Some(FinishedStream::Thought { .. })
         ));
     }
 }

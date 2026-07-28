@@ -74,15 +74,8 @@ pub(crate) struct ViewportFrame {
     pub(crate) scroll_top: u16,
     pub(crate) max_scroll_top: u16,
     pub(crate) page_rows: u16,
-    pub(crate) thought_hits: Vec<ThoughtHit>,
     transcript_area: Rect,
     selectable_text: SelectableText,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ThoughtHit {
-    row: u16,
-    block_id: u64,
 }
 
 impl ViewportFrame {
@@ -99,17 +92,9 @@ impl ViewportFrame {
             scroll_top: 0,
             max_scroll_top: 0,
             page_rows: area.height.max(1),
-            thought_hits: Vec::new(),
             transcript_area: area,
             selectable_text,
         }
-    }
-
-    pub(crate) fn thought_at(&self, row: u16) -> Option<u64> {
-        self.thought_hits
-            .iter()
-            .find(|hit| hit.row == row)
-            .map(|hit| hit.block_id)
     }
 
     pub(crate) fn selection_text(&self, anchor: Position, focus: Position) -> String {
@@ -228,12 +213,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .scroll_top
         .unwrap_or(max_scroll_top)
         .min(max_scroll_top);
-    let thought_hits = visible_thought_hits(
-        input.transcript,
-        &layout.areas,
-        scroll_top,
-        transcript_view_rows,
-    );
     let selectable_text = selectable_transcript(
         &regions,
         &layout.areas,
@@ -283,7 +262,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         scroll_top,
         max_scroll_top,
         page_rows: transcript_view_rows.max(1),
-        thought_hits,
         transcript_area: screen.transcript,
         selectable_text,
     }
@@ -529,27 +507,6 @@ fn selectable_transcript(
         }
     }
     text
-}
-
-fn visible_thought_hits(
-    blocks: &[LiveBlock],
-    areas: &[Rect],
-    scroll_top: u16,
-    visible_rows: u16,
-) -> Vec<ThoughtHit> {
-    let visible_bottom = scroll_top.saturating_add(visible_rows);
-    blocks
-        .iter()
-        .zip(areas)
-        .filter_map(|(block, area)| {
-            (block.is_thought() && area.y >= scroll_top && area.y < visible_bottom).then_some(
-                ThoughtHit {
-                    row: area.y.saturating_sub(scroll_top),
-                    block_id: block.id(),
-                },
-            )
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1389,53 +1346,6 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, 0), "• entry 2");
         assert_eq!(row_text(&frame.buffer, 4), "• entry 4");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
-    }
-
-    #[test]
-    fn completed_thought_title_is_clickable_after_scrolling() {
-        let mut blocks = (0..8)
-            .map(|index| {
-                LiveBlock::history(
-                    index + 1,
-                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
-                )
-            })
-            .collect::<Vec<_>>();
-        let thought_id = 99;
-        blocks.push(LiveBlock::thought(
-            thought_id,
-            "reasoning detail".to_string(),
-            3,
-        ));
-
-        let frame = render(ViewportInput {
-            terminal_width: 40,
-            terminal_height: 10,
-            transcript: &blocks,
-            scroll_top: None,
-            busy: false,
-            active_lines: &[],
-            status_header: "",
-            status_dots: "",
-            elapsed: "0s",
-            queued: "",
-            prompt_lines: &[],
-            prompt_cursor_row: 0,
-            prompt_cursor_column: 0,
-            menu: MenuView::None,
-            model: "mock",
-            protocol: "openai",
-            working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-            context_estimated: false,
-            context_limit: None,
-        });
-
-        let title_row = (0..frame.buffer.area.height)
-            .find(|row| row_text(&frame.buffer, *row).contains("Thought for 3s"))
-            .expect("visible thought title");
-        assert_eq!(frame.thought_at(title_row), Some(thought_id));
-        assert_eq!(frame.thought_at(title_row.saturating_sub(1)), None);
     }
 
     #[test]

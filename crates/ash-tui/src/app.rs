@@ -431,12 +431,6 @@ async fn handle_key(
             return Ok(LoopAction::Continue);
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.input.is_empty() {
-                terminal.toggle_latest_thought()?;
-            }
-            return Ok(LoopAction::Continue);
-        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.input.is_empty() {
                 return Ok(if state.operation.is_busy() {

@@ -592,41 +592,6 @@ impl TerminalUi {
         self.redraw()
     }
 
-    pub fn toggle_latest_thought(&mut self) -> io::Result<()> {
-        self.selection = None;
-        let Some(block) = self
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|block| block.is_thought())
-        else {
-            return Ok(());
-        };
-        if block.toggle_thought() {
-            self.redraw()?;
-        }
-        Ok(())
-    }
-
-    pub fn toggle_thought_at(&mut self, row: u16) -> io::Result<()> {
-        self.selection = None;
-        let (width, height) = terminal_size()?;
-        let Some(block_id) = self.viewport_frame(width, height).thought_at(row) else {
-            return Ok(());
-        };
-        let Some(block) = self
-            .transcript
-            .iter_mut()
-            .find(|block| block.id() == block_id)
-        else {
-            return Ok(());
-        };
-        if block.toggle_thought() {
-            self.redraw_at(width, height)?;
-        }
-        Ok(())
-    }
-
     pub fn start_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
         let (width, height) = terminal_size()?;
         self.selection = self
@@ -665,7 +630,7 @@ impl TerminalUi {
         }
         if selection.anchor == selection.focus {
             self.selection = None;
-            return self.toggle_thought_at(row);
+            return Ok(());
         }
 
         self.selection = Some(selection);
@@ -714,10 +679,9 @@ impl TerminalUi {
             Some(FinishedStream::Assistant { pending, block_id }) => {
                 let _ = self.append_assistant(pending, block_id);
             }
-            Some(FinishedStream::Thought {
-                source,
-                elapsed_seconds,
-            }) => self.push_thought_block(source, elapsed_seconds),
+            Some(FinishedStream::Thought { elapsed_seconds }) => {
+                self.push_thought_block(elapsed_seconds)
+            }
             None => {}
         }
     }
@@ -868,9 +832,9 @@ impl TerminalUi {
         self.push_block(LiveBlock::assistant(id, source));
     }
 
-    fn push_thought_block(&mut self, source: String, elapsed_seconds: u64) {
+    fn push_thought_block(&mut self, elapsed_seconds: u64) {
         let id = self.allocate_block_id();
-        self.push_block(LiveBlock::thought(id, source, elapsed_seconds));
+        self.push_block(LiveBlock::thought(id, elapsed_seconds));
     }
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
@@ -927,7 +891,7 @@ impl TerminalUi {
                                 text,
                                 elapsed_seconds,
                             } if !text.is_empty() => {
-                                self.push_thought_block(text.clone(), *elapsed_seconds);
+                                self.push_thought_block(*elapsed_seconds);
                             }
                             ContentBlock::ToolCall {
                                 id,
