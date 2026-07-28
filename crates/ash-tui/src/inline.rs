@@ -17,6 +17,7 @@ use crate::{
     inline_surface::InlineScreen,
     input::InputState,
     live_block::LiveBlock,
+    menu::MenuView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
     stream_state::{format_elapsed, FinishedStream, StreamRefresh, StreamState},
@@ -110,10 +111,7 @@ struct ComposerState {
 
 pub(crate) struct TerminalView<'a> {
     pub(crate) input: &'a InputState,
-    pub(crate) commands: &'a [CommandCompletion],
-    pub(crate) selected_command: usize,
-    pub(crate) sessions: &'a [SessionSummary],
-    pub(crate) selected_session: usize,
+    pub(crate) menu: MenuView<'a>,
     pub(crate) busy: bool,
     pub(crate) queued_messages: usize,
 }
@@ -173,7 +171,7 @@ impl StatusState {
 }
 
 #[derive(Debug, Default)]
-enum ActiveMenu {
+enum RenderedMenu {
     #[default]
     None,
     Commands {
@@ -186,42 +184,32 @@ enum ActiveMenu {
     },
 }
 
-impl ActiveMenu {
-    fn set_commands(&mut self, items: &[CommandCompletion], selected: usize) {
-        let selected = selected.min(items.len().saturating_sub(1));
-        *self = if items.is_empty() {
-            Self::None
-        } else {
-            Self::Commands {
+impl RenderedMenu {
+    fn set(&mut self, menu: MenuView<'_>) {
+        *self = match menu {
+            MenuView::None => Self::None,
+            MenuView::Commands { items, selected } => Self::Commands {
                 items: items.to_vec(),
-                selected,
-            }
+                selected: selected.min(items.len().saturating_sub(1)),
+            },
+            MenuView::Sessions { items, selected } => Self::Sessions {
+                items: items.to_vec(),
+                selected: selected.min(items.len().saturating_sub(1)),
+            },
         };
     }
 
-    fn set_sessions(&mut self, items: &[SessionSummary], selected: usize) {
-        let selected = selected.min(items.len().saturating_sub(1));
-        *self = if items.is_empty() {
-            Self::None
-        } else {
-            Self::Sessions {
-                items: items.to_vec(),
-                selected,
-            }
-        };
-    }
-
-    fn commands(&self) -> (&[CommandCompletion], usize) {
+    fn view(&self) -> MenuView<'_> {
         match self {
-            Self::Commands { items, selected } => (items, *selected),
-            Self::None | Self::Sessions { .. } => (&[], 0),
-        }
-    }
-
-    fn sessions(&self) -> (&[SessionSummary], usize) {
-        match self {
-            Self::Sessions { items, selected } => (items, *selected),
-            Self::None | Self::Commands { .. } => (&[], 0),
+            Self::None => MenuView::None,
+            Self::Commands { items, selected } => MenuView::Commands {
+                items,
+                selected: *selected,
+            },
+            Self::Sessions { items, selected } => MenuView::Sessions {
+                items,
+                selected: *selected,
+            },
         }
     }
 
@@ -233,7 +221,7 @@ impl ActiveMenu {
 #[derive(Debug, Default)]
 struct ViewState {
     composer: ComposerState,
-    menu: ActiveMenu,
+    menu: RenderedMenu,
     busy: bool,
     queued_messages: usize,
 }
@@ -369,7 +357,7 @@ impl TerminalUi {
         }
         self.scroll_top = None;
         self.reset_turn_state();
-        self.rebuild_scrollback_at(width, height, false)
+        self.rebuild_scrollback_at(width, height)
     }
 
     pub fn restore_session(
@@ -409,15 +397,7 @@ impl TerminalUi {
         self.view.composer.lines = input.lines;
         self.view.composer.cursor_row = input.cursor_row;
         self.view.composer.cursor_column = input.cursor_column;
-        if view.sessions.is_empty() {
-            self.view
-                .menu
-                .set_commands(view.commands, view.selected_command);
-        } else {
-            self.view
-                .menu
-                .set_sessions(view.sessions, view.selected_session);
-        }
+        self.view.menu.set(view.menu);
         self.view.busy = view.busy;
         self.view.queued_messages = view.queued_messages;
     }
@@ -572,13 +552,12 @@ impl TerminalUi {
         let height = height.max(1);
         self.selection = None;
         self.surface.resize(width, height)?;
-        self.surface.reset()?;
         if self.stream.is_reasoning() {
             self.stream
                 .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
         }
         self.apply_view(view, width);
-        self.rebuild_scrollback_at(width, height, true)
+        self.rebuild_scrollback_at(width, height)
     }
 
     pub fn scroll_page_up(&mut self) -> io::Result<()> {
@@ -804,11 +783,7 @@ impl TerminalUi {
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
             terminal.render_viewport(width, height)?;
-            for block in &committed {
-                let buffer = block.render(render_width);
-                terminal.surface.insert_buffer(&buffer, 1)?;
-                block.clear_render_cache();
-            }
+            insert_history_blocks(&mut terminal.surface, &committed, render_width)?;
             terminal.render_viewport(width, height)
         });
         if result.is_ok() {
@@ -819,25 +794,14 @@ impl TerminalUi {
         result
     }
 
-    fn rebuild_scrollback_at(
-        &mut self,
-        width: u16,
-        height: u16,
-        scrollback_already_cleared: bool,
-    ) -> io::Result<()> {
+    fn rebuild_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
         let render_width = viewport::drawable_width(width);
         let history = std::mem::take(&mut self.history);
         let result = self.synchronized(|terminal| {
-            if !scrollback_already_cleared {
-                terminal.surface.reset()?;
-            }
+            terminal.surface.reset()?;
             terminal.selection = None;
             terminal.render_viewport(width, height)?;
-            for block in &history {
-                let buffer = block.render(render_width);
-                terminal.surface.insert_buffer(&buffer, 1)?;
-                block.clear_render_cache();
-            }
+            insert_history_blocks(&mut terminal.surface, &history, render_width)?;
             terminal.render_viewport(width, height)
         });
         for block in &history {
@@ -997,8 +961,6 @@ impl TerminalUi {
         let queued = queued_status(self.view.queued_messages);
         let model = sanitize_single_line(&self.session.model);
         let protocol = sanitize_single_line(&self.session.protocol);
-        let (command_menu, command_menu_selected) = self.view.menu.commands();
-        let (session_menu, session_menu_selected) = self.view.menu.sessions();
         viewport::render(ViewportInput {
             terminal_width: width,
             terminal_height: height,
@@ -1013,10 +975,7 @@ impl TerminalUi {
             prompt_lines: &self.view.composer.lines,
             prompt_cursor_row: self.view.composer.cursor_row,
             prompt_cursor_column: self.view.composer.cursor_column,
-            command_menu,
-            command_menu_selected,
-            session_menu,
-            session_menu_selected,
+            menu: self.view.menu.view(),
             model: &model,
             protocol: &protocol,
             working_dir: &self.session.working_dir,
@@ -1025,6 +984,19 @@ impl TerminalUi {
             context_limit: self.session.context_limit,
         })
     }
+}
+
+fn insert_history_blocks(
+    surface: &mut InlineScreen,
+    blocks: &[LiveBlock],
+    render_width: u16,
+) -> io::Result<()> {
+    for block in blocks {
+        let buffer = block.render(render_width);
+        surface.insert_buffer(&buffer, 1)?;
+        block.clear_render_cache();
+    }
+    Ok(())
 }
 
 fn status_dots(frame: usize) -> &'static str {

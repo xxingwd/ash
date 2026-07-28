@@ -12,11 +12,6 @@ impl SessionPickerState {
         self.selected = 0;
     }
 
-    pub(crate) fn close(&mut self) {
-        self.sessions.clear();
-        self.selected = 0;
-    }
-
     pub(crate) fn is_visible(&self) -> bool {
         !self.sessions.is_empty()
     }
@@ -77,7 +72,5 @@ mod tests {
         assert_eq!(picker.selected_session_id(), Some(second.session_id));
         picker.move_down();
         assert_eq!(picker.selected_session_id(), Some(first.session_id));
-        picker.close();
-        assert!(!picker.is_visible());
     }
 }

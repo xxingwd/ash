@@ -12,12 +12,12 @@ use futures::StreamExt;
 use crate::{
     inline::{TerminalUi, TerminalView},
     input::InputState,
+    menu::ComposerMenuState,
     operation::{
-        BackgroundAction, Cancellation, EventRoute, OperationState, SubmissionPolicy,
-        TurnCompletion,
+        BackgroundAction, Cancellation, EventRoute, OperationState, RollbackCompletion,
+        SubmissionPolicy, TurnCompletion,
     },
-    session_picker::SessionPickerState,
-    slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
+    slash_command::{self, ParsedInput, SlashCommand},
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -40,8 +40,7 @@ pub enum UiCommand {
 struct AppState {
     input: InputState,
     operation: OperationState,
-    completion: CommandCompletionState,
-    sessions: SessionPickerState,
+    menu: ComposerMenuState,
     queue: VecDeque<String>,
 }
 
@@ -56,24 +55,23 @@ impl AppState {
         Self {
             input: InputState::with_history(input_history),
             operation: OperationState::default(),
-            completion: CommandCompletionState::default(),
-            sessions: SessionPickerState::default(),
+            menu: ComposerMenuState::default(),
             queue: VecDeque::new(),
         }
     }
 
-    fn view(&mut self) -> TerminalView<'_> {
-        self.completion.sync(
+    fn sync_menu(&mut self) {
+        self.menu.sync_commands(
             self.input.text(),
             self.input.cursor(),
             self.operation.is_busy(),
         );
+    }
+
+    fn view(&self) -> TerminalView<'_> {
         TerminalView {
             input: &self.input,
-            commands: self.completion.items(),
-            selected_command: self.completion.selected_index(),
-            sessions: self.sessions.sessions(),
-            selected_session: self.sessions.selected_index(),
+            menu: self.menu.view(),
             busy: self.operation.shows_activity(),
             queued_messages: self.queue.len(),
         }
@@ -88,6 +86,7 @@ impl AppState {
     }
 
     fn render(&mut self, terminal: &mut TerminalUi) -> std::io::Result<()> {
+        self.sync_menu();
         terminal.sync_view(self.view())
     }
 
@@ -97,6 +96,7 @@ impl AppState {
         width: u16,
         height: u16,
     ) -> std::io::Result<()> {
+        self.sync_menu();
         terminal.resize_view(self.view(), width, height)
     }
 }
@@ -163,7 +163,7 @@ impl App {
                     match state.operation.route_event(&event) {
                         EventRoute::Handle => {}
                         EventRoute::Ignore => continue,
-                        EventRoute::StateChanged => {
+                        EventRoute::Render => {
                             state.render(&mut terminal)?;
                             continue;
                         }
@@ -241,7 +241,7 @@ async fn handle_agent_event(
         Event::Error(error) => {
             terminal.error(&error)?;
             if state.operation.complete_failed_action() {
-                state.sessions.close();
+                state.menu.close_sessions();
                 state.render(terminal)?;
             }
             Ok(LoopAction::Continue)
@@ -267,11 +267,11 @@ async fn handle_agent_event(
             }
         }
         Event::TurnRolledBack { prompt } => {
-            let already_rolled_back = state.operation.finish_rollback();
+            let rollback = state.operation.finish_rollback();
             if state.input.text() != prompt {
                 state.input.restore_submission(prompt);
             }
-            if !already_rolled_back {
+            if rollback == RollbackCompletion::ReplayViewport {
                 terminal.rollback_turn()?;
             }
             state.render(terminal)?;
@@ -298,7 +298,7 @@ async fn handle_agent_event(
             working_dir,
             messages,
         } => {
-            state.sessions.close();
+            state.menu.close_sessions();
             state.operation.finish();
             terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
             state.render(terminal)?;
@@ -311,7 +311,7 @@ async fn handle_agent_event(
             if sessions.is_empty() {
                 terminal.command_output("No saved chats are available to resume.")?;
             } else {
-                state.sessions.open(sessions);
+                state.menu.open_sessions(sessions);
             }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -340,7 +340,7 @@ async fn handle_terminal_event(
             state.resize(terminal, width, height)?;
             Ok(LoopAction::Continue)
         }
-        CrosstermEvent::Paste(text) if !state.sessions.is_visible() => {
+        CrosstermEvent::Paste(text) if !state.menu.session_picker_is_visible() => {
             state.input.insert_paste(&text);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -360,19 +360,19 @@ fn handle_mouse(
     terminal: &mut TerminalUi,
     mouse: crossterm::event::MouseEvent,
 ) -> anyhow::Result<LoopAction> {
-    if state.sessions.is_visible() {
+    if let Some(sessions) = state.menu.visible_session_picker_mut() {
         match mouse.kind {
-            MouseEventKind::ScrollUp => state.sessions.move_up(),
-            MouseEventKind::ScrollDown => state.sessions.move_down(),
+            MouseEventKind::ScrollUp => sessions.move_up(),
+            MouseEventKind::ScrollDown => sessions.move_down(),
             _ => return Ok(LoopAction::Continue),
         }
         state.render(terminal)?;
         return Ok(LoopAction::Continue);
     }
-    if state.completion.is_visible() {
+    if let Some(completion) = state.menu.visible_completion_mut() {
         match mouse.kind {
-            MouseEventKind::ScrollUp => state.completion.move_up(),
-            MouseEventKind::ScrollDown => state.completion.move_down(),
+            MouseEventKind::ScrollUp => completion.move_up(),
+            MouseEventKind::ScrollDown => completion.move_down(),
             _ => return Ok(LoopAction::Continue),
         }
         state.render(terminal)?;
@@ -402,7 +402,7 @@ async fn handle_key(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     key: KeyEvent,
 ) -> anyhow::Result<LoopAction> {
-    if state.sessions.is_visible() {
+    if state.menu.session_picker_is_visible() {
         return handle_session_key(state, terminal, commands, key).await;
     }
     if handle_completion_key(state, terminal, key)? {
@@ -483,37 +483,36 @@ async fn handle_session_key(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     key: KeyEvent,
 ) -> anyhow::Result<LoopAction> {
-    let selected = match key.code {
-        KeyCode::Esc => {
-            state.sessions.close();
-            None
-        }
+    let Some(sessions) = state.menu.visible_session_picker_mut() else {
+        return Ok(LoopAction::Continue);
+    };
+    let (selected, close) = match key.code {
+        KeyCode::Esc => (None, true),
         KeyCode::Up => {
-            state.sessions.move_up();
-            None
+            sessions.move_up();
+            (None, false)
         }
         KeyCode::Down => {
-            state.sessions.move_down();
-            None
+            sessions.move_down();
+            (None, false)
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.sessions.move_up();
-            None
+            sessions.move_up();
+            (None, false)
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.sessions.move_down();
-            None
+            sessions.move_down();
+            (None, false)
         }
-        KeyCode::Enter => {
-            let selected = state.sessions.selected_session_id();
-            state.sessions.close();
-            if selected.is_some() {
-                state.operation.start_background(BackgroundAction::Resume);
-            }
-            selected
-        }
+        KeyCode::Enter => (sessions.selected_session_id(), true),
         _ => return Ok(LoopAction::Continue),
     };
+    if close {
+        state.menu.close_sessions();
+    }
+    if selected.is_some() {
+        state.operation.start_background(BackgroundAction::Resume);
+    }
     state.render(terminal)?;
     if let Some(session_id) = selected {
         if commands
@@ -532,26 +531,24 @@ fn handle_completion_key(
     terminal: &mut TerminalUi,
     key: KeyEvent,
 ) -> anyhow::Result<bool> {
-    if !state.completion.is_visible() {
+    let Some(completion) = state.menu.visible_completion_mut() else {
         return Ok(false);
-    }
+    };
     match key.code {
-        KeyCode::Esc => state.completion.dismiss(),
-        KeyCode::Up => state.completion.move_up(),
-        KeyCode::Down => state.completion.move_down(),
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.completion.move_up()
-        }
+        KeyCode::Esc => completion.dismiss(),
+        KeyCode::Up => completion.move_up(),
+        KeyCode::Down => completion.move_down(),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => completion.move_up(),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.completion.move_down()
+            completion.move_down()
         }
         KeyCode::Tab => {
-            if let Some(selected) = state.completion.selected() {
+            if let Some(selected) = completion.selected() {
                 state.input.set_text(format!("/{} ", selected.name));
             }
         }
         KeyCode::Enter if !inserts_newline(&key) => {
-            if let Some(selected) = state.completion.selected() {
+            if let Some(selected) = completion.selected() {
                 state.input.set_text(format!("/{}", selected.name));
             }
             return Ok(false);
@@ -693,7 +690,7 @@ async fn run_command(
 
     let outgoing = match command {
         SlashCommand::New | SlashCommand::Clear => {
-            state.sessions.close();
+            state.menu.close_sessions();
             terminal.start_new_session()?;
             Some(UiCommand::NewSession)
         }
@@ -754,18 +751,19 @@ mod tests {
         state.operation.start_turn(Some("question".into()));
         state.queue.push_back("next".into());
 
+        state.sync_menu();
         let view = state.view();
 
         assert!(view.busy);
         assert_eq!(view.queued_messages, 1);
         assert_eq!(
-            view.commands
-                .iter()
-                .map(|command| command.name)
-                .collect::<Vec<_>>(),
+            match view.menu {
+                crate::menu::MenuView::Commands { items, .. } =>
+                    items.iter().map(|command| command.name).collect::<Vec<_>>(),
+                crate::menu::MenuView::None | crate::menu::MenuView::Sessions { .. } => Vec::new(),
+            },
             ["exit"]
         );
-        assert!(view.sessions.is_empty());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::{
     block_layout::{layout_stack, StackItem},
     live_block::LiveBlock,
     markdown::RenderedLine,
+    menu::MenuView,
     selection::SelectableText,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left, format_token_count},
@@ -56,10 +57,7 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) prompt_lines: &'a [String],
     pub(crate) prompt_cursor_row: u16,
     pub(crate) prompt_cursor_column: u16,
-    pub(crate) command_menu: &'a [CommandCompletion],
-    pub(crate) command_menu_selected: usize,
-    pub(crate) session_menu: &'a [SessionSummary],
-    pub(crate) session_menu_selected: usize,
+    pub(crate) menu: MenuView<'a>,
     pub(crate) model: &'a str,
     pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
@@ -204,11 +202,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let regions = transcript_regions(&rendered_blocks, active_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
-    let menu_item_rows = if input.session_menu.is_empty() {
-        input.command_menu.len()
-    } else {
-        input.session_menu.len()
-    };
+    let menu_item_rows = input.menu.item_count();
     let menu_rows = if menu_item_rows == 0 {
         0
     } else {
@@ -264,14 +258,16 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     let prompt = prompt_window(&input, screen.composer.height);
     render_composer(screen.composer, &prompt, &mut buffer);
-    if !input.session_menu.is_empty() {
-        let content = render_menu_frame(screen.menu, &mut buffer);
-        render_session_menu(content, &input, &mut buffer);
-    } else if !input.command_menu.is_empty() {
-        let content = render_menu_frame(screen.menu, &mut buffer);
-        render_command_menu(content, &input, &mut buffer);
-    } else {
-        render_footer(screen.footer, &input, &mut buffer);
+    match input.menu {
+        MenuView::None => render_footer(screen.footer, &input, &mut buffer),
+        MenuView::Commands { items, selected } => {
+            let content = render_menu_frame(screen.menu, &mut buffer);
+            render_command_menu(content, items, selected, &mut buffer);
+        }
+        MenuView::Sessions { items, selected } => {
+            let content = render_menu_frame(screen.menu, &mut buffer);
+            render_session_menu(content, items, selected, &mut buffer);
+        }
     }
 
     ViewportFrame {
@@ -817,20 +813,22 @@ fn render_menu_frame(area: Rect, buffer: &mut Buffer) -> Rect {
     content
 }
 
-fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let visible = usize::from(area.height).min(input.command_menu.len());
+fn render_command_menu(
+    area: Rect,
+    items: &[CommandCompletion],
+    selected: usize,
+    buffer: &mut Buffer,
+) {
+    let visible = usize::from(area.height).min(items.len());
     if visible == 0 {
         return;
     }
-    let selected = input
-        .command_menu_selected
-        .min(input.command_menu.len().saturating_sub(1));
+    let selected = selected.min(items.len().saturating_sub(1));
     let start = selected
         .saturating_add(1)
         .saturating_sub(visible)
-        .min(input.command_menu.len().saturating_sub(visible));
-    let name_width = input
-        .command_menu
+        .min(items.len().saturating_sub(visible));
+    let name_width = items
         .iter()
         .map(|item| UnicodeWidthStr::width(item.name))
         .max()
@@ -838,10 +836,7 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     let description_column = COMMAND_NAME_PREFIX_COLUMNS
         .saturating_add(name_width)
         .saturating_add(MENU_COLUMN_GAP);
-    for (offset, item) in input.command_menu[start..start + visible]
-        .iter()
-        .enumerate()
-    {
+    for (offset, item) in items[start..start + visible].iter().enumerate() {
         let index = start + offset;
         let selected_style = Style::default()
             .fg(Color::Cyan)
@@ -871,22 +866,22 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     }
 }
 
-fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let visible = usize::from(area.height).min(input.session_menu.len());
+fn render_session_menu(
+    area: Rect,
+    sessions: &[SessionSummary],
+    selected: usize,
+    buffer: &mut Buffer,
+) {
+    let visible = usize::from(area.height).min(sessions.len());
     if visible == 0 {
         return;
     }
-    let selected = input
-        .session_menu_selected
-        .min(input.session_menu.len().saturating_sub(1));
+    let selected = selected.min(sessions.len().saturating_sub(1));
     let start = selected
         .saturating_add(1)
         .saturating_sub(visible)
-        .min(input.session_menu.len().saturating_sub(visible));
-    for (offset, session) in input.session_menu[start..start + visible]
-        .iter()
-        .enumerate()
-    {
+        .min(sessions.len().saturating_sub(visible));
+    for (offset, session) in sessions[start..start + visible].iter().enumerate() {
         let index = start + offset;
         let selected_style = Style::default()
             .fg(Color::Cyan)
@@ -989,10 +984,7 @@ mod tests {
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1043,10 +1035,7 @@ mod tests {
             prompt_lines: &["/".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 1,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1056,8 +1045,10 @@ mod tests {
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
-            command_menu: &menu,
-            command_menu_selected: 1,
+            menu: MenuView::Commands {
+                items: &menu,
+                selected: 1,
+            },
             ..input
         });
 
@@ -1107,10 +1098,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1120,8 +1108,10 @@ mod tests {
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
-            session_menu: &sessions,
-            session_menu_selected: 1,
+            menu: MenuView::Sessions {
+                items: &sessions,
+                selected: 1,
+            },
             ..input
         });
 
@@ -1159,10 +1149,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1194,10 +1181,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1234,10 +1218,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1274,10 +1255,7 @@ mod tests {
             prompt_lines: &prompt,
             prompt_cursor_row: 2,
             prompt_cursor_column: 5,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1315,10 +1293,7 @@ mod tests {
             prompt_lines: &prompt,
             prompt_cursor_row: 9,
             prompt_cursor_column: 6,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1358,10 +1333,7 @@ mod tests {
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1404,10 +1376,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
@@ -1453,10 +1422,7 @@ mod tests {
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
-            command_menu: &[],
-            command_menu_selected: 0,
-            session_menu: &[],
-            session_menu_selected: 0,
+            menu: MenuView::None,
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),

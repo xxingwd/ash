@@ -27,10 +27,16 @@ pub(crate) enum TurnCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RollbackCompletion {
+    ReplayViewport,
+    ViewportAlreadyRemoved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventRoute {
     Handle,
     Ignore,
-    StateChanged,
+    Render,
 }
 
 #[derive(Debug, Default)]
@@ -146,7 +152,7 @@ impl OperationState {
                 Event::AgentFinished { .. },
             ) => {
                 rollback.stage = RollbackStage::AwaitingResult;
-                EventRoute::StateChanged
+                EventRoute::Render
             }
             (
                 Operation::Turn(TurnOperation::RollingBack(Rollback {
@@ -205,7 +211,7 @@ impl OperationState {
         self.current = Operation::Idle;
     }
 
-    pub(crate) fn finish_rollback(&mut self) -> bool {
+    pub(crate) fn finish_rollback(&mut self) -> RollbackCompletion {
         let viewport_removed = matches!(
             self.current,
             Operation::Turn(TurnOperation::RollingBack(Rollback {
@@ -214,7 +220,11 @@ impl OperationState {
             }))
         );
         self.finish();
-        viewport_removed
+        if viewport_removed {
+            RollbackCompletion::ViewportAlreadyRemoved
+        } else {
+            RollbackCompletion::ReplayViewport
+        }
     }
 }
 
@@ -285,7 +295,7 @@ mod tests {
             state.route_event(&Event::AgentFinished {
                 reason: StopReason::Aborted,
             }),
-            EventRoute::StateChanged
+            EventRoute::Render
         );
         assert_eq!(
             state.route_event(&Event::TextDelta("rollback result".into())),
@@ -322,10 +332,13 @@ mod tests {
     fn rollback_origin_records_whether_the_viewport_was_already_removed() {
         let mut state = OperationState::default();
         state.start_rollback();
-        assert!(!state.finish_rollback());
+        assert_eq!(state.finish_rollback(), RollbackCompletion::ReplayViewport);
 
         state.start_turn(None);
         state.begin_cancellation(false);
-        assert!(state.finish_rollback());
+        assert_eq!(
+            state.finish_rollback(),
+            RollbackCompletion::ViewportAlreadyRemoved
+        );
     }
 }
