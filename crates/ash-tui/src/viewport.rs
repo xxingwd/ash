@@ -316,7 +316,6 @@ enum ScreenRegion {
     Transcript,
     Status,
     Composer,
-    Menu,
     Footer,
 }
 
@@ -364,8 +363,7 @@ fn screen_height(rows: ScreenRows) -> u32 {
     let values = [
         rows.transcript,
         rows.status,
-        rows.composer,
-        rows.menu,
+        rows.composer.saturating_add(rows.menu),
         rows.footer,
     ];
     let content = values
@@ -383,13 +381,15 @@ fn screen_height(rows: ScreenRows) -> u32 {
 }
 
 fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
-    let mut regions = Vec::with_capacity(5);
-    let mut constraints = Vec::with_capacity(5);
+    let mut regions = Vec::with_capacity(4);
+    let mut constraints = Vec::with_capacity(4);
     for (region, rows) in [
         (ScreenRegion::Transcript, rows.transcript),
         (ScreenRegion::Status, rows.status),
-        (ScreenRegion::Composer, rows.composer),
-        (ScreenRegion::Menu, rows.menu),
+        (
+            ScreenRegion::Composer,
+            rows.composer.saturating_add(rows.menu),
+        ),
         (ScreenRegion::Footer, rows.footer),
     ] {
         if rows > 0 {
@@ -412,8 +412,16 @@ fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
         match region {
             ScreenRegion::Transcript => areas.transcript = area,
             ScreenRegion::Status => areas.status = area,
+            ScreenRegion::Composer if rows.menu > 0 => {
+                let input_surface = Layout::vertical([
+                    Constraint::Length(rows.composer),
+                    Constraint::Length(rows.menu),
+                ])
+                .split(area);
+                areas.composer = input_surface[0];
+                areas.menu = input_surface[1];
+            }
             ScreenRegion::Composer => areas.composer = area,
-            ScreenRegion::Menu => areas.menu = area,
             ScreenRegion::Footer => areas.footer = area,
         }
     }
@@ -1058,11 +1066,12 @@ mod tests {
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(baseline.viewport_height, 3);
-        assert_eq!(frame.viewport_height, 6);
+        assert_eq!(frame.viewport_height, 5);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /");
-        assert!(row_text(&frame.buffer, 3).contains("/new"));
-        assert!(row_text(&frame.buffer, 4).contains("/clear"));
-        assert!(row_text(&frame.buffer, 4).contains("start a new chat"));
+        assert!(row_text(&frame.buffer, 1).starts_with('┌'));
+        assert!(row_text(&frame.buffer, 2).contains("/new"));
+        assert!(row_text(&frame.buffer, 3).contains("/clear"));
+        assert!(row_text(&frame.buffer, 3).contains("start a new chat"));
     }
 
     #[test]
@@ -1121,15 +1130,16 @@ mod tests {
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(baseline.viewport_height, 3);
-        assert_eq!(frame.viewport_height, 7);
-        let title_row = row_text(&frame.buffer, 3);
+        assert_eq!(frame.viewport_height, 6);
+        assert!(row_text(&frame.buffer, 1).starts_with('┌'));
+        let title_row = row_text(&frame.buffer, 2);
         assert!(
             title_row.contains("继续这个中文会话"),
             "unexpected session title row: {title_row:?}"
         );
-        assert!(row_text(&frame.buffer, 4).contains("Inspect the session picker"));
-        assert!(row_text(&frame.buffer, 4).contains("2026-07-15 12:30"));
-        assert!(row_text(&frame.buffer, 5).contains("Third saved chat"));
+        assert!(row_text(&frame.buffer, 3).contains("Inspect the session picker"));
+        assert!(row_text(&frame.buffer, 3).contains("2026-07-15 12:30"));
+        assert!(row_text(&frame.buffer, 4).contains("Third saved chat"));
     }
 
     #[test]
