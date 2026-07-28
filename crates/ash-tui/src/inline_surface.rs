@@ -190,13 +190,28 @@ impl InlineScreen {
             append_native_scrollback(&mut self.terminal, screen_height, scroll_by)?;
         }
         if area != previous_area {
-            clear_removed_rows(&mut self.terminal, area, previous_area)?;
-            self.terminal.set_viewport_area(area);
-            self.terminal.force_redraw();
+            apply_viewport_resize(&mut self.terminal, area, previous_area, scroll_by > 0)?;
             self.viewport_area = area;
         }
         Ok(())
     }
+}
+
+fn apply_viewport_resize<B: Backend>(
+    terminal: &mut Terminal<B>,
+    current: Rect,
+    previous: Rect,
+    contents_moved: bool,
+) -> io::Result<()> {
+    clear_removed_rows(terminal, current, previous)?;
+    terminal.set_viewport_area(current);
+
+    let cell_positions_changed =
+        current.x != previous.x || current.y != previous.y || current.width != previous.width;
+    if contents_moved || cell_positions_changed {
+        terminal.force_redraw();
+    }
+    Ok(())
 }
 
 fn clear_removed_rows<B: Backend>(
@@ -406,6 +421,38 @@ mod tests {
         assert_eq!(row_text(screen, 0), "first");
         assert_eq!(row_text(screen, 1), "");
         assert_eq!(row_text(screen, 2), "");
+    }
+
+    #[test]
+    fn shrinking_a_viewport_clears_stale_menu_borders_from_retained_rows() {
+        let previous = Rect::new(0, 0, 8, 5);
+        let current = Rect::new(0, 0, 8, 3);
+        let backend = TestBackend::new(8, 5);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(previous),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("input\n\n--------\nchoice")
+                    .render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        apply_viewport_resize(&mut terminal, current, previous, false).unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("input\n\nmodel").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        let screen = terminal.backend().buffer();
+        assert_eq!(row_text(screen, 2), "model");
+        assert_eq!(row_text(screen, 3), "");
+        assert_eq!(row_text(screen, 4), "");
     }
 
     #[test]
