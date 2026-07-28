@@ -55,6 +55,13 @@ impl TurnPhase {
         !matches!(self, Self::Idle)
     }
 
+    fn shows_activity(&self) -> bool {
+        !matches!(
+            self,
+            Self::Idle | Self::Pending(PendingAction::ListSessions | PendingAction::Resume)
+        )
+    }
+
     fn is_rolling_back(&self) -> bool {
         matches!(self, Self::Pending(PendingAction::Rollback { .. }))
     }
@@ -165,7 +172,7 @@ impl AppState {
             selected_command: self.completion.selected_index(),
             sessions: self.sessions.sessions(),
             selected_session: self.sessions.selected_index(),
-            busy: self.phase.is_busy(),
+            busy: self.phase.shows_activity(),
             queued_messages: self.queue.len(),
         }
     }
@@ -248,8 +255,8 @@ impl App {
 
         loop {
             tokio::select! {
-                _ = render_tick.tick(), if state.phase.is_busy() => terminal.refresh_content()?,
-                _ = status_tick.tick(), if state.phase.is_busy() => terminal.refresh_status()?,
+                _ = render_tick.tick(), if state.phase.shows_activity() => terminal.refresh_content()?,
+                _ = status_tick.tick(), if state.phase.shows_activity() => terminal.refresh_status()?,
                 event = events.next() => {
                     let Some(event) = event else { break };
                     if state.phase.ignores_turn_events() && is_turn_output_event(&event) {
@@ -907,6 +914,10 @@ mod tests {
         assert!(list.ignores_turn_events());
         assert!(list.ignores_turn_finished());
         assert!(list.accepts_action_result());
+        assert!(!list.shows_activity());
+
+        let resume = TurnPhase::Pending(PendingAction::Resume);
+        assert!(!resume.shows_activity());
 
         let mut rollback = TurnPhase::Pending(PendingAction::Rollback {
             viewport_removed: true,
