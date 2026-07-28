@@ -184,9 +184,9 @@ impl InlineScreen {
         let (area, scroll_by) =
             resized_viewport_area(self.viewport_area, width, screen_height, viewport_height);
         if scroll_by > 0 {
-            self.terminal
-                .backend_mut()
-                .scroll_region_up(0..self.viewport_area.top(), scroll_by)?;
+            // Newlines at the bottom of the primary screen enter native scrollback reliably.
+            // Region-scrolling sequences can discard those rows in multiplexers such as Zellij.
+            append_native_scrollback(&mut self.terminal, screen_height, scroll_by)?;
         }
         if area != self.viewport_area {
             self.terminal.set_viewport_area(area);
@@ -196,6 +196,15 @@ impl InlineScreen {
         }
         Ok(())
     }
+}
+
+fn append_native_scrollback<B: Backend>(
+    terminal: &mut Terminal<B>,
+    screen_height: u16,
+    rows: u16,
+) -> io::Result<()> {
+    terminal.set_cursor_position(Position::new(0, screen_height.saturating_sub(1)))?;
+    terminal.backend_mut().append_lines(rows)
 }
 
 fn resized_viewport_area(
@@ -278,7 +287,13 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::Buffer,
+        layout::Rect,
+        style::Style,
+        widgets::{Paragraph, Widget},
+    };
 
     use super::*;
 
@@ -338,6 +353,24 @@ mod tests {
 
         assert_eq!(area, Rect::new(0, 0, 80, 24));
         assert_eq!(scroll_by, 8);
+    }
+
+    #[test]
+    fn viewport_expansion_moves_rows_into_native_scrollback() {
+        let backend = TestBackend::new(8, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("first\nsecond\nthird").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        append_native_scrollback(&mut terminal, 3, 2).unwrap();
+
+        let scrollback = terminal.backend().scrollback();
+        assert_eq!(scrollback.area.height, 2);
+        assert_eq!(row_text(scrollback, 0), "first");
+        assert_eq!(row_text(scrollback, 1), "second");
     }
 
     #[test]
