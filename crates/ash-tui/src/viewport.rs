@@ -252,8 +252,12 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     let prompt = prompt_window(&input, screen.composer.height);
     render_composer(screen.composer, &prompt, &mut buffer);
-    render_footer(screen.footer, &input, &mut buffer);
-    render_menu_popup(
+    if input.command_menu.is_empty() {
+        render_footer(screen.footer, &input, &mut buffer);
+    } else {
+        render_command_hint(screen.footer, &input, &mut buffer);
+    }
+    render_session_popup(
         screen.composer,
         Rect::new(0, 0, width, terminal_height),
         &input,
@@ -262,7 +266,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     ViewportFrame {
         buffer,
-        viewport_height: if input.command_menu.is_empty() && input.session_menu.is_empty() {
+        viewport_height: if input.session_menu.is_empty() {
             u16::try_from(screen_height(screen_rows))
                 .unwrap_or(u16::MAX)
                 .min(terminal_height)
@@ -770,12 +774,13 @@ fn footer_right_width(context: Option<&ContextDisplay>, protocol: Option<&str>) 
         .saturating_add(u16::from(context_width > 0 && protocol_width > 0) * 3)
 }
 
-fn render_menu_popup(composer: Rect, bounds: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let content_rows = if input.session_menu.is_empty() {
-        menu_rows(input.command_menu.len())
-    } else {
-        session_menu_rows(input.session_menu.len())
-    };
+fn render_session_popup(
+    composer: Rect,
+    bounds: Rect,
+    input: &ViewportInput<'_>,
+    buffer: &mut Buffer,
+) {
+    let content_rows = session_menu_rows(input.session_menu.len());
     let Some(area) = menu_popup_area(composer, bounds, content_rows) else {
         return;
     };
@@ -784,11 +789,7 @@ fn render_menu_popup(composer: Rect, bounds: Rect, input: &ViewportInput<'_>, bu
     let popup = Block::bordered().border_style(Style::default().add_modifier(Modifier::DIM));
     let content = popup.inner(area);
     popup.render(area, buffer);
-    if input.session_menu.is_empty() {
-        render_command_menu(content, input, buffer);
-    } else {
-        render_session_menu(content, input, buffer);
-    }
+    render_session_menu(content, input, buffer);
 }
 
 fn menu_popup_area(composer: Rect, bounds: Rect, content_rows: u16) -> Option<Rect> {
@@ -823,18 +824,16 @@ fn menu_popup_area(composer: Rect, bounds: Rect, content_rows: u16) -> Option<Re
     None
 }
 
-fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
-    let visible = usize::from(area.height).min(input.command_menu.len());
-    if visible == 0 {
+fn render_command_hint(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
+    if area.is_empty() {
         return;
     }
     let selected = input
         .command_menu_selected
         .min(input.command_menu.len().saturating_sub(1));
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible)
-        .min(input.command_menu.len().saturating_sub(visible));
+    let Some(item) = input.command_menu.get(selected) else {
+        return;
+    };
     let name_width = input
         .command_menu
         .iter()
@@ -844,38 +843,21 @@ fn render_command_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
     let description_column = COMMAND_NAME_PREFIX_COLUMNS
         .saturating_add(name_width)
         .saturating_add(MENU_COLUMN_GAP);
-    for (offset, item) in input.command_menu[start..start + visible]
-        .iter()
-        .enumerate()
-    {
-        let index = start + offset;
-        let Ok(offset) = u16::try_from(offset) else {
-            break;
-        };
-        let y = area.y.saturating_add(offset);
-        if y >= area.bottom() {
-            break;
-        }
-        let mut spans = if index == input.command_menu_selected {
-            vec![Span::styled(
-                format!("› /{:<name_width$}", item.name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]
-        } else {
-            vec![Span::raw(format!("  /{:<name_width$}", item.name))]
-        };
-        if usize::from(area.width) > description_column {
-            let available = usize::from(area.width) - description_column;
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                truncate_end(item.description, available),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        buffer.set_line(area.x, y, &Line::from(spans), area.width);
+    let mut spans = vec![Span::styled(
+        format!("› /{:<name_width$}", item.name),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if usize::from(area.width) > description_column {
+        let available = usize::from(area.width) - description_column;
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            truncate_end(item.description, available),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
+    buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
 fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -944,10 +926,6 @@ fn render_session_menu(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffe
         }
         buffer.set_line(area.x, y, &Line::from(spans), area.width);
     }
-}
-
-fn menu_rows(item_count: usize) -> u16 {
-    u16::try_from(item_count).unwrap_or(u16::MAX)
 }
 
 fn session_menu_rows(item_count: usize) -> u16 {
@@ -1035,23 +1013,21 @@ mod tests {
     }
 
     #[test]
-    fn completion_menu_overlays_without_reflowing_the_screen() {
-        let menu = [CommandCompletion {
-            name: "clear",
-            description: "start a new chat",
-        }];
-        let blocks = (0..8)
-            .map(|index| {
-                LiveBlock::history(
-                    index + 1,
-                    crate::history_block::HistoryBlock::info(&format!("entry {index}")),
-                )
-            })
-            .collect::<Vec<_>>();
+    fn command_completion_does_not_expand_an_idle_viewport() {
+        let menu = [
+            CommandCompletion {
+                name: "new",
+                description: "start a new chat",
+            },
+            CommandCompletion {
+                name: "clear",
+                description: "start a new chat",
+            },
+        ];
         let input = ViewportInput {
             terminal_width: 80,
             terminal_height: 12,
-            transcript: &blocks,
+            transcript: &[],
             scroll_top: None,
             busy: false,
             active_lines: &[],
@@ -1059,9 +1035,9 @@ mod tests {
             status_dots: "",
             elapsed: "0s",
             queued: "",
-            prompt_lines: &["/cl".to_string()],
+            prompt_lines: &["/".to_string()],
             prompt_cursor_row: 0,
-            prompt_cursor_column: 3,
+            prompt_cursor_column: 1,
             command_menu: &[],
             command_menu_selected: 0,
             session_menu: &[],
@@ -1076,6 +1052,7 @@ mod tests {
         let baseline = render(input);
         let frame = render(ViewportInput {
             command_menu: &menu,
+            command_menu_selected: 1,
             ..input
         });
 
@@ -1083,10 +1060,11 @@ mod tests {
         assert_eq!(frame.page_rows, baseline.page_rows);
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
-        assert_eq!(frame.viewport_height, 12);
-        assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /cl");
-        assert!((0..frame.cursor_row).any(|row| row_text(&frame.buffer, row).contains("/clear")));
-        assert!(row_text(&frame.buffer, 11).contains("mock"));
+        assert_eq!(frame.viewport_height, baseline.viewport_height);
+        assert_eq!(frame.viewport_height, 3);
+        assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /");
+        assert!(row_text(&frame.buffer, 2).contains("/clear"));
+        assert!(row_text(&frame.buffer, 2).contains("start a new chat"));
     }
 
     #[test]
