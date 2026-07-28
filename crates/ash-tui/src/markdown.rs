@@ -164,7 +164,7 @@ impl MarkdownWriter {
     fn push_text(&mut self, text: &str) {
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
-                self.finish_line(/*force*/ true);
+                self.force_line_break();
             }
             if part.is_empty() {
                 continue;
@@ -177,14 +177,18 @@ impl MarkdownWriter {
         }
     }
 
-    fn finish_line(&mut self, force: bool) {
-        if force || !self.current.spans.is_empty() {
+    fn finish_line(&mut self) {
+        if !self.current.spans.is_empty() {
             self.lines.push(std::mem::take(&mut self.current));
         }
     }
 
+    fn force_line_break(&mut self) {
+        self.lines.push(std::mem::take(&mut self.current));
+    }
+
     fn block_gap(&mut self) {
-        self.finish_line(/*force*/ false);
+        self.finish_line();
         if self.needs_block_gap {
             self.push_blank_line();
         }
@@ -192,13 +196,13 @@ impl MarkdownWriter {
     }
 
     fn push_blank_line(&mut self) {
-        self.finish_line(/*force*/ false);
+        self.finish_line();
         if self.lines.is_empty() || self.lines.last().is_some_and(logical_line_is_blank) {
             return;
         }
         if self.blockquote_depth > 0 {
             self.ensure_prefix();
-            self.finish_line(/*force*/ true);
+            self.force_line_break();
         } else {
             self.lines.push(LogicalLine::default());
         }
@@ -221,7 +225,7 @@ impl MarkdownWriter {
         {
             self.push_blank_line();
         }
-        self.finish_line(/*force*/ false);
+        self.finish_line();
         self.list_item_start_line_counts.push(self.lines.len());
         let marker = self.lists.last_mut().map_or_else(
             || "- ".to_string(),
@@ -240,7 +244,7 @@ impl MarkdownWriter {
     }
 
     fn finish_item(&mut self) {
-        self.finish_line(/*force*/ false);
+        self.finish_line();
         let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
         if self.lines.len().saturating_sub(start_line_count) > 1 {
             if let Some(needs_blank) = self.list_needs_blank_before_next_item.last_mut() {
@@ -323,7 +327,7 @@ impl MarkdownWriter {
             }
         }
 
-        let push_row = |writer: &mut Self, row: &[String], header: bool| {
+        let push_row = |writer: &mut Self, row: &[String], style: Style| {
             let mut line = LogicalLine::default();
             for (column, column_width) in widths.iter().copied().enumerate().take(columns) {
                 if column > 0 {
@@ -337,18 +341,14 @@ impl MarkdownWriter {
                 let padding = column_width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
                 line.spans.push(StyledSpan {
                     text: format!("{value}{}", " ".repeat(padding)),
-                    style: if header {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
+                    style,
                 });
             }
             writer.lines.push(line);
         };
 
         if let Some(header) = table.header {
-            push_row(self, &header, true);
+            push_row(self, &header, Style::default().add_modifier(Modifier::BOLD));
             let separator = widths
                 .iter()
                 .map(|width| "─".repeat(*width))
@@ -363,7 +363,7 @@ impl MarkdownWriter {
             });
         }
         for row in table.rows {
-            push_row(self, &row, false);
+            push_row(self, &row, Style::default());
         }
         self.needs_block_gap = true;
     }
@@ -385,7 +385,7 @@ impl MarkdownWriter {
             match event {
                 Event::Start(Tag::Paragraph) => self.block_gap(),
                 Event::End(TagEnd::Paragraph) => {
-                    self.finish_line(/*force*/ false);
+                    self.finish_line();
                     self.needs_block_gap = true;
                 }
                 Event::Start(Tag::Heading { level, .. }) => {
@@ -393,7 +393,7 @@ impl MarkdownWriter {
                     self.push_style(heading_style(level));
                 }
                 Event::End(TagEnd::Heading(_)) => {
-                    self.finish_line(/*force*/ false);
+                    self.finish_line();
                     self.pop_style();
                     self.needs_block_gap = true;
                 }
@@ -402,7 +402,7 @@ impl MarkdownWriter {
                     self.blockquote_depth += 1;
                 }
                 Event::End(TagEnd::BlockQuote) => {
-                    self.finish_line(/*force*/ false);
+                    self.finish_line();
                     self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
                     self.needs_block_gap = true;
                 }
@@ -416,12 +416,12 @@ impl MarkdownWriter {
                                 text: language.to_string(),
                                 style: Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                             });
-                            self.finish_line(/*force*/ false);
+                            self.finish_line();
                         }
                     }
                 }
                 Event::End(TagEnd::CodeBlock) => {
-                    self.finish_line(/*force*/ false);
+                    self.finish_line();
                     self.code_block = false;
                     self.needs_block_gap = true;
                 }
@@ -468,8 +468,7 @@ impl MarkdownWriter {
                     self.push_text(&code);
                     self.pop_style();
                 }
-                Event::SoftBreak => self.finish_line(/*force*/ true),
-                Event::HardBreak => self.finish_line(/*force*/ true),
+                Event::SoftBreak | Event::HardBreak => self.force_line_break(),
                 Event::Rule => {
                     self.block_gap();
                     self.lines.push(LogicalLine {
@@ -491,7 +490,7 @@ impl MarkdownWriter {
                 _ => {}
             }
         }
-        self.finish_line(/*force*/ false);
+        self.finish_line();
 
         let mut rendered = self
             .lines

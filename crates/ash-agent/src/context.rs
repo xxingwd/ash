@@ -45,6 +45,18 @@ const SUMMARY_TEMPLATE: &str = r#"Output exactly this Markdown structure and kee
 
 Keep every section. Use terse bullets. Preserve exact paths, symbols, commands, errors, URLs, and identifiers. Do not mention compaction or the summary process."#;
 
+#[derive(Clone, Copy)]
+enum TextSerialization {
+    Full,
+    Truncated,
+}
+
+#[derive(Clone, Copy)]
+enum ThoughtAccounting {
+    Exclude,
+    Include,
+}
+
 #[derive(Debug)]
 pub(crate) struct CompactionPlan {
     pub(crate) summary_prompt: String,
@@ -67,7 +79,7 @@ fn character_units(input: &str) -> usize {
 pub fn count_tokens(messages: &[Message]) -> usize {
     let content = messages
         .iter()
-        .map(|message| message_characters(message, false))
+        .map(|message| message_characters(message, ThoughtAccounting::Exclude))
         .fold(0usize, usize::saturating_add);
     estimate_character_count(content)
         .saturating_add(messages.len().saturating_mul(TOKENS_PER_MESSAGE_OVERHEAD))
@@ -75,7 +87,7 @@ pub fn count_tokens(messages: &[Message]) -> usize {
 }
 
 pub fn count_output_tokens(message: &Message) -> usize {
-    estimate_character_count(message_characters(message, true))
+    estimate_character_count(message_characters(message, ThoughtAccounting::Include))
 }
 
 pub(crate) fn estimate_request_tokens(
@@ -318,7 +330,10 @@ fn serialize_message(message: &Message) -> String {
             } else {
                 "User"
             };
-            format!("[{label}]: {}", serialize_contents(contents, false))
+            format!(
+                "[{label}]: {}",
+                serialize_contents(contents, TextSerialization::Full)
+            )
         }
         MessageContent::Assistant(blocks) => blocks
             .iter()
@@ -344,7 +359,7 @@ fn serialize_message(message: &Message) -> String {
                 Err(error) => ("Tool error", error),
             };
             let output = truncate_chars(output, TOOL_OUTPUT_MAX_CHARS);
-            let attachments = serialize_contents(attachments, true);
+            let attachments = serialize_contents(attachments, TextSerialization::Truncated);
             if attachments.is_empty() {
                 format!("[{label}]: {output}")
             } else {
@@ -354,12 +369,14 @@ fn serialize_message(message: &Message) -> String {
     }
 }
 
-fn serialize_contents(contents: &[Content], truncate_text: bool) -> String {
+fn serialize_contents(contents: &[Content], mode: TextSerialization) -> String {
     contents
         .iter()
         .map(|content| match content {
-            Content::Text(text) if truncate_text => truncate_chars(text, TOOL_OUTPUT_MAX_CHARS),
-            Content::Text(text) => text.clone(),
+            Content::Text(text) => match mode {
+                TextSerialization::Full => text.clone(),
+                TextSerialization::Truncated => truncate_chars(text, TOOL_OUTPUT_MAX_CHARS),
+            },
             Content::Image { media_type, data } => {
                 format!("[Attached {media_type}: {} bytes omitted]", data.len())
             }
@@ -399,14 +416,18 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{prefix}{OMITTED_HISTORY_MARKER}{suffix}")
 }
 
-fn message_characters(message: &Message, include_thoughts: bool) -> usize {
+fn message_characters(message: &Message, thoughts: ThoughtAccounting) -> usize {
     match &message.content {
         MessageContent::User(contents) => content_characters(contents),
         MessageContent::Assistant(blocks) => blocks
             .iter()
             .map(|block| match block {
                 ContentBlock::Text(text) => character_units(text),
-                ContentBlock::Thought { text, .. } if include_thoughts => character_units(text),
+                ContentBlock::Thought { text, .. }
+                    if matches!(thoughts, ThoughtAccounting::Include) =>
+                {
+                    character_units(text)
+                }
                 ContentBlock::Thought { .. } => 0,
                 ContentBlock::ToolCall {
                     name, arguments, ..

@@ -98,7 +98,7 @@
   Thinking、工具和文本事件不再参与渲染，确认事件也不会重复清除同一区域
 - 回退按 turn ID 从 live transcript、已完成语义历史和模型上下文移除当前轮，然后清空并
   重放终端历史
-- 流式思考摘要显示带耗时的 `Thinking` 标题和完整正文，并随 transcript 向下滚动；
+- 流式思考摘要显示带耗时的 `Thinking` 标题和最近五行正文，并随 transcript 向下滚动；
   切换到回答、工具或完成状态时折叠为不可展开的单行耗时摘要
 - 工具历史按工具语义生成单行摘要，隐藏内容参数和默认参数，并把绝对路径缩短为
   可辨识的文件名或末级目录；不把原始工具参数 JSON 加入 transcript
@@ -111,6 +111,7 @@
 模块分工：
 
 - `app`：事件与命令协调
+- `operation`：互斥操作状态、取消/回退阶段和迟到事件路由
 - `block_layout`：完整块、continuation 与 Ratatui Flex spacing
 - `input`：Unicode 安全的编辑、历史和可视窗口
 - `viewport`：transcript 窗口、Composer 组件、行高、间距和 Buffer 渲染
@@ -124,8 +125,10 @@
 
 负责参数、环境变量、Skill 应用和交互控制器。
 
-控制器保证同一会话同一时间只运行一个 Agent turn，并在 UI 发出取消命令时触发
-当前 turn 的 `CancellationToken`。
+控制器独占 `AgentSession`、命令接收端、事件发送端和输入历史存储，保证同一会话同一
+时间只运行一个 Agent turn。活动 turn 通过带类型的结束结果返回延迟提交、回退或退出，
+不通过可变出参隐式修改外层状态；UI 发出取消命令时，控制器触发当前 turn 的
+`CancellationToken`。
 
 ### `ash-orchestrator`
 

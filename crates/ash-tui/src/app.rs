@@ -14,8 +14,8 @@ use crate::{
     input::InputState,
     menu::ComposerMenuState,
     operation::{
-        BackgroundAction, Cancellation, EventRoute, OperationState, RollbackCompletion,
-        SubmissionPolicy, TurnCompletion,
+        AgentStart, BackgroundAction, Cancellation, EventRoute, FailureCompletion, OperationState,
+        RollbackCompletion, SubmissionPolicy, TurnCompletion,
     },
     slash_command::{self, ParsedInput, SlashCommand},
 };
@@ -205,13 +205,12 @@ async fn handle_agent_event(
 ) -> anyhow::Result<LoopAction> {
     match event {
         Event::AgentStarted { .. } => {
-            let reset_timers = state.operation.agent_started();
+            let start = state.operation.agent_started();
             terminal.agent_started()?;
             state.render(terminal)?;
-            Ok(if reset_timers {
-                LoopAction::ResetTimers
-            } else {
-                LoopAction::Continue
+            Ok(match start {
+                AgentStart::StartedTurn => LoopAction::ResetTimers,
+                AgentStart::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
         Event::TextDelta(text) => {
@@ -240,9 +239,12 @@ async fn handle_agent_event(
         }
         Event::Error(error) => {
             terminal.error(&error)?;
-            if state.operation.complete_failed_action() {
-                state.menu.close_sessions();
-                state.render(terminal)?;
+            match state.operation.complete_failed_action() {
+                FailureCompletion::FinishedOperation => {
+                    state.menu.close_sessions();
+                    state.render(terminal)?;
+                }
+                FailureCompletion::OperationUnchanged => {}
             }
             Ok(LoopAction::Continue)
         }

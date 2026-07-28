@@ -33,6 +33,18 @@ pub(crate) enum RollbackCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentStart {
+    StartedTurn,
+    TurnAlreadyTracked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureCompletion {
+    FinishedOperation,
+    OperationUnchanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventRoute {
     Handle,
     Ignore,
@@ -106,12 +118,12 @@ impl OperationState {
         self.current = Operation::Turn(TurnOperation::Running { prompt });
     }
 
-    pub(crate) fn agent_started(&mut self) -> bool {
+    pub(crate) fn agent_started(&mut self) -> AgentStart {
         if self.is_busy() {
-            false
+            AgentStart::TurnAlreadyTracked
         } else {
             self.start_turn(None);
-            true
+            AgentStart::StartedTurn
         }
     }
 
@@ -186,7 +198,7 @@ impl OperationState {
         }
     }
 
-    pub(crate) fn complete_failed_action(&mut self) -> bool {
+    pub(crate) fn complete_failed_action(&mut self) -> FailureCompletion {
         let is_action_result = matches!(
             self.current,
             Operation::Background(_)
@@ -197,8 +209,10 @@ impl OperationState {
         );
         if is_action_result {
             self.finish();
+            FailureCompletion::FinishedOperation
+        } else {
+            FailureCompletion::OperationUnchanged
         }
-        is_action_result
     }
 
     pub(crate) fn finish_background(&mut self, action: BackgroundAction) {
@@ -258,6 +272,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_start_reports_whether_the_turn_was_already_tracked() {
+        let mut state = OperationState::default();
+
+        assert_eq!(state.agent_started(), AgentStart::StartedTurn);
+        assert_eq!(state.agent_started(), AgentStart::TurnAlreadyTracked);
+    }
+
+    #[test]
+    fn turn_errors_do_not_finish_the_operation_before_agent_finished() {
+        let mut state = OperationState::default();
+        state.start_turn(Some("question".into()));
+
+        assert_eq!(
+            state.complete_failed_action(),
+            FailureCompletion::OperationUnchanged
+        );
+        assert!(state.is_busy());
+    }
+
+    #[test]
     fn submission_policy_follows_the_active_operation() {
         let mut state = OperationState::default();
         assert_eq!(state.submission_policy(), SubmissionPolicy::Start);
@@ -301,7 +335,10 @@ mod tests {
             state.route_event(&Event::TextDelta("rollback result".into())),
             EventRoute::Handle
         );
-        assert!(state.complete_failed_action());
+        assert_eq!(
+            state.complete_failed_action(),
+            FailureCompletion::FinishedOperation
+        );
         assert!(!state.is_busy());
     }
 
@@ -325,7 +362,10 @@ mod tests {
             state.route_event(&Event::Error("list failed".into())),
             EventRoute::Handle
         );
-        assert!(state.complete_failed_action());
+        assert_eq!(
+            state.complete_failed_action(),
+            FailureCompletion::FinishedOperation
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::Cli;
 
 #[derive(Debug, Eq, PartialEq)]
 enum TurnOutcome {
-    Completed,
+    Continue { deferred_submission: Option<String> },
     Rollback,
     Exit,
 }
@@ -25,6 +25,13 @@ enum ActiveTurnCommand {
     CancelAndRollback,
     Reject,
     Exit,
+}
+
+struct InteractiveController {
+    session: AgentSession,
+    event_tx: tokio::sync::mpsc::Sender<Event>,
+    command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
+    history_store: MessageHistoryStore,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -185,7 +192,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
     let model = config.model.as_str().to_string();
     let working_dir = config.working_dir.clone();
     let context_limit = Some(u64::try_from(config.max_input_tokens).unwrap_or(u64::MAX));
-    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
     let event_rx = tokio_stream::wrappers::ReceiverStream::new(event_rx);
@@ -198,128 +205,184 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
             Vec::new()
         }
     };
-    let mut session = AgentSession::new(config);
     let app = ash_tui::App::new(protocol, model, working_dir)
         .with_context_limit(context_limit)
         .with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
 
-    run_controller(&mut session, &event_tx, &mut command_rx, &history_store).await;
+    InteractiveController::new(
+        AgentSession::new(config),
+        event_tx,
+        command_rx,
+        history_store,
+    )
+    .run()
+    .await;
 
-    drop(event_tx);
     app_handle.await??;
     Ok(())
 }
 
-async fn run_controller(
-    session: &mut AgentSession,
-    event_tx: &tokio::sync::mpsc::Sender<Event>,
-    command_rx: &mut tokio::sync::mpsc::Receiver<UiCommand>,
-    history_store: &MessageHistoryStore,
-) {
-    let mut deferred_submission = None;
-
-    'controller: loop {
-        let command = match deferred_submission.take() {
-            Some(input) => UiCommand::Submit(input),
-            None => match command_rx.recv().await {
-                Some(command) => command,
-                None => break,
-            },
-        };
-        match command {
-            UiCommand::Submit(input) => {
-                if let Err(error) = history_store.append(session.id(), &input).await {
-                    tracing::warn!(%error, "failed to persist input history");
-                }
-                match run_active_turn(
-                    session,
-                    input,
-                    event_tx,
-                    command_rx,
-                    &mut deferred_submission,
-                )
-                .await
-                {
-                    TurnOutcome::Completed => {}
-                    TurnOutcome::Rollback => {
-                        deferred_submission = None;
-                        rollback_last_turn(session, event_tx, history_store).await;
-                    }
-                    TurnOutcome::Exit => break 'controller,
-                }
-            }
-            UiCommand::CancelAndRollback => {
-                deferred_submission = None;
-                rollback_last_turn(session, event_tx, history_store).await;
-            }
-            UiCommand::Cancel => {}
-            UiCommand::Rollback => {
-                deferred_submission = None;
-                rollback_last_turn(session, event_tx, history_store).await;
-            }
-            UiCommand::Compact => {
-                deferred_submission = None;
-                compact_session(session, event_tx).await;
-            }
-            UiCommand::NewSession => {
-                session.reset();
-                deferred_submission = None;
-            }
-            UiCommand::ListSessions => {
-                list_sessions(session, event_tx).await;
-            }
-            UiCommand::ResumeSession(session_id) => {
-                deferred_submission = None;
-                resume_session(session, session_id, event_tx).await;
-            }
-            UiCommand::Exit => break,
+impl InteractiveController {
+    fn new(
+        session: AgentSession,
+        event_tx: tokio::sync::mpsc::Sender<Event>,
+        command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
+        history_store: MessageHistoryStore,
+    ) -> Self {
+        Self {
+            session,
+            event_tx,
+            command_rx,
+            history_store,
         }
     }
-}
 
-async fn run_active_turn(
-    session: &mut AgentSession,
-    input: String,
-    event_tx: &tokio::sync::mpsc::Sender<Event>,
-    command_rx: &mut tokio::sync::mpsc::Receiver<UiCommand>,
-    deferred_submission: &mut Option<String>,
-) -> TurnOutcome {
-    let cancel = CancellationToken::new();
-    let mut turn = Box::pin(session.submit(input, event_tx.clone(), cancel.clone()));
-    let outcome = loop {
-        tokio::select! {
-            _ = &mut turn => break TurnOutcome::Completed,
-            command = command_rx.recv() => match classify_active_command(command) {
-                ActiveTurnCommand::Defer(input) => *deferred_submission = Some(input),
-                ActiveTurnCommand::Reject => {
-                    let _ = event_tx
-                        .send(Event::Error(
-                            "That command is unavailable while working.".to_string(),
-                        ))
-                        .await;
+    async fn run(mut self) {
+        let mut deferred_submission = None;
+
+        'controller: loop {
+            let command = match deferred_submission.take() {
+                Some(input) => UiCommand::Submit(input),
+                None => match self.command_rx.recv().await {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+            match command {
+                UiCommand::Submit(input) => {
+                    if let Err(error) = self.history_store.append(self.session.id(), &input).await {
+                        tracing::warn!(%error, "failed to persist input history");
+                    }
+                    match self.run_active_turn(input).await {
+                        TurnOutcome::Continue {
+                            deferred_submission: next,
+                        } => deferred_submission = next,
+                        TurnOutcome::Rollback => {
+                            deferred_submission = None;
+                            self.rollback_last_turn().await;
+                        }
+                        TurnOutcome::Exit => break 'controller,
+                    }
                 }
-                ActiveTurnCommand::Cancel => {
-                    cancel.cancel();
-                    let _ = (&mut turn).await;
-                    *deferred_submission = None;
-                    break TurnOutcome::Completed;
+                UiCommand::CancelAndRollback => {
+                    deferred_submission = None;
+                    self.rollback_last_turn().await;
                 }
-                ActiveTurnCommand::CancelAndRollback => {
-                    cancel.cancel();
-                    let _ = (&mut turn).await;
-                    break TurnOutcome::Rollback;
+                UiCommand::Cancel => {}
+                UiCommand::Rollback => {
+                    deferred_submission = None;
+                    self.rollback_last_turn().await;
                 }
-                ActiveTurnCommand::Exit => {
-                    cancel.cancel();
-                    let _ = (&mut turn).await;
-                    break TurnOutcome::Exit;
+                UiCommand::Compact => {
+                    deferred_submission = None;
+                    self.compact_session().await;
+                }
+                UiCommand::NewSession => {
+                    self.session.reset();
+                    deferred_submission = None;
+                }
+                UiCommand::ListSessions => self.list_sessions().await,
+                UiCommand::ResumeSession(session_id) => {
+                    deferred_submission = None;
+                    self.resume_session(session_id).await;
+                }
+                UiCommand::Exit => break,
+            }
+        }
+    }
+
+    async fn run_active_turn(&mut self, input: String) -> TurnOutcome {
+        let cancel = CancellationToken::new();
+        let mut deferred_submission = None;
+        let mut turn = Box::pin(
+            self.session
+                .submit(input, self.event_tx.clone(), cancel.clone()),
+        );
+        loop {
+            tokio::select! {
+                _ = &mut turn => {
+                    break TurnOutcome::Continue { deferred_submission };
+                }
+                command = self.command_rx.recv() => match classify_active_command(command) {
+                    ActiveTurnCommand::Defer(input) => deferred_submission = Some(input),
+                    ActiveTurnCommand::Reject => {
+                        let _ = self.event_tx
+                            .send(Event::Error(
+                                "That command is unavailable while working.".to_string(),
+                            ))
+                            .await;
+                    }
+                    ActiveTurnCommand::Cancel => {
+                        cancel.cancel();
+                        let _ = (&mut turn).await;
+                        break TurnOutcome::Continue {
+                            deferred_submission: None,
+                        };
+                    }
+                    ActiveTurnCommand::CancelAndRollback => {
+                        cancel.cancel();
+                        let _ = (&mut turn).await;
+                        break TurnOutcome::Rollback;
+                    }
+                    ActiveTurnCommand::Exit => {
+                        cancel.cancel();
+                        let _ = (&mut turn).await;
+                        break TurnOutcome::Exit;
+                    }
                 }
             }
         }
-    };
-    drop(turn);
-    outcome
+    }
+
+    async fn rollback_last_turn(&mut self) {
+        let event = match self.session.rollback_last_turn().await {
+            Ok(Some(prompt)) => {
+                if let Err(error) = self.history_store.undo(self.session.id(), &prompt).await {
+                    tracing::warn!(%error, "failed to undo input history entry");
+                }
+                Event::TurnRolledBack { prompt }
+            }
+            Ok(None) => Event::Error("No submitted turn is available to undo.".to_string()),
+            Err(error) => Event::Error(format!("Failed to undo the last turn: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
+
+    async fn compact_session(&mut self) {
+        let event = match self.session.compact().await {
+            Ok(result) => Event::ContextCompacted {
+                before_tokens: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
+                after_tokens: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
+                dropped_messages: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
+                automatic: false,
+            },
+            Err(error) => Event::Error(format!("Failed to compact context: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
+
+    async fn list_sessions(&self) {
+        let event = match self.session.resumable_sessions().await {
+            Ok(sessions) => Event::SessionsListed { sessions },
+            Err(error) => Event::Error(format!("Failed to list saved chats: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
+
+    async fn resume_session(&mut self, session_id: SessionId) {
+        let event = match self.session.resume(session_id).await {
+            Ok(Some(restored)) => Event::SessionRestored {
+                model: restored.model,
+                protocol: restored.protocol,
+                working_dir: restored.working_dir,
+                messages: restored.messages,
+            },
+            Ok(None) => Event::Error("That saved chat is no longer available.".to_string()),
+            Err(error) => Event::Error(format!("Failed to resume saved chat: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
 }
 
 fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
@@ -336,69 +399,6 @@ fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
         ) => ActiveTurnCommand::Reject,
         Some(UiCommand::Exit) | None => ActiveTurnCommand::Exit,
     }
-}
-
-async fn rollback_last_turn(
-    session: &mut AgentSession,
-    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
-    history_store: &MessageHistoryStore,
-) {
-    let event = match session.rollback_last_turn().await {
-        Ok(Some(prompt)) => {
-            if let Err(error) = history_store.undo(session.id(), &prompt).await {
-                tracing::warn!(%error, "failed to undo input history entry");
-            }
-            ash_core::Event::TurnRolledBack { prompt }
-        }
-        Ok(None) => ash_core::Event::Error("No submitted turn is available to undo.".to_string()),
-        Err(error) => ash_core::Event::Error(format!("Failed to undo the last turn: {error}")),
-    };
-    let _ = event_tx.send(event).await;
-}
-
-async fn compact_session(
-    session: &mut AgentSession,
-    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
-) {
-    let event = match session.compact().await {
-        Ok(result) => ash_core::Event::ContextCompacted {
-            before_tokens: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
-            after_tokens: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
-            dropped_messages: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
-            automatic: false,
-        },
-        Err(error) => ash_core::Event::Error(format!("Failed to compact context: {error}")),
-    };
-    let _ = event_tx.send(event).await;
-}
-
-async fn list_sessions(
-    session: &AgentSession,
-    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
-) {
-    let event = match session.resumable_sessions().await {
-        Ok(sessions) => ash_core::Event::SessionsListed { sessions },
-        Err(error) => ash_core::Event::Error(format!("Failed to list saved chats: {error}")),
-    };
-    let _ = event_tx.send(event).await;
-}
-
-async fn resume_session(
-    session: &mut AgentSession,
-    session_id: SessionId,
-    event_tx: &tokio::sync::mpsc::Sender<ash_core::Event>,
-) {
-    let event = match session.resume(session_id).await {
-        Ok(Some(restored)) => ash_core::Event::SessionRestored {
-            model: restored.model,
-            protocol: restored.protocol,
-            working_dir: restored.working_dir,
-            messages: restored.messages,
-        },
-        Ok(None) => ash_core::Event::Error("That saved chat is no longer available.".to_string()),
-        Err(error) => ash_core::Event::Error(format!("Failed to resume saved chat: {error}")),
-    };
-    let _ = event_tx.send(event).await;
 }
 
 #[cfg(test)]
