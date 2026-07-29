@@ -50,6 +50,13 @@ enum LoopAction {
     Exit,
 }
 
+#[derive(Clone, Copy)]
+enum SessionPickerAction {
+    KeepOpen,
+    Close,
+    Resume(SessionId),
+}
+
 impl AppState {
     fn new(input_history: Vec<String>) -> Self {
         Self {
@@ -482,42 +489,48 @@ async fn handle_session_key(
     let Some(sessions) = state.menu.visible_session_picker_mut() else {
         return Ok(LoopAction::Continue);
     };
-    let (selected, close) = match key.code {
-        KeyCode::Esc => (None, true),
+    let action = match key.code {
+        KeyCode::Esc => SessionPickerAction::Close,
         KeyCode::Up => {
             sessions.move_up();
-            (None, false)
+            SessionPickerAction::KeepOpen
         }
         KeyCode::Down => {
             sessions.move_down();
-            (None, false)
+            SessionPickerAction::KeepOpen
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             sessions.move_up();
-            (None, false)
+            SessionPickerAction::KeepOpen
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             sessions.move_down();
-            (None, false)
+            SessionPickerAction::KeepOpen
         }
-        KeyCode::Enter => (sessions.selected_session_id(), true),
+        KeyCode::Enter => match sessions.selected_session_id() {
+            Some(session_id) => SessionPickerAction::Resume(session_id),
+            None => SessionPickerAction::Close,
+        },
         _ => return Ok(LoopAction::Continue),
     };
-    if close {
-        state.menu.close_sessions();
-    }
-    if selected.is_some() {
-        state.operation.start_background(BackgroundAction::Resume);
+    match action {
+        SessionPickerAction::KeepOpen => {}
+        SessionPickerAction::Close => state.menu.close_sessions(),
+        SessionPickerAction::Resume(_) => {
+            state.menu.close_sessions();
+            state.operation.start_background(BackgroundAction::Resume);
+        }
     }
     state.render(terminal)?;
-    if let Some(session_id) = selected {
-        if commands
-            .send(UiCommand::ResumeSession(session_id))
-            .await
-            .is_err()
-        {
-            return Ok(LoopAction::Exit);
-        }
+    let SessionPickerAction::Resume(session_id) = action else {
+        return Ok(LoopAction::Continue);
+    };
+    if commands
+        .send(UiCommand::ResumeSession(session_id))
+        .await
+        .is_err()
+    {
+        return Ok(LoopAction::Exit);
     }
     Ok(LoopAction::Continue)
 }

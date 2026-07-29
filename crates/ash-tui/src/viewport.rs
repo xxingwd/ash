@@ -618,13 +618,13 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         input.context_tokens,
         input.context_limit,
         input.context_estimated,
-        true,
+        ContextDisplayMode::Detailed,
     );
     let compact_context = context_display(
         input.context_tokens,
         input.context_limit,
         input.context_estimated,
-        false,
+        ContextDisplayMode::Compact,
     );
     let candidates = [
         (detailed_context.clone(), protocol),
@@ -691,11 +691,17 @@ struct ContextDisplay {
     color: Color,
 }
 
+#[derive(Clone, Copy)]
+enum ContextDisplayMode {
+    Detailed,
+    Compact,
+}
+
 fn context_display(
     context_tokens: Option<u64>,
     context_limit: Option<u64>,
     estimated: bool,
-    detailed: bool,
+    mode: ContextDisplayMode,
 ) -> Option<ContextDisplay> {
     let tokens = context_tokens?;
     let estimate = if estimated { "~" } else { "" };
@@ -716,22 +722,23 @@ fn context_display(
         70..=84 => Color::Yellow,
         _ => Color::Red,
     };
-    let text = if detailed {
-        let filled = usize::try_from(
-            tokens
-                .saturating_mul(CONTEXT_BAR_COLUMNS as u64)
-                .saturating_add(limit.saturating_sub(1))
-                / limit,
-        )
-        .unwrap_or(CONTEXT_BAR_COLUMNS)
-        .min(CONTEXT_BAR_COLUMNS);
-        format!(
-            "ctx {}{} {estimate}{percent_text}",
-            "█".repeat(filled),
-            "░".repeat(CONTEXT_BAR_COLUMNS - filled),
-        )
-    } else {
-        format!("ctx {estimate}{percent_text}")
+    let text = match mode {
+        ContextDisplayMode::Detailed => {
+            let filled = usize::try_from(
+                tokens
+                    .saturating_mul(CONTEXT_BAR_COLUMNS as u64)
+                    .saturating_add(limit.saturating_sub(1))
+                    / limit,
+            )
+            .unwrap_or(CONTEXT_BAR_COLUMNS)
+            .min(CONTEXT_BAR_COLUMNS);
+            format!(
+                "ctx {}{} {estimate}{percent_text}",
+                "█".repeat(filled),
+                "░".repeat(CONTEXT_BAR_COLUMNS - filled),
+            )
+        }
+        ContextDisplayMode::Compact => format!("ctx {estimate}{percent_text}"),
     };
     Some(ContextDisplay { text, color })
 }
@@ -1431,15 +1438,18 @@ mod tests {
 
     #[test]
     fn context_display_uses_a_fixed_bar_and_compact_fallback() {
-        let detailed = context_display(Some(50), Some(100), false, true).expect("detailed meter");
+        let detailed = context_display(Some(50), Some(100), false, ContextDisplayMode::Detailed)
+            .expect("detailed meter");
         assert_eq!(detailed.text, "ctx ████░░░░ 50%");
         assert_eq!(detailed.color, Color::Green);
 
-        let compact = context_display(Some(85), Some(100), true, false).expect("compact meter");
+        let compact = context_display(Some(85), Some(100), true, ContextDisplayMode::Compact)
+            .expect("compact meter");
         assert_eq!(compact.text, "ctx ~85%");
         assert_eq!(compact.color, Color::Red);
 
-        let unknown = context_display(Some(12_345), None, true, true).expect("token display");
+        let unknown = context_display(Some(12_345), None, true, ContextDisplayMode::Detailed)
+            .expect("token display");
         assert_eq!(unknown.text, "ctx ~12.3k");
     }
 }

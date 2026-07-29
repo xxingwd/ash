@@ -32,10 +32,14 @@ struct PendingToolCall {
 struct CollectedResponse {
     message: Option<Message>,
     calls: Vec<PendingToolCall>,
-    usage: UsageMetrics,
-    stop_reason: StopReason,
-    cancelled: bool,
-    error: Option<ash_core::ProtocolError>,
+    usage: UsageAccumulator,
+    termination: StreamTermination,
+}
+
+enum StreamTermination {
+    Completed(StopReason),
+    Cancelled,
+    Failed(ash_core::ProtocolError),
 }
 
 pub(crate) struct CompactedHistory {
@@ -46,27 +50,43 @@ pub(crate) struct CompactedHistory {
 }
 
 #[derive(Default)]
-struct UsageMetrics {
+struct UsageAccumulator {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    generation_ms: u64,
+}
+
+struct FinalUsage {
     input_tokens: u64,
     output_tokens: u64,
     generation_ms: u64,
     estimated: bool,
 }
 
-impl UsageMetrics {
+impl UsageAccumulator {
     fn record(&mut self, input_tokens: u64, output_tokens: u64) {
-        self.input_tokens = self.input_tokens.max(input_tokens);
-        self.output_tokens = self.output_tokens.max(output_tokens);
+        if input_tokens > 0 {
+            self.input_tokens = Some(
+                self.input_tokens
+                    .map_or(input_tokens, |current| current.max(input_tokens)),
+            );
+        }
+        if output_tokens > 0 {
+            self.output_tokens = Some(
+                self.output_tokens
+                    .map_or(output_tokens, |current| current.max(output_tokens)),
+            );
+        }
     }
 
-    fn fill_missing(&mut self, input_tokens: u64, output_tokens: u64) {
-        if self.input_tokens == 0 {
-            self.input_tokens = input_tokens;
-            self.estimated = true;
-        }
-        if self.output_tokens == 0 && output_tokens > 0 {
-            self.output_tokens = output_tokens;
-            self.estimated = true;
+    fn finalize(self, input_tokens: u64, output_tokens: u64) -> FinalUsage {
+        let estimated =
+            self.input_tokens.is_none() || (self.output_tokens.is_none() && output_tokens > 0);
+        FinalUsage {
+            input_tokens: self.input_tokens.unwrap_or(input_tokens),
+            output_tokens: self.output_tokens.unwrap_or(output_tokens),
+            generation_ms: self.generation_ms,
+            estimated,
         }
     }
 }
@@ -281,17 +301,14 @@ async fn run_with_adapter(
             message,
             calls,
             usage,
-            stop_reason,
-            cancelled,
-            error,
+            termination,
         } = collect_response(&mut stream, &tx, &cancel, request_started).await;
         let estimated_output_tokens = message
             .as_ref()
             .map(count_output_tokens)
             .and_then(|tokens| u64::try_from(tokens).ok())
             .unwrap_or(0);
-        let mut usage = usage;
-        usage.fill_missing(estimated_input_tokens, estimated_output_tokens);
+        let usage = usage.finalize(estimated_input_tokens, estimated_output_tokens);
         let _ = tx
             .send(Event::Usage {
                 input_tokens: usage.input_tokens,
@@ -304,21 +321,18 @@ async fn run_with_adapter(
             persist_message(store.as_deref_mut(), &message).await?;
             messages.push(message);
         }
-        if let Some(error) = error {
-            return Err(error.into());
-        }
-        if calls.is_empty() {
-            return if cancelled {
-                Ok(StopReason::Aborted)
-            } else {
-                Ok(stop_reason)
-            };
-        }
+        let response_cancelled = match termination {
+            StreamTermination::Completed(reason) if calls.is_empty() => return Ok(reason),
+            StreamTermination::Completed(_) => false,
+            StreamTermination::Cancelled if calls.is_empty() => return Ok(StopReason::Aborted),
+            StreamTermination::Cancelled => true,
+            StreamTermination::Failed(error) => return Err(error.into()),
+        };
         execute_tool_calls(
             config, messages, session_id, &cancel, &tx, &mut store, calls,
         )
         .await?;
-        if cancelled || cancel.is_cancelled() {
+        if response_cancelled || cancel.is_cancelled() {
             return Ok(StopReason::Aborted);
         }
     }
@@ -334,16 +348,14 @@ async fn collect_response(
 ) -> CollectedResponse {
     let mut blocks = Vec::new();
     let mut thought_started_at = None;
-    let mut stop_reason = StopReason::EndTurn;
-    let mut cancelled = false;
-    let mut error = None;
-    let mut usage = UsageMetrics::default();
+    let mut termination = StreamTermination::Completed(StopReason::EndTurn);
+    let mut usage = UsageAccumulator::default();
     let mut first_output_at = None;
 
     loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => {
-                cancelled = true;
+                termination = StreamTermination::Cancelled;
                 None
             },
             next = stream.next() => next,
@@ -354,7 +366,7 @@ async fn collect_response(
         let item = match item {
             Ok(item) => item,
             Err(stream_error) => {
-                error = Some(stream_error);
+                termination = StreamTermination::Failed(stream_error);
                 break;
             }
         };
@@ -399,7 +411,7 @@ async fn collect_response(
                 input_tokens,
                 output_tokens,
             } => usage.record(input_tokens, output_tokens),
-            StreamItem::Stop(reason) => stop_reason = reason,
+            StreamItem::Stop(reason) => termination = StreamTermination::Completed(reason),
         }
     }
     finish_open_thought(&mut blocks, &mut thought_started_at);
@@ -427,7 +439,7 @@ async fn collect_response(
     CollectedResponse {
         message,
         calls,
-        usage: UsageMetrics {
+        usage: UsageAccumulator {
             generation_ms: u64::try_from(
                 first_output_at
                     .unwrap_or(request_started)
@@ -437,9 +449,7 @@ async fn collect_response(
             .unwrap_or(u64::MAX),
             ..usage
         },
-        stop_reason,
-        cancelled,
-        error,
+        termination,
     }
 }
 
@@ -1012,13 +1022,24 @@ mod tests {
 
     #[test]
     fn fills_missing_provider_usage_with_estimates() {
-        let mut usage = UsageMetrics::default();
-
-        usage.fill_missing(120, 25);
+        let usage = UsageAccumulator::default().finalize(120, 25);
 
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 25);
         assert!(usage.estimated);
+    }
+
+    #[test]
+    fn combines_split_provider_usage_without_marking_it_estimated() {
+        let mut usage = UsageAccumulator::default();
+        usage.record(120, 0);
+        usage.record(0, 25);
+
+        let usage = usage.finalize(999, 999);
+
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 25);
+        assert!(!usage.estimated);
     }
 
     #[tokio::test]
