@@ -8,7 +8,6 @@ Ash is a Rust 2021 workspace under `crates/`. `ash-core` defines shared types; `
 
 - `cargo build --workspace` builds every crate in debug mode.
 - `cargo run -p ash-cli -- --print "inspect this project"` runs a single non-interactive request.
-- `./start.sh` launches the CLI and forwards any arguments to `ash-cli`.
 - `cargo test --workspace` runs all unit, integration, and snapshot tests.
 - `cargo fmt --all -- --check` verifies standard Rust formatting.
 - `cargo clippy --workspace --all-targets -- -D warnings` treats every lint warning as an error.
@@ -29,4 +28,4 @@ This checkout has no Git history, so use concise, imperative subjects with an op
 
 ## Security & Configuration
 
-Copy `.env.example` to `.env` for local credentials. Never commit API keys, provider tokens, logs, or generated files. Preserve the tool layer's working-directory boundary and cancellation/timeout behavior when changing file or process execution.
+Never commit API keys, provider tokens, logs, or generated files. Preserve the tool layer's working-directory boundary and cancellation/timeout behavior when changing file or process execution.

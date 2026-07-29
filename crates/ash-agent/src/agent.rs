@@ -145,7 +145,7 @@ pub(crate) async fn compact_with_adapter(
         .map(|tool| tool.definition())
         .collect::<Vec<_>>();
     let before_tokens = estimate_request_tokens(config.system_prompt.as_deref(), messages, &tools);
-    let Some(plan) = plan_compaction(messages, config.max_input_tokens) else {
+    let Some(plan) = plan_compaction(messages, config.max_context_tokens) else {
         return Ok(None);
     };
     let mut stream = adapter.stream(LlmRequest {
@@ -153,7 +153,7 @@ pub(crate) async fn compact_with_adapter(
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![Message::user(&plan.summary_prompt)],
         tools: Vec::new(),
-        max_tokens: Some(summary_output_tokens(config.max_input_tokens)),
+        max_tokens: Some(summary_output_tokens(config.max_context_tokens)),
     })?;
     let summary = collect_compaction_summary(&mut stream, cancel).await?;
     let compacted = apply_summary(&summary, plan.tail);
@@ -385,7 +385,7 @@ impl<'a> AgentTurnRunner<'a> {
             messages,
             &self.tool_defs,
         );
-        if !needs_compaction(estimated_context, self.config.max_input_tokens) {
+        if !needs_compaction(estimated_context, self.config.max_context_tokens) {
             return Ok(());
         }
         let Some(compacted) =
@@ -500,7 +500,7 @@ impl<'a> AgentTurnRunner<'a> {
                 tools: self.config.tools.clone(),
                 model: self.config.model.clone(),
                 max_turns: self.config.max_turns,
-                max_input_tokens: self.config.max_input_tokens,
+                max_context_tokens: self.config.max_context_tokens,
                 max_output_tokens: self.config.max_output_tokens,
             },
         };
@@ -805,7 +805,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 4,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -868,7 +868,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 1_000,
+            max_context_tokens: 1_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -958,7 +958,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 120_000,
+            max_context_tokens: 120_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -1049,7 +1049,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -1131,7 +1131,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -1192,7 +1192,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -1258,7 +1258,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
@@ -1320,7 +1320,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 1,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(30),
             agent_path: "/root".to_string(),

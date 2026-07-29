@@ -3,7 +3,6 @@
 /opencode/
 /.env
 /.env.*
-!/.env.example
 /test
 *.local
 *.log

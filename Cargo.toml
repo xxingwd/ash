@@ -75,7 +75,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 secrecy = { version = "0.10", features = ["serde"] }
 directories = "6"
-dotenvy = "0.15"
 async-trait = "0.1"
 
 # Tools

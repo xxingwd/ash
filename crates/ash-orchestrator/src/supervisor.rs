@@ -12,6 +12,14 @@ use tokio::sync::{mpsc, Mutex, Notify};
 const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 3;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
+const COLLABORATION_TOOL_NAMES: [&str; 6] = [
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "interrupt_agent",
+    "list_agents",
+    "wait_agent",
+];
 
 const MULTI_AGENT_INSTRUCTIONS: &str = r#"<multi_agent_mode>
 You are one agent in a team that shares the same workspace and tools. Split work where parallelism pays; keep tightly coupled work local.
@@ -81,7 +89,7 @@ impl FromStr for AgentRole {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
-            "" | "default" => Ok(Self::Default),
+            "default" => Ok(Self::Default),
             "explorer" => Ok(Self::Explorer),
             "worker" => Ok(Self::Worker),
             other => Err(format!("unknown agent_type '{other}'")),
@@ -97,12 +105,6 @@ pub enum AgentStatus {
     Completed,
     Interrupted,
     Errored,
-}
-
-impl AgentStatus {
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Interrupted | Self::Errored)
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,7 +133,14 @@ struct SupervisorInner {
 
 #[derive(Default)]
 struct SupervisorState {
-    sessions: HashMap<SessionId, HashMap<AgentId, ChildRecord>>,
+    sessions: HashMap<SessionId, ChildSession>,
+}
+
+#[derive(Default)]
+struct ChildSession {
+    agents: HashMap<AgentId, ChildRecord>,
+    next_completion_revision: u64,
+    wait_cursors: HashMap<String, u64>,
 }
 
 struct ChildRecord {
@@ -139,6 +148,7 @@ struct ChildRecord {
     task_name: String,
     role: AgentRole,
     state: ChildState,
+    completion_revision: Option<u64>,
     last_task_message: String,
     command_tx: mpsc::Sender<ChildCommand>,
 }
@@ -237,6 +247,7 @@ impl ChildRecord {
         self.last_task_message.push_str(message);
         if delivery == MessageDelivery::Followup {
             self.state.queue_followup();
+            self.completion_revision = None;
         }
     }
 }
@@ -285,10 +296,101 @@ impl SupervisorState {
     fn active_count(&self, root_session_id: SessionId) -> usize {
         self.sessions
             .get(&root_session_id)
+            .map_or(0, ChildSession::active_count)
+    }
+
+    fn snapshots(
+        &self,
+        root_session_id: SessionId,
+        path_prefix: Option<&str>,
+    ) -> Vec<AgentSnapshot> {
+        let mut agents = self
+            .sessions
+            .get(&root_session_id)
             .into_iter()
-            .flat_map(HashMap::values)
+            .flat_map(|session| session.agents.values())
+            .filter(|record| path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix)))
+            .map(ChildRecord::snapshot)
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        agents
+    }
+
+    fn wait_snapshot(&mut self, root_session_id: SessionId, waiter: &str) -> WaitSnapshot {
+        self.sessions
+            .get_mut(&root_session_id)
+            .map_or_else(WaitSnapshot::empty, |session| session.wait_snapshot(waiter))
+    }
+
+    fn finish_turn(
+        &mut self,
+        root_session_id: SessionId,
+        agent_id: AgentId,
+        completed: ChildState,
+    ) -> bool {
+        self.sessions
+            .get_mut(&root_session_id)
+            .is_some_and(|session| session.finish_turn(agent_id, completed))
+    }
+}
+
+impl ChildSession {
+    fn active_count(&self) -> usize {
+        self.agents
+            .values()
             .filter(|record| record.state.is_active())
             .count()
+    }
+
+    fn wait_snapshot(&mut self, waiter: &str) -> WaitSnapshot {
+        let cursor = self.wait_cursors.get(waiter).copied().unwrap_or(0);
+        let completion_revision = self
+            .agents
+            .values()
+            .filter(|record| !record.state.is_active())
+            .filter_map(|record| record.completion_revision)
+            .filter(|revision| *revision > cursor)
+            .max();
+        if let Some(revision) = completion_revision {
+            self.wait_cursors.insert(waiter.to_string(), revision);
+        }
+        let mut agents = self
+            .agents
+            .values()
+            .map(ChildRecord::snapshot)
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        WaitSnapshot {
+            agents,
+            has_update: completion_revision.is_some(),
+        }
+    }
+
+    fn finish_turn(&mut self, agent_id: AgentId, completed: ChildState) -> bool {
+        let Some(record) = self.agents.get_mut(&agent_id) else {
+            return false;
+        };
+        let current = std::mem::replace(&mut record.state, ChildState::Pending);
+        record.state = current.finish_turn(completed);
+        if !record.state.is_active() {
+            self.next_completion_revision = self.next_completion_revision.saturating_add(1);
+            record.completion_revision = Some(self.next_completion_revision);
+        }
+        true
+    }
+}
+
+struct WaitSnapshot {
+    agents: Vec<AgentSnapshot>,
+    has_update: bool,
+}
+
+impl WaitSnapshot {
+    fn empty() -> Self {
+        Self {
+            agents: Vec::new(),
+            has_update: false,
+        }
     }
 }
 
@@ -478,29 +580,33 @@ impl Supervisor {
 
         {
             let mut state = self.inner.state.lock().await;
-            let active_count = state.active_count(context.agent.root_session_id);
             let session = state
                 .sessions
                 .entry(context.agent.root_session_id)
                 .or_default();
-            if active_count >= self.inner.max_concurrent_children {
+            if session.active_count() >= self.inner.max_concurrent_children {
                 return Err(ToolError::Execution(format!(
                     "maximum of {} concurrent sub-agents reached",
                     self.inner.max_concurrent_children
                 )));
             }
-            if session.values().any(|record| record.task_name == task_name) {
+            if session
+                .agents
+                .values()
+                .any(|record| record.task_name == task_name)
+            {
                 return Err(ToolError::Execution(format!(
                     "agent task name already exists: {task_name}; use followup_task to reuse it"
                 )));
             }
-            session.insert(
+            session.agents.insert(
                 id,
                 ChildRecord {
                     id,
                     task_name: task_name.clone(),
                     role,
                     state: ChildState::Pending,
+                    completion_revision: None,
                     last_task_message: args.message.clone(),
                     command_tx,
                 },
@@ -521,7 +627,7 @@ impl Supervisor {
             model: context.agent.model,
             max_turns: context.agent.max_turns,
             working_dir: context.working_dir,
-            max_input_tokens: context.agent.max_input_tokens,
+            max_context_tokens: context.agent.max_context_tokens,
             max_output_tokens: context.agent.max_output_tokens,
             max_tool_duration: context.max_duration,
             agent_path: task_name.clone(),
@@ -642,10 +748,15 @@ impl Supervisor {
             let notified = self.inner.updates.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let agents = self.snapshots(context.agent.root_session_id, None).await;
-            if agents.is_empty() || agents.iter().any(|agent| agent.status.is_terminal()) {
+            let snapshot = self
+                .inner
+                .state
+                .lock()
+                .await
+                .wait_snapshot(context.agent.root_session_id, &context.agent.agent_path);
+            if snapshot.agents.is_empty() || snapshot.has_update {
                 return json_output(&serde_json::json!({
-                    "agents": agents,
+                    "agents": snapshot.agents,
                     "timed_out": false,
                 }));
             }
@@ -655,10 +766,15 @@ impl Supervisor {
                 _ = &mut notified => false,
             };
             if timed_out {
-                let agents = self.snapshots(context.agent.root_session_id, None).await;
+                let snapshot = self
+                    .inner
+                    .state
+                    .lock()
+                    .await
+                    .wait_snapshot(context.agent.root_session_id, &context.agent.agent_path);
                 return json_output(&serde_json::json!({
-                    "agents": agents,
-                    "timed_out": true,
+                    "agents": snapshot.agents,
+                    "timed_out": !snapshot.has_update,
                 }));
             }
         }
@@ -669,17 +785,11 @@ impl Supervisor {
         root_session_id: SessionId,
         path_prefix: Option<&str>,
     ) -> Vec<AgentSnapshot> {
-        let state = self.inner.state.lock().await;
-        let mut agents = state
-            .sessions
-            .get(&root_session_id)
-            .into_iter()
-            .flat_map(HashMap::values)
-            .filter(|record| path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix)))
-            .map(ChildRecord::snapshot)
-            .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
-        agents
+        self.inner
+            .state
+            .lock()
+            .await
+            .snapshots(root_session_id, path_prefix)
     }
 
     async fn run_child(
@@ -726,7 +836,7 @@ impl Supervisor {
             let Some(record) = state
                 .sessions
                 .get_mut(&root_session_id)
-                .and_then(|session| session.get_mut(&agent_id))
+                .and_then(|session| session.agents.get_mut(&agent_id))
             else {
                 return;
             };
@@ -739,14 +849,6 @@ impl Supervisor {
         let result = run_agent_turn(config, messages, event_tx, cancel, SessionId::new()).await;
         let final_message = final_assistant_message(messages);
 
-        let mut state = self.inner.state.lock().await;
-        let Some(record) = state
-            .sessions
-            .get_mut(&root_session_id)
-            .and_then(|session| session.get_mut(&agent_id))
-        else {
-            return;
-        };
         let completed = match result {
             Ok(StopReason::Aborted) => ChildState::Interrupted(final_message),
             Ok(_) => ChildState::Completed(final_message),
@@ -755,23 +857,32 @@ impl Supervisor {
                 error: error.to_string(),
             },
         };
-        let current = std::mem::replace(&mut record.state, ChildState::Pending);
-        record.state = current.finish_turn(completed);
+        let mut state = self.inner.state.lock().await;
+        if !state.finish_turn(root_session_id, agent_id, completed) {
+            return;
+        }
         drop(state);
         self.inner.updates.notify_waiters();
     }
 }
 
 pub fn install_subagent_tools(config: &mut AgentConfig) {
+    if COLLABORATION_TOOL_NAMES
+        .iter()
+        .all(|name| config.tools.iter().any(|tool| tool.name() == *name))
+    {
+        return;
+    }
+    config
+        .tools
+        .retain(|tool| !COLLABORATION_TOOL_NAMES.contains(&tool.name()));
     let supervisor = Supervisor::default();
     config.tools.extend(supervisor.tools());
     let system_prompt = config.system_prompt.get_or_insert_with(String::new);
-    if !system_prompt.contains("<multi_agent_mode>") {
-        if !system_prompt.trim().is_empty() {
-            system_prompt.push_str("\n\n");
-        }
-        system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
+    if !system_prompt.trim().is_empty() {
+        system_prompt.push_str("\n\n");
     }
+    system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -812,6 +923,7 @@ fn resolve_target_mut<'a>(
     })?;
     if let Ok(agent_id) = AgentId::from_str(target) {
         return session
+            .agents
             .get_mut(&agent_id)
             .ok_or_else(|| ToolError::Execution(format!("sub-agent not found: {target}")));
     }
@@ -819,6 +931,7 @@ fn resolve_target_mut<'a>(
     let current_path = normalized_agent_path(current_agent_path);
     let relative_path = format!("{current_path}/{}", target.trim_matches('/'));
     let mut matches = session
+        .agents
         .values_mut()
         .filter(|record| {
             record.task_name == target
@@ -957,7 +1070,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 10,
             working_dir: PathBuf::from("."),
-            max_input_tokens: 200_000,
+            max_context_tokens: 200_000,
             max_output_tokens: None,
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
@@ -979,7 +1092,7 @@ mod tests {
                 tools: config.tools,
                 model: config.model,
                 max_turns: config.max_turns,
-                max_input_tokens: config.max_input_tokens,
+                max_context_tokens: config.max_context_tokens,
                 max_output_tokens: config.max_output_tokens,
             },
         }
@@ -996,6 +1109,7 @@ mod tests {
     #[test]
     fn installs_the_codex_style_collaboration_tools_and_prompt() {
         let mut config = test_config();
+        install_subagent_tools(&mut config);
         install_subagent_tools(&mut config);
         let names = config
             .tools
@@ -1033,6 +1147,15 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Delegation is proactive"));
+        assert_eq!(
+            config
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .matches("<multi_agent_mode>")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1070,6 +1193,7 @@ mod tests {
             .sessions
             .entry(root_session_id)
             .or_default()
+            .agents
             .insert(
                 agent_id,
                 ChildRecord {
@@ -1077,6 +1201,7 @@ mod tests {
                     task_name: "/root/inspect".to_string(),
                     role: AgentRole::Explorer,
                     state: ChildState::Completed(Some("done".to_string())),
+                    completion_revision: None,
                     last_task_message: "original".to_string(),
                     command_tx,
                 },
@@ -1193,6 +1318,7 @@ mod tests {
             .sessions
             .entry(root)
             .or_default()
+            .agents
             .insert(
                 agent_id,
                 ChildRecord {
@@ -1200,6 +1326,7 @@ mod tests {
                     task_name: "/root/inspect".to_string(),
                     role: AgentRole::Explorer,
                     state: ChildState::Completed(Some("done".to_string())),
+                    completion_revision: None,
                     last_task_message: "inspect".to_string(),
                     command_tx,
                 },
@@ -1207,6 +1334,95 @@ mod tests {
 
         assert_eq!(supervisor.snapshots(root, None).await.len(), 1);
         assert!(supervisor.snapshots(other_root, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_returns_each_completion_only_once() {
+        let supervisor = Supervisor::default();
+        let root_session_id = SessionId::new();
+        let completed_id = AgentId::new();
+        let running_id = AgentId::new();
+        let (completed_tx, _completed_rx) = mpsc::channel(1);
+        let (running_tx, _running_rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.inner.state.lock().await;
+            let session = state.sessions.entry(root_session_id).or_default();
+            session.next_completion_revision = 1;
+            session.agents.insert(
+                completed_id,
+                ChildRecord {
+                    id: completed_id,
+                    task_name: "/root/completed".to_string(),
+                    role: AgentRole::Explorer,
+                    state: ChildState::Completed(Some("first result".to_string())),
+                    completion_revision: Some(1),
+                    last_task_message: "first task".to_string(),
+                    command_tx: completed_tx,
+                },
+            );
+            session.agents.insert(
+                running_id,
+                ChildRecord {
+                    id: running_id,
+                    task_name: "/root/running".to_string(),
+                    role: AgentRole::Worker,
+                    state: ChildState::Running(CancellationToken::new()),
+                    completion_revision: None,
+                    last_task_message: "second task".to_string(),
+                    command_tx: running_tx,
+                },
+            );
+        }
+
+        let context = test_context(root_session_id);
+        let first = supervisor
+            .wait(
+                &context,
+                WaitAgentArgs {
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::from_str::<serde_json::Value>(&first).unwrap()["timed_out"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let waiting_supervisor = supervisor.clone();
+        let waiting_context = context.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_supervisor
+                .wait(
+                    &waiting_context,
+                    WaitAgentArgs {
+                        timeout_ms: Some(1_000),
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+
+        {
+            let mut state = supervisor.inner.state.lock().await;
+            assert!(state.finish_turn(
+                root_session_id,
+                running_id,
+                ChildState::Completed(Some("second result".to_string())),
+            ));
+        }
+        supervisor.inner.updates.notify_waiters();
+
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert!(!second["timed_out"].as_bool().unwrap());
+        assert_eq!(second["agents"][1]["final_message"], "second result");
     }
 
     #[tokio::test]
@@ -1275,7 +1491,7 @@ mod tests {
                 tools: Vec::new(),
                 model: ModelId::new("test-model"),
                 max_turns: 2,
-                max_input_tokens: 200_000,
+                max_context_tokens: 200_000,
                 max_output_tokens: None,
             },
         };

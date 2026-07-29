@@ -104,17 +104,17 @@ pub(crate) fn estimate_request_tokens(
         .saturating_add(tool_tokens)
 }
 
-pub(crate) fn compaction_threshold(max_input_tokens: usize) -> usize {
-    max_input_tokens.saturating_mul(COMPACTION_TRIGGER_PERCENT) / 100
+pub(crate) fn compaction_threshold(max_context_tokens: usize) -> usize {
+    max_context_tokens.saturating_mul(COMPACTION_TRIGGER_PERCENT) / 100
 }
 
-pub(crate) fn summary_output_tokens(max_input_tokens: usize) -> u32 {
-    let input_fraction = u32::try_from(max_input_tokens / 5).unwrap_or(u32::MAX);
+pub(crate) fn summary_output_tokens(max_context_tokens: usize) -> u32 {
+    let input_fraction = u32::try_from(max_context_tokens / 5).unwrap_or(u32::MAX);
     SUMMARY_MAX_OUTPUT_TOKENS.min(input_fraction.max(1))
 }
 
-pub(crate) fn needs_compaction(estimated_tokens: usize, max_input_tokens: usize) -> bool {
-    estimated_tokens >= compaction_threshold(max_input_tokens)
+pub(crate) fn needs_compaction(estimated_tokens: usize, max_context_tokens: usize) -> bool {
+    estimated_tokens >= compaction_threshold(max_context_tokens)
 }
 
 pub(crate) fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
@@ -187,7 +187,7 @@ fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
 
 pub(crate) fn plan_compaction(
     messages: &[Message],
-    max_input_tokens: usize,
+    max_context_tokens: usize,
 ) -> Option<CompactionPlan> {
     let mut previous_summary = None;
     let history = messages
@@ -203,7 +203,7 @@ pub(crate) fn plan_compaction(
         .collect::<Vec<_>>();
 
     let turns = user_turns(&history);
-    let recent_budget = preserve_recent_budget(max_input_tokens);
+    let recent_budget = preserve_recent_budget(max_context_tokens);
     let mut used = 0usize;
     let mut tail_start = None;
     for (position, (start, end)) in turns.iter().rev().take(DEFAULT_TAIL_TURNS).enumerate() {
@@ -225,7 +225,7 @@ pub(crate) fn plan_compaction(
         return None;
     }
     let summary_prompt =
-        fit_summary_prompt(previous_summary.as_deref(), &serialized, max_input_tokens);
+        fit_summary_prompt(previous_summary.as_deref(), &serialized, max_context_tokens);
 
     Some(CompactionPlan {
         summary_prompt,
@@ -255,8 +255,8 @@ fn extract_summary(message: &Message) -> Option<&str> {
         .strip_suffix(SUMMARY_SUFFIX)
 }
 
-fn preserve_recent_budget(max_input_tokens: usize) -> usize {
-    (compaction_threshold(max_input_tokens) / 4)
+fn preserve_recent_budget(max_context_tokens: usize) -> usize {
+    (compaction_threshold(max_context_tokens) / 4)
         .clamp(MIN_PRESERVE_RECENT_TOKENS, MAX_PRESERVE_RECENT_TOKENS)
 }
 
@@ -278,12 +278,12 @@ fn user_turns(messages: &[Message]) -> Vec<(usize, usize)> {
 fn fit_summary_prompt(
     previous_summary: Option<&str>,
     serialized_history: &str,
-    max_input_tokens: usize,
+    max_context_tokens: usize,
 ) -> String {
     let prompt = build_summary_prompt(previous_summary, serialized_history);
     let output_reserve =
-        usize::try_from(summary_output_tokens(max_input_tokens)).unwrap_or(usize::MAX);
-    let prompt_budget = max_input_tokens.saturating_sub(output_reserve);
+        usize::try_from(summary_output_tokens(max_context_tokens)).unwrap_or(usize::MAX);
+    let prompt_budget = max_context_tokens.saturating_sub(output_reserve);
     if estimate_tokens(&prompt) <= prompt_budget {
         return prompt;
     }

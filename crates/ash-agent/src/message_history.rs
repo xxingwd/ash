@@ -14,37 +14,6 @@ enum MessageHistoryRecord {
     Undone { session_id: SessionId, text: String },
 }
 
-#[derive(Deserialize)]
-struct LegacyMessageHistoryRecord {
-    session_id: SessionId,
-    text: String,
-    #[serde(default)]
-    undone: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredMessageHistoryRecord {
-    Current(MessageHistoryRecord),
-    Legacy(LegacyMessageHistoryRecord),
-}
-
-impl StoredMessageHistoryRecord {
-    fn into_current(self) -> MessageHistoryRecord {
-        match self {
-            Self::Current(record) => record,
-            Self::Legacy(record) if record.undone => MessageHistoryRecord::Undone {
-                session_id: record.session_id,
-                text: record.text,
-            },
-            Self::Legacy(record) => MessageHistoryRecord::Submitted {
-                session_id: record.session_id,
-                text: record.text,
-            },
-        }
-    }
-}
-
 #[derive(Default)]
 struct MessageHistoryReplay {
     entries: Vec<(SessionId, String)>,
@@ -145,9 +114,7 @@ impl MessageHistoryStore {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<StoredMessageHistoryRecord>(&line)
-                .map(StoredMessageHistoryRecord::into_current)
-            {
+            match serde_json::from_str::<MessageHistoryRecord>(&line) {
                 Ok(record) => replay.apply(record),
                 Err(error) => warn!(%error, "skipping malformed input history line"),
             }
@@ -197,25 +164,5 @@ mod tests {
         store.undo(session_id, "second prompt").await.unwrap();
 
         assert_eq!(store.load().await.unwrap(), vec!["first prompt"]);
-    }
-
-    #[tokio::test]
-    async fn loads_legacy_boolean_history_records() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("history.jsonl");
-        let session_id = SessionId::new();
-        tokio::fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"first\",\"undone\":false}}\n\
-                 {{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"second\",\"undone\":false}}\n\
-                 {{\"timestamp\":\"old\",\"session_id\":\"{session_id}\",\"text\":\"second\",\"undone\":true}}\n"
-            ),
-        )
-        .await
-        .unwrap();
-        let store = MessageHistoryStore { path };
-
-        assert_eq!(store.load().await.unwrap(), vec!["first"]);
     }
 }

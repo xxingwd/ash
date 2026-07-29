@@ -10,7 +10,7 @@ mod session_store;
 pub mod skill;
 
 pub use agent::{run_agent_loop, run_agent_turn, Agent};
-pub use config::{AgentConfig, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_INPUT_TOKENS};
+pub use config::{AgentConfig, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_CONTEXT_TOKENS};
 pub use context::{count_tokens, estimate_tokens};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;

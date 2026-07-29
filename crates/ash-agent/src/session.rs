@@ -139,7 +139,7 @@ impl AgentSession {
         let Some((turn_start, prompt)) = last_user_turn(&self.messages) else {
             return Ok(None);
         };
-        self.store.truncate_last_turn().await?;
+        self.store.append_rollback().await?;
         let stored = self.store.load().await?;
         self.messages = stored.messages;
         self.model_messages = stored.model_messages;
@@ -268,7 +268,7 @@ mod tests {
             model: ModelId::new("current-model"),
             max_turns: 10,
             working_dir,
-            max_input_tokens: 1000,
+            max_context_tokens: 1000,
             max_output_tokens: Some(200),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
@@ -358,8 +358,7 @@ mod tests {
                 working_dir: directory.path().join("missing-old-directory"),
                 system_prompt: Some("old prompt".to_string()),
                 max_turns: 1,
-                max_input_tokens: None,
-                max_context_tokens: None,
+                max_context_tokens: 64_000,
                 max_output_tokens: None,
                 tool_timeout_ms: 1,
             },

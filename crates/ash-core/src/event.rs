@@ -17,14 +17,11 @@ pub enum Event {
     ToolCallStart {
         id: ToolCallId,
         name: String,
-        #[serde(default)]
         arguments: serde_json::Value,
     },
     ToolCallEnd {
         id: ToolCallId,
-        #[serde(default)]
         name: String,
-        #[serde(default)]
         arguments: serde_json::Value,
         output: String,
         is_error: bool,
@@ -33,9 +30,7 @@ pub enum Event {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
-        #[serde(default)]
         generation_ms: u64,
-        #[serde(default)]
         estimated: bool,
     },
     AgentStarted {
@@ -60,7 +55,6 @@ pub enum Event {
         before_tokens: u64,
         after_tokens: u64,
         dropped_messages: u64,
-        #[serde(default)]
         automatic: bool,
     },
     ChildSpawned {
@@ -87,58 +81,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_tool_start_events_default_missing_arguments() {
+    fn serialized_events_require_complete_payloads() {
         let id = ToolCallId::new();
-        let event: Event = serde_json::from_value(serde_json::json!({
+        assert!(serde_json::from_value::<Event>(serde_json::json!({
             "ToolCallStart": {
                 "id": id,
                 "name": "read"
             }
         }))
-        .expect("legacy event should deserialize");
-
-        let Event::ToolCallStart { arguments, .. } = event else {
-            panic!("expected tool call start");
-        };
-        assert_eq!(arguments, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn old_tool_end_events_default_missing_display_context() {
-        let id = ToolCallId::new();
-        let event: Event = serde_json::from_value(serde_json::json!({
-            "ToolCallEnd": {
-                "id": id,
-                "output": "done",
-                "is_error": false
-            }
-        }))
-        .expect("legacy event should deserialize");
-
-        let Event::ToolCallEnd {
-            name, arguments, ..
-        } = event
-        else {
-            panic!("expected tool call end");
-        };
-        assert!(name.is_empty());
-        assert_eq!(arguments, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn old_compaction_events_default_to_manual() {
-        let event: Event = serde_json::from_value(serde_json::json!({
+        .is_err());
+        assert!(serde_json::from_value::<Event>(serde_json::json!({
             "ContextCompacted": {
                 "before_tokens": 100,
                 "after_tokens": 50,
                 "dropped_messages": 4
             }
         }))
-        .expect("legacy compaction event should deserialize");
-
-        let Event::ContextCompacted { automatic, .. } = event else {
-            panic!("expected context compaction event");
-        };
-        assert!(!automatic);
+        .is_err());
     }
 }

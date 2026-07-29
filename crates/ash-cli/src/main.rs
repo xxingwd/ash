@@ -29,15 +29,13 @@ struct Cli {
     #[arg(long)]
     base_url: Option<String>,
 
-    /// Maximum model input tokens before output generation
+    /// Model context window in tokens
     #[arg(long)]
-    max_input_tokens: Option<usize>,
+    max_context_tokens: Option<usize>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)

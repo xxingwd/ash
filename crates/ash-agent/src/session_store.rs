@@ -20,10 +20,7 @@ pub(crate) struct SessionMetadata {
     pub working_dir: PathBuf,
     pub system_prompt: Option<String>,
     pub max_turns: u32,
-    #[serde(default)]
-    pub max_input_tokens: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_context_tokens: Option<usize>,
+    pub max_context_tokens: usize,
     pub max_output_tokens: Option<u32>,
     pub tool_timeout_ms: u64,
 }
@@ -39,18 +36,12 @@ impl SessionMetadata {
             working_dir: config.working_dir.clone(),
             system_prompt: config.system_prompt.clone(),
             max_turns: config.max_turns,
-            max_input_tokens: Some(config.max_input_tokens),
-            max_context_tokens: None,
+            max_context_tokens: config.max_context_tokens,
             max_output_tokens: config.max_output_tokens,
             tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TurnRolledBackRecord {
-    num_turns: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,9 +57,7 @@ enum SessionRecord {
     UserMessage(Message),
     AssistantMessage(Message),
     ToolResult(Message),
-    TurnFinished(serde_json::Value),
-    TurnFailed(serde_json::Value),
-    TurnRolledBack(TurnRolledBackRecord),
+    TurnRolledBack,
     ContextCompacted(ContextCompactedRecord),
 }
 
@@ -86,11 +75,7 @@ impl SessionRecord {
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
             | Self::ToolResult(message) => Some(message),
-            Self::SessionMeta(_)
-            | Self::TurnFinished(_)
-            | Self::TurnFailed(_)
-            | Self::TurnRolledBack(_)
-            | Self::ContextCompacted(_) => None,
+            Self::SessionMeta(_) | Self::TurnRolledBack | Self::ContextCompacted(_) => None,
         }
     }
 }
@@ -122,8 +107,7 @@ pub(crate) struct StoredSession {
 #[derive(Default)]
 struct SessionReplay {
     metadata: Option<SessionMetadata>,
-    messages: Vec<Message>,
-    model_messages: Vec<Message>,
+    records: Vec<SessionRecord>,
 }
 
 impl StoredSession {
@@ -140,19 +124,8 @@ impl SessionReplay {
             SessionRecord::SessionMeta(metadata) => {
                 self.metadata.get_or_insert(metadata);
             }
-            SessionRecord::TurnRolledBack(record) => {
-                rollback_messages(&mut self.messages, record.num_turns);
-                rollback_messages(&mut self.model_messages, record.num_turns);
-            }
-            SessionRecord::ContextCompacted(record) => {
-                self.model_messages = apply_compaction(&self.messages, record);
-            }
-            record => {
-                if let Some(message) = record.into_message() {
-                    self.messages.push(message.clone());
-                    self.model_messages.push(message);
-                }
-            }
+            SessionRecord::TurnRolledBack => rollback_last_turn(&mut self.records),
+            record => self.records.push(record),
         }
     }
 
@@ -170,11 +143,12 @@ impl SessionReplay {
                 path.display()
             )));
         }
+        let (messages, model_messages) = replay_records(self.records);
         Ok(StoredSession {
             path: path.to_path_buf(),
             metadata,
-            messages: self.messages,
-            model_messages: self.model_messages,
+            messages,
+            model_messages,
         })
     }
 }
@@ -271,19 +245,13 @@ impl SessionStore {
         Ok(())
     }
 
-    pub(crate) async fn truncate_last_turn(&mut self) -> Result<(), ash_core::AshError> {
-        let file = self.file.as_mut().ok_or_else(|| {
-            ash_core::AshError::Config("session store was not materialized".to_string())
-        })?;
-        file.flush().await?;
-        let contents = tokio::fs::read_to_string(&self.path).await?;
-        let length = last_active_turn_offset(&contents).ok_or_else(|| {
-            ash_core::AshError::Config("session has no turn to truncate".to_string())
-        })?;
-        let length = u64::try_from(length)
-            .map_err(|_| ash_core::AshError::Config("session file is too large".to_string()))?;
-        file.set_len(length).await?;
-        Ok(())
+    pub(crate) async fn append_rollback(&mut self) -> Result<(), ash_core::AshError> {
+        if self.file.is_none() {
+            return Err(ash_core::AshError::Config(
+                "session store has no persisted turn to roll back".to_string(),
+            ));
+        }
+        self.append_record(SessionRecord::TurnRolledBack).await
     }
 
     pub(crate) async fn load(&self) -> Result<StoredSession, ash_core::AshError> {
@@ -426,30 +394,6 @@ fn is_session_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with("session-") && name.ends_with(".jsonl"))
 }
 
-fn last_active_turn_offset(contents: &str) -> Option<usize> {
-    let mut turn_offsets = Vec::new();
-    let mut offset = 0;
-    for line in contents.split_inclusive('\n') {
-        if let Ok(parsed) = serde_json::from_str::<SessionLine>(line.trim()) {
-            match parsed.record {
-                SessionRecord::UserMessage(_) => turn_offsets.push(offset),
-                SessionRecord::TurnRolledBack(record) => {
-                    let count = usize::try_from(record.num_turns).unwrap_or(usize::MAX);
-                    turn_offsets.truncate(turn_offsets.len().saturating_sub(count));
-                }
-                SessionRecord::SessionMeta(_)
-                | SessionRecord::AssistantMessage(_)
-                | SessionRecord::ToolResult(_)
-                | SessionRecord::TurnFinished(_)
-                | SessionRecord::TurnFailed(_)
-                | SessionRecord::ContextCompacted(_) => {}
-            }
-        }
-        offset += line.len();
-    }
-    turn_offsets.last().copied()
-}
-
 async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     let mut lines = tokio::io::BufReader::new(file).lines();
@@ -486,17 +430,34 @@ fn apply_compaction(messages: &[Message], record: ContextCompactedRecord) -> Vec
     model_messages
 }
 
-fn rollback_messages(messages: &mut Vec<Message>, num_turns: u32) {
-    for _ in 0..num_turns {
-        let Some(turn_start) = messages
-            .iter()
-            .rposition(|message| matches!(&message.content, MessageContent::User(_)))
-        else {
-            messages.clear();
-            return;
-        };
-        messages.truncate(turn_start);
+fn rollback_last_turn(records: &mut Vec<SessionRecord>) {
+    let Some(turn_start) = records
+        .iter()
+        .rposition(|record| matches!(record, SessionRecord::UserMessage(_)))
+    else {
+        records.clear();
+        return;
+    };
+    records.truncate(turn_start);
+}
+
+fn replay_records(records: Vec<SessionRecord>) -> (Vec<Message>, Vec<Message>) {
+    let mut messages = Vec::new();
+    let mut model_messages = Vec::new();
+    for record in records {
+        match record {
+            SessionRecord::ContextCompacted(record) => {
+                model_messages = apply_compaction(&messages, record);
+            }
+            record => {
+                if let Some(message) = record.into_message() {
+                    messages.push(message.clone());
+                    model_messages.push(message);
+                }
+            }
+        }
     }
+    (messages, model_messages)
 }
 
 async fn ensure_newline_terminated(file: &mut tokio::fs::File) -> std::io::Result<()> {
@@ -537,7 +498,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 10,
             working_dir,
-            max_input_tokens: 1000,
+            max_context_tokens: 1000,
             max_output_tokens: Some(200),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
@@ -598,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncates_last_turn_from_jsonl() {
+    async fn appends_rollback_and_replays_without_the_last_turn() {
         let directory = TempDir::new().unwrap();
         let session_id = SessionId::new();
         let mut store = SessionStore::new(&config(directory.path().to_path_buf()), session_id);
@@ -621,7 +582,8 @@ mod tests {
             .append_message(&Message::assistant_text("second answer"))
             .await
             .unwrap();
-        store.truncate_last_turn().await.unwrap();
+        let length_before_rollback = tokio::fs::metadata(store.path()).await.unwrap().len();
+        store.append_rollback().await.unwrap();
 
         let loaded = read_session(store.path()).await.unwrap();
         assert_eq!(loaded.messages.len(), 2);
@@ -634,30 +596,9 @@ mod tests {
             MessageContent::Assistant(_)
         ));
         let contents = tokio::fs::read_to_string(store.path()).await.unwrap();
-        assert!(!contents.contains("second"));
-        assert!(!contents.contains("turn_rolled_back"));
-    }
-
-    #[test]
-    fn locates_the_last_turn_after_legacy_rollbacks() {
-        let metadata = SessionLine::new(SessionRecord::SessionMeta(SessionMetadata::from_config(
-            &config(PathBuf::from(".")),
-            SessionId::new(),
-            Utc::now(),
-        )));
-        let first = SessionLine::new(SessionRecord::from_message(&Message::user("first")));
-        let second = SessionLine::new(SessionRecord::from_message(&Message::user("second")));
-        let rollback = SessionLine::new(SessionRecord::TurnRolledBack(TurnRolledBackRecord {
-            num_turns: 1,
-        }));
-        let lines = [&metadata, &first, &second, &rollback]
-            .into_iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let contents = format!("{}\n", lines.join("\n"));
-
-        assert_eq!(last_active_turn_offset(&contents), Some(lines[0].len() + 1));
+        assert!(contents.contains("second"));
+        assert!(contents.contains("turn_rolled_back"));
+        assert!(tokio::fs::metadata(store.path()).await.unwrap().len() > length_before_rollback);
     }
 
     #[tokio::test]
@@ -726,7 +667,7 @@ mod tests {
                 if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("new facts"))
         ));
 
-        store.truncate_last_turn().await.unwrap();
+        store.append_rollback().await.unwrap();
         let rolled_back = read_session(store.path()).await.unwrap();
         assert_eq!(rolled_back.messages.len(), 4);
         assert_eq!(rolled_back.model_messages.len(), 3);
@@ -736,7 +677,7 @@ mod tests {
                 if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("old facts"))
         ));
 
-        store.truncate_last_turn().await.unwrap();
+        store.append_rollback().await.unwrap();
         let rolled_back = read_session(store.path()).await.unwrap();
         assert_eq!(rolled_back.messages.len(), 2);
         assert_eq!(rolled_back.model_messages.len(), 2);

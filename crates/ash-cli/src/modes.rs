@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
-    DEFAULT_MAX_INPUT_TOKENS,
+    DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_core::{CancellationToken, Event, Message, ModelId, Protocol, ProviderConfig, SessionId};
 use ash_tui::UiCommand;
@@ -52,8 +52,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         .unwrap_or_else(|| "anthropic".into());
     let protocol = parse_protocol(&protocol_name)?;
 
-    let api_key =
-        env_value("ASH_API_KEY").context("set ASH_API_KEY in .env or the process environment")?;
+    let api_key = env_value("ASH_API_KEY").context("set ASH_API_KEY in the process environment")?;
 
     let model = cli.model.clone().or_else(|| env_value("ASH_MODEL"));
     let model = match model {
@@ -61,17 +60,14 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         None if matches!(&protocol, Protocol::AnthropicMessages) => {
             "claude-sonnet-4-20250514".into()
         }
-        None => anyhow::bail!("set ASH_MODEL in .env or pass --model"),
+        None => anyhow::bail!("set ASH_MODEL in the process environment or pass --model"),
     };
     let base_url = cli.base_url.clone().or_else(|| env_value("ASH_BASE_URL"));
-    let configured_max_input_tokens = match cli.max_input_tokens {
+    let configured_max_context_tokens = match cli.max_context_tokens {
         Some(value) => Some(value),
-        None => match env_usize("ASH_MAX_INPUT_TOKENS")? {
-            Some(value) => Some(value),
-            None => env_usize("ASH_MAX_CONTEXT_TOKENS")?,
-        },
+        None => env_usize("ASH_MAX_CONTEXT_TOKENS")?,
     };
-    let max_input_tokens = resolve_max_input_tokens(configured_max_input_tokens)?;
+    let max_context_tokens = resolve_max_context_tokens(configured_max_context_tokens)?;
     let working_dir = std::env::current_dir()?;
     let skills = Skill::discover(&working_dir)?;
     let active_skill = cli
@@ -104,7 +100,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         tools,
         max_turns: 100,
         working_dir,
-        max_input_tokens,
+        max_context_tokens,
         max_output_tokens: None,
         max_tool_duration: std::time::Duration::from_secs(120),
         agent_path: "/root".to_string(),
@@ -144,10 +140,10 @@ fn env_usize(name: &str) -> Result<Option<usize>> {
         .transpose()
 }
 
-fn resolve_max_input_tokens(configured: Option<usize>) -> Result<usize> {
-    let value = configured.unwrap_or(DEFAULT_MAX_INPUT_TOKENS);
+fn resolve_max_context_tokens(configured: Option<usize>) -> Result<usize> {
+    let value = configured.unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
     if value == 0 {
-        anyhow::bail!("maximum input tokens must be a positive integer");
+        anyhow::bail!("maximum context tokens must be a positive integer");
     }
     Ok(value)
 }
@@ -191,7 +187,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
     let protocol = config.provider.protocol.as_cli_name().to_string();
     let model = config.model.as_str().to_string();
     let working_dir = config.working_dir.clone();
-    let context_limit = Some(u64::try_from(config.max_input_tokens).unwrap_or(u64::MAX));
+    let context_limit = Some(u64::try_from(config.max_context_tokens).unwrap_or(u64::MAX));
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
@@ -406,10 +402,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_input_limit_defaults_to_200k() {
-        assert_eq!(resolve_max_input_tokens(None).unwrap(), 200_000);
-        assert_eq!(resolve_max_input_tokens(Some(64_000)).unwrap(), 64_000);
-        assert!(resolve_max_input_tokens(Some(0)).is_err());
+    fn model_context_limit_defaults_to_200k() {
+        assert_eq!(resolve_max_context_tokens(None).unwrap(), 200_000);
+        assert_eq!(resolve_max_context_tokens(Some(64_000)).unwrap(), 64_000);
+        assert!(resolve_max_context_tokens(Some(0)).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 
 ## 运行
 
-推荐使用启动脚本：
+在进程环境中提供配置，然后直接运行 CLI：
 
 ```bash
 export ASH_PROTOCOL=openai-responses
@@ -19,21 +19,20 @@ export ASH_MODEL=gpt-5
 export ASH_BASE_URL=https://api.example.com
 export ASH_API_KEY=...
 export ASH_MODEL_CONFIG='reasoning.effort=high;temperature=0.2'
-./start.sh
+cargo run -p ash-cli
 ```
 
-也可以直接写入项目根目录的 `.env`：
+也可以只对单次命令设置环境变量：
 
-```dotenv
-ASH_PROTOCOL=openai-responses
-ASH_MODEL=gpt-5
-ASH_BASE_URL=https://api.example.com
-ASH_API_KEY=your-key
-ASH_MODEL_CONFIG=reasoning.effort=high
+```bash
+ASH_PROTOCOL=openai-responses \
+ASH_MODEL=gpt-5 \
+ASH_API_KEY=your-key \
+ASH_MODEL_CONFIG='reasoning.effort=high' \
+cargo run -p ash-cli
 ```
 
-CLI 会自动加载该文件，命令行参数优先于 `.env`。`.env` 已被 `.gitignore`
-排除。
+CLI 参数优先于对应的环境变量。
 
 Anthropic：
 
@@ -60,8 +59,8 @@ cargo run -p ash-cli -- \
 写入请求 body；`model`、`messages`、`input`、`tools`、`stream`、`system` 和
 `instructions` 等请求结构字段不能覆盖。
 
-模型最大输入默认是 200K token，可用 `--max-input-tokens` 或
-`ASH_MAX_INPUT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
+模型上下文窗口默认是 200K token，可用 `--max-context-tokens` 或
+`ASH_MAX_CONTEXT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
 1 token 的轻量估算，不引入 tokenizer 依赖。每轮结束后的 `Worked` 行显示输入、输出
 token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地估算值。
 
