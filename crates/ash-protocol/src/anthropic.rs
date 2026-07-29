@@ -155,7 +155,6 @@ impl ProtocolAdapter for AnthropicAdapter {
 struct AnthropicDecoder {
     calls: HashMap<u64, PendingCall>,
     stop: Option<StopReason>,
-    done: bool,
 }
 
 struct PendingCall {
@@ -165,10 +164,11 @@ struct PendingCall {
 }
 
 impl sse::Decoder for AnthropicDecoder {
-    fn decode(&mut self, data: &str) -> Result<Vec<StreamItem>, ProtocolError> {
+    fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         let event: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
+        let mut finished = false;
 
         match event["type"].as_str().unwrap_or_default() {
             "message_start" => {
@@ -256,7 +256,7 @@ impl sse::Decoder for AnthropicDecoder {
                 items.push(StreamItem::Stop(
                     self.stop.take().unwrap_or(StopReason::EndTurn),
                 ));
-                self.done = true;
+                finished = true;
             }
             "error" => {
                 return Err(ProtocolError::InvalidResponse(
@@ -269,11 +269,11 @@ impl sse::Decoder for AnthropicDecoder {
             _ => {}
         }
 
-        Ok(items)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
+        Ok(if finished {
+            sse::DecodeResult::finished(items)
+        } else {
+            sse::DecodeResult::continuing(items)
+        })
     }
 }
 
@@ -306,7 +306,8 @@ mod tests {
             .unwrap();
         let items = decoder
             .decode(r#"{"type":"content_block_stop","index":1}"#)
-            .unwrap();
+            .unwrap()
+            .into_items();
 
         assert_eq!(
             items,
@@ -316,6 +317,15 @@ mod tests {
                 arguments: json!({"path": "README.md"}),
             }]
         );
+    }
+
+    #[test]
+    fn message_stop_finishes_the_decoder() {
+        let mut decoder = AnthropicDecoder::default();
+
+        let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
+
+        assert!(matches!(result, sse::DecodeResult::Finished(_)));
     }
 
     #[test]

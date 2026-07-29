@@ -176,7 +176,6 @@ struct ResponsesDecoder {
     calls: BTreeMap<String, PendingCall>,
     emitted_calls: BTreeSet<String>,
     streamed_reasoning_summaries: BTreeSet<u64>,
-    done: bool,
 }
 
 #[derive(Default)]
@@ -223,14 +222,14 @@ impl ResponsesDecoder {
 }
 
 impl sse::Decoder for ResponsesDecoder {
-    fn decode(&mut self, data: &str) -> Result<Vec<StreamItem>, ProtocolError> {
+    fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         if data == "[DONE]" {
-            self.done = true;
-            return Ok(Vec::new());
+            return Ok(sse::DecodeResult::finished(Vec::new()));
         }
         let event: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
+        let mut finished = false;
 
         match event["type"].as_str().unwrap_or_default() {
             "response.output_text.delta" => {
@@ -330,7 +329,7 @@ impl sse::Decoder for ResponsesDecoder {
                     StopReason::EndTurn
                 };
                 items.push(StreamItem::Stop(reason));
-                self.done = true;
+                finished = true;
             }
             "response.failed" => {
                 return Err(ProtocolError::InvalidResponse(
@@ -342,11 +341,11 @@ impl sse::Decoder for ResponsesDecoder {
             }
             _ => {}
         }
-        Ok(items)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
+        Ok(if finished {
+            sse::DecodeResult::finished(items)
+        } else {
+            sse::DecodeResult::continuing(items)
+        })
     }
 }
 
@@ -381,7 +380,8 @@ mod tests {
             .decode(
                 r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"path\":\"Cargo.toml\"}"}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
 
         assert_eq!(
             items,
@@ -396,7 +396,8 @@ mod tests {
             .decode(
                 r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
         assert!(duplicate.is_empty());
     }
 
@@ -407,12 +408,14 @@ mod tests {
             .decode(
                 r#"{"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"checking"}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
         let done = decoder
             .decode(
                 r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"checking"}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
 
         assert_eq!(delta, vec![StreamItem::ThinkingDelta("checking".into())]);
         assert!(done.is_empty());
@@ -425,9 +428,21 @@ mod tests {
             .decode(
                 r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"checked"}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
 
         assert_eq!(items, vec![StreamItem::ThinkingDelta("checked".into())]);
+    }
+
+    #[test]
+    fn completed_response_finishes_the_decoder() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result = decoder
+            .decode(r#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+
+        assert!(matches!(result, sse::DecodeResult::Finished(_)));
     }
 
     #[test]

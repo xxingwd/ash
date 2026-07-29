@@ -34,6 +34,19 @@ struct Match {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchProgress {
+    Complete,
+    MatchLimitReached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineRead {
+    EndOfFile,
+    Complete,
+    Oversized,
+}
+
 pub fn tool() -> Arc<dyn Tool> {
     define_tool(
         "grep",
@@ -66,7 +79,7 @@ fn search(
         .map_err(|error| ToolError::Execution(format!("invalid regular expression: {error}")))?;
     let search = SearchPath::new(root, requested)?;
     let mut matches = Vec::new();
-    let mut truncated = false;
+    let mut progress = SearchProgress::Complete;
 
     if search.full_path().is_file() {
         let included = match include {
@@ -74,7 +87,7 @@ fn search(
             None => true,
         };
         if included {
-            truncated = search_file(&search, search.full_path(), &regex, &mut matches)?;
+            progress = search_file(&search, search.full_path(), &regex, &mut matches)?;
         }
     } else if search.full_path().is_dir() {
         let mut builder = WalkBuilder::new(search.full_path());
@@ -105,8 +118,10 @@ fn search(
             {
                 continue;
             }
-            if search_file(&search, entry.path(), &regex, &mut matches)? {
-                truncated = true;
+            if search_file(&search, entry.path(), &regex, &mut matches)?
+                == SearchProgress::MatchLimitReached
+            {
+                progress = SearchProgress::MatchLimitReached;
                 break;
             }
         }
@@ -128,7 +143,11 @@ fn search(
     let mut output = format!(
         "Found {} matching lines{}",
         matches.len(),
-        if truncated { " (more available)" } else { "" }
+        if progress == SearchProgress::MatchLimitReached {
+            " (more available)"
+        } else {
+            ""
+        }
     );
     let mut current = None;
     for found in matches {
@@ -138,7 +157,7 @@ fn search(
         }
         output.push_str(&format!("\n  Line {}: {}", found.line, found.text));
     }
-    if truncated {
+    if progress == SearchProgress::MatchLimitReached {
         output.push_str(
             "\n\n[Results truncated at 100 matching lines. Use a narrower path, pattern, or include glob.]",
         );
@@ -163,7 +182,7 @@ fn search_file(
     path: &Path,
     regex: &Regex,
     matches: &mut Vec<Match>,
-) -> Result<bool, ToolError> {
+) -> Result<SearchProgress, ToolError> {
     let file = File::open(path).map_err(|error| {
         ToolError::Execution(format!("cannot read {}: {error}", path.display()))
     })?;
@@ -171,17 +190,17 @@ fn search_file(
     let mut buffer = Vec::new();
     let mut line = 0;
     loop {
-        let Some(truncated) = read_line(&mut reader, &mut buffer).map_err(|error| {
+        let line_read = read_line(&mut reader, &mut buffer).map_err(|error| {
             ToolError::Execution(format!("cannot read {}: {error}", path.display()))
-        })?
-        else {
-            return Ok(false);
-        };
+        })?;
+        if line_read == LineRead::EndOfFile {
+            return Ok(SearchProgress::Complete);
+        }
         if buffer.contains(&0) {
-            return Ok(false);
+            return Ok(SearchProgress::Complete);
         }
         line += 1;
-        if truncated {
+        if line_read == LineRead::Oversized {
             continue;
         }
         while matches!(buffer.last(), Some(b'\n' | b'\r')) {
@@ -192,7 +211,7 @@ fn search_file(
             continue;
         }
         if matches.len() == MAX_MATCHES {
-            return Ok(true);
+            return Ok(SearchProgress::MatchLimitReached);
         }
         let text = text.chars().take(MAX_LINE_CHARS).collect::<String>();
         matches.push(Match {
@@ -203,14 +222,20 @@ fn search_file(
     }
 }
 
-fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<LineRead> {
     output.clear();
     let mut read_any = false;
     let mut truncated = false;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(read_any.then_some(truncated));
+            return Ok(if !read_any {
+                LineRead::EndOfFile
+            } else if truncated {
+                LineRead::Oversized
+            } else {
+                LineRead::Complete
+            });
         }
         read_any = true;
         let newline = available.iter().position(|byte| *byte == b'\n');
@@ -222,7 +247,11 @@ fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result
         let complete = newline.is_some();
         reader.consume(consumed);
         if complete {
-            return Ok(Some(truncated));
+            return Ok(if truncated {
+                LineRead::Oversized
+            } else {
+                LineRead::Complete
+            });
         }
     }
 }
@@ -287,10 +316,20 @@ mod tests {
         let mut reader = BufReader::new(input.as_bytes());
         let mut buffer = Vec::new();
 
-        assert_eq!(read_line(&mut reader, &mut buffer).unwrap(), Some(true));
+        assert_eq!(
+            read_line(&mut reader, &mut buffer).unwrap(),
+            LineRead::Oversized
+        );
         assert!(buffer.len() <= MAX_SEARCH_LINE_BYTES);
-        assert_eq!(read_line(&mut reader, &mut buffer).unwrap(), Some(false));
+        assert_eq!(
+            read_line(&mut reader, &mut buffer).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(buffer, b"needle");
+        assert_eq!(
+            read_line(&mut reader, &mut buffer).unwrap(),
+            LineRead::EndOfFile
+        );
     }
 
     #[cfg(unix)]

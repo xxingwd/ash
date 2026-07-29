@@ -186,7 +186,6 @@ impl ProtocolAdapter for CompletionsAdapter {
 #[derive(Default)]
 struct CompletionsDecoder {
     calls: BTreeMap<usize, PendingCall>,
-    done: bool,
 }
 
 #[derive(Default)]
@@ -197,7 +196,7 @@ struct PendingCall {
 }
 
 impl CompletionsDecoder {
-    fn finish(&mut self, reason: StopReason) -> Result<Vec<StreamItem>, ProtocolError> {
+    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<StreamItem>, ProtocolError> {
         let mut items = Vec::new();
         for (_, call) in std::mem::take(&mut self.calls) {
             let arguments = if call.arguments.trim().is_empty() {
@@ -220,15 +219,16 @@ impl CompletionsDecoder {
             });
         }
         items.push(StreamItem::Stop(reason));
-        self.done = true;
         Ok(items)
     }
 }
 
 impl sse::Decoder for CompletionsDecoder {
-    fn decode(&mut self, data: &str) -> Result<Vec<StreamItem>, ProtocolError> {
+    fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         if data == "[DONE]" {
-            return self.finish(StopReason::EndTurn);
+            return Ok(sse::DecodeResult::finished(
+                self.finish_items(StopReason::EndTurn)?,
+            ));
         }
 
         let chunk: Value = serde_json::from_str(data)
@@ -245,7 +245,7 @@ impl sse::Decoder for CompletionsDecoder {
             .as_array()
             .and_then(|choices| choices.first())
         else {
-            return Ok(items);
+            return Ok(sse::DecodeResult::continuing(items));
         };
         let delta = &choice["delta"];
         if let Some(reasoning) = ["reasoning_content", "reasoning", "thinking"]
@@ -285,13 +285,10 @@ impl sse::Decoder for CompletionsDecoder {
             } else {
                 StopReason::EndTurn
             };
-            items.extend(self.finish(reason)?);
+            items.extend(self.finish_items(reason)?);
+            return Ok(sse::DecodeResult::finished(items));
         }
-        Ok(items)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
+        Ok(sse::DecodeResult::continuing(items))
     }
 }
 
@@ -312,11 +309,13 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","function":{"name":"bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
             )
             .unwrap();
-        let items = decoder
+        let result = decoder
             .decode(
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}"#,
             )
             .unwrap();
+        assert!(matches!(&result, sse::DecodeResult::Finished(_)));
+        let items = result.into_items();
 
         assert_eq!(
             items,
@@ -338,7 +337,8 @@ mod tests {
             .decode(
                 r#"{"choices":[{"delta":{"reasoning_content":"inspect first","content":"done"},"finish_reason":null}]}"#,
             )
-            .unwrap();
+            .unwrap()
+            .into_items();
 
         assert_eq!(
             items,

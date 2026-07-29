@@ -146,6 +146,7 @@ struct ChildRecord {
 enum ChildState {
     Pending,
     Running(CancellationToken),
+    RunningThenPending(CancellationToken),
     Completed(Option<String>),
     Interrupted(Option<String>),
     Errored {
@@ -158,7 +159,7 @@ impl ChildState {
     fn status(&self) -> AgentStatus {
         match self {
             Self::Pending => AgentStatus::Pending,
-            Self::Running(_) => AgentStatus::Running,
+            Self::Running(_) | Self::RunningThenPending(_) => AgentStatus::Running,
             Self::Completed(_) => AgentStatus::Completed,
             Self::Interrupted(_) => AgentStatus::Interrupted,
             Self::Errored { .. } => AgentStatus::Errored,
@@ -166,14 +167,17 @@ impl ChildState {
     }
 
     fn is_active(&self) -> bool {
-        matches!(self, Self::Pending | Self::Running(_))
+        matches!(
+            self,
+            Self::Pending | Self::Running(_) | Self::RunningThenPending(_)
+        )
     }
 
     fn final_message(&self) -> Option<&str> {
         match self {
             Self::Completed(message) | Self::Interrupted(message) => message.as_deref(),
             Self::Errored { final_message, .. } => final_message.as_deref(),
-            Self::Pending | Self::Running(_) => None,
+            Self::Pending | Self::Running(_) | Self::RunningThenPending(_) => None,
         }
     }
 
@@ -186,8 +190,31 @@ impl ChildState {
 
     fn cancel(&self) -> Option<CancellationToken> {
         match self {
-            Self::Running(cancel) => Some(cancel.clone()),
+            Self::Running(cancel) | Self::RunningThenPending(cancel) => Some(cancel.clone()),
             _ => None,
+        }
+    }
+
+    fn queue_followup(&mut self) {
+        let current = std::mem::replace(self, Self::Pending);
+        *self = match current {
+            Self::Running(cancel) | Self::RunningThenPending(cancel) => {
+                Self::RunningThenPending(cancel)
+            }
+            Self::Pending | Self::Completed(_) | Self::Interrupted(_) | Self::Errored { .. } => {
+                Self::Pending
+            }
+        };
+    }
+
+    fn finish_turn(self, completed: Self) -> Self {
+        match self {
+            Self::RunningThenPending(_) => Self::Pending,
+            Self::Running(_)
+            | Self::Pending
+            | Self::Completed(_)
+            | Self::Interrupted(_)
+            | Self::Errored { .. } => completed,
         }
     }
 }
@@ -208,8 +235,8 @@ impl ChildRecord {
     fn prepare_delivery(&mut self, delivery: MessageDelivery, message: &str) {
         self.last_task_message.clear();
         self.last_task_message.push_str(message);
-        if delivery.starts_idle_turn(&self.state) {
-            self.state = ChildState::Pending;
+        if delivery == MessageDelivery::Followup {
+            self.state.queue_followup();
         }
     }
 }
@@ -231,7 +258,7 @@ impl ChildCommand {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum MessageDelivery {
     Queue,
     Followup,
@@ -251,10 +278,6 @@ impl MessageDelivery {
 
     fn needs_new_slot(self, state: &ChildState) -> bool {
         self.triggers_turn() && !state.is_active()
-    }
-
-    fn starts_idle_turn(self, state: &ChildState) -> bool {
-        self.triggers_turn() && !matches!(state, ChildState::Running(_))
     }
 }
 
@@ -531,12 +554,26 @@ impl Supervisor {
         }
         let (target, command_tx) = {
             let mut state = self.inner.state.lock().await;
-            let active_count = state.active_count(context.agent.root_session_id);
             let record = resolve_target_mut(
                 &mut state,
                 context.agent.root_session_id,
                 &context.agent.agent_path,
                 &args.target,
+            )?;
+            (record.task_name.clone(), record.command_tx.clone())
+        };
+        let permit = command_tx
+            .reserve()
+            .await
+            .map_err(|_| ToolError::Execution(format!("agent is no longer available: {target}")))?;
+        {
+            let mut state = self.inner.state.lock().await;
+            let active_count = state.active_count(context.agent.root_session_id);
+            let record = resolve_target_mut(
+                &mut state,
+                context.agent.root_session_id,
+                &context.agent.agent_path,
+                &target,
             )?;
             if delivery.needs_new_slot(&record.state)
                 && active_count >= self.inner.max_concurrent_children
@@ -547,13 +584,8 @@ impl Supervisor {
                 )));
             }
             record.prepare_delivery(delivery, &args.message);
-            (record.task_name.clone(), record.command_tx.clone())
-        };
-        let command = delivery.command(args.message);
-        command_tx
-            .send(command)
-            .await
-            .map_err(|_| ToolError::Execution(format!("agent is no longer available: {target}")))?;
+            permit.send(delivery.command(args.message));
+        }
         self.inner.updates.notify_waiters();
         json_output(&serde_json::json!({
             "target": target,
@@ -715,7 +747,7 @@ impl Supervisor {
         else {
             return;
         };
-        record.state = match result {
+        let completed = match result {
             Ok(StopReason::Aborted) => ChildState::Interrupted(final_message),
             Ok(_) => ChildState::Completed(final_message),
             Err(error) => ChildState::Errored {
@@ -723,6 +755,8 @@ impl Supervisor {
                 error: error.to_string(),
             },
         };
+        let current = std::mem::replace(&mut record.state, ChildState::Pending);
+        record.state = current.finish_turn(completed);
         drop(state);
         self.inner.updates.notify_waiters();
     }
@@ -931,6 +965,26 @@ mod tests {
         }
     }
 
+    fn test_context(root_session_id: SessionId) -> ToolContext {
+        let config = test_config();
+        ToolContext {
+            working_dir: config.working_dir,
+            max_duration: config.max_tool_duration,
+            agent: AgentToolContext {
+                root_session_id,
+                agent_path: "/root".to_string(),
+                messages: Vec::new(),
+                provider: config.provider,
+                system_prompt: config.system_prompt,
+                tools: config.tools,
+                model: config.model,
+                max_turns: config.max_turns,
+                max_input_tokens: config.max_input_tokens,
+                max_output_tokens: config.max_output_tokens,
+            },
+        }
+    }
+
     #[test]
     fn exposes_the_codex_0_144_3_builtin_roles() {
         assert_eq!(AgentRole::from_str("default"), Ok(AgentRole::Default));
@@ -988,6 +1042,61 @@ mod tests {
         assert!(validate_task_name("Parser").is_err());
         assert!(validate_task_name("parser-tests").is_err());
         assert!(validate_task_name("").is_err());
+    }
+
+    #[test]
+    fn queued_followup_keeps_the_current_turn_active_until_the_next_turn() {
+        let mut state = ChildState::Running(CancellationToken::new());
+
+        state.queue_followup();
+        assert_eq!(state.status(), AgentStatus::Running);
+
+        let state = state.finish_turn(ChildState::Completed(Some("first turn".to_string())));
+        assert!(matches!(state, ChildState::Pending));
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_does_not_change_the_agent_lifecycle() {
+        let supervisor = Supervisor::default();
+        let root_session_id = SessionId::new();
+        let agent_id = AgentId::new();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        supervisor
+            .inner
+            .state
+            .lock()
+            .await
+            .sessions
+            .entry(root_session_id)
+            .or_default()
+            .insert(
+                agent_id,
+                ChildRecord {
+                    id: agent_id,
+                    task_name: "/root/inspect".to_string(),
+                    role: AgentRole::Explorer,
+                    state: ChildState::Completed(Some("done".to_string())),
+                    last_task_message: "original".to_string(),
+                    command_tx,
+                },
+            );
+
+        let result = supervisor
+            .send_message(
+                &test_context(root_session_id),
+                MessageAgentArgs {
+                    target: "/root/inspect".to_string(),
+                    message: "follow up".to_string(),
+                },
+                MessageDelivery::Followup,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let agents = supervisor.snapshots(root_session_id, None).await;
+        assert_eq!(agents[0].status, AgentStatus::Completed);
+        assert_eq!(agents[0].last_task_message, "original");
     }
 
     #[test]

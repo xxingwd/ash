@@ -5,9 +5,35 @@ use reqwest_eventsource::{retry::Never, Event, RequestBuilderExt};
 
 use crate::{ProtocolStream, StreamItem};
 
+pub(crate) enum DecodeResult {
+    Continue(Vec<StreamItem>),
+    Finished(Vec<StreamItem>),
+}
+
+impl DecodeResult {
+    pub(crate) fn continuing(items: Vec<StreamItem>) -> Self {
+        Self::Continue(items)
+    }
+
+    pub(crate) fn finished(items: Vec<StreamItem>) -> Self {
+        Self::Finished(items)
+    }
+
+    fn into_parts(self) -> (Vec<StreamItem>, bool) {
+        match self {
+            Self::Continue(items) => (items, false),
+            Self::Finished(items) => (items, true),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_items(self) -> Vec<StreamItem> {
+        self.into_parts().0
+    }
+}
+
 pub(crate) trait Decoder: Send + 'static {
-    fn decode(&mut self, data: &str) -> Result<Vec<StreamItem>, ProtocolError>;
-    fn is_done(&self) -> bool;
+    fn decode(&mut self, data: &str) -> Result<DecodeResult, ProtocolError>;
 }
 
 pub(crate) fn stream<D>(
@@ -27,10 +53,11 @@ where
             match event {
                 Ok(Event::Open) => {}
                 Ok(Event::Message(message)) => {
-                    for item in decoder.decode(&message.data)? {
+                    let (items, finished) = decoder.decode(&message.data)?.into_parts();
+                    for item in items {
                         yield item;
                     }
-                    if decoder.is_done() {
+                    if finished {
                         source.close();
                         break;
                     }
