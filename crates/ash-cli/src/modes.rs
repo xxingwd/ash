@@ -50,12 +50,7 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         .clone()
         .or_else(|| env_value("ASH_PROTOCOL"))
         .unwrap_or_else(|| "anthropic".into());
-    let protocol = match protocol_name.as_str() {
-        "anthropic" => Protocol::AnthropicMessages,
-        "openai" => Protocol::OpenaiCompletions,
-        "openai-responses" => Protocol::OpenaiResponses,
-        other => anyhow::bail!("unknown protocol: {other}"),
-    };
+    let protocol = parse_protocol(&protocol_name)?;
 
     let api_key =
         env_value("ASH_API_KEY").context("set ASH_API_KEY in .env or the process environment")?;
@@ -122,6 +117,11 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     ash_orchestrator::install_subagent_tools(&mut config);
 
     Ok(config)
+}
+
+fn parse_protocol(name: &str) -> Result<Protocol> {
+    name.parse()
+        .map_err(|_| anyhow::anyhow!("unknown protocol: {name}"))
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -410,6 +410,19 @@ mod tests {
         assert_eq!(resolve_max_input_tokens(None).unwrap(), 200_000);
         assert_eq!(resolve_max_input_tokens(Some(64_000)).unwrap(), 64_000);
         assert!(resolve_max_input_tokens(Some(0)).is_err());
+    }
+
+    #[test]
+    fn protocol_names_have_one_parser() {
+        for protocol in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenaiCompletions,
+            Protocol::OpenaiResponses,
+        ] {
+            let name = protocol.as_cli_name();
+            assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);
+        }
+        assert!(parse_protocol("responses").is_err());
     }
 
     #[test]

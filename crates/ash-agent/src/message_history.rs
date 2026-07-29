@@ -45,6 +45,38 @@ impl StoredMessageHistoryRecord {
     }
 }
 
+#[derive(Default)]
+struct MessageHistoryReplay {
+    entries: Vec<(SessionId, String)>,
+}
+
+impl MessageHistoryReplay {
+    fn apply(&mut self, record: MessageHistoryRecord) {
+        match record {
+            MessageHistoryRecord::Submitted { session_id, text } => {
+                self.entries.push((session_id, text));
+            }
+            MessageHistoryRecord::Undone { session_id, text } => {
+                if let Some(index) =
+                    self.entries
+                        .iter()
+                        .rposition(|(stored_session, stored_text)| {
+                            *stored_session == session_id && stored_text == &text
+                        })
+                {
+                    self.entries.remove(index);
+                }
+            }
+        }
+    }
+
+    fn into_recent(mut self) -> Vec<String> {
+        let excess = self.entries.len().saturating_sub(MAX_LOADED_ENTRIES);
+        self.entries.drain(..excess);
+        self.entries.into_iter().map(|(_, text)| text).collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MessageHistoryStore {
     path: PathBuf,
@@ -108,7 +140,7 @@ impl MessageHistoryStore {
             Err(error) => return Err(error.into()),
         };
         let mut lines = tokio::io::BufReader::new(file).lines();
-        let mut entries: Vec<(SessionId, String)> = Vec::new();
+        let mut replay = MessageHistoryReplay::default();
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -116,26 +148,11 @@ impl MessageHistoryStore {
             match serde_json::from_str::<StoredMessageHistoryRecord>(&line)
                 .map(StoredMessageHistoryRecord::into_current)
             {
-                Ok(MessageHistoryRecord::Undone {
-                    session_id: undone_session,
-                    text: undone_text,
-                }) => {
-                    if let Some(index) = entries.iter().rposition(|(session_id, text)| {
-                        *session_id == undone_session && *text == undone_text
-                    }) {
-                        entries.remove(index);
-                    }
-                }
-                Ok(MessageHistoryRecord::Submitted { session_id, text }) => {
-                    entries.push((session_id, text))
-                }
+                Ok(record) => replay.apply(record),
                 Err(error) => warn!(%error, "skipping malformed input history line"),
             }
         }
-        if entries.len() > MAX_LOADED_ENTRIES {
-            entries.drain(..entries.len() - MAX_LOADED_ENTRIES);
-        }
-        Ok(entries.into_iter().map(|(_, text)| text).collect())
+        Ok(replay.into_recent())
     }
 }
 

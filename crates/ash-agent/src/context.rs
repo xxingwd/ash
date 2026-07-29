@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, Role, ToolCallId, ToolDefinition};
 
-use crate::config::COMPACTION_TRIGGER_PERCENT;
+use crate::{config::COMPACTION_TRIGGER_PERCENT, skill::SKILL_TOOL_NAME};
 
 const CHARS_PER_TOKEN: usize = 4;
 const TOKENS_PER_MESSAGE_OVERHEAD: usize = 4;
@@ -177,7 +177,7 @@ fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
         })
         .flatten()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall { id, name, .. } if name == "skill" => Some(id.clone()),
+            ContentBlock::ToolCall { id, name, .. } if name == SKILL_TOOL_NAME => Some(id.clone()),
             ContentBlock::Text(_)
             | ContentBlock::Thought { .. }
             | ContentBlock::ToolCall { .. } => None,

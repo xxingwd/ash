@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 const SKILL_FILE_LIMIT: usize = 10;
+pub(crate) const SKILL_TOOL_NAME: &str = "skill";
 
 #[derive(Deserialize, JsonSchema)]
 struct SkillArgs {
@@ -129,7 +130,7 @@ impl Skill {
 pub fn tool(skills: Vec<Skill>) -> Arc<dyn Tool> {
     let skills = Arc::new(skills);
     define_tool(
-        "skill",
+        SKILL_TOOL_NAME,
         "Load a specialized skill when its description matches the task. The name must match one of the skills listed in the system prompt.",
         move |_ctx, args: SkillArgs| {
             let skills = Arc::clone(&skills);

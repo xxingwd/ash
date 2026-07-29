@@ -119,11 +119,63 @@ pub(crate) struct StoredSession {
     pub(crate) model_messages: Vec<Message>,
 }
 
+#[derive(Default)]
+struct SessionReplay {
+    metadata: Option<SessionMetadata>,
+    messages: Vec<Message>,
+    model_messages: Vec<Message>,
+}
+
 impl StoredSession {
     fn has_user_message(&self) -> bool {
         self.messages
             .iter()
             .any(|message| matches!(message.content, MessageContent::User(_)))
+    }
+}
+
+impl SessionReplay {
+    fn apply(&mut self, record: SessionRecord) {
+        match record {
+            SessionRecord::SessionMeta(metadata) => {
+                self.metadata.get_or_insert(metadata);
+            }
+            SessionRecord::TurnRolledBack(record) => {
+                rollback_messages(&mut self.messages, record.num_turns);
+                rollback_messages(&mut self.model_messages, record.num_turns);
+            }
+            SessionRecord::ContextCompacted(record) => {
+                self.model_messages = apply_compaction(&self.messages, record);
+            }
+            record => {
+                if let Some(message) = record.into_message() {
+                    self.messages.push(message.clone());
+                    self.model_messages.push(message);
+                }
+            }
+        }
+    }
+
+    fn finish(self, path: &Path) -> Result<StoredSession, ash_core::AshError> {
+        let metadata = self.metadata.ok_or_else(|| {
+            ash_core::AshError::Config(format!(
+                "session file is missing session metadata: {}",
+                path.display()
+            ))
+        })?;
+        if metadata.format_version != SESSION_FORMAT_VERSION {
+            return Err(ash_core::AshError::Config(format!(
+                "unsupported session format version {} in {}",
+                metadata.format_version,
+                path.display()
+            )));
+        }
+        Ok(StoredSession {
+            path: path.to_path_buf(),
+            metadata,
+            messages: self.messages,
+            model_messages: self.model_messages,
+        })
     }
 }
 
@@ -382,9 +434,8 @@ fn last_active_turn_offset(contents: &str) -> Option<usize> {
             match parsed.record {
                 SessionRecord::UserMessage(_) => turn_offsets.push(offset),
                 SessionRecord::TurnRolledBack(record) => {
-                    for _ in 0..record.num_turns {
-                        turn_offsets.pop();
-                    }
+                    let count = usize::try_from(record.num_turns).unwrap_or(usize::MAX);
+                    turn_offsets.truncate(turn_offsets.len().saturating_sub(count));
                 }
                 SessionRecord::SessionMeta(_)
                 | SessionRecord::AssistantMessage(_)
@@ -402,9 +453,7 @@ fn last_active_turn_offset(contents: &str) -> Option<usize> {
 async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     let mut lines = tokio::io::BufReader::new(file).lines();
-    let mut metadata = None;
-    let mut messages = Vec::new();
-    let mut model_messages = Vec::new();
+    let mut replay = SessionReplay::default();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -417,43 +466,9 @@ async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> 
                 continue;
             }
         };
-        match parsed.record {
-            SessionRecord::SessionMeta(value) if metadata.is_none() => metadata = Some(value),
-            SessionRecord::TurnRolledBack(record) => {
-                rollback_messages(&mut messages, record.num_turns);
-                rollback_messages(&mut model_messages, record.num_turns);
-            }
-            SessionRecord::ContextCompacted(record) => {
-                model_messages = apply_compaction(&messages, record);
-            }
-            record => {
-                if let Some(message) = record.into_message() {
-                    messages.push(message.clone());
-                    model_messages.push(message);
-                }
-            }
-        }
+        replay.apply(parsed.record);
     }
-
-    let metadata = metadata.ok_or_else(|| {
-        ash_core::AshError::Config(format!(
-            "session file is missing session metadata: {}",
-            path.display()
-        ))
-    })?;
-    if metadata.format_version != SESSION_FORMAT_VERSION {
-        return Err(ash_core::AshError::Config(format!(
-            "unsupported session format version {} in {}",
-            metadata.format_version,
-            path.display()
-        )));
-    }
-    Ok(StoredSession {
-        path: path.to_path_buf(),
-        metadata,
-        messages,
-        model_messages,
-    })
+    replay.finish(path)
 }
 
 fn apply_compaction(messages: &[Message], record: ContextCompactedRecord) -> Vec<Message> {

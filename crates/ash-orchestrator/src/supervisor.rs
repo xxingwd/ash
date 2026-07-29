@@ -204,11 +204,31 @@ impl ChildRecord {
             error: self.state.error().map(str::to_string),
         }
     }
+
+    fn prepare_delivery(&mut self, delivery: MessageDelivery, message: &str) {
+        self.last_task_message.clear();
+        self.last_task_message.push_str(message);
+        if delivery.starts_idle_turn(&self.state) {
+            self.state = ChildState::Pending;
+        }
+    }
 }
 
 enum ChildCommand {
     Queue(String),
     Followup(String),
+}
+
+impl ChildCommand {
+    fn triggers_turn(&self) -> bool {
+        matches!(self, Self::Followup(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Queue(message) | Self::Followup(message) => message,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +247,25 @@ impl MessageDelivery {
             Self::Queue => ChildCommand::Queue(message),
             Self::Followup => ChildCommand::Followup(message),
         }
+    }
+
+    fn needs_new_slot(self, state: &ChildState) -> bool {
+        self.triggers_turn() && !state.is_active()
+    }
+
+    fn starts_idle_turn(self, state: &ChildState) -> bool {
+        self.triggers_turn() && !matches!(state, ChildState::Running(_))
+    }
+}
+
+impl SupervisorState {
+    fn active_count(&self, root_session_id: SessionId) -> usize {
+        self.sessions
+            .get(&root_session_id)
+            .into_iter()
+            .flat_map(HashMap::values)
+            .filter(|record| record.state.is_active())
+            .count()
     }
 }
 
@@ -416,14 +455,11 @@ impl Supervisor {
 
         {
             let mut state = self.inner.state.lock().await;
+            let active_count = state.active_count(context.agent.root_session_id);
             let session = state
                 .sessions
                 .entry(context.agent.root_session_id)
                 .or_default();
-            let active_count = session
-                .values()
-                .filter(|record| record.state.is_active())
-                .count();
             if active_count >= self.inner.max_concurrent_children {
                 return Err(ToolError::Execution(format!(
                     "maximum of {} concurrent sub-agents reached",
@@ -495,21 +531,14 @@ impl Supervisor {
         }
         let (target, command_tx) = {
             let mut state = self.inner.state.lock().await;
-            let active_count = state
-                .sessions
-                .get(&context.agent.root_session_id)
-                .into_iter()
-                .flat_map(HashMap::values)
-                .filter(|record| record.state.is_active())
-                .count();
+            let active_count = state.active_count(context.agent.root_session_id);
             let record = resolve_target_mut(
                 &mut state,
                 context.agent.root_session_id,
                 &context.agent.agent_path,
                 &args.target,
             )?;
-            if delivery.triggers_turn()
-                && !record.state.is_active()
+            if delivery.needs_new_slot(&record.state)
                 && active_count >= self.inner.max_concurrent_children
             {
                 return Err(ToolError::Execution(format!(
@@ -517,10 +546,7 @@ impl Supervisor {
                     self.inner.max_concurrent_children
                 )));
             }
-            record.last_task_message.clone_from(&args.message);
-            if delivery.triggers_turn() && !matches!(record.state, ChildState::Running(_)) {
-                record.state = ChildState::Pending;
-            }
+            record.prepare_delivery(delivery, &args.message);
             (record.task_name.clone(), record.command_tx.clone())
         };
         let command = delivery.command(args.message);
@@ -637,24 +663,21 @@ impl Supervisor {
         let mut queued_messages = Vec::new();
 
         while let Some(command) = command_rx.recv().await {
-            match command {
-                ChildCommand::Queue(message) => queued_messages.push(message),
-                ChildCommand::Followup(message) => {
-                    queued_messages.push(message);
-                    while let Ok(command) = command_rx.try_recv() {
-                        match command {
-                            ChildCommand::Queue(message) | ChildCommand::Followup(message) => {
-                                queued_messages.push(message);
-                            }
-                        }
-                    }
-                    for message in queued_messages.drain(..) {
-                        messages.push(Message::user(&message));
-                    }
-                    self.run_child_turn(root_session_id, agent_id, &config, &mut messages)
-                        .await;
-                }
+            let triggers_turn = command.triggers_turn();
+            queued_messages.push(command.into_message());
+            if !triggers_turn {
+                continue;
             }
+            while let Ok(command) = command_rx.try_recv() {
+                queued_messages.push(command.into_message());
+            }
+            messages.extend(
+                queued_messages
+                    .drain(..)
+                    .map(|message| Message::user(&message)),
+            );
+            self.run_child_turn(root_session_id, agent_id, &config, &mut messages)
+                .await;
         }
     }
 
@@ -781,13 +804,10 @@ fn resolve_target_mut<'a>(
 }
 
 fn fork_messages(messages: &[Message], mode: ForkMode) -> Vec<Message> {
-    if mode == ForkMode::None {
-        return Vec::new();
-    }
     let end = complete_history_end(messages);
     let messages = &messages[..end];
     let start = match mode {
-        ForkMode::None => messages.len(),
+        ForkMode::None => return Vec::new(),
         ForkMode::All => 0,
         ForkMode::Last(turns) => messages
             .iter()

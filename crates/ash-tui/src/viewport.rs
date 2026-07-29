@@ -293,38 +293,55 @@ enum ScreenRegion {
     Footer,
 }
 
+#[derive(Clone, Copy)]
+enum ScreenPart {
+    Transcript,
+    Status,
+    Composer,
+    Menu,
+    Footer,
+}
+
+impl ScreenRows {
+    fn rows_mut(&mut self, part: ScreenPart) -> &mut u16 {
+        match part {
+            ScreenPart::Transcript => &mut self.transcript,
+            ScreenPart::Status => &mut self.status,
+            ScreenPart::Composer => &mut self.composer,
+            ScreenPart::Menu => &mut self.menu,
+            ScreenPart::Footer => &mut self.footer,
+        }
+    }
+
+    fn shrink_to_fit(&mut self, part: ScreenPart, minimum: u16, height: u16) {
+        let overflow = screen_overflow(*self, height);
+        let rows = self.rows_mut(part);
+        *rows = rows.saturating_sub(overflow.min(rows.saturating_sub(minimum)));
+    }
+
+    fn remove_if_needed(&mut self, part: ScreenPart, height: u16) {
+        if screen_height(*self) > u32::from(height) {
+            *self.rows_mut(part) = 0;
+        }
+    }
+}
+
 fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> ScreenRows {
-    let overflow = screen_overflow(rows, height);
-    rows.transcript = rows
-        .transcript
-        .saturating_sub(overflow.min(rows.transcript.saturating_sub(1)));
-
-    let overflow = screen_overflow(rows, height);
-    rows.footer = rows
-        .footer
-        .saturating_sub(overflow.min(rows.footer.saturating_sub(1)));
-
-    let overflow = screen_overflow(rows, height);
-    rows.menu = rows
-        .menu
-        .saturating_sub(overflow.min(rows.menu.saturating_sub(1)));
-
-    let overflow = screen_overflow(rows, height);
-    rows.composer = rows
-        .composer
-        .saturating_sub(overflow.min(rows.composer.saturating_sub(1)));
-
-    if screen_height(rows) > u32::from(height) {
-        rows.status = 0;
+    for part in [
+        ScreenPart::Transcript,
+        ScreenPart::Footer,
+        ScreenPart::Menu,
+        ScreenPart::Composer,
+    ] {
+        rows.shrink_to_fit(part, 1, height);
     }
-    if screen_height(rows) > u32::from(height) {
-        rows.transcript = 0;
-    }
-    if screen_height(rows) > u32::from(height) {
-        rows.footer = 0;
-    }
-    if screen_height(rows) > u32::from(height) {
-        rows.menu = 0;
+    for part in [
+        ScreenPart::Status,
+        ScreenPart::Transcript,
+        ScreenPart::Footer,
+        ScreenPart::Menu,
+    ] {
+        rows.remove_if_needed(part, height);
     }
     rows
 }
@@ -929,6 +946,23 @@ mod tests {
 
         assert_eq!(rows.transcript, 18);
         assert_eq!(screen_height(rows), 24);
+    }
+
+    #[test]
+    fn screen_layout_keeps_the_composer_in_a_one_row_terminal() {
+        let rows = fit_screen_rows(
+            ScreenRows {
+                transcript: 10,
+                status: 1,
+                composer: 4,
+                menu: 6,
+                footer: 1,
+            },
+            1,
+        );
+
+        assert_eq!(rows.composer, 1);
+        assert_eq!(screen_height(rows), 1);
     }
 
     #[test]

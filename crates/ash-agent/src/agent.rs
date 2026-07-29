@@ -31,15 +31,29 @@ struct PendingToolCall {
 
 struct CollectedResponse {
     message: Option<Message>,
-    calls: Vec<PendingToolCall>,
     usage: UsageAccumulator,
-    termination: StreamTermination,
+    outcome: ResponseOutcome,
 }
 
 enum StreamTermination {
     Completed(StopReason),
     Cancelled,
     Failed(ash_core::ProtocolError),
+}
+
+enum ResponseOutcome {
+    Finished(StopReason),
+    ToolCalls {
+        calls: Vec<PendingToolCall>,
+        after_tools: AfterToolCalls,
+    },
+    Failed(ash_core::ProtocolError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterToolCalls {
+    Continue,
+    Abort,
 }
 
 pub(crate) struct CompactedHistory {
@@ -61,6 +75,34 @@ struct FinalUsage {
     output_tokens: u64,
     generation_ms: u64,
     estimated: bool,
+}
+
+struct AgentTurnRunner<'a> {
+    config: &'a AgentConfig,
+    tx: &'a mpsc::Sender<Event>,
+    cancel: &'a CancellationToken,
+    session_id: SessionId,
+    adapter: &'a dyn ProtocolAdapter,
+    store: Option<&'a mut SessionStore>,
+    tool_defs: Vec<ToolDefinition>,
+}
+
+impl StreamTermination {
+    fn resolve(self, calls: Vec<PendingToolCall>) -> ResponseOutcome {
+        match (self, calls.is_empty()) {
+            (Self::Completed(reason), true) => ResponseOutcome::Finished(reason),
+            (Self::Completed(_), false) => ResponseOutcome::ToolCalls {
+                calls,
+                after_tools: AfterToolCalls::Continue,
+            },
+            (Self::Cancelled, true) => ResponseOutcome::Finished(StopReason::Aborted),
+            (Self::Cancelled, false) => ResponseOutcome::ToolCalls {
+                calls,
+                after_tools: AfterToolCalls::Abort,
+            },
+            (Self::Failed(error), _) => ResponseOutcome::Failed(error),
+        }
+    }
 }
 
 impl UsageAccumulator {
@@ -246,70 +288,130 @@ async fn run_with_adapter(
     cancel: CancellationToken,
     session_id: SessionId,
     adapter: &dyn ProtocolAdapter,
-    mut store: Option<&mut SessionStore>,
+    store: Option<&mut SessionStore>,
 ) -> Result<StopReason, ash_core::AshError> {
-    let tool_defs: Vec<ToolDefinition> =
-        config.tools.iter().map(|tool| tool.definition()).collect();
-    for turn in 0..config.max_turns {
-        if cancel.is_cancelled() {
-            return Ok(StopReason::Aborted);
-        }
-        debug!(turn = turn + 1, "calling LLM");
+    AgentTurnRunner::new(config, &tx, &cancel, session_id, adapter, store)
+        .run(messages)
+        .await
+}
 
+impl<'a> AgentTurnRunner<'a> {
+    fn new(
+        config: &'a AgentConfig,
+        tx: &'a mpsc::Sender<Event>,
+        cancel: &'a CancellationToken,
+        session_id: SessionId,
+        adapter: &'a dyn ProtocolAdapter,
+        store: Option<&'a mut SessionStore>,
+    ) -> Self {
+        let tool_defs = config.tools.iter().map(|tool| tool.definition()).collect();
+        Self {
+            config,
+            tx,
+            cancel,
+            session_id,
+            adapter,
+            store,
+            tool_defs,
+        }
+    }
+
+    async fn run(&mut self, messages: &mut Vec<Message>) -> Result<StopReason, ash_core::AshError> {
+        for turn in 0..self.config.max_turns {
+            if self.cancel.is_cancelled() {
+                return Ok(StopReason::Aborted);
+            }
+            debug!(turn = turn + 1, "calling LLM");
+
+            self.prepare_context(messages).await?;
+
+            let request_messages = messages.clone();
+            let estimated_input_tokens = u64::try_from(estimate_request_tokens(
+                self.config.system_prompt.as_deref(),
+                &request_messages,
+                &self.tool_defs,
+            ))
+            .unwrap_or(u64::MAX);
+            let request_started = Instant::now();
+            let mut stream = self.adapter.stream(LlmRequest {
+                model: self.config.model.clone(),
+                system: self.config.system_prompt.clone(),
+                messages: request_messages,
+                tools: self.tool_defs.clone(),
+                max_tokens: self.config.max_output_tokens,
+            })?;
+            let CollectedResponse {
+                message,
+                usage,
+                outcome,
+            } = collect_response(&mut stream, self.tx, self.cancel, request_started).await;
+            let estimated_output_tokens = message
+                .as_ref()
+                .map(count_output_tokens)
+                .and_then(|tokens| u64::try_from(tokens).ok())
+                .unwrap_or(0);
+            self.emit_usage(usage.finalize(estimated_input_tokens, estimated_output_tokens))
+                .await;
+            if let Some(message) = message {
+                self.persist_message(&message).await?;
+                messages.push(message);
+            }
+
+            match outcome {
+                ResponseOutcome::Finished(reason) => return Ok(reason),
+                ResponseOutcome::Failed(error) => return Err(error.into()),
+                ResponseOutcome::ToolCalls { calls, after_tools } => {
+                    self.execute_tool_calls(messages, calls).await?;
+                    if after_tools == AfterToolCalls::Abort || self.cancel.is_cancelled() {
+                        return Ok(StopReason::Aborted);
+                    }
+                }
+            }
+        }
+
+        Ok(StopReason::MaxTurns)
+    }
+
+    async fn prepare_context(
+        &mut self,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), ash_core::AshError> {
         if let Some(pruned) = prune_tool_outputs(messages) {
             *messages = pruned;
         }
 
-        let estimated_context =
-            estimate_request_tokens(config.system_prompt.as_deref(), messages, &tool_defs);
-        if needs_compaction(estimated_context, config.max_input_tokens) {
-            if let Some(compacted) =
-                compact_with_adapter(config, messages, adapter, &cancel).await?
-            {
-                if let Some(store) = store.as_deref_mut() {
-                    store.append_compaction(&compacted.messages).await?;
-                }
-                *messages = compacted.messages;
-                let _ = tx
-                    .send(Event::ContextCompacted {
-                        before_tokens: u64::try_from(compacted.before_tokens).unwrap_or(u64::MAX),
-                        after_tokens: u64::try_from(compacted.after_tokens).unwrap_or(u64::MAX),
-                        dropped_messages: u64::try_from(compacted.dropped_messages)
-                            .unwrap_or(u64::MAX),
-                        automatic: true,
-                    })
-                    .await;
-            }
+        let estimated_context = estimate_request_tokens(
+            self.config.system_prompt.as_deref(),
+            messages,
+            &self.tool_defs,
+        );
+        if !needs_compaction(estimated_context, self.config.max_input_tokens) {
+            return Ok(());
         }
+        let Some(compacted) =
+            compact_with_adapter(self.config, messages, self.adapter, self.cancel).await?
+        else {
+            return Ok(());
+        };
+        if let Some(store) = self.store.as_deref_mut() {
+            store.append_compaction(&compacted.messages).await?;
+        }
+        *messages = compacted.messages;
+        let _ = self
+            .tx
+            .send(Event::ContextCompacted {
+                before_tokens: u64::try_from(compacted.before_tokens).unwrap_or(u64::MAX),
+                after_tokens: u64::try_from(compacted.after_tokens).unwrap_or(u64::MAX),
+                dropped_messages: u64::try_from(compacted.dropped_messages).unwrap_or(u64::MAX),
+                automatic: true,
+            })
+            .await;
+        Ok(())
+    }
 
-        let request_messages = messages.clone();
-        let estimated_input_tokens = u64::try_from(estimate_request_tokens(
-            config.system_prompt.as_deref(),
-            &request_messages,
-            &tool_defs,
-        ))
-        .unwrap_or(u64::MAX);
-        let request_started = Instant::now();
-        let mut stream = adapter.stream(LlmRequest {
-            model: config.model.clone(),
-            system: config.system_prompt.clone(),
-            messages: request_messages,
-            tools: tool_defs.clone(),
-            max_tokens: config.max_output_tokens,
-        })?;
-        let CollectedResponse {
-            message,
-            calls,
-            usage,
-            termination,
-        } = collect_response(&mut stream, &tx, &cancel, request_started).await;
-        let estimated_output_tokens = message
-            .as_ref()
-            .map(count_output_tokens)
-            .and_then(|tokens| u64::try_from(tokens).ok())
-            .unwrap_or(0);
-        let usage = usage.finalize(estimated_input_tokens, estimated_output_tokens);
-        let _ = tx
+    async fn emit_usage(&self, usage: FinalUsage) {
+        let _ = self
+            .tx
             .send(Event::Usage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
@@ -317,27 +419,100 @@ async fn run_with_adapter(
                 estimated: usage.estimated,
             })
             .await;
-        if let Some(message) = message {
-            persist_message(store.as_deref_mut(), &message).await?;
-            messages.push(message);
-        }
-        let response_cancelled = match termination {
-            StreamTermination::Completed(reason) if calls.is_empty() => return Ok(reason),
-            StreamTermination::Completed(_) => false,
-            StreamTermination::Cancelled if calls.is_empty() => return Ok(StopReason::Aborted),
-            StreamTermination::Cancelled => true,
-            StreamTermination::Failed(error) => return Err(error.into()),
-        };
-        execute_tool_calls(
-            config, messages, session_id, &cancel, &tx, &mut store, calls,
-        )
-        .await?;
-        if response_cancelled || cancel.is_cancelled() {
-            return Ok(StopReason::Aborted);
+    }
+
+    async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
+        match self.store.as_deref_mut() {
+            Some(store) => store.append_message(message).await,
+            None => Ok(()),
         }
     }
 
-    Ok(StopReason::MaxTurns)
+    async fn execute_tool_calls(
+        &mut self,
+        messages: &mut Vec<Message>,
+        calls: Vec<PendingToolCall>,
+    ) -> Result<(), ash_core::AshError> {
+        for call in calls {
+            let _ = self
+                .tx
+                .send(Event::ToolCallStart {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .await;
+            let result = limit_tool_result(
+                self.execute_tool(messages, &call.name, call.arguments.clone())
+                    .await,
+            );
+            let (output, is_error) = match &result {
+                Ok(output) => (output.text.clone(), false),
+                Err(error) => (error.to_string(), true),
+            };
+            let _ = self
+                .tx
+                .send(Event::ToolCallEnd {
+                    id: call.id.clone(),
+                    name: call.name,
+                    arguments: call.arguments,
+                    output,
+                    is_error,
+                })
+                .await;
+            let (result, attachments) = match result {
+                Ok(output) => (Ok(output.text), output.attachments),
+                Err(error) => (Err(error.to_string()), Vec::new()),
+            };
+            let message = Message {
+                id: ash_core::MessageId::new(),
+                role: Role::User,
+                content: MessageContent::ToolResult {
+                    id: call.id,
+                    result,
+                    attachments,
+                },
+            };
+            self.persist_message(&message).await?;
+            messages.push(message);
+        }
+        Ok(())
+    }
+
+    async fn execute_tool(
+        &self,
+        messages: &[Message],
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let Some(tool) = self.config.tools.iter().find(|tool| tool.name() == name) else {
+            return Err(ToolError::Execution(format!("unknown tool: {name}")));
+        };
+        let context = ToolContext {
+            working_dir: self.config.working_dir.clone(),
+            max_duration: self.config.max_tool_duration,
+            agent: AgentToolContext {
+                root_session_id: self.config.root_session_id.unwrap_or(self.session_id),
+                agent_path: self.config.agent_path.clone(),
+                messages: messages.to_vec(),
+                provider: self.config.provider.clone(),
+                system_prompt: self.config.system_prompt.clone(),
+                tools: self.config.tools.clone(),
+                model: self.config.model.clone(),
+                max_turns: self.config.max_turns,
+                max_input_tokens: self.config.max_input_tokens,
+                max_output_tokens: self.config.max_output_tokens,
+            },
+        };
+
+        tokio::select! {
+            _ = self.cancel.cancelled() => Err(ToolError::Cancelled),
+            result = tokio::time::timeout(
+                self.config.max_tool_duration,
+                tool.execute(context, arguments),
+            ) => result.unwrap_or(Err(ToolError::Timeout(self.config.max_tool_duration)))
+        }
+    }
 }
 
 async fn collect_response(
@@ -438,7 +613,6 @@ async fn collect_response(
     });
     CollectedResponse {
         message,
-        calls,
         usage: UsageAccumulator {
             generation_ms: u64::try_from(
                 first_output_at
@@ -449,68 +623,8 @@ async fn collect_response(
             .unwrap_or(u64::MAX),
             ..usage
         },
-        termination,
+        outcome: termination.resolve(calls),
     }
-}
-
-async fn execute_tool_calls(
-    config: &AgentConfig,
-    messages: &mut Vec<Message>,
-    session_id: SessionId,
-    cancel: &CancellationToken,
-    tx: &mpsc::Sender<Event>,
-    store: &mut Option<&mut SessionStore>,
-    calls: Vec<PendingToolCall>,
-) -> Result<(), ash_core::AshError> {
-    for call in calls {
-        let _ = tx
-            .send(Event::ToolCallStart {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            })
-            .await;
-        let result = limit_tool_result(
-            execute_tool(
-                config,
-                messages,
-                session_id,
-                cancel,
-                &call.name,
-                call.arguments.clone(),
-            )
-            .await,
-        );
-        let (output, is_error) = match &result {
-            Ok(output) => (output.text.clone(), false),
-            Err(error) => (error.to_string(), true),
-        };
-        let _ = tx
-            .send(Event::ToolCallEnd {
-                id: call.id.clone(),
-                name: call.name,
-                arguments: call.arguments,
-                output,
-                is_error,
-            })
-            .await;
-        let (result, attachments) = match result {
-            Ok(output) => (Ok(output.text), output.attachments),
-            Err(error) => (Err(error.to_string()), Vec::new()),
-        };
-        let message = Message {
-            id: ash_core::MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id: call.id,
-                result,
-                attachments,
-            },
-        };
-        persist_message(store.as_deref_mut(), &message).await?;
-        messages.push(message);
-    }
-    Ok(())
 }
 
 fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
@@ -522,52 +636,6 @@ fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Inst
     }) = blocks.last_mut()
     {
         *elapsed_seconds = started.elapsed().as_secs();
-    }
-}
-
-async fn persist_message(
-    store: Option<&mut SessionStore>,
-    message: &Message,
-) -> Result<(), ash_core::AshError> {
-    match store {
-        Some(store) => store.append_message(message).await,
-        None => Ok(()),
-    }
-}
-
-async fn execute_tool(
-    config: &AgentConfig,
-    messages: &[Message],
-    session_id: SessionId,
-    cancel: &CancellationToken,
-    name: &str,
-    arguments: serde_json::Value,
-) -> Result<ToolOutput, ToolError> {
-    let Some(tool) = config.tools.iter().find(|tool| tool.name() == name) else {
-        return Err(ToolError::Execution(format!("unknown tool: {name}")));
-    };
-    let context = ToolContext {
-        working_dir: config.working_dir.clone(),
-        max_duration: config.max_tool_duration,
-        agent: AgentToolContext {
-            root_session_id: config.root_session_id.unwrap_or(session_id),
-            agent_path: config.agent_path.clone(),
-            messages: messages.to_vec(),
-            provider: config.provider.clone(),
-            system_prompt: config.system_prompt.clone(),
-            tools: config.tools.clone(),
-            model: config.model.clone(),
-            max_turns: config.max_turns,
-            max_input_tokens: config.max_input_tokens,
-            max_output_tokens: config.max_output_tokens,
-        },
-    };
-
-    tokio::select! {
-        _ = cancel.cancelled() => Err(ToolError::Cancelled),
-        result = tokio::time::timeout(config.max_tool_duration, tool.execute(context, arguments)) => {
-            result.unwrap_or(Err(ToolError::Timeout(config.max_tool_duration)))
-        }
     }
 }
 

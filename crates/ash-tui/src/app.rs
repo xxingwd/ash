@@ -620,7 +620,7 @@ async fn submit_input(
     if input.trim().is_empty() {
         return Ok(LoopAction::Continue);
     }
-    if matches!(input.trim(), "exit" | "quit") {
+    if slash_command::is_bare_exit(&input) {
         terminal.commit_exit(&input)?;
         let _ = commands.send(UiCommand::Exit).await;
         return Ok(LoopAction::Exit);

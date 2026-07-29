@@ -125,6 +125,14 @@ pub(crate) fn parse(input: &str) -> ParsedInput {
         )
 }
 
+pub(crate) fn is_bare_exit(input: &str) -> bool {
+    let input = input.trim();
+    COMMANDS
+        .iter()
+        .find(|spec| spec.command == SlashCommand::Exit)
+        .is_some_and(|spec| spec.name == input || spec.aliases.contains(&input))
+}
+
 pub(crate) fn help_text() -> String {
     COMMANDS
         .iter()
@@ -247,6 +255,9 @@ mod tests {
         );
         assert_eq!(parse(" /quit "), ParsedInput::Command(SlashCommand::Exit));
         assert_eq!(parse("/commands"), ParsedInput::Command(SlashCommand::Help));
+        assert!(is_bare_exit(" exit "));
+        assert!(is_bare_exit("quit"));
+        assert!(!is_bare_exit("close"));
     }
 
     #[test]
