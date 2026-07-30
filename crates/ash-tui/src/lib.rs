@@ -1,6 +1,7 @@
 pub mod app;
 mod block_layout;
 mod buffer;
+mod fork_picker;
 mod history_block;
 mod inline;
 mod inline_surface;

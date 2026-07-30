@@ -3,7 +3,9 @@ use ash_core::Event;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackgroundAction {
     ListSessions,
+    ListForkPoints,
     Resume,
+    Fork,
     Compact,
 }
 
@@ -72,12 +74,6 @@ enum TurnOperation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RollbackOrigin {
-    Command,
-    CancelledTurn,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RollbackStage {
     AwaitingTurn,
     AwaitingResult,
@@ -85,7 +81,6 @@ enum RollbackStage {
 
 #[derive(Debug)]
 struct Rollback {
-    origin: RollbackOrigin,
     stage: RollbackStage,
 }
 
@@ -131,13 +126,6 @@ impl OperationState {
         self.current = Operation::Background(action);
     }
 
-    pub(crate) fn start_rollback(&mut self) {
-        self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
-            origin: RollbackOrigin::Command,
-            stage: RollbackStage::AwaitingResult,
-        }));
-    }
-
     pub(crate) fn begin_cancellation(&mut self, has_response: bool) -> Option<Cancellation> {
         let current = std::mem::take(&mut self.current);
         let Operation::Turn(TurnOperation::Running { prompt }) = current else {
@@ -150,7 +138,6 @@ impl OperationState {
             Some(Cancellation::KeepResponse)
         } else {
             self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
-                origin: RollbackOrigin::CancelledTurn,
                 stage: RollbackStage::AwaitingTurn,
             }));
             Some(Cancellation::RemoveTurn { prompt })
@@ -226,13 +213,8 @@ impl OperationState {
     }
 
     pub(crate) fn finish_rollback(&mut self) -> RollbackCompletion {
-        let viewport_removed = matches!(
-            self.current,
-            Operation::Turn(TurnOperation::RollingBack(Rollback {
-                origin: RollbackOrigin::CancelledTurn,
-                ..
-            }))
-        );
+        let viewport_removed =
+            matches!(self.current, Operation::Turn(TurnOperation::RollingBack(_)));
         self.finish();
         if viewport_removed {
             RollbackCompletion::ViewportAlreadyRemoved
@@ -369,11 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn rollback_origin_records_whether_the_viewport_was_already_removed() {
+    fn cancelled_turn_rollback_records_that_the_viewport_was_already_removed() {
         let mut state = OperationState::default();
-        state.start_rollback();
-        assert_eq!(state.finish_rollback(), RollbackCompletion::ReplayViewport);
-
         state.start_turn(None);
         state.begin_cancellation(false);
         assert_eq!(

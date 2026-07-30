@@ -33,7 +33,6 @@ pub struct AgentToolContext {
     pub model: ModelId,
     pub max_turns: u32,
     pub max_context_tokens: usize,
-    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -122,19 +122,20 @@ Review the relevant code and report concrete findings.
 session-2026-07-14T16-30-25.123-<session-id>.jsonl
 ```
 
-文件第一次提交消息时才会创建。首行保存格式版本、Session ID、模型、协议、工作
-目录、最终系统提示词、工具定义和上下文限制等配置快照；后续按顺序追加完整用户
-消息、Assistant 消息、工具结果和 Turn 结束状态。压缩时只追加摘要和近期历史起点；
-恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。API Key、
-访问令牌和自定义接口地址内容不会写入文件。
+普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
+首行保存格式版本、Session ID、模型、协议、工作目录、最终系统提示词、工具定义和上下文
+限制等配置快照；后续按顺序追加完整用户消息、Assistant 消息、工具结果和 Turn 结束状态。
+压缩时只追加摘要和近期历史起点；恢复会话后，UI 重放完整消息，模型请求则使用该
+checkpoint 构造压缩上下文。API Key、访问令牌和自定义接口地址内容不会写入文件。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
 Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
-`/undo` 会从内存历史和 Session JSONL 中直接截断最后一轮，并把该轮输入恢复到输入框。
-新 Session 会立即获得 ID 和创建时间，但在第一条用户消息发出前不会创建文件；会话名称
-取第一条有效用户消息。
-`/resume` 会在输入框下方列出其他已保存会话的名称和创建时间，使用方向键选择。输入框的
-跨进程历史单独保存在 `~/.local/share/ash/history.jsonl`。
+`/undo` 会列出当前会话的历史用户输入；选中后创建一个新的 fork Session，继承该输入
+之前的消息，并把所选输入恢复到输入框。原 Session 的内存历史和 JSONL 都不会改变。
+通过 `/new` 或 `/clear` 建立的 Session 会立即获得 ID 和创建时间，但在第一条用户消息
+发出前不会创建文件；会话名称取第一条有效用户消息。
+`/resume` 和 `/undo` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
+历史单独保存在 `~/.local/share/ash/history.jsonl`。
 
 ## 子 Agent
 
@@ -171,10 +172,10 @@ viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随
 
 收到 `AgentFinished` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
 随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
-resize 和 `/undo` 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并
-立即释放 Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。
-`/new`、`/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 则从 JSONL
-重新渲染历史。
+resize 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并立即释放
+Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。`/new`、
+`/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 和完成的 `/undo` fork
+则从对应 Session 消息重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
 正文、工具调用或本轮结束后，思考区折叠为不可展开的一行 `• Thought for Xs`。OpenAI Chat
@@ -201,8 +202,8 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `exit` / `quit`：退出
 
 按下 `Esc` 会从模型会话历史和 live viewport 中移除当前轮，并把问题恢复到输入框；它不会
-反向撤销已经由工具写入文件系统的修改。`/undo` 会回滚模型与 Session JSONL 并恢复问题，
-然后清空 scrollback 并重放删除该轮后的完整语义历史。
+反向撤销已经由工具写入文件系统的修改。`/undo` 也不会撤销工具副作用或修改原 Session；
+它会从所选输入之前的历史创建新 Session，随后重放继承的历史并恢复该输入。
 
 ## 开发检查
 

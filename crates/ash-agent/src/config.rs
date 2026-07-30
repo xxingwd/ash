@@ -14,7 +14,6 @@ pub struct AgentConfig {
     pub max_turns: u32,
     pub working_dir: PathBuf,
     pub max_context_tokens: usize,
-    pub max_output_tokens: Option<u32>,
     pub max_tool_duration: Duration,
     pub agent_path: String,
     pub root_session_id: Option<SessionId>,

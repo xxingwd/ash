@@ -68,8 +68,10 @@
 首行的配置快照包含恢复模型上下文所需的信息，但不包含 API Key、Token 或自定义
 接口地址内容。`/new` 立即生成 Session ID 和创建时间，但会话文件延迟到第一条用户
 消息时创建；会话标题由重放后的第一条有效用户消息派生。`/resume` 列出其他已保存
-会话的标题和创建时间，选中后按 Session ID 恢复 `Vec<Message>`。Turn rollback 也以 append-only 记录保存；重放 JSONL
-时按顺序截断对应用户轮次，不重写已有文件。
+会话的标题和创建时间，选中后按 Session ID 恢复 `Vec<Message>`。`/undo` 列出当前会话
+中的真实用户消息，选中后把此前消息复制到新的 Session JSONL，并将所选输入恢复为草稿；
+原 Session 保持不变。取消尚未形成响应的当前 turn 时，rollback 仍以 append-only 记录保存；
+重放 JSONL 时按顺序截断对应用户轮次，不重写已有文件。
 
 提示词由固定基础约定和启动时上下文组合而成。动态上下文只包含环境信息、从 Git 项目根到
 当前目录生效的 `AGENTS.md`，以及 `.agents/skills` 中 Skills 的名称与描述；运行时 `skill` 工具按名称注入完整指令、
@@ -88,8 +90,10 @@
 - `AgentFinished` 是唯一的正常 turn 提交边界：先收缩到 Composer，再在一次同步更新中把
   用户消息、Thought、工具、回答和 Worked 块写到 scrollback，随后转存语义块并释放缓存
 - `/new` 和 `/clear` 清空模型历史、可见屏幕与 scrollback；`/resume` 从 JSONL 重放历史
-- resize 与 `/undo` 先清空可见屏幕和 scrollback，再从语义历史按当前宽度完整重放；重放
-  每次只构建一个块的 Buffer，插入后立即释放
+- `/undo` 从历史用户输入中选择 fork 点，创建新 Session 并重放所选输入之前的历史；
+  原会话不回退
+- resize 先清空可见屏幕和 scrollback，再从语义历史按当前宽度完整重放；重放每次只
+  构建一个块的 Buffer，插入后立即释放
 - 除全量重放边界外，终端模拟器负责历史滚动、选择与复制
 - Agent 工作期间 `Ctrl-C` 不发送取消命令；状态栏提示 `esc to interrupt`，第一次按
   `Esc` 不展示额外状态

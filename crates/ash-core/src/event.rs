@@ -2,13 +2,19 @@ use derive_more::Display;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{AgentId, Message, SessionId, ToolCallId};
+use crate::message::{AgentId, Message, MessageId, SessionId, ToolCallId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: SessionId,
     pub title: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkPoint {
+    pub message_id: MessageId,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, EnumAsInner)]
@@ -47,6 +53,16 @@ pub enum Event {
     },
     SessionsListed {
         sessions: Vec<SessionSummary>,
+    },
+    ForkPointsListed {
+        points: Vec<ForkPoint>,
+    },
+    SessionForked {
+        model: String,
+        protocol: String,
+        working_dir: std::path::PathBuf,
+        messages: Vec<Message>,
+        prompt: String,
     },
     TurnRolledBack {
         prompt: String,

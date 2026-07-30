@@ -157,7 +157,7 @@ fn buffer_row(buffer: &Buffer, row: u16) -> Vec<TextCell<'_>> {
             .unwrap_or(u16::MAX)
             .max(1);
         hidden_columns = width.saturating_sub(1);
-        if !cell.skip {
+        if !crate::buffer::cell_is_skipped(cell) {
             cells.push(TextCell {
                 column: column.saturating_sub(buffer.area.x),
                 width,

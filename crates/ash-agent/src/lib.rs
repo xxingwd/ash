@@ -15,5 +15,5 @@ pub use context::{count_tokens, estimate_tokens};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;
-pub use session::{AgentSession, ContextCompaction, ResumedSession};
+pub use session::{AgentSession, ContextCompaction, ForkedSession, ResumedSession};
 pub use skill::{tool as skill_tool, Skill};

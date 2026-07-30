@@ -1,4 +1,7 @@
-use ratatui::{buffer::Buffer, layout::Rect};
+use ratatui::{
+    buffer::{Buffer, Cell, CellDiffOption},
+    layout::Rect,
+};
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn copy_rows(source: &Buffer, destination: &mut Buffer, source_y: u16, target: Rect) {
@@ -43,7 +46,7 @@ pub(crate) fn copy_rows_for_direct_draw(
             let Some(cell) = destination.cell_mut((x, y)) else {
                 continue;
             };
-            if continuation_columns > 0 || cell.skip {
+            if continuation_columns > 0 || cell_is_skipped(cell) {
                 cell.set_symbol("");
                 continuation_columns = continuation_columns.saturating_sub(1);
             } else {
@@ -51,6 +54,10 @@ pub(crate) fn copy_rows_for_direct_draw(
             }
         }
     }
+}
+
+pub(crate) fn cell_is_skipped(cell: &Cell) -> bool {
+    matches!(cell.diff_option, CellDiffOption::Skip)
 }
 
 #[cfg(test)]

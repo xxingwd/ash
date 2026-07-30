@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use ash_core::{Content, ContentBlock, Message, MessageContent, SessionSummary};
+use ash_core::{Content, ContentBlock, ForkPoint, Message, MessageContent, SessionSummary};
 use crossterm::terminal;
 use ratatui::layout::Position;
 use serde_json::Value;
@@ -182,6 +182,10 @@ enum RenderedMenu {
         items: Vec<SessionSummary>,
         selected: usize,
     },
+    ForkPoints {
+        items: Vec<ForkPoint>,
+        selected: usize,
+    },
 }
 
 impl RenderedMenu {
@@ -196,6 +200,10 @@ impl RenderedMenu {
                 items: items.to_vec(),
                 selected: selected.min(items.len().saturating_sub(1)),
             },
+            MenuView::ForkPoints { items, selected } => Self::ForkPoints {
+                items: items.to_vec(),
+                selected: selected.min(items.len().saturating_sub(1)),
+            },
         };
     }
 
@@ -207,6 +215,10 @@ impl RenderedMenu {
                 selected: *selected,
             },
             Self::Sessions { items, selected } => MenuView::Sessions {
+                items,
+                selected: *selected,
+            },
+            Self::ForkPoints { items, selected } => MenuView::ForkPoints {
                 items,
                 selected: *selected,
             },
@@ -1052,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_finds_the_latest_committed_turn_behind_non_turn_history() {
+    fn rollback_finds_the_latest_committed_turn_behind_non_turn_history() {
         let history = [
             LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(7)),
             LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(7)),

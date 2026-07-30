@@ -628,7 +628,6 @@ impl Supervisor {
             max_turns: context.agent.max_turns,
             working_dir: context.working_dir,
             max_context_tokens: context.agent.max_context_tokens,
-            max_output_tokens: context.agent.max_output_tokens,
             max_tool_duration: context.max_duration,
             agent_path: task_name.clone(),
             root_session_id: Some(context.agent.root_session_id),
@@ -1071,7 +1070,6 @@ mod tests {
             max_turns: 10,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            max_output_tokens: None,
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1093,7 +1091,6 @@ mod tests {
                 model: config.model,
                 max_turns: config.max_turns,
                 max_context_tokens: config.max_context_tokens,
-                max_output_tokens: config.max_output_tokens,
             },
         }
     }
@@ -1492,7 +1489,6 @@ mod tests {
                 model: ModelId::new("test-model"),
                 max_turns: 2,
                 max_context_tokens: 200_000,
-                max_output_tokens: None,
             },
         };
         let followup_context = context.clone();

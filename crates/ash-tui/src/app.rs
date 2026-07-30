@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{Event, SessionId};
+use ash_core::{Event, MessageId, SessionId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -29,11 +29,12 @@ pub enum UiCommand {
     Submit(String),
     Cancel,
     CancelAndRollback,
-    Rollback,
     Compact,
     NewSession,
     ListSessions,
+    ListForkPoints,
     ResumeSession(SessionId),
+    ForkSession(MessageId),
     Exit,
 }
 
@@ -55,6 +56,13 @@ enum SessionPickerAction {
     KeepOpen,
     Close,
     Resume(SessionId),
+}
+
+#[derive(Clone, Copy)]
+enum ForkPickerAction {
+    KeepOpen,
+    Close,
+    Fork(MessageId),
 }
 
 impl AppState {
@@ -248,7 +256,7 @@ async fn handle_agent_event(
             terminal.error(&error)?;
             match state.operation.complete_failed_action() {
                 FailureCompletion::FinishedOperation => {
-                    state.menu.close_sessions();
+                    state.menu.close_picker();
                     state.render(terminal)?;
                 }
                 FailureCompletion::OperationUnchanged => {}
@@ -307,7 +315,7 @@ async fn handle_agent_event(
             working_dir,
             messages,
         } => {
-            state.menu.close_sessions();
+            state.menu.close_picker();
             state.operation.finish();
             terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
             state.render(terminal)?;
@@ -322,6 +330,32 @@ async fn handle_agent_event(
             } else {
                 state.menu.open_sessions(sessions);
             }
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
+        Event::ForkPointsListed { points } => {
+            state
+                .operation
+                .finish_background(BackgroundAction::ListForkPoints);
+            if points.is_empty() {
+                terminal.command_output("No submitted prompts are available to fork from.")?;
+            } else {
+                state.menu.open_fork_points(points);
+            }
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
+        Event::SessionForked {
+            model,
+            protocol,
+            working_dir,
+            messages,
+            prompt,
+        } => {
+            state.menu.close_picker();
+            state.operation.finish_background(BackgroundAction::Fork);
+            terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
+            state.input.set_text(prompt);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -349,7 +383,7 @@ async fn handle_terminal_event(
             state.resize(terminal, width, height)?;
             Ok(LoopAction::Continue)
         }
-        CrosstermEvent::Paste(text) if !state.menu.session_picker_is_visible() => {
+        CrosstermEvent::Paste(text) if !state.menu.picker_is_visible() => {
             state.input.insert_paste(&text);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -373,6 +407,15 @@ fn handle_mouse(
         match mouse.kind {
             MouseEventKind::ScrollUp => sessions.move_up(),
             MouseEventKind::ScrollDown => sessions.move_down(),
+            _ => return Ok(LoopAction::Continue),
+        }
+        state.render(terminal)?;
+        return Ok(LoopAction::Continue);
+    }
+    if let Some(points) = state.menu.visible_fork_picker_mut() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => points.move_up(),
+            MouseEventKind::ScrollDown => points.move_down(),
             _ => return Ok(LoopAction::Continue),
         }
         state.render(terminal)?;
@@ -413,6 +456,9 @@ async fn handle_key(
 ) -> anyhow::Result<LoopAction> {
     if state.menu.session_picker_is_visible() {
         return handle_session_key(state, terminal, commands, key).await;
+    }
+    if state.menu.fork_picker_is_visible() {
+        return handle_fork_key(state, terminal, commands, key).await;
     }
     if handle_completion_key(state, terminal, key)? {
         return Ok(LoopAction::Continue);
@@ -527,6 +573,61 @@ async fn handle_session_key(
     };
     if commands
         .send(UiCommand::ResumeSession(session_id))
+        .await
+        .is_err()
+    {
+        return Ok(LoopAction::Exit);
+    }
+    Ok(LoopAction::Continue)
+}
+
+async fn handle_fork_key(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    key: KeyEvent,
+) -> anyhow::Result<LoopAction> {
+    let Some(points) = state.menu.visible_fork_picker_mut() else {
+        return Ok(LoopAction::Continue);
+    };
+    let action = match key.code {
+        KeyCode::Esc => ForkPickerAction::Close,
+        KeyCode::Up => {
+            points.move_up();
+            ForkPickerAction::KeepOpen
+        }
+        KeyCode::Down => {
+            points.move_down();
+            ForkPickerAction::KeepOpen
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            points.move_up();
+            ForkPickerAction::KeepOpen
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            points.move_down();
+            ForkPickerAction::KeepOpen
+        }
+        KeyCode::Enter => match points.selected_message_id() {
+            Some(message_id) => ForkPickerAction::Fork(message_id),
+            None => ForkPickerAction::Close,
+        },
+        _ => return Ok(LoopAction::Continue),
+    };
+    match action {
+        ForkPickerAction::KeepOpen => {}
+        ForkPickerAction::Close => state.menu.close_picker(),
+        ForkPickerAction::Fork(_) => {
+            state.menu.close_picker();
+            state.operation.start_background(BackgroundAction::Fork);
+        }
+    }
+    state.render(terminal)?;
+    let ForkPickerAction::Fork(message_id) = action else {
+        return Ok(LoopAction::Continue);
+    };
+    if commands
+        .send(UiCommand::ForkSession(message_id))
         .await
         .is_err()
     {
@@ -699,7 +800,7 @@ async fn run_command(
 
     let outgoing = match command {
         SlashCommand::New | SlashCommand::Clear => {
-            state.menu.close_sessions();
+            state.menu.close_picker();
             terminal.start_new_session()?;
             Some(UiCommand::NewSession)
         }
@@ -710,8 +811,10 @@ async fn run_command(
             Some(UiCommand::ListSessions)
         }
         SlashCommand::Undo => {
-            state.operation.start_rollback();
-            Some(UiCommand::Rollback)
+            state
+                .operation
+                .start_background(BackgroundAction::ListForkPoints);
+            Some(UiCommand::ListForkPoints)
         }
         SlashCommand::Compact => {
             state.operation.start_background(BackgroundAction::Compact);
@@ -720,10 +823,6 @@ async fn run_command(
         }
         SlashCommand::Status => {
             terminal.show_session_status()?;
-            None
-        }
-        SlashCommand::Help => {
-            terminal.command_output(&slash_command::help_text())?;
             None
         }
         SlashCommand::Exit => {
@@ -769,7 +868,9 @@ mod tests {
             match view.menu {
                 crate::menu::MenuView::Commands { items, .. } =>
                     items.iter().map(|command| command.name).collect::<Vec<_>>(),
-                crate::menu::MenuView::None | crate::menu::MenuView::Sessions { .. } => Vec::new(),
+                crate::menu::MenuView::None
+                | crate::menu::MenuView::Sessions { .. }
+                | crate::menu::MenuView::ForkPoints { .. } => Vec::new(),
             },
             ["exit"]
         );

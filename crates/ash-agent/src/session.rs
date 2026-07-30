@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use ash_core::{
-    CancellationToken, Content, Event, Message, MessageContent, MessageId, SessionId,
+    CancellationToken, Content, Event, ForkPoint, Message, MessageContent, MessageId, SessionId,
     SessionSummary, StopReason,
 };
 use ash_protocol::{create_adapter, ProtocolAdapter};
@@ -17,6 +17,14 @@ pub struct ResumedSession {
     pub model: String,
     pub protocol: String,
     pub working_dir: PathBuf,
+}
+
+pub struct ForkedSession {
+    pub messages: Vec<Message>,
+    pub model: String,
+    pub protocol: String,
+    pub working_dir: PathBuf,
+    pub prompt: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +82,57 @@ impl AgentSession {
             return Ok(None);
         };
         self.restore(stored).await.map(Some)
+    }
+
+    pub fn fork_points(&self) -> Vec<ForkPoint> {
+        self.messages
+            .iter()
+            .rev()
+            .filter_map(|message| {
+                user_prompt(message).map(|prompt| ForkPoint {
+                    message_id: message.id,
+                    prompt,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn fork_at(
+        &mut self,
+        message_id: MessageId,
+    ) -> Result<Option<ForkedSession>, ash_core::AshError> {
+        let Some((turn_start, prompt)) =
+            self.messages
+                .iter()
+                .enumerate()
+                .find_map(|(index, message)| {
+                    (message.id == message_id)
+                        .then(|| user_prompt(message).map(|prompt| (index, prompt)))
+                        .flatten()
+                })
+        else {
+            return Ok(None);
+        };
+
+        let messages = self.messages[..turn_start].to_vec();
+        let id = SessionId::new();
+        let mut store = self.store.new_sibling(&self.config, id);
+        for message in &messages {
+            store.append_message(message).await?;
+        }
+
+        self.id = id;
+        self.messages = messages.clone();
+        self.model_messages = messages.clone();
+        self.store = store;
+
+        Ok(Some(ForkedSession {
+            messages,
+            model: self.config.model.as_str().to_string(),
+            protocol: self.config.provider.protocol.as_cli_name().to_string(),
+            working_dir: self.config.working_dir.clone(),
+            prompt,
+        }))
     }
 
     async fn restore(
@@ -206,23 +265,27 @@ fn sync_model_turn_output(
 }
 
 fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
-    let (index, contents) = messages
+    messages
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, message)| match &message.content {
-            MessageContent::User(contents) => Some((index, contents)),
-            MessageContent::Assistant(_) | MessageContent::ToolResult { .. } => None,
-        })?;
-    let prompt = contents
-        .iter()
-        .map(|content| match content {
-            Content::Text(text) => text.clone(),
-            Content::Image { media_type, .. } => format!("[image: {media_type}]"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some((index, prompt))
+        .find_map(|(index, message)| user_prompt(message).map(|prompt| (index, prompt)))
+}
+
+fn user_prompt(message: &Message) -> Option<String> {
+    let MessageContent::User(contents) = &message.content else {
+        return None;
+    };
+    Some(
+        contents
+            .iter()
+            .map(|content| match content {
+                Content::Text(text) => text.clone(),
+                Content::Image { media_type, .. } => format!("[image: {media_type}]"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 #[cfg(test)]
@@ -269,7 +332,6 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
-            max_output_tokens: Some(200),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -306,6 +368,109 @@ mod tests {
         let (turn_start, prompt) = last_user_turn(&messages).unwrap();
         assert_eq!(turn_start, 2);
         assert_eq!(prompt, "second");
+    }
+
+    #[test]
+    fn fork_points_list_real_user_prompts_newest_first() {
+        let tool_id = ToolCallId::from_provider("call");
+        let first = Message::user("first");
+        let second = Message::user("second\nline");
+        let session = AgentSession {
+            id: SessionId::new(),
+            config: config(PathBuf::from(".")),
+            messages: vec![
+                first.clone(),
+                Message::assistant_text("answer"),
+                Message {
+                    id: MessageId::new(),
+                    role: Role::User,
+                    content: MessageContent::ToolResult {
+                        id: tool_id,
+                        result: Ok("result".to_string()),
+                        attachments: Vec::new(),
+                    },
+                },
+                second.clone(),
+            ],
+            model_messages: Vec::new(),
+            store: SessionStore::new(&config(PathBuf::from(".")), SessionId::new()),
+        };
+
+        assert_eq!(
+            session.fork_points(),
+            vec![
+                ForkPoint {
+                    message_id: second.id,
+                    prompt: "second\nline".to_string(),
+                },
+                ForkPoint {
+                    message_id: first.id,
+                    prompt: "first".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_creates_a_new_session_before_the_selected_prompt() {
+        let directory = TempDir::new().unwrap();
+        let config = config(directory.path().to_path_buf());
+        let original_id = SessionId::new();
+        let mut store = SessionStore::new_in(&config, original_id, directory.path());
+        let first = Message::user("first");
+        let answer = Message::assistant_text("first answer");
+        let expected_ids = [first.id, answer.id];
+        let selected = Message::user("try another direction");
+        let later = Message::assistant_text("second answer");
+        let messages = vec![first.clone(), answer.clone(), selected.clone(), later];
+        for message in &messages {
+            store.append_message(message).await.unwrap();
+        }
+        let original_path = store.path().to_path_buf();
+        let original_contents = tokio::fs::read_to_string(&original_path).await.unwrap();
+        let mut session = AgentSession {
+            id: original_id,
+            config,
+            messages: messages.clone(),
+            model_messages: messages,
+            store,
+        };
+
+        let forked = session.fork_at(selected.id).await.unwrap().unwrap();
+
+        assert_ne!(session.id(), original_id);
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(
+            forked
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(forked.prompt, "try another direction");
+        assert_ne!(session.store.path(), original_path);
+        assert_eq!(
+            tokio::fs::read_to_string(original_path).await.unwrap(),
+            original_contents
+        );
+        let stored_fork = session.store.load().await.unwrap();
+        assert_eq!(
+            stored_fork
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
     }
 
     #[test]
@@ -359,7 +524,6 @@ mod tests {
                 system_prompt: Some("old prompt".to_string()),
                 max_turns: 1,
                 max_context_tokens: 64_000,
-                max_output_tokens: None,
                 tool_timeout_ms: 1,
             },
             messages: vec![saved_message.clone()],

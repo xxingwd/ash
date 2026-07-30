@@ -3,7 +3,9 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{CancellationToken, Event, Message, ModelId, Protocol, ProviderConfig, SessionId};
+use ash_core::{
+    CancellationToken, Event, Message, MessageId, ModelId, Protocol, ProviderConfig, SessionId,
+};
 use ash_tui::UiCommand;
 use futures::StreamExt;
 use owo_colors::OwoColorize;
@@ -101,7 +103,6 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
         max_turns: 100,
         working_dir,
         max_context_tokens,
-        max_output_tokens: None,
         max_tool_duration: std::time::Duration::from_secs(120),
         agent_path: "/root".to_string(),
         root_session_id: None,
@@ -266,10 +267,6 @@ impl InteractiveController {
                     self.rollback_last_turn().await;
                 }
                 UiCommand::Cancel => {}
-                UiCommand::Rollback => {
-                    deferred_submission = None;
-                    self.rollback_last_turn().await;
-                }
                 UiCommand::Compact => {
                     deferred_submission = None;
                     self.compact_session().await;
@@ -279,9 +276,14 @@ impl InteractiveController {
                     deferred_submission = None;
                 }
                 UiCommand::ListSessions => self.list_sessions().await,
+                UiCommand::ListForkPoints => self.list_fork_points().await,
                 UiCommand::ResumeSession(session_id) => {
                     deferred_submission = None;
                     self.resume_session(session_id).await;
+                }
+                UiCommand::ForkSession(message_id) => {
+                    deferred_submission = None;
+                    self.fork_session(message_id).await;
                 }
                 UiCommand::Exit => break,
             }
@@ -366,6 +368,15 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
+    async fn list_fork_points(&self) {
+        let _ = self
+            .event_tx
+            .send(Event::ForkPointsListed {
+                points: self.session.fork_points(),
+            })
+            .await;
+    }
+
     async fn resume_session(&mut self, session_id: SessionId) {
         let event = match self.session.resume(session_id).await {
             Ok(Some(restored)) => Event::SessionRestored {
@@ -379,6 +390,23 @@ impl InteractiveController {
         };
         let _ = self.event_tx.send(event).await;
     }
+
+    async fn fork_session(&mut self, message_id: MessageId) {
+        let event = match self.session.fork_at(message_id).await {
+            Ok(Some(forked)) => Event::SessionForked {
+                model: forked.model,
+                protocol: forked.protocol,
+                working_dir: forked.working_dir,
+                messages: forked.messages,
+                prompt: forked.prompt,
+            },
+            Ok(None) => {
+                Event::Error("That prompt is no longer available to fork from.".to_string())
+            }
+            Err(error) => Event::Error(format!("Failed to fork the current chat: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
 }
 
 fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
@@ -388,10 +416,11 @@ fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
         Some(UiCommand::CancelAndRollback) => ActiveTurnCommand::CancelAndRollback,
         Some(
             UiCommand::NewSession
-            | UiCommand::Rollback
             | UiCommand::Compact
             | UiCommand::ListSessions
-            | UiCommand::ResumeSession(_),
+            | UiCommand::ListForkPoints
+            | UiCommand::ResumeSession(_)
+            | UiCommand::ForkSession(_),
         ) => ActiveTurnCommand::Reject,
         Some(UiCommand::Exit) | None => ActiveTurnCommand::Exit,
     }
@@ -440,7 +469,7 @@ mod tests {
             ActiveTurnCommand::Reject
         );
         assert_eq!(
-            classify_active_command(Some(UiCommand::Rollback)),
+            classify_active_command(Some(UiCommand::ListForkPoints)),
             ActiveTurnCommand::Reject
         );
         assert_eq!(
@@ -453,6 +482,10 @@ mod tests {
         );
         assert_eq!(
             classify_active_command(Some(UiCommand::ResumeSession(SessionId::new()))),
+            ActiveTurnCommand::Reject
+        );
+        assert_eq!(
+            classify_active_command(Some(UiCommand::ForkSession(MessageId::new()))),
             ActiveTurnCommand::Reject
         );
         assert_eq!(

@@ -128,32 +128,35 @@ mod tests {
             .as_str()
             .and_then(|reference| reference.rsplit('/').next())
             .unwrap();
-        assert_eq!(
-            edit_schema["definitions"][replacement_name]["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["newText", "oldText"]
-        );
-    }
-
-    fn property_names(definition: &ash_core::ToolDefinition) -> Vec<&str> {
-        definition.parameters_schema["properties"]
+        let mut replacement_properties = edit_schema["$defs"][replacement_name]["properties"]
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
-            .collect()
+            .collect::<Vec<_>>();
+        replacement_properties.sort_unstable();
+        assert_eq!(replacement_properties, ["newText", "oldText"]);
+    }
+
+    fn property_names(definition: &ash_core::ToolDefinition) -> Vec<&str> {
+        let mut names = definition.parameters_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
     }
 
     fn required_names(definition: &ash_core::ToolDefinition) -> Vec<&str> {
-        definition.parameters_schema["required"]
+        let mut names = definition.parameters_schema["required"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|value| value.as_str())
-            .collect()
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
     }
 }

@@ -1,7 +1,7 @@
 use ash_core::ProtocolError;
+use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
-use reqwest_eventsource::{retry::Never, Event, RequestBuilderExt};
 
 use crate::{ProtocolStream, StreamItem};
 
@@ -43,48 +43,42 @@ pub(crate) fn stream<D>(
 where
     D: Decoder,
 {
-    let mut source = request
-        .eventsource()
-        .map_err(|error| ProtocolError::Request(error.to_string()))?;
-    source.set_retry_policy(Box::new(Never));
-
     Ok(Box::pin(async_stream::try_stream! {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ProtocolError::Request(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            Err(map_status(status))?;
+        }
+        let mut source = response.bytes_stream().eventsource();
         while let Some(event) = source.next().await {
             match event {
-                Ok(Event::Open) => {}
-                Ok(Event::Message(message)) => {
-                    let (items, finished) = decoder.decode(&message.data)?.into_parts();
+                Ok(event) => {
+                    let (items, finished) = decoder.decode(&event.data)?.into_parts();
                     for item in items {
                         yield item;
                     }
                     if finished {
-                        source.close();
                         break;
                     }
                 }
                 Err(error) => {
-                    source.close();
-                    Err(map_error(error))?;
+                    Err(ProtocolError::Request(error.to_string()))?;
                 }
             }
         }
     }))
 }
 
-fn map_error(error: reqwest_eventsource::Error) -> ProtocolError {
-    match error {
-        reqwest_eventsource::Error::InvalidStatusCode(status, _)
-            if status.as_u16() == 401 || status.as_u16() == 403 =>
-        {
-            ProtocolError::Auth
-        }
-        reqwest_eventsource::Error::InvalidStatusCode(status, _) if status.as_u16() == 429 => {
-            ProtocolError::RateLimited { retry_after: None }
-        }
-        reqwest_eventsource::Error::InvalidStatusCode(status, _) => ProtocolError::Upstream {
+fn map_status(status: reqwest::StatusCode) -> ProtocolError {
+    match status.as_u16() {
+        401 | 403 => ProtocolError::Auth,
+        429 => ProtocolError::RateLimited { retry_after: None },
+        _ => ProtocolError::Upstream {
             status: status.as_u16(),
             message: "request rejected before the event stream opened".into(),
         },
-        other => ProtocolError::Request(other.to_string()),
     }
 }

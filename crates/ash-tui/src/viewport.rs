@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::SessionSummary;
+use ash_core::{ForkPoint, SessionSummary};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Position, Rect},
@@ -15,6 +15,7 @@ use crate::{
     live_block::LiveBlock,
     markdown::RenderedLine,
     menu::MenuView,
+    scrollback::sanitize_single_line,
     selection::SelectableText,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left, format_token_count},
@@ -246,6 +247,10 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         MenuView::Sessions { items, selected } => {
             let content = render_menu_frame(screen.menu, &mut buffer);
             render_session_menu(content, items, selected, &mut buffer);
+        }
+        MenuView::ForkPoints { items, selected } => {
+            let content = render_menu_frame(screen.menu, &mut buffer);
+            render_fork_menu(content, items, selected, &mut buffer);
         }
     }
 
@@ -905,11 +910,44 @@ fn render_session_menu(
     }
 }
 
+fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &mut Buffer) {
+    let visible = usize::from(area.height).min(points.len());
+    if visible == 0 {
+        return;
+    }
+    let selected = selected.min(points.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(points.len().saturating_sub(visible));
+    let prompt_width = usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS);
+    for (offset, point) in points[start..start + visible].iter().enumerate() {
+        let index = start + offset;
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let prefix = if index == selected { "› " } else { "  " };
+        let prompt = sanitize_single_line(&point.prompt);
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(truncate_end(&prompt, prompt_width), style),
+        ]);
+        let y = area
+            .y
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        buffer.set_line(area.x, y, &line, area.width);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use ash_core::SessionId;
+    use ash_core::{MessageId, SessionId};
 
     use super::*;
     use crate::markdown::render_markdown;
@@ -921,7 +959,7 @@ mod tests {
             let Some(cell) = buffer.cell((x, y)) else {
                 continue;
             };
-            if continuation_columns > 0 || cell.skip {
+            if continuation_columns > 0 || crate::buffer::cell_is_skipped(cell) {
                 continuation_columns = continuation_columns.saturating_sub(1);
                 continue;
             }
@@ -1128,6 +1166,48 @@ mod tests {
         assert!(row_text(&frame.buffer, 3).contains("Inspect the session picker"));
         assert!(row_text(&frame.buffer, 3).contains("2026-07-15 12:30"));
         assert!(row_text(&frame.buffer, 4).contains("Third saved chat"));
+    }
+
+    #[test]
+    fn fork_picker_renders_prompts_as_single_lines() {
+        let points = [
+            ForkPoint {
+                message_id: MessageId::new(),
+                prompt: "latest prompt\ncontinued".to_string(),
+            },
+            ForkPoint {
+                message_id: MessageId::new(),
+                prompt: "older prompt".to_string(),
+            },
+        ];
+        let frame = render(ViewportInput {
+            terminal_width: 50,
+            terminal_height: 10,
+            transcript: &[],
+            scroll_top: None,
+            busy: false,
+            active_lines: &[],
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            menu: MenuView::ForkPoints {
+                items: &points,
+                selected: 0,
+            },
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+            context_limit: None,
+        });
+
+        assert!(row_text(&frame.buffer, 2).contains("latest prompt continued"));
+        assert!(row_text(&frame.buffer, 3).contains("older prompt"));
     }
 
     #[test]

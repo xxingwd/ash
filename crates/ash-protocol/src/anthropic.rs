@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 use crate::{model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
 pub struct AnthropicAdapter {
     config: ProviderConfig,
     client: Client,
@@ -125,7 +127,7 @@ impl AnthropicAdapter {
             "model": req.model.as_str(),
             "messages": messages,
             "stream": true,
-            "max_tokens": req.max_tokens.unwrap_or(8192),
+            "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
         });
         if let Some(system) = &req.system {
             body["system"] = json!(system);
@@ -326,6 +328,46 @@ mod tests {
         let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
         assert!(matches!(result, sse::DecodeResult::Finished(_)));
+    }
+
+    #[test]
+    fn uses_the_default_output_limit() {
+        let adapter = AnthropicAdapter::new(ProviderConfig {
+            protocol: Protocol::AnthropicMessages,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn honors_an_explicit_output_limit() {
+        let adapter = AnthropicAdapter::new(ProviderConfig {
+            protocol: Protocol::AnthropicMessages,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = LlmRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: Some(1_024),
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        assert_eq!(body["max_tokens"], 1_024);
     }
 
     #[test]

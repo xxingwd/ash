@@ -397,11 +397,11 @@ impl MarkdownWriter {
                     self.pop_style();
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::BlockQuote) => {
+                Event::Start(Tag::BlockQuote(_)) => {
                     self.block_gap();
                     self.blockquote_depth += 1;
                 }
-                Event::End(TagEnd::BlockQuote) => {
+                Event::End(TagEnd::BlockQuote(_)) => {
                     self.finish_line();
                     self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
                     self.needs_block_gap = true;

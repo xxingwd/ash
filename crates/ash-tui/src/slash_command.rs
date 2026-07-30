@@ -6,7 +6,6 @@ pub(crate) enum SlashCommand {
     Compact,
     Resume,
     Status,
-    Help,
     Exit,
 }
 
@@ -61,7 +60,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "undo",
         aliases: &[],
-        description: "roll back the last turn and restore its prompt",
+        description: "choose a prompt to fork from",
         command: SlashCommand::Undo,
     },
     CommandSpec {
@@ -75,12 +74,6 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         description: "show the current session configuration",
         command: SlashCommand::Status,
-    },
-    CommandSpec {
-        name: "help",
-        aliases: &["commands"],
-        description: "show available commands",
-        command: SlashCommand::Help,
     },
     CommandSpec {
         name: "exit",
@@ -120,7 +113,7 @@ pub(crate) fn parse(input: &str) -> ParsedInput {
         .iter()
         .find(|spec| spec.name == name || spec.aliases.contains(&name))
         .map_or_else(
-            || ParsedInput::Invalid(format!("unknown command '/{name}'; use /help")),
+            || ParsedInput::Invalid(format!("unknown command '/{name}'")),
             |spec| ParsedInput::Command(spec.command),
         )
 }
@@ -131,14 +124,6 @@ pub(crate) fn is_bare_exit(input: &str) -> bool {
         .iter()
         .find(|spec| spec.command == SlashCommand::Exit)
         .is_some_and(|spec| spec.name == input || spec.aliases.contains(&input))
-}
-
-pub(crate) fn help_text() -> String {
-    COMMANDS
-        .iter()
-        .map(|spec| format!("/{:<8} {}", spec.name, spec.description))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {
@@ -254,7 +239,6 @@ mod tests {
             ParsedInput::Command(SlashCommand::Compact)
         );
         assert_eq!(parse(" /quit "), ParsedInput::Command(SlashCommand::Exit));
-        assert_eq!(parse("/commands"), ParsedInput::Command(SlashCommand::Help));
         assert!(is_bare_exit(" exit "));
         assert!(is_bare_exit("quit"));
         assert!(!is_bare_exit("close"));
@@ -305,8 +289,8 @@ mod tests {
         state.dismiss();
         state.sync("/", 1, false);
         assert!(!state.is_visible());
-        state.sync("/h", 2, false);
-        assert_eq!(state.selected().unwrap().name, "help");
+        state.sync("/st", 3, false);
+        assert_eq!(state.selected().unwrap().name, "status");
     }
 
     #[test]

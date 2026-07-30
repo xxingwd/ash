@@ -21,7 +21,6 @@ pub(crate) struct SessionMetadata {
     pub system_prompt: Option<String>,
     pub max_turns: u32,
     pub max_context_tokens: usize,
-    pub max_output_tokens: Option<u32>,
     pub tool_timeout_ms: u64,
 }
 
@@ -37,7 +36,6 @@ impl SessionMetadata {
             system_prompt: config.system_prompt.clone(),
             max_turns: config.max_turns,
             max_context_tokens: config.max_context_tokens,
-            max_output_tokens: config.max_output_tokens,
             tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
         }
@@ -183,6 +181,11 @@ impl SessionStore {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn new_sibling(&self, config: &AgentConfig, session_id: SessionId) -> Self {
+        let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        Self::new_in(config, session_id, directory)
     }
 
     pub(crate) async fn append_message(
@@ -499,7 +502,6 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
-            max_output_tokens: Some(200),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,

@@ -578,7 +578,7 @@ mod tests {
     fn row_text(buffer: &Buffer, y: u16) -> String {
         (0..buffer.area.width)
             .filter_map(|x| buffer.cell((x, y)))
-            .filter(|cell| !cell.skip)
+            .filter(|cell| !crate::buffer::cell_is_skipped(cell))
             .map(|cell| cell.symbol())
             .collect::<String>()
             .trim_end()

@@ -1,7 +1,7 @@
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use ash_core::{Tool, ToolContext, ToolError, ToolOutput};
-use rmcp::model::{CallToolRequestParam, JsonObject};
+use rmcp::model::{CallToolRequestParams, JsonObject};
 use rmcp::serve_client;
 use rmcp::service::{Peer, RoleClient};
 use rmcp::transport::TokioChildProcess;
@@ -64,12 +64,14 @@ impl Tool for McpToolAdapter {
         let arguments: Option<JsonObject> = serde_json::from_value(args)
             .map_err(|e| ToolError::Execution(format!("invalid args: {e}")))?;
 
+        let mut request = CallToolRequestParams::new(self.tool_name.clone());
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+
         let result = self
             .peer
-            .call_tool(CallToolRequestParam {
-                name: Cow::Owned(self.tool_name.clone()),
-                arguments,
-            })
+            .call_tool(request)
             .await
             .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
 
@@ -115,7 +117,7 @@ impl McpManager {
             }
         }
 
-        let transport = TokioChildProcess::new(&mut cmd)
+        let transport = TokioChildProcess::new(cmd)
             .map_err(|e| ash_core::AshError::Config(format!("MCP spawn failed: {e}")))?;
 
         let running = serve_client((), transport)
@@ -149,7 +151,7 @@ impl McpManager {
 
                 tools.push(Arc::new(McpToolAdapter::new(
                     tool_info.name.to_string(),
-                    tool_info.description.to_string(),
+                    tool_info.description.unwrap_or_default().to_string(),
                     schema,
                     peer.clone(),
                     tool_info.name.to_string(),
