@@ -14,8 +14,8 @@ use crate::{
         apply_summary, count_output_tokens, estimate_request_tokens, needs_compaction,
         plan_compaction, prune_tool_outputs, summary_output_tokens,
     },
-    session_store::SessionStore,
-    AgentConfig,
+    conversation::{ContextCheckpoint, ConversationEntry},
+    AgentConfig, ConversationStore,
 };
 
 const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
@@ -77,13 +77,13 @@ struct FinalUsage {
     estimated: bool,
 }
 
-struct AgentTurnRunner<'a> {
-    config: &'a AgentConfig,
-    tx: &'a mpsc::Sender<Event>,
-    cancel: &'a CancellationToken,
+struct AgentTurnRunner<'config, 'store> {
+    config: &'config AgentConfig,
+    tx: mpsc::Sender<Event>,
+    cancel: CancellationToken,
     session_id: SessionId,
-    model: &'a dyn ModelClient,
-    store: Option<&'a mut SessionStore>,
+    model: &'config dyn ModelClient,
+    store: Option<&'store mut dyn ConversationStore>,
     tool_defs: Vec<ToolDefinition>,
 }
 
@@ -240,7 +240,7 @@ pub(crate) async fn run_agent_turn_persisted(
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
     session_id: SessionId,
-    store: &mut SessionStore,
+    store: &mut dyn ConversationStore,
 ) -> Result<StopReason, ash_core::AshError> {
     run_agent_turn_inner(model, config, messages, tx, cancel, session_id, Some(store)).await
 }
@@ -252,7 +252,7 @@ async fn run_agent_turn_inner(
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
     session_id: SessionId,
-    store: Option<&mut SessionStore>,
+    store: Option<&mut dyn ConversationStore>,
 ) -> Result<StopReason, ash_core::AshError> {
     let _ = tx.send(Event::AgentStarted { session_id }).await;
     let result = run_with_adapter(
@@ -294,21 +294,21 @@ async fn run_with_adapter(
     cancel: CancellationToken,
     session_id: SessionId,
     model: &dyn ModelClient,
-    store: Option<&mut SessionStore>,
+    store: Option<&mut dyn ConversationStore>,
 ) -> Result<StopReason, ash_core::AshError> {
-    AgentTurnRunner::new(config, &tx, &cancel, session_id, model, store)
+    AgentTurnRunner::new(config, tx, cancel, session_id, model, store)
         .run(messages)
         .await
 }
 
-impl<'a> AgentTurnRunner<'a> {
+impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     fn new(
-        config: &'a AgentConfig,
-        tx: &'a mpsc::Sender<Event>,
-        cancel: &'a CancellationToken,
+        config: &'config AgentConfig,
+        tx: mpsc::Sender<Event>,
+        cancel: CancellationToken,
         session_id: SessionId,
-        model: &'a dyn ModelClient,
-        store: Option<&'a mut SessionStore>,
+        model: &'config dyn ModelClient,
+        store: Option<&'store mut dyn ConversationStore>,
     ) -> Self {
         let tool_defs = config.tools.iter().map(|tool| tool.definition()).collect();
         Self {
@@ -350,7 +350,7 @@ impl<'a> AgentTurnRunner<'a> {
                 message,
                 usage,
                 outcome,
-            } = collect_response(&mut stream, self.tx, self.cancel, request_started).await;
+            } = collect_response(&mut stream, &self.tx, &self.cancel, request_started).await;
             let estimated_output_tokens = message
                 .as_ref()
                 .map(count_output_tokens)
@@ -395,12 +395,16 @@ impl<'a> AgentTurnRunner<'a> {
             return Ok(());
         }
         let Some(compacted) =
-            compact_with_adapter(self.config, messages, self.model, self.cancel).await?
+            compact_with_adapter(self.config, messages, self.model, &self.cancel).await?
         else {
             return Ok(());
         };
         if let Some(store) = self.store.as_deref_mut() {
-            store.append_compaction(&compacted.messages).await?;
+            store
+                .append(ConversationEntry::ContextCheckpoint(
+                    ContextCheckpoint::from_model_context(&compacted.messages)?,
+                ))
+                .await?;
         }
         *messages = compacted.messages;
         let _ = self
@@ -415,7 +419,7 @@ impl<'a> AgentTurnRunner<'a> {
         Ok(())
     }
 
-    async fn emit_usage(&self, usage: FinalUsage) {
+    async fn emit_usage(&mut self, usage: FinalUsage) {
         let _ = self
             .tx
             .send(Event::Usage {
@@ -429,7 +433,11 @@ impl<'a> AgentTurnRunner<'a> {
 
     async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
         match self.store.as_deref_mut() {
-            Some(store) => store.append_message(message).await,
+            Some(store) => {
+                store
+                    .append(ConversationEntry::Message(message.clone()))
+                    .await
+            }
             None => Ok(()),
         }
     }
@@ -486,7 +494,7 @@ impl<'a> AgentTurnRunner<'a> {
     }
 
     async fn execute_tool(
-        &self,
+        &mut self,
         messages: &[Message],
         name: &str,
         arguments: serde_json::Value,
@@ -706,6 +714,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::session_store::SessionStore;
 
     struct MockAdapter {
         responses: Mutex<VecDeque<Vec<StreamItem>>>,
@@ -895,10 +904,10 @@ mod tests {
 
         assert_eq!(reason, StopReason::EndTurn);
         let stored = store.load().await.unwrap();
-        assert_eq!(stored.messages.len(), 7);
-        assert_eq!(stored.model_messages.len(), 6);
+        assert_eq!(stored.messages().len(), 7);
+        assert_eq!(stored.model_context().len(), 6);
         assert!(matches!(
-            &stored.messages[0].content,
+            &stored.messages()[0].content,
             MessageContent::User(contents)
                 if matches!(contents.as_slice(), [Content::Text(text)] if text.starts_with("old request"))
         ));

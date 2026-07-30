@@ -2,13 +2,17 @@ use std::sync::Arc;
 
 use ash_core::ModelClient;
 
-use crate::{AgentConfig, AgentSession};
+use crate::{
+    AgentConfig, AgentSession, ConversationRepository, JsonlConversationRepository,
+    SharedConversationRepository,
+};
 
 /// Shared, provider-neutral dependencies used to create agent sessions.
 #[derive(Clone)]
 pub struct AgentRuntime {
     model: Arc<dyn ModelClient>,
     model_backend: Arc<str>,
+    conversations: SharedConversationRepository,
 }
 
 impl AgentRuntime {
@@ -16,7 +20,16 @@ impl AgentRuntime {
         Self {
             model,
             model_backend: Arc::from(model_backend.into()),
+            conversations: Arc::new(JsonlConversationRepository::default()),
         }
+    }
+
+    pub fn with_conversation_repository(
+        mut self,
+        conversations: Arc<dyn ConversationRepository>,
+    ) -> Self {
+        self.conversations = conversations;
+        self
     }
 
     pub fn create_session(&self, config: AgentConfig) -> AgentSession {
@@ -33,5 +46,9 @@ impl AgentRuntime {
 
     pub(crate) fn model(&self) -> &dyn ModelClient {
         self.model.as_ref()
+    }
+
+    pub(crate) fn conversations(&self) -> &dyn ConversationRepository {
+        self.conversations.as_ref()
     }
 }

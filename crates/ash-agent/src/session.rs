@@ -8,8 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::agent::{compact_with_adapter, run_agent_turn_persisted};
 use crate::context::estimate_request_tokens;
-use crate::session_store::{SessionStore, StoredSession};
-use crate::{AgentConfig, AgentRuntime};
+use crate::{
+    AgentConfig, AgentRuntime, ContextCheckpoint, ConversationEntry, ConversationLog,
+    ConversationMetadata, ConversationStore,
+};
 
 pub struct ResumedSession {
     pub messages: Vec<Message>,
@@ -37,21 +39,21 @@ pub struct AgentSession {
     id: SessionId,
     config: AgentConfig,
     runtime: AgentRuntime,
-    messages: Vec<Message>,
-    model_messages: Vec<Message>,
-    store: SessionStore,
+    log: ConversationLog,
+    store: Box<dyn ConversationStore>,
 }
 
 impl AgentSession {
     pub(crate) fn new(config: AgentConfig, runtime: AgentRuntime) -> Self {
         let id = SessionId::new();
-        let store = SessionStore::new_with_backend(&config, id, runtime.model_backend());
+        let store = runtime
+            .conversations()
+            .create(conversation_metadata(&config, &runtime, id));
         Self {
             id,
             config,
             runtime,
-            messages: Vec::new(),
-            model_messages: Vec::new(),
+            log: ConversationLog::new(),
             store,
         }
     }
@@ -60,34 +62,37 @@ impl AgentSession {
         self.id
     }
 
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
+    pub fn messages(&self) -> Vec<Message> {
+        self.log.messages()
     }
 
     pub fn reset(&mut self) {
         self.id = SessionId::new();
-        self.messages.clear();
-        self.model_messages.clear();
-        self.store =
-            SessionStore::new_with_backend(&self.config, self.id, self.runtime.model_backend());
+        self.log = ConversationLog::new();
+        self.store = self.runtime.conversations().create(conversation_metadata(
+            &self.config,
+            &self.runtime,
+            self.id,
+        ));
     }
 
     pub async fn resumable_sessions(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        SessionStore::summaries_except(self.store.path()).await
+        self.runtime.conversations().list(Some(self.id)).await
     }
 
     pub async fn resume(
         &mut self,
         session_id: SessionId,
     ) -> Result<Option<ResumedSession>, ash_core::AshError> {
-        let Some(stored) = SessionStore::find(session_id).await? else {
+        let Some(store) = self.runtime.conversations().open(session_id).await? else {
             return Ok(None);
         };
-        self.restore(stored).await.map(Some)
+        self.restore(store).await.map(Some)
     }
 
     pub fn fork_points(&self) -> Vec<ForkPoint> {
-        self.messages
+        self.log
+            .messages()
             .iter()
             .rev()
             .filter_map(|message| {
@@ -104,7 +109,8 @@ impl AgentSession {
         message_id: MessageId,
     ) -> Result<Option<ForkedSession>, ash_core::AshError> {
         let Some((turn_start, prompt)) =
-            self.messages
+            self.log
+                .messages()
                 .iter()
                 .enumerate()
                 .find_map(|(index, message)| {
@@ -116,16 +122,21 @@ impl AgentSession {
             return Ok(None);
         };
 
-        let messages = self.messages[..turn_start].to_vec();
+        let messages = self.log.messages()[..turn_start].to_vec();
         let id = SessionId::new();
-        let mut store = self.store.new_sibling(&self.config, id);
+        let mut store = self.runtime.conversations().create(conversation_metadata(
+            &self.config,
+            &self.runtime,
+            id,
+        ));
         for message in &messages {
-            store.append_message(message).await?;
+            store
+                .append(ConversationEntry::Message(message.clone()))
+                .await?;
         }
 
         self.id = id;
-        self.messages = messages.clone();
-        self.model_messages = messages.clone();
+        self.log = ConversationLog::from_messages(messages.clone());
         self.store = store;
 
         Ok(Some(ForkedSession {
@@ -139,17 +150,15 @@ impl AgentSession {
 
     async fn restore(
         &mut self,
-        stored: StoredSession,
+        store: Box<dyn ConversationStore>,
     ) -> Result<ResumedSession, ash_core::AshError> {
         // Saved sessions replay history; the current runtime configuration stays indivisible.
-        let store = SessionStore::resume(&stored).await?;
-        self.id = stored.metadata.session_id;
-        self.messages = stored.messages;
-        self.model_messages = stored.model_messages;
+        self.id = store.session_id();
+        self.log = store.load().await?;
         self.store = store;
 
         Ok(ResumedSession {
-            messages: self.messages.clone(),
+            messages: self.log.messages(),
             model: self.config.model.as_str().to_string(),
             protocol: self.runtime.model_backend().to_string(),
             working_dir: self.config.working_dir.clone(),
@@ -164,8 +173,11 @@ impl AgentSession {
     ) -> Result<StopReason, ash_core::AshError> {
         let input = input.into();
         let user_message = Message::user(&input);
-        let user_message_id = user_message.id;
-        if let Err(error) = self.store.append_message(&user_message).await {
+        if let Err(error) = self
+            .store
+            .append(ConversationEntry::Message(user_message.clone()))
+            .await
+        {
             let _ = events.send(Event::Error(error.to_string())).await;
             let _ = events
                 .send(Event::AgentFinished {
@@ -174,38 +186,35 @@ impl AgentSession {
                 .await;
             return Err(error);
         }
-        self.messages.push(user_message.clone());
-        self.model_messages.push(user_message);
+        self.log
+            .push(ConversationEntry::Message(user_message.clone()));
+        let mut model_context = self.log.model_context();
         let result = run_agent_turn_persisted(
             self.runtime.model(),
             &self.config,
-            &mut self.model_messages,
+            &mut model_context,
             events,
             cancel,
             self.id,
-            &mut self.store,
+            self.store.as_mut(),
         )
         .await;
-        let sync_result =
-            sync_model_turn_output(&mut self.messages, &self.model_messages, user_message_id);
-        match result {
-            Err(error) => Err(error),
-            Ok(reason) => {
-                sync_result?;
-                Ok(reason)
-            }
+        match self.store.load().await {
+            Ok(log) => self.log = log,
+            Err(error) if result.is_ok() => return Err(error),
+            Err(_) => {}
         }
+        result
     }
 
     pub async fn rollback_last_turn(&mut self) -> Result<Option<String>, ash_core::AshError> {
-        let Some((turn_start, prompt)) = last_user_turn(&self.messages) else {
+        let messages = self.log.messages();
+        let Some((turn_start, prompt)) = last_user_turn(&messages) else {
             return Ok(None);
         };
-        self.store.append_rollback().await?;
-        let stored = self.store.load().await?;
-        self.messages = stored.messages;
-        self.model_messages = stored.model_messages;
-        debug_assert_eq!(self.messages.len(), turn_start);
+        self.store.append(ConversationEntry::TurnRolledBack).await?;
+        self.log = self.store.load().await?;
+        debug_assert_eq!(self.log.messages().len(), turn_start);
         Ok(Some(prompt))
     }
 
@@ -226,13 +235,11 @@ impl AgentSession {
             .iter()
             .map(|tool| tool.definition())
             .collect::<Vec<_>>();
-        let before_tokens = estimate_request_tokens(
-            self.config.system_prompt.as_deref(),
-            &self.model_messages,
-            &tools,
-        );
+        let model_context = self.log.model_context();
+        let before_tokens =
+            estimate_request_tokens(self.config.system_prompt.as_deref(), &model_context, &tools);
         let Some(compacted) =
-            compact_with_adapter(&self.config, &self.model_messages, model, cancel).await?
+            compact_with_adapter(&self.config, &model_context, model, cancel).await?
         else {
             return Ok(ContextCompaction {
                 before_tokens,
@@ -240,8 +247,12 @@ impl AgentSession {
                 dropped_messages: 0,
             });
         };
-        self.store.append_compaction(&compacted.messages).await?;
-        self.model_messages = compacted.messages;
+        let checkpoint = ContextCheckpoint::from_model_context(&compacted.messages)?;
+        self.store
+            .append(ConversationEntry::ContextCheckpoint(checkpoint.clone()))
+            .await?;
+        self.log
+            .push(ConversationEntry::ContextCheckpoint(checkpoint));
         Ok(ContextCompaction {
             before_tokens: compacted.before_tokens,
             after_tokens: compacted.after_tokens,
@@ -250,21 +261,21 @@ impl AgentSession {
     }
 }
 
-fn sync_model_turn_output(
-    messages: &mut Vec<Message>,
-    model_messages: &[Message],
-    user_message_id: MessageId,
-) -> Result<(), ash_core::AshError> {
-    let turn_start = model_messages
-        .iter()
-        .position(|message| message.id == user_message_id)
-        .ok_or_else(|| {
-            ash_core::AshError::Config(
-                "compacted model context lost the active user message".to_string(),
-            )
-        })?;
-    messages.extend_from_slice(&model_messages[turn_start + 1..]);
-    Ok(())
+fn conversation_metadata(
+    config: &AgentConfig,
+    runtime: &AgentRuntime,
+    session_id: SessionId,
+) -> ConversationMetadata {
+    ConversationMetadata {
+        session_id,
+        model_backend: runtime.model_backend().to_string(),
+        model: config.model.clone(),
+        working_dir: config.working_dir.clone(),
+        system_prompt: config.system_prompt.clone(),
+        max_turns: config.max_turns,
+        max_context_tokens: config.max_context_tokens,
+        max_tool_duration: config.max_tool_duration,
+    }
 }
 
 fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
@@ -345,6 +356,31 @@ mod tests {
         )
     }
 
+    fn runtime_in(directory: &std::path::Path) -> AgentRuntime {
+        runtime().with_conversation_repository(Arc::new(crate::JsonlConversationRepository::new(
+            directory,
+        )))
+    }
+
+    async fn session_with_messages(
+        config: AgentConfig,
+        runtime: AgentRuntime,
+        messages: &[Message],
+    ) -> AgentSession {
+        let mut session = AgentSession::new(config, runtime);
+        for message in messages {
+            session
+                .store
+                .append(ConversationEntry::Message(message.clone()))
+                .await
+                .unwrap();
+            session
+                .log
+                .push(ConversationEntry::Message(message.clone()));
+        }
+        session
+    }
+
     #[test]
     fn finds_the_latest_real_user_turn_after_tool_results() {
         let tool_id = ToolCallId::from_provider("call");
@@ -382,27 +418,21 @@ mod tests {
         let tool_id = ToolCallId::from_provider("call");
         let first = Message::user("first");
         let second = Message::user("second\nline");
-        let session = AgentSession {
-            id: SessionId::new(),
-            config: config(PathBuf::from(".")),
-            runtime: runtime(),
-            messages: vec![
-                first.clone(),
-                Message::assistant_text("answer"),
-                Message {
-                    id: MessageId::new(),
-                    role: Role::User,
-                    content: MessageContent::ToolResult {
-                        id: tool_id,
-                        result: Ok("result".to_string()),
-                        attachments: Vec::new(),
-                    },
+        let mut session = AgentSession::new(config(PathBuf::from(".")), runtime());
+        session.log = ConversationLog::from_messages(vec![
+            first.clone(),
+            Message::assistant_text("answer"),
+            Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: MessageContent::ToolResult {
+                    id: tool_id,
+                    result: Ok("result".to_string()),
+                    attachments: Vec::new(),
                 },
-                second.clone(),
-            ],
-            model_messages: Vec::new(),
-            store: SessionStore::new(&config(PathBuf::from(".")), SessionId::new()),
-        };
+            },
+            second.clone(),
+        ]);
 
         assert_eq!(
             session.fork_points(),
@@ -423,27 +453,15 @@ mod tests {
     async fn fork_creates_a_new_session_before_the_selected_prompt() {
         let directory = TempDir::new().unwrap();
         let config = config(directory.path().to_path_buf());
-        let original_id = SessionId::new();
-        let mut store = SessionStore::new_in(&config, original_id, directory.path());
+        let runtime = runtime_in(directory.path());
         let first = Message::user("first");
         let answer = Message::assistant_text("first answer");
         let expected_ids = [first.id, answer.id];
         let selected = Message::user("try another direction");
         let later = Message::assistant_text("second answer");
         let messages = vec![first.clone(), answer.clone(), selected.clone(), later];
-        for message in &messages {
-            store.append_message(message).await.unwrap();
-        }
-        let original_path = store.path().to_path_buf();
-        let original_contents = tokio::fs::read_to_string(&original_path).await.unwrap();
-        let mut session = AgentSession {
-            id: original_id,
-            config,
-            runtime: runtime(),
-            messages: messages.clone(),
-            model_messages: messages,
-            store,
-        };
+        let mut session = session_with_messages(config, runtime.clone(), &messages).await;
+        let original_id = session.id();
 
         let forked = session.fork_at(selected.id).await.unwrap().unwrap();
 
@@ -466,15 +484,20 @@ mod tests {
             expected_ids
         );
         assert_eq!(forked.prompt, "try another direction");
-        assert_ne!(session.store.path(), original_path);
-        assert_eq!(
-            tokio::fs::read_to_string(original_path).await.unwrap(),
-            original_contents
-        );
+        let original = runtime
+            .conversations()
+            .open(original_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(original.messages().len(), 4);
         let stored_fork = session.store.load().await.unwrap();
         assert_eq!(
             stored_fork
-                .messages
+                .messages()
                 .iter()
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
@@ -482,64 +505,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn syncs_only_new_turn_output_back_to_full_history() {
-        let current = Message::user("current request");
-        let mut messages = vec![
-            Message::user("original title"),
-            Message::assistant_text("old answer"),
-            current.clone(),
-        ];
-        let model_messages = vec![
-            Message::assistant_text("<context-summary>\nold facts\n</context-summary>"),
-            current.clone(),
-            Message::assistant_text("new answer"),
-        ];
-
-        sync_model_turn_output(&mut messages, &model_messages, current.id).unwrap();
-
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(
-            &messages[0].content,
-            MessageContent::User(contents)
-                if matches!(contents.as_slice(), [Content::Text(text)] if text == "original title")
-        ));
-        assert!(matches!(
-            &messages[3].content,
-            MessageContent::Assistant(blocks)
-                if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "new answer")
-        ));
-    }
-
     #[tokio::test]
     async fn resume_keeps_the_current_runtime_configuration() {
         let directory = TempDir::new().unwrap();
         let current_dir = directory.path().join("current");
         tokio::fs::create_dir(&current_dir).await.unwrap();
-        let mut session = AgentSession::new(config(current_dir.clone()), runtime());
-        let saved_path = directory.path().join("saved.jsonl");
-        tokio::fs::write(&saved_path, b"\n").await.unwrap();
+        let runtime = runtime_in(directory.path());
+        let mut session = AgentSession::new(config(current_dir.clone()), runtime.clone());
         let saved_id = SessionId::new();
         let saved_message = Message::user("saved question");
-        let stored = StoredSession {
-            path: saved_path,
-            metadata: crate::session_store::SessionMetadata {
-                format_version: 1,
-                session_id: saved_id,
-                created_at: "2026-01-01T00:00:00.000Z".to_string(),
-                protocol: "invalid-old-protocol".to_string(),
-                model: "old-model".to_string(),
-                working_dir: directory.path().join("missing-old-directory"),
-                system_prompt: Some("old prompt".to_string()),
-                max_turns: 1,
-                max_context_tokens: 64_000,
-                tool_timeout_ms: 1,
-            },
-            messages: vec![saved_message.clone()],
-            model_messages: vec![saved_message],
-        };
+        let mut saved = runtime.conversations().create(conversation_metadata(
+            &config(directory.path().join("old")),
+            &runtime,
+            saved_id,
+        ));
+        saved
+            .append(ConversationEntry::Message(saved_message))
+            .await
+            .unwrap();
 
-        let restored = session.restore(stored).await.unwrap();
+        let restored = session.resume(saved_id).await.unwrap().unwrap();
 
         assert_eq!(session.id(), saved_id);
         assert_eq!(session.config.model.as_str(), "current-model");
@@ -559,14 +544,13 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let mut session = AgentSession::new(config(directory.path().to_path_buf()), runtime());
         let message = Message::user("unpersisted");
-        session.messages.push(message.clone());
-        session.model_messages.push(message);
+        session.log.push(ConversationEntry::Message(message));
 
         let result = session.rollback_last_turn().await;
 
         assert!(result.is_err());
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.model_messages.len(), 1);
+        assert_eq!(session.log.messages().len(), 1);
+        assert_eq!(session.log.model_context().len(), 1);
     }
 
     #[tokio::test]
@@ -575,16 +559,8 @@ mod tests {
         let blocked_parent = directory.path().join("not-a-directory");
         tokio::fs::write(&blocked_parent, b"file").await.unwrap();
         let config = config(directory.path().to_path_buf());
-        let id = SessionId::new();
-        let store = SessionStore::new_in(&config, id, &blocked_parent);
-        let mut session = AgentSession {
-            id,
-            config,
-            runtime: runtime(),
-            messages: Vec::new(),
-            model_messages: Vec::new(),
-            store,
-        };
+        let runtime = runtime_in(&blocked_parent);
+        let mut session = AgentSession::new(config, runtime);
         let (events, mut received) = mpsc::channel(4);
 
         let result = session
@@ -592,8 +568,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(session.messages.is_empty());
-        assert!(session.model_messages.is_empty());
+        assert!(session.log.messages().is_empty());
+        assert!(session.log.model_context().is_empty());
         assert!(matches!(received.recv().await, Some(Event::Error(_))));
         assert!(matches!(
             received.recv().await,
@@ -607,8 +583,7 @@ mod tests {
     async fn manual_compaction_preserves_full_history_and_updates_model_context() {
         let directory = TempDir::new().unwrap();
         let config = config(directory.path().to_path_buf());
-        let id = SessionId::new();
-        let mut store = SessionStore::new_in(&config, id, directory.path());
+        let runtime = runtime_in(directory.path());
         let messages = vec![
             Message::user(&format!("old request {}", "x".repeat(10_000))),
             Message::assistant_text("old answer"),
@@ -617,17 +592,7 @@ mod tests {
             Message::user("recent request"),
             Message::assistant_text("recent answer"),
         ];
-        for message in &messages {
-            store.append_message(message).await.unwrap();
-        }
-        let mut session = AgentSession {
-            id,
-            config,
-            runtime: runtime(),
-            messages: messages.clone(),
-            model_messages: messages,
-            store,
-        };
+        let mut session = session_with_messages(config, runtime, &messages).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
@@ -643,25 +608,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.dropped_messages, 2);
-        assert_eq!(session.messages.len(), 6);
-        assert_eq!(session.model_messages.len(), 5);
+        assert_eq!(session.log.messages().len(), 6);
+        assert_eq!(session.log.model_context().len(), 5);
         assert!(result.after_tokens < result.before_tokens);
         {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].tools.is_empty());
         }
-        let contents = tokio::fs::read_to_string(session.store.path())
-            .await
-            .unwrap();
-        assert!(contents.contains("old request"));
-        assert!(contents.contains("condensed facts"));
-        assert!(contents.contains("recent request"));
         let stored = session.store.load().await.unwrap();
-        assert_eq!(stored.messages.len(), 6);
-        assert_eq!(stored.model_messages.len(), 5);
+        assert_eq!(stored.messages().len(), 6);
+        assert_eq!(stored.model_context().len(), 5);
         assert!(matches!(
-            &stored.messages[0].content,
+            &stored.messages()[0].content,
             MessageContent::User(contents)
                 if matches!(contents.as_slice(), [Content::Text(text)] if text.starts_with("old request"))
         ));

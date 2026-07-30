@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
+#[cfg(test)]
 use crate::AgentConfig;
+use crate::{
+    ContextCheckpoint, ConversationEntry, ConversationLog, ConversationMetadata,
+    ConversationRepository, ConversationStore,
+};
 
 const SESSION_FORMAT_VERSION: u32 = 1;
 
@@ -25,6 +30,7 @@ pub(crate) struct SessionMetadata {
 }
 
 impl SessionMetadata {
+    #[cfg(test)]
     fn from_config(
         config: &AgentConfig,
         session_id: SessionId,
@@ -42,6 +48,22 @@ impl SessionMetadata {
             max_turns: config.max_turns,
             max_context_tokens: config.max_context_tokens,
             tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    fn from_metadata(metadata: ConversationMetadata, created_at: DateTime<Utc>) -> Self {
+        Self {
+            format_version: SESSION_FORMAT_VERSION,
+            session_id: metadata.session_id,
+            created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            protocol: metadata.model_backend,
+            model: metadata.model.as_str().to_string(),
+            working_dir: metadata.working_dir,
+            system_prompt: metadata.system_prompt,
+            max_turns: metadata.max_turns,
+            max_context_tokens: metadata.max_context_tokens,
+            tool_timeout_ms: u64::try_from(metadata.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
         }
     }
@@ -73,12 +95,32 @@ impl SessionRecord {
         }
     }
 
-    fn into_message(self) -> Option<Message> {
+    fn from_entry(entry: ConversationEntry) -> Self {
+        match entry {
+            ConversationEntry::Message(message) => Self::from_message(&message),
+            ConversationEntry::ContextCheckpoint(checkpoint) => {
+                Self::ContextCompacted(ContextCompactedRecord {
+                    summary: checkpoint.summary,
+                    tail_start_id: checkpoint.tail_start_id,
+                })
+            }
+            ConversationEntry::TurnRolledBack => Self::TurnRolledBack,
+        }
+    }
+
+    fn into_entry(self) -> Option<ConversationEntry> {
         match self {
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
-            | Self::ToolResult(message) => Some(message),
-            Self::SessionMeta(_) | Self::TurnRolledBack | Self::ContextCompacted(_) => None,
+            | Self::ToolResult(message) => Some(ConversationEntry::Message(message)),
+            Self::ContextCompacted(record) => {
+                Some(ConversationEntry::ContextCheckpoint(ContextCheckpoint {
+                    summary: record.summary,
+                    tail_start_id: record.tail_start_id,
+                }))
+            }
+            Self::TurnRolledBack => Some(ConversationEntry::TurnRolledBack),
+            Self::SessionMeta(_) => None,
         }
     }
 }
@@ -103,8 +145,7 @@ impl SessionLine {
 pub(crate) struct StoredSession {
     pub(crate) path: PathBuf,
     pub(crate) metadata: SessionMetadata,
-    pub(crate) messages: Vec<Message>,
-    pub(crate) model_messages: Vec<Message>,
+    pub(crate) log: ConversationLog,
 }
 
 #[derive(Default)]
@@ -115,9 +156,20 @@ struct SessionReplay {
 
 impl StoredSession {
     fn has_user_message(&self) -> bool {
-        self.messages
+        self.log
+            .messages()
             .iter()
             .any(|message| matches!(message.content, MessageContent::User(_)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> Vec<Message> {
+        self.log.messages()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_context(&self) -> Vec<Message> {
+        self.log.model_context()
     }
 }
 
@@ -127,7 +179,6 @@ impl SessionReplay {
             SessionRecord::SessionMeta(metadata) => {
                 self.metadata.get_or_insert(metadata);
             }
-            SessionRecord::TurnRolledBack => rollback_last_turn(&mut self.records),
             record => self.records.push(record),
         }
     }
@@ -146,12 +197,16 @@ impl SessionReplay {
                 path.display()
             )));
         }
-        let (messages, model_messages) = replay_records(self.records);
+        let log = ConversationLog::from_entries(
+            self.records
+                .into_iter()
+                .filter_map(SessionRecord::into_entry)
+                .collect(),
+        );
         Ok(StoredSession {
             path: path.to_path_buf(),
             metadata,
-            messages,
-            model_messages,
+            log,
         })
     }
 }
@@ -162,12 +217,33 @@ pub(crate) struct SessionStore {
     file: Option<tokio::fs::File>,
 }
 
+pub struct JsonlConversationRepository {
+    directory: PathBuf,
+}
+
+impl Default for JsonlConversationRepository {
+    fn default() -> Self {
+        Self {
+            directory: SessionStore::default_dir(),
+        }
+    }
+}
+
+impl JsonlConversationRepository {
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+        }
+    }
+}
+
 impl SessionStore {
     #[cfg(test)]
     pub(crate) fn new(config: &AgentConfig, session_id: SessionId) -> Self {
         Self::new_with_backend(config, session_id, "custom")
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_backend(
         config: &AgentConfig,
         session_id: SessionId,
@@ -181,6 +257,7 @@ impl SessionStore {
         Self::new_in_with_backend(config, session_id, directory, "custom")
     }
 
+    #[cfg(test)]
     fn new_in_with_backend(
         config: &AgentConfig,
         session_id: SessionId,
@@ -197,41 +274,45 @@ impl SessionStore {
         }
     }
 
+    fn from_metadata(metadata: ConversationMetadata, directory: &Path) -> Self {
+        let local_now = Local::now().fixed_offset();
+        let created_at = local_now.with_timezone(&Utc);
+        let path = directory.join(session_filename(metadata.session_id, local_now));
+        Self {
+            path,
+            metadata: SessionMetadata::from_metadata(metadata, created_at),
+            file: None,
+        }
+    }
+
     fn default_dir() -> PathBuf {
         directories::ProjectDirs::from("", "", "ash")
             .map(|dirs| dirs.data_dir().join("sessions"))
             .unwrap_or_else(|| PathBuf::from(".ash/sessions"))
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn new_sibling(&self, config: &AgentConfig, session_id: SessionId) -> Self {
-        let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
-        Self::new_in_with_backend(config, session_id, directory, &self.metadata.protocol)
-    }
-
+    #[cfg(test)]
     pub(crate) async fn append_message(
         &mut self,
         message: &Message,
     ) -> Result<(), ash_core::AshError> {
-        self.append_record(SessionRecord::from_message(message))
+        self.append(ConversationEntry::Message(message.clone()))
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_compaction(
         &mut self,
         compacted_messages: &[Message],
     ) -> Result<(), ash_core::AshError> {
-        let summary = compacted_messages.first().cloned().ok_or_else(|| {
-            ash_core::AshError::Config("compacted context has no summary message".to_string())
-        })?;
-        let tail_start_id = compacted_messages.get(1).map(|message| message.id);
-        self.append_record(SessionRecord::ContextCompacted(ContextCompactedRecord {
-            summary,
-            tail_start_id,
-        }))
+        self.append(ConversationEntry::ContextCheckpoint(
+            ContextCheckpoint::from_model_context(compacted_messages)?,
+        ))
         .await
     }
 
@@ -272,42 +353,19 @@ impl SessionStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_rollback(&mut self) -> Result<(), ash_core::AshError> {
         if self.file.is_none() {
             return Err(ash_core::AshError::Config(
                 "session store has no persisted turn to roll back".to_string(),
             ));
         }
-        self.append_record(SessionRecord::TurnRolledBack).await
+        self.append(ConversationEntry::TurnRolledBack).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn load(&self) -> Result<StoredSession, ash_core::AshError> {
         read_session(&self.path).await
-    }
-
-    pub(crate) async fn summaries_except(
-        excluded_path: &Path,
-    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        Ok(Self::stored_sessions(Some(excluded_path))
-            .await?
-            .iter()
-            .map(session_summary)
-            .collect())
-    }
-
-    pub(crate) async fn find(
-        session_id: SessionId,
-    ) -> Result<Option<StoredSession>, ash_core::AshError> {
-        Ok(Self::stored_sessions(None)
-            .await?
-            .into_iter()
-            .find(|stored| stored.metadata.session_id == session_id))
-    }
-
-    async fn stored_sessions(
-        excluded_path: Option<&Path>,
-    ) -> Result<Vec<StoredSession>, ash_core::AshError> {
-        Self::stored_sessions_in(Self::default_dir(), excluded_path).await
     }
 
     async fn stored_sessions_in(
@@ -358,6 +416,61 @@ impl SessionStore {
     }
 }
 
+#[async_trait::async_trait]
+impl ConversationStore for SessionStore {
+    fn session_id(&self) -> SessionId {
+        self.metadata.session_id
+    }
+
+    async fn append(&mut self, entry: ConversationEntry) -> Result<(), ash_core::AshError> {
+        if matches!(&entry, ConversationEntry::TurnRolledBack) && self.file.is_none() {
+            return Err(ash_core::AshError::Config(
+                "session store has no persisted turn to roll back".to_string(),
+            ));
+        }
+        self.append_record(SessionRecord::from_entry(entry)).await
+    }
+
+    async fn load(&self) -> Result<ConversationLog, ash_core::AshError> {
+        Ok(read_session(&self.path).await?.log)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationRepository for JsonlConversationRepository {
+    fn create(&self, metadata: ConversationMetadata) -> Box<dyn ConversationStore> {
+        Box::new(SessionStore::from_metadata(metadata, &self.directory))
+    }
+
+    async fn open(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<Box<dyn ConversationStore>>, ash_core::AshError> {
+        let stored = SessionStore::stored_sessions_in(self.directory.clone(), None)
+            .await?
+            .into_iter()
+            .find(|stored| stored.metadata.session_id == session_id);
+        match stored {
+            Some(stored) => Ok(Some(Box::new(SessionStore::resume(&stored).await?))),
+            None => Ok(None),
+        }
+    }
+
+    async fn list(
+        &self,
+        excluded_session: Option<SessionId>,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        Ok(
+            SessionStore::stored_sessions_in(self.directory.clone(), None)
+                .await?
+                .into_iter()
+                .filter(|stored| Some(stored.metadata.session_id) != excluded_session)
+                .map(|stored| session_summary(&stored))
+                .collect(),
+        )
+    }
+}
+
 async fn open_session_for_append(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
     let mut file = tokio::fs::OpenOptions::new()
         .read(true)
@@ -371,7 +484,7 @@ async fn open_session_for_append(path: &Path) -> Result<tokio::fs::File, ash_cor
 fn session_summary(stored: &StoredSession) -> SessionSummary {
     SessionSummary {
         session_id: stored.metadata.session_id,
-        title: session_title(&stored.messages),
+        title: session_title(&stored.log.messages()),
         created_at: display_created_at(&stored.metadata.created_at),
     }
 }
@@ -440,51 +553,6 @@ async fn read_session(path: &Path) -> Result<StoredSession, ash_core::AshError> 
         replay.apply(parsed.record);
     }
     replay.finish(path)
-}
-
-fn apply_compaction(messages: &[Message], record: ContextCompactedRecord) -> Vec<Message> {
-    let mut model_messages = vec![record.summary];
-    let Some(tail_start_id) = record.tail_start_id else {
-        return model_messages;
-    };
-    let Some(tail_start) = messages
-        .iter()
-        .position(|message| message.id == tail_start_id)
-    else {
-        return model_messages;
-    };
-    model_messages.extend_from_slice(&messages[tail_start..]);
-    model_messages
-}
-
-fn rollback_last_turn(records: &mut Vec<SessionRecord>) {
-    let Some(turn_start) = records
-        .iter()
-        .rposition(|record| matches!(record, SessionRecord::UserMessage(_)))
-    else {
-        records.clear();
-        return;
-    };
-    records.truncate(turn_start);
-}
-
-fn replay_records(records: Vec<SessionRecord>) -> (Vec<Message>, Vec<Message>) {
-    let mut messages = Vec::new();
-    let mut model_messages = Vec::new();
-    for record in records {
-        match record {
-            SessionRecord::ContextCompacted(record) => {
-                model_messages = apply_compaction(&messages, record);
-            }
-            record => {
-                if let Some(message) = record.into_message() {
-                    messages.push(message.clone());
-                    model_messages.push(message);
-                }
-            }
-        }
-    }
-    (messages, model_messages)
 }
 
 async fn ensure_newline_terminated(file: &mut tokio::fs::File) -> std::io::Result<()> {
@@ -574,8 +642,8 @@ mod tests {
 
         let loaded = read_session(store.path()).await.unwrap();
         assert_eq!(loaded.metadata.session_id, session_id);
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.model_messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
+        assert_eq!(loaded.model_context().len(), 1);
     }
 
     #[tokio::test]
@@ -606,15 +674,10 @@ mod tests {
         store.append_rollback().await.unwrap();
 
         let loaded = read_session(store.path()).await.unwrap();
-        assert_eq!(loaded.messages.len(), 2);
-        assert!(matches!(
-            &loaded.messages[0].content,
-            MessageContent::User(_)
-        ));
-        assert!(matches!(
-            &loaded.messages[1].content,
-            MessageContent::Assistant(_)
-        ));
+        let messages = loaded.messages();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content, MessageContent::User(_)));
+        assert!(matches!(&messages[1].content, MessageContent::Assistant(_)));
         let contents = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(contents.contains("second"));
         assert!(contents.contains("turn_rolled_back"));
@@ -652,9 +715,9 @@ mod tests {
 
         let loaded = read_session(store.path()).await.unwrap();
         assert_eq!(loaded.metadata.session_id, session_id);
-        assert_eq!(loaded.messages.len(), 4);
-        assert_eq!(loaded.model_messages.len(), compacted.len());
-        assert_eq!(session_title(&loaded.messages), "old request");
+        assert_eq!(loaded.messages().len(), 4);
+        assert_eq!(loaded.model_context().len(), compacted.len());
+        assert_eq!(session_title(&loaded.messages()), "old request");
         let summaries = SessionStore::stored_sessions_in(directory.path().to_path_buf(), None)
             .await
             .unwrap()
@@ -679,28 +742,28 @@ mod tests {
         store.append_compaction(&second_compaction).await.unwrap();
 
         let loaded = read_session(store.path()).await.unwrap();
-        assert_eq!(loaded.messages.len(), 6);
-        assert_eq!(loaded.model_messages.len(), 3);
+        assert_eq!(loaded.messages().len(), 6);
+        assert_eq!(loaded.model_context().len(), 3);
         assert!(matches!(
-            &loaded.model_messages[0].content,
+            &loaded.model_context()[0].content,
             MessageContent::Assistant(blocks)
                 if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("new facts"))
         ));
 
         store.append_rollback().await.unwrap();
         let rolled_back = read_session(store.path()).await.unwrap();
-        assert_eq!(rolled_back.messages.len(), 4);
-        assert_eq!(rolled_back.model_messages.len(), 3);
+        assert_eq!(rolled_back.messages().len(), 4);
+        assert_eq!(rolled_back.model_context().len(), 3);
         assert!(matches!(
-            &rolled_back.model_messages[0].content,
+            &rolled_back.model_context()[0].content,
             MessageContent::Assistant(blocks)
                 if matches!(blocks.as_slice(), [ash_core::ContentBlock::Text(text)] if text.contains("old facts"))
         ));
 
         store.append_rollback().await.unwrap();
         let rolled_back = read_session(store.path()).await.unwrap();
-        assert_eq!(rolled_back.messages.len(), 2);
-        assert_eq!(rolled_back.model_messages.len(), 2);
+        assert_eq!(rolled_back.messages().len(), 2);
+        assert_eq!(rolled_back.model_context().len(), 2);
     }
 
     #[tokio::test]
