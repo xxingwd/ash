@@ -7,5 +7,7 @@ pub mod tool;
 pub use error::*;
 pub use event::*;
 pub use message::*;
-pub use model::{ModelId, Protocol, ProviderConfig};
+pub use model::{
+    ModelClient, ModelId, ModelRequest, ModelStream, ModelStreamEvent, Protocol, ProviderConfig,
+};
 pub use tool::*;

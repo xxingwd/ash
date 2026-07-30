@@ -1,8 +1,8 @@
 use ash_core::{
-    AgentToolContext, CancellationToken, ContentBlock, Event, Message, MessageContent, Role,
-    SessionId, StopReason, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolOutput,
+    AgentToolContext, CancellationToken, ContentBlock, Event, Message, MessageContent, ModelClient,
+    ModelRequest, ModelStream, ModelStreamEvent, Role, SessionId, StopReason, ToolCallId,
+    ToolContext, ToolDefinition, ToolError, ToolOutput,
 };
-use ash_protocol::{create_adapter, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
 use futures::StreamExt;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -82,7 +82,7 @@ struct AgentTurnRunner<'a> {
     tx: &'a mpsc::Sender<Event>,
     cancel: &'a CancellationToken,
     session_id: SessionId,
-    adapter: &'a dyn ProtocolAdapter,
+    model: &'a dyn ModelClient,
     store: Option<&'a mut SessionStore>,
     tool_defs: Vec<ToolDefinition>,
 }
@@ -136,7 +136,7 @@ impl UsageAccumulator {
 pub(crate) async fn compact_with_adapter(
     config: &AgentConfig,
     messages: &[Message],
-    adapter: &dyn ProtocolAdapter,
+    model: &dyn ModelClient,
     cancel: &CancellationToken,
 ) -> Result<Option<CompactedHistory>, ash_core::AshError> {
     let tools = config
@@ -148,7 +148,7 @@ pub(crate) async fn compact_with_adapter(
     let Some(plan) = plan_compaction(messages, config.max_context_tokens) else {
         return Ok(None);
     };
-    let mut stream = adapter.stream(LlmRequest {
+    let mut stream = model.stream(ModelRequest {
         model: config.model.clone(),
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![Message::user(&plan.summary_prompt)],
@@ -170,7 +170,7 @@ pub(crate) async fn compact_with_adapter(
 }
 
 async fn collect_compaction_summary(
-    stream: &mut ProtocolStream,
+    stream: &mut ModelStream,
     cancel: &CancellationToken,
 ) -> Result<String, ash_core::AshError> {
     let mut summary = String::new();
@@ -183,9 +183,11 @@ async fn collect_compaction_summary(
             break;
         };
         match item? {
-            StreamItem::TextDelta(text) => summary.push_str(&text),
-            StreamItem::ThinkingDelta(_) | StreamItem::Usage { .. } | StreamItem::Stop(_) => {}
-            StreamItem::ToolCall { .. } => {
+            ModelStreamEvent::TextDelta(text) => summary.push_str(&text),
+            ModelStreamEvent::ThinkingDelta(_)
+            | ModelStreamEvent::Usage { .. }
+            | ModelStreamEvent::Stop(_) => {}
+            ModelStreamEvent::ToolCall { .. } => {
                 return Err(ash_core::ProtocolError::InvalidResponse(
                     "compaction model unexpectedly requested a tool".to_string(),
                 )
@@ -204,11 +206,13 @@ async fn collect_compaction_summary(
 }
 
 pub async fn run_agent_loop(
+    model: std::sync::Arc<dyn ModelClient>,
     config: AgentConfig,
     mut messages: Vec<Message>,
     tx: mpsc::Sender<Event>,
 ) -> Result<StopReason, ash_core::AshError> {
     run_agent_turn(
+        model.as_ref(),
         &config,
         &mut messages,
         tx,
@@ -219,16 +223,18 @@ pub async fn run_agent_loop(
 }
 
 pub async fn run_agent_turn(
+    model: &dyn ModelClient,
     config: &AgentConfig,
     messages: &mut Vec<Message>,
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
     session_id: SessionId,
 ) -> Result<StopReason, ash_core::AshError> {
-    run_agent_turn_inner(config, messages, tx, cancel, session_id, None).await
+    run_agent_turn_inner(model, config, messages, tx, cancel, session_id, None).await
 }
 
 pub(crate) async fn run_agent_turn_persisted(
+    model: &dyn ModelClient,
     config: &AgentConfig,
     messages: &mut Vec<Message>,
     tx: mpsc::Sender<Event>,
@@ -236,10 +242,11 @@ pub(crate) async fn run_agent_turn_persisted(
     session_id: SessionId,
     store: &mut SessionStore,
 ) -> Result<StopReason, ash_core::AshError> {
-    run_agent_turn_inner(config, messages, tx, cancel, session_id, Some(store)).await
+    run_agent_turn_inner(model, config, messages, tx, cancel, session_id, Some(store)).await
 }
 
 async fn run_agent_turn_inner(
+    model: &dyn ModelClient,
     config: &AgentConfig,
     messages: &mut Vec<Message>,
     tx: mpsc::Sender<Event>,
@@ -248,14 +255,13 @@ async fn run_agent_turn_inner(
     store: Option<&mut SessionStore>,
 ) -> Result<StopReason, ash_core::AshError> {
     let _ = tx.send(Event::AgentStarted { session_id }).await;
-    let adapter = create_adapter(config.provider.clone());
     let result = run_with_adapter(
         config,
         messages,
         tx.clone(),
         cancel,
         session_id,
-        adapter.as_ref(),
+        model,
         store,
     )
     .await;
@@ -287,10 +293,10 @@ async fn run_with_adapter(
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
     session_id: SessionId,
-    adapter: &dyn ProtocolAdapter,
+    model: &dyn ModelClient,
     store: Option<&mut SessionStore>,
 ) -> Result<StopReason, ash_core::AshError> {
-    AgentTurnRunner::new(config, &tx, &cancel, session_id, adapter, store)
+    AgentTurnRunner::new(config, &tx, &cancel, session_id, model, store)
         .run(messages)
         .await
 }
@@ -301,7 +307,7 @@ impl<'a> AgentTurnRunner<'a> {
         tx: &'a mpsc::Sender<Event>,
         cancel: &'a CancellationToken,
         session_id: SessionId,
-        adapter: &'a dyn ProtocolAdapter,
+        model: &'a dyn ModelClient,
         store: Option<&'a mut SessionStore>,
     ) -> Self {
         let tool_defs = config.tools.iter().map(|tool| tool.definition()).collect();
@@ -310,7 +316,7 @@ impl<'a> AgentTurnRunner<'a> {
             tx,
             cancel,
             session_id,
-            adapter,
+            model,
             store,
             tool_defs,
         }
@@ -333,7 +339,7 @@ impl<'a> AgentTurnRunner<'a> {
             ))
             .unwrap_or(u64::MAX);
             let request_started = Instant::now();
-            let mut stream = self.adapter.stream(LlmRequest {
+            let mut stream = self.model.stream(ModelRequest {
                 model: self.config.model.clone(),
                 system: self.config.system_prompt.clone(),
                 messages: request_messages,
@@ -389,7 +395,7 @@ impl<'a> AgentTurnRunner<'a> {
             return Ok(());
         }
         let Some(compacted) =
-            compact_with_adapter(self.config, messages, self.adapter, self.cancel).await?
+            compact_with_adapter(self.config, messages, self.model, self.cancel).await?
         else {
             return Ok(());
         };
@@ -495,12 +501,6 @@ impl<'a> AgentTurnRunner<'a> {
                 root_session_id: self.config.root_session_id.unwrap_or(self.session_id),
                 agent_path: self.config.agent_path.clone(),
                 messages: messages.to_vec(),
-                provider: self.config.provider.clone(),
-                system_prompt: self.config.system_prompt.clone(),
-                tools: self.config.tools.clone(),
-                model: self.config.model.clone(),
-                max_turns: self.config.max_turns,
-                max_context_tokens: self.config.max_context_tokens,
             },
         };
 
@@ -515,7 +515,7 @@ impl<'a> AgentTurnRunner<'a> {
 }
 
 async fn collect_response(
-    stream: &mut ProtocolStream,
+    stream: &mut ModelStream,
     tx: &mpsc::Sender<Event>,
     cancel: &CancellationToken,
     request_started: Instant,
@@ -545,7 +545,7 @@ async fn collect_response(
             }
         };
         match item {
-            StreamItem::TextDelta(delta) => {
+            ModelStreamEvent::TextDelta(delta) => {
                 first_output_at.get_or_insert_with(Instant::now);
                 finish_open_thought(&mut blocks, &mut thought_started_at);
                 match blocks.last_mut() {
@@ -554,7 +554,7 @@ async fn collect_response(
                 }
                 let _ = tx.send(Event::TextDelta(delta)).await;
             }
-            StreamItem::ThinkingDelta(delta) => {
+            ModelStreamEvent::ThinkingDelta(delta) => {
                 first_output_at.get_or_insert_with(Instant::now);
                 match blocks.last_mut() {
                     Some(ContentBlock::Thought { text, .. }) => text.push_str(&delta),
@@ -568,7 +568,7 @@ async fn collect_response(
                 }
                 let _ = tx.send(Event::Thinking(delta)).await;
             }
-            StreamItem::ToolCall {
+            ModelStreamEvent::ToolCall {
                 id,
                 name,
                 arguments,
@@ -581,11 +581,11 @@ async fn collect_response(
                     arguments,
                 });
             }
-            StreamItem::Usage {
+            ModelStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
             } => usage.record(input_tokens, output_tokens),
-            StreamItem::Stop(reason) => termination = StreamTermination::Completed(reason),
+            ModelStreamEvent::Stop(reason) => termination = StreamTermination::Completed(reason),
         }
     }
     finish_open_thought(&mut blocks, &mut thought_started_at);
@@ -676,10 +676,14 @@ fn limit_tool_output(output: String) -> String {
 pub struct Agent;
 
 impl Agent {
-    pub fn run(config: AgentConfig, messages: Vec<Message>) -> impl futures::Stream<Item = Event> {
+    pub fn run(
+        model: std::sync::Arc<dyn ModelClient>,
+        config: AgentConfig,
+        messages: Vec<Message>,
+    ) -> impl futures::Stream<Item = Event> {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
-            let _ = run_agent_loop(config, messages, tx).await;
+            let _ = run_agent_loop(model, config, messages, tx).await;
         });
         ReceiverStream::new(rx)
     }
@@ -695,9 +699,10 @@ mod tests {
     };
 
     use ash_core::{
-        Content, ModelId, Protocol, ProviderConfig, Tool, ToolCallId, ToolContext, ToolError,
+        Content, ModelClient as ProtocolAdapter, ModelId, ModelRequest as LlmRequest,
+        ModelStream as ProtocolStream, ModelStreamEvent as StreamItem, Tool, ToolCallId,
+        ToolContext, ToolError,
     };
-    use ash_protocol::{ProtocolStream, StreamItem};
     use tempfile::TempDir;
 
     use super::*;
@@ -794,11 +799,6 @@ mod tests {
             requests: requests.clone(),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: vec![Arc::new(EchoTool)],
             model: ModelId::new("test-model"),
@@ -856,11 +856,6 @@ mod tests {
             requests: requests.clone(),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: Some("system".to_string()),
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -945,11 +940,6 @@ mod tests {
             requests: requests.clone(),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: Some("system".to_string()),
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1035,11 +1025,6 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::AnthropicMessages,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1116,11 +1101,6 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1176,11 +1156,6 @@ mod tests {
         }
 
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1241,11 +1216,6 @@ mod tests {
         }
 
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1302,11 +1272,6 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let config = AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: None,
             tools: vec![Arc::new(BlockingTool)],
             model: ModelId::new("test-model"),

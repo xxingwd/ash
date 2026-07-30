@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 pub use tokio_util::sync::CancellationToken;
 
-use crate::{error::ToolError, Content, Message, ModelId, ProviderConfig, SessionId};
+use crate::{error::ToolError, Content, Message, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -21,18 +21,16 @@ pub struct ToolContext {
     pub agent: AgentToolContext,
 }
 
-/// Additional state exposed only to tools that manage child agents.
+/// Read-only invocation state used by agent-aware tools.
+///
+/// Model credentials, model clients, prompts, and the complete tool registry are
+/// intentionally not exposed here. Product-specific tools must capture those
+/// capabilities when they are constructed.
 #[derive(Clone)]
 pub struct AgentToolContext {
     pub root_session_id: SessionId,
     pub agent_path: String,
     pub messages: Vec<Message>,
-    pub provider: ProviderConfig,
-    pub system_prompt: Option<String>,
-    pub tools: Vec<Arc<dyn Tool>>,
-    pub model: ModelId,
-    pub max_turns: u32,
-    pub max_context_tokens: usize,
 }
 
 #[derive(Debug, Clone, Default)]

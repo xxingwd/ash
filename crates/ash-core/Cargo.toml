@@ -17,6 +17,7 @@ secrecy = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

@@ -2,8 +2,8 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use ash_agent::{run_agent_turn, AgentConfig};
 use ash_core::{
-    define_tool, AgentId, CancellationToken, ContentBlock, Message, MessageContent, SessionId,
-    StopReason, Tool, ToolContext, ToolError,
+    define_tool, AgentId, CancellationToken, ContentBlock, Message, MessageContent, ModelClient,
+    SessionId, StopReason, Tool, ToolContext, ToolError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -97,6 +97,32 @@ impl FromStr for AgentRole {
     }
 }
 
+impl ChildAgentFactory for InheritedAgentFactory {
+    fn create(&self, request: ChildAgentRequest) -> Result<ChildAgent, ToolError> {
+        let config = AgentConfig {
+            system_prompt: Some(subagent_system_prompt(
+                self.system_prompt.as_deref(),
+                request.role,
+                &request.parent_path,
+                &request.task_name,
+            )),
+            tools: self.tools.clone(),
+            model: self.model_id.clone(),
+            max_turns: self.max_turns,
+            working_dir: request.working_dir,
+            max_context_tokens: self.max_context_tokens,
+            max_tool_duration: request.max_duration,
+            agent_path: request.task_name,
+            root_session_id: Some(request.root_session_id),
+        };
+        Ok(ChildAgent {
+            model: Arc::clone(&self.model),
+            config,
+            messages: request.messages,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -129,6 +155,36 @@ struct SupervisorInner {
     state: Mutex<SupervisorState>,
     updates: Notify,
     max_concurrent_children: usize,
+    factory: Option<Arc<dyn ChildAgentFactory>>,
+}
+
+pub struct ChildAgentRequest {
+    pub role: AgentRole,
+    pub parent_path: String,
+    pub task_name: String,
+    pub messages: Vec<Message>,
+    pub working_dir: std::path::PathBuf,
+    pub max_duration: Duration,
+    pub root_session_id: SessionId,
+}
+
+pub struct ChildAgent {
+    pub model: Arc<dyn ModelClient>,
+    pub config: AgentConfig,
+    pub messages: Vec<Message>,
+}
+
+pub trait ChildAgentFactory: Send + Sync {
+    fn create(&self, request: ChildAgentRequest) -> Result<ChildAgent, ToolError>;
+}
+
+struct InheritedAgentFactory {
+    model: Arc<dyn ModelClient>,
+    system_prompt: Option<String>,
+    tools: Vec<Arc<dyn Tool>>,
+    model_id: ash_core::ModelId,
+    max_turns: u32,
+    max_context_tokens: usize,
 }
 
 #[derive(Default)]
@@ -472,11 +528,26 @@ impl Default for Supervisor {
 
 impl Supervisor {
     pub fn new(max_concurrent_children: usize) -> Self {
+        Self::new_with_factory(max_concurrent_children, None)
+    }
+
+    pub fn with_factory(
+        max_concurrent_children: usize,
+        factory: Arc<dyn ChildAgentFactory>,
+    ) -> Self {
+        Self::new_with_factory(max_concurrent_children, Some(factory))
+    }
+
+    fn new_with_factory(
+        max_concurrent_children: usize,
+        factory: Option<Arc<dyn ChildAgentFactory>>,
+    ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 state: Mutex::new(SupervisorState::default()),
                 updates: Notify::new(),
                 max_concurrent_children,
+                factory,
             }),
         }
     }
@@ -615,28 +686,24 @@ impl Supervisor {
 
         let mut messages = fork_messages(&context.agent.messages, fork_mode);
         messages.push(Message::user(&args.message));
-        let config = AgentConfig {
-            provider: context.agent.provider,
-            system_prompt: Some(subagent_system_prompt(
-                context.agent.system_prompt.as_deref(),
-                role,
-                &parent_path,
-                &task_name,
-            )),
-            tools: context.agent.tools,
-            model: context.agent.model,
-            max_turns: context.agent.max_turns,
+        let factory = self.inner.factory.as_ref().ok_or_else(|| {
+            ToolError::Execution("sub-agent factory is not configured".to_string())
+        })?;
+        let mut child = factory.create(ChildAgentRequest {
+            role,
+            parent_path,
+            task_name: task_name.clone(),
+            messages,
             working_dir: context.working_dir,
-            max_context_tokens: context.agent.max_context_tokens,
-            max_tool_duration: context.max_duration,
-            agent_path: task_name.clone(),
-            root_session_id: Some(context.agent.root_session_id),
-        };
+            max_duration: context.max_duration,
+            root_session_id: context.agent.root_session_id,
+        })?;
+        child.config.tools.extend(self.tools());
         let supervisor = self.clone();
         let root_session_id = context.agent.root_session_id;
         tokio::spawn(async move {
             supervisor
-                .run_child(root_session_id, id, config, messages, command_rx)
+                .run_child(root_session_id, id, child, command_rx)
                 .await;
         });
         self.inner.updates.notify_waiters();
@@ -795,12 +862,22 @@ impl Supervisor {
         &self,
         root_session_id: SessionId,
         agent_id: AgentId,
-        config: AgentConfig,
-        mut messages: Vec<Message>,
+        child: ChildAgent,
         mut command_rx: mpsc::Receiver<ChildCommand>,
     ) {
-        self.run_child_turn(root_session_id, agent_id, &config, &mut messages)
-            .await;
+        let ChildAgent {
+            model,
+            config,
+            mut messages,
+        } = child;
+        self.run_child_turn(
+            root_session_id,
+            agent_id,
+            model.as_ref(),
+            &config,
+            &mut messages,
+        )
+        .await;
         let mut queued_messages = Vec::new();
 
         while let Some(command) = command_rx.recv().await {
@@ -817,8 +894,14 @@ impl Supervisor {
                     .drain(..)
                     .map(|message| Message::user(&message)),
             );
-            self.run_child_turn(root_session_id, agent_id, &config, &mut messages)
-                .await;
+            self.run_child_turn(
+                root_session_id,
+                agent_id,
+                model.as_ref(),
+                &config,
+                &mut messages,
+            )
+            .await;
         }
     }
 
@@ -826,6 +909,7 @@ impl Supervisor {
         &self,
         root_session_id: SessionId,
         agent_id: AgentId,
+        model: &dyn ModelClient,
         config: &AgentConfig,
         messages: &mut Vec<Message>,
     ) {
@@ -845,7 +929,8 @@ impl Supervisor {
 
         let (event_tx, event_rx) = mpsc::channel(1);
         drop(event_rx);
-        let result = run_agent_turn(config, messages, event_tx, cancel, SessionId::new()).await;
+        let result =
+            run_agent_turn(model, config, messages, event_tx, cancel, SessionId::new()).await;
         let final_message = final_assistant_message(messages);
 
         let completed = match result {
@@ -865,7 +950,7 @@ impl Supervisor {
     }
 }
 
-pub fn install_subagent_tools(config: &mut AgentConfig) {
+pub fn install_subagent_tools(config: &mut AgentConfig, model: Arc<dyn ModelClient>) {
     if COLLABORATION_TOOL_NAMES
         .iter()
         .all(|name| config.tools.iter().any(|tool| tool.name() == *name))
@@ -875,13 +960,21 @@ pub fn install_subagent_tools(config: &mut AgentConfig) {
     config
         .tools
         .retain(|tool| !COLLABORATION_TOOL_NAMES.contains(&tool.name()));
-    let supervisor = Supervisor::default();
-    config.tools.extend(supervisor.tools());
     let system_prompt = config.system_prompt.get_or_insert_with(String::new);
     if !system_prompt.trim().is_empty() {
         system_prompt.push_str("\n\n");
     }
     system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
+    let factory = Arc::new(InheritedAgentFactory {
+        model,
+        system_prompt: config.system_prompt.clone(),
+        tools: config.tools.clone(),
+        model_id: config.model.clone(),
+        max_turns: config.max_turns,
+        max_context_tokens: config.max_context_tokens,
+    });
+    let supervisor = Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory);
+    config.tools.extend(supervisor.tools());
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -1053,17 +1146,13 @@ mod tests {
     use std::path::PathBuf;
 
     use ash_core::{AgentToolContext, ModelId, Protocol, ProviderConfig};
+    use ash_protocol::create_adapter;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
     fn test_config() -> AgentConfig {
         AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: "test".into(),
-                base_url: None,
-            },
             system_prompt: Some("base prompt".to_string()),
             tools: Vec::new(),
             model: ModelId::new("test-model"),
@@ -1085,14 +1174,30 @@ mod tests {
                 root_session_id,
                 agent_path: "/root".to_string(),
                 messages: Vec::new(),
-                provider: config.provider,
-                system_prompt: config.system_prompt,
-                tools: config.tools,
-                model: config.model,
-                max_turns: config.max_turns,
-                max_context_tokens: config.max_context_tokens,
             },
         }
+    }
+
+    fn test_model(base_url: Option<String>) -> Arc<dyn ModelClient> {
+        create_adapter(ProviderConfig {
+            protocol: Protocol::OpenaiResponses,
+            api_key: "test".into(),
+            base_url,
+        })
+    }
+
+    fn test_supervisor(model: Arc<dyn ModelClient>, max_turns: u32) -> Supervisor {
+        let mut config = test_config();
+        config.max_turns = max_turns;
+        let factory = Arc::new(InheritedAgentFactory {
+            model,
+            system_prompt: config.system_prompt,
+            tools: config.tools,
+            model_id: config.model,
+            max_turns: config.max_turns,
+            max_context_tokens: config.max_context_tokens,
+        });
+        Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory)
     }
 
     #[test]
@@ -1106,8 +1211,8 @@ mod tests {
     #[test]
     fn installs_the_codex_style_collaboration_tools_and_prompt() {
         let mut config = test_config();
-        install_subagent_tools(&mut config);
-        install_subagent_tools(&mut config);
+        install_subagent_tools(&mut config, test_model(None));
+        install_subagent_tools(&mut config, test_model(None));
         let names = config
             .tools
             .iter()
@@ -1470,7 +1575,7 @@ mod tests {
             requests
         });
 
-        let supervisor = Supervisor::default();
+        let supervisor = test_supervisor(test_model(Some(format!("http://{address}"))), 2);
         let root_session_id = SessionId::new();
         let context = ToolContext {
             working_dir: PathBuf::from("."),
@@ -1479,16 +1584,6 @@ mod tests {
                 root_session_id,
                 agent_path: "/root".to_string(),
                 messages: vec![Message::user("delegate this")],
-                provider: ProviderConfig {
-                    protocol: Protocol::OpenaiResponses,
-                    api_key: "test".into(),
-                    base_url: Some(format!("http://{address}")),
-                },
-                system_prompt: Some("base prompt".to_string()),
-                tools: Vec::new(),
-                model: ModelId::new("test-model"),
-                max_turns: 2,
-                max_context_tokens: 200_000,
             },
         };
         let followup_context = context.clone();

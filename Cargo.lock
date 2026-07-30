@@ -102,7 +102,6 @@ name = "ash-agent"
 version = "0.1.0"
 dependencies = [
  "ash-core",
- "ash-protocol",
  "async-trait",
  "chrono",
  "directories",
@@ -130,6 +129,7 @@ dependencies = [
  "ash-agent",
  "ash-core",
  "ash-orchestrator",
+ "ash-protocol",
  "ash-tools",
  "ash-tui",
  "clap",
@@ -150,6 +150,7 @@ dependencies = [
  "chrono",
  "derive_more",
  "enum-as-inner",
+ "futures",
  "insta",
  "schemars",
  "secrecy",
@@ -168,6 +169,7 @@ version = "0.1.0"
 dependencies = [
  "ash-agent",
  "ash-core",
+ "ash-protocol",
  "async-trait",
  "schemars",
  "serde",

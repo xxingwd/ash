@@ -1,13 +1,12 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use ash_core::{ModelId, ProviderConfig, SessionId, Tool};
+use ash_core::{ModelId, SessionId, Tool};
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 200_000;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
 
 #[derive(Clone)]
 pub struct AgentConfig {
-    pub provider: ProviderConfig,
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub model: ModelId,

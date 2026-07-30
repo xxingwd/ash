@@ -25,12 +25,17 @@ pub(crate) struct SessionMetadata {
 }
 
 impl SessionMetadata {
-    fn from_config(config: &AgentConfig, session_id: SessionId, created_at: DateTime<Utc>) -> Self {
+    fn from_config(
+        config: &AgentConfig,
+        session_id: SessionId,
+        created_at: DateTime<Utc>,
+        model_backend: &str,
+    ) -> Self {
         Self {
             format_version: SESSION_FORMAT_VERSION,
             session_id,
             created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            protocol: config.provider.protocol.as_cli_name().to_string(),
+            protocol: model_backend.to_string(),
             model: config.model.as_str().to_string(),
             working_dir: config.working_dir.clone(),
             system_prompt: config.system_prompt.clone(),
@@ -158,17 +163,36 @@ pub(crate) struct SessionStore {
 }
 
 impl SessionStore {
+    #[cfg(test)]
     pub(crate) fn new(config: &AgentConfig, session_id: SessionId) -> Self {
-        Self::new_in(config, session_id, &Self::default_dir())
+        Self::new_with_backend(config, session_id, "custom")
     }
 
+    pub(crate) fn new_with_backend(
+        config: &AgentConfig,
+        session_id: SessionId,
+        model_backend: &str,
+    ) -> Self {
+        Self::new_in_with_backend(config, session_id, &Self::default_dir(), model_backend)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_in(config: &AgentConfig, session_id: SessionId, directory: &Path) -> Self {
+        Self::new_in_with_backend(config, session_id, directory, "custom")
+    }
+
+    fn new_in_with_backend(
+        config: &AgentConfig,
+        session_id: SessionId,
+        directory: &Path,
+        model_backend: &str,
+    ) -> Self {
         let local_now = Local::now().fixed_offset();
         let created_at = local_now.with_timezone(&Utc);
         let path = directory.join(session_filename(session_id, local_now));
         Self {
             path,
-            metadata: SessionMetadata::from_config(config, session_id, created_at),
+            metadata: SessionMetadata::from_config(config, session_id, created_at, model_backend),
             file: None,
         }
     }
@@ -185,7 +209,7 @@ impl SessionStore {
 
     pub(crate) fn new_sibling(&self, config: &AgentConfig, session_id: SessionId) -> Self {
         let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
-        Self::new_in(config, session_id, directory)
+        Self::new_in_with_backend(config, session_id, directory, &self.metadata.protocol)
     }
 
     pub(crate) async fn append_message(
@@ -482,20 +506,14 @@ async fn ensure_newline_terminated(file: &mut tokio::fs::File) -> std::io::Resul
 mod tests {
     use std::time::Duration;
 
-    use ash_core::{ModelId, Protocol, ProviderConfig};
+    use ash_core::ModelId;
     use chrono::{FixedOffset, TimeZone};
-    use secrecy::SecretString;
     use tempfile::TempDir;
 
     use super::*;
 
     fn config(working_dir: PathBuf) -> AgentConfig {
         AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: SecretString::from("must-not-be-persisted"),
-                base_url: Some("https://example.invalid/v1?token=secret".to_string()),
-            },
             system_prompt: Some("system prompt".to_string()),
             tools: Vec::new(),
             model: ModelId::new("test-model"),

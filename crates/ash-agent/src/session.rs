@@ -4,13 +4,12 @@ use ash_core::{
     CancellationToken, Content, Event, ForkPoint, Message, MessageContent, MessageId, SessionId,
     SessionSummary, StopReason,
 };
-use ash_protocol::{create_adapter, ProtocolAdapter};
 use tokio::sync::mpsc;
 
 use crate::agent::{compact_with_adapter, run_agent_turn_persisted};
 use crate::context::estimate_request_tokens;
 use crate::session_store::{SessionStore, StoredSession};
-use crate::AgentConfig;
+use crate::{AgentConfig, AgentRuntime};
 
 pub struct ResumedSession {
     pub messages: Vec<Message>,
@@ -37,18 +36,20 @@ pub struct ContextCompaction {
 pub struct AgentSession {
     id: SessionId,
     config: AgentConfig,
+    runtime: AgentRuntime,
     messages: Vec<Message>,
     model_messages: Vec<Message>,
     store: SessionStore,
 }
 
 impl AgentSession {
-    pub fn new(config: AgentConfig) -> Self {
+    pub(crate) fn new(config: AgentConfig, runtime: AgentRuntime) -> Self {
         let id = SessionId::new();
-        let store = SessionStore::new(&config, id);
+        let store = SessionStore::new_with_backend(&config, id, runtime.model_backend());
         Self {
             id,
             config,
+            runtime,
             messages: Vec::new(),
             model_messages: Vec::new(),
             store,
@@ -67,7 +68,8 @@ impl AgentSession {
         self.id = SessionId::new();
         self.messages.clear();
         self.model_messages.clear();
-        self.store = SessionStore::new(&self.config, self.id);
+        self.store =
+            SessionStore::new_with_backend(&self.config, self.id, self.runtime.model_backend());
     }
 
     pub async fn resumable_sessions(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
@@ -129,7 +131,7 @@ impl AgentSession {
         Ok(Some(ForkedSession {
             messages,
             model: self.config.model.as_str().to_string(),
-            protocol: self.config.provider.protocol.as_cli_name().to_string(),
+            protocol: self.runtime.model_backend().to_string(),
             working_dir: self.config.working_dir.clone(),
             prompt,
         }))
@@ -149,7 +151,7 @@ impl AgentSession {
         Ok(ResumedSession {
             messages: self.messages.clone(),
             model: self.config.model.as_str().to_string(),
-            protocol: self.config.provider.protocol.as_cli_name().to_string(),
+            protocol: self.runtime.model_backend().to_string(),
             working_dir: self.config.working_dir.clone(),
         })
     }
@@ -175,6 +177,7 @@ impl AgentSession {
         self.messages.push(user_message.clone());
         self.model_messages.push(user_message);
         let result = run_agent_turn_persisted(
+            self.runtime.model(),
             &self.config,
             &mut self.model_messages,
             events,
@@ -207,14 +210,14 @@ impl AgentSession {
     }
 
     pub async fn compact(&mut self) -> Result<ContextCompaction, ash_core::AshError> {
-        let adapter = create_adapter(self.config.provider.clone());
-        self.compact_using(adapter.as_ref(), &CancellationToken::new())
+        let model = self.runtime.model_client();
+        self.compact_using(model.as_ref(), &CancellationToken::new())
             .await
     }
 
     async fn compact_using(
         &mut self,
-        adapter: &dyn ProtocolAdapter,
+        model: &dyn ash_core::ModelClient,
         cancel: &CancellationToken,
     ) -> Result<ContextCompaction, ash_core::AshError> {
         let tools = self
@@ -229,7 +232,7 @@ impl AgentSession {
             &tools,
         );
         let Some(compacted) =
-            compact_with_adapter(&self.config, &self.model_messages, adapter, cancel).await?
+            compact_with_adapter(&self.config, &self.model_messages, model, cancel).await?
         else {
             return Ok(ContextCompaction {
                 before_tokens,
@@ -297,11 +300,10 @@ mod tests {
     };
 
     use ash_core::{
-        ContentBlock, MessageContent, MessageId, ModelId, Protocol, ProviderConfig, Role,
-        ToolCallId,
+        ContentBlock, MessageContent, MessageId, ModelClient as ProtocolAdapter, ModelId,
+        ModelRequest as LlmRequest, ModelStream as ProtocolStream, ModelStreamEvent as StreamItem,
+        Role, ToolCallId,
     };
-    use ash_protocol::{LlmRequest, ProtocolStream, StreamItem};
-    use secrecy::SecretString;
     use tempfile::TempDir;
 
     use super::*;
@@ -321,11 +323,6 @@ mod tests {
 
     fn config(working_dir: PathBuf) -> AgentConfig {
         AgentConfig {
-            provider: ProviderConfig {
-                protocol: Protocol::OpenaiResponses,
-                api_key: SecretString::from("test"),
-                base_url: None,
-            },
             system_prompt: Some("current prompt".to_string()),
             tools: Vec::new(),
             model: ModelId::new("current-model"),
@@ -336,6 +333,16 @@ mod tests {
             agent_path: "/root".to_string(),
             root_session_id: None,
         }
+    }
+
+    fn runtime() -> AgentRuntime {
+        AgentRuntime::new(
+            Arc::new(MockAdapter {
+                responses: Mutex::new(VecDeque::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            "test",
+        )
     }
 
     #[test]
@@ -378,6 +385,7 @@ mod tests {
         let session = AgentSession {
             id: SessionId::new(),
             config: config(PathBuf::from(".")),
+            runtime: runtime(),
             messages: vec![
                 first.clone(),
                 Message::assistant_text("answer"),
@@ -431,6 +439,7 @@ mod tests {
         let mut session = AgentSession {
             id: original_id,
             config,
+            runtime: runtime(),
             messages: messages.clone(),
             model_messages: messages,
             store,
@@ -507,7 +516,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let current_dir = directory.path().join("current");
         tokio::fs::create_dir(&current_dir).await.unwrap();
-        let mut session = AgentSession::new(config(current_dir.clone()));
+        let mut session = AgentSession::new(config(current_dir.clone()), runtime());
         let saved_path = directory.path().join("saved.jsonl");
         tokio::fs::write(&saved_path, b"\n").await.unwrap();
         let saved_id = SessionId::new();
@@ -534,24 +543,21 @@ mod tests {
 
         assert_eq!(session.id(), saved_id);
         assert_eq!(session.config.model.as_str(), "current-model");
-        assert!(matches!(
-            session.config.provider.protocol,
-            Protocol::OpenaiResponses
-        ));
+        assert_eq!(session.runtime.model_backend(), "test");
         assert_eq!(
             session.config.system_prompt.as_deref(),
             Some("current prompt")
         );
         assert_eq!(session.config.working_dir, current_dir);
         assert_eq!(restored.model, "current-model");
-        assert_eq!(restored.protocol, "openai-responses");
+        assert_eq!(restored.protocol, "test");
         assert_eq!(restored.messages.len(), 1);
     }
 
     #[tokio::test]
     async fn rollback_keeps_memory_when_persistence_fails() {
         let directory = TempDir::new().unwrap();
-        let mut session = AgentSession::new(config(directory.path().to_path_buf()));
+        let mut session = AgentSession::new(config(directory.path().to_path_buf()), runtime());
         let message = Message::user("unpersisted");
         session.messages.push(message.clone());
         session.model_messages.push(message);
@@ -574,6 +580,7 @@ mod tests {
         let mut session = AgentSession {
             id,
             config,
+            runtime: runtime(),
             messages: Vec::new(),
             model_messages: Vec::new(),
             store,
@@ -616,6 +623,7 @@ mod tests {
         let mut session = AgentSession {
             id,
             config,
+            runtime: runtime(),
             messages: messages.clone(),
             model_messages: messages,
             store,

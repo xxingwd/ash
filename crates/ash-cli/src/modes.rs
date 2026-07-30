@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, AgentConfig, AgentSession, MessageHistoryStore, Skill,
-    DEFAULT_MAX_CONTEXT_TOKENS,
+    build_system_prompt, skill_tool, Agent, AgentConfig, AgentRuntime, AgentSession,
+    MessageHistoryStore, Skill, DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_core::{
     CancellationToken, Event, Message, MessageId, ModelId, Protocol, ProviderConfig, SessionId,
 };
+use ash_protocol::create_adapter;
 use ash_tui::UiCommand;
 use futures::StreamExt;
 use owo_colors::OwoColorize;
@@ -36,17 +37,22 @@ struct InteractiveController {
     history_store: MessageHistoryStore,
 }
 
+struct AgentSetup {
+    config: AgentConfig,
+    runtime: AgentRuntime,
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
-    let config = build_config(&cli)?;
+    let setup = build_config(&cli)?;
 
     if cli.print {
-        run_print(config, cli.prompt).await
+        run_print(setup, cli.prompt).await
     } else {
-        run_interactive(config).await
+        run_interactive(setup).await
     }
 }
 
-fn build_config(cli: &Cli) -> Result<AgentConfig> {
+fn build_config(cli: &Cli) -> Result<AgentSetup> {
     let protocol_name = cli
         .protocol
         .clone()
@@ -91,12 +97,12 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     )?;
     tools.push(skill_tool(skills.clone()));
 
+    let provider = ProviderConfig {
+        protocol: protocol.clone(),
+        api_key: SecretString::from(api_key),
+        base_url,
+    };
     let mut config = AgentConfig {
-        provider: ProviderConfig {
-            protocol,
-            api_key: SecretString::from(api_key),
-            base_url,
-        },
         system_prompt: Some(system_prompt),
         model: ModelId::new(model),
         tools,
@@ -111,9 +117,10 @@ fn build_config(cli: &Cli) -> Result<AgentConfig> {
     if let Some(skill) = active_skill {
         skill.apply_overrides(&mut config);
     }
-    ash_orchestrator::install_subagent_tools(&mut config);
+    let runtime = AgentRuntime::new(create_adapter(provider), protocol.as_cli_name());
+    ash_orchestrator::install_subagent_tools(&mut config, runtime.model_client());
 
-    Ok(config)
+    Ok(AgentSetup { config, runtime })
 }
 
 fn parse_protocol(name: &str) -> Result<Protocol> {
@@ -149,7 +156,7 @@ fn resolve_max_context_tokens(configured: Option<usize>) -> Result<usize> {
     Ok(value)
 }
 
-async fn run_print(config: AgentConfig, prompt: Option<String>) -> Result<()> {
+async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
     let input = match prompt {
         Some(p) => p,
         None => {
@@ -160,7 +167,7 @@ async fn run_print(config: AgentConfig, prompt: Option<String>) -> Result<()> {
     };
 
     let messages = vec![Message::user(&input)];
-    let mut stream = Agent::run(config, messages);
+    let mut stream = Agent::run(setup.runtime.model_client(), setup.config, messages);
 
     while let Some(event) = stream.next().await {
         match event {
@@ -184,8 +191,9 @@ async fn run_print(config: AgentConfig, prompt: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run_interactive(config: AgentConfig) -> Result<()> {
-    let protocol = config.provider.protocol.as_cli_name().to_string();
+async fn run_interactive(setup: AgentSetup) -> Result<()> {
+    let AgentSetup { config, runtime } = setup;
+    let protocol = runtime.model_backend().to_string();
     let model = config.model.as_str().to_string();
     let working_dir = config.working_dir.clone();
     let context_limit = Some(u64::try_from(config.max_context_tokens).unwrap_or(u64::MAX));
@@ -208,7 +216,7 @@ async fn run_interactive(config: AgentConfig) -> Result<()> {
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
 
     InteractiveController::new(
-        AgentSession::new(config),
+        runtime.create_session(config),
         event_tx,
         command_rx,
         history_store,

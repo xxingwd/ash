@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 ash-core = { workspace = true }
+ash-protocol = { workspace = true }
 ash-tools = { workspace = true }
 ash-agent = { workspace = true }
 ash-orchestrator = { workspace = true }
