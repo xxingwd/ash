@@ -47,12 +47,13 @@ enum LineRead {
     Oversized,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "grep",
         "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
-        |ctx, args: GrepArgs| async move {
-            let root = ctx.working_dir;
+        move |_ctx, args: GrepArgs| {
+            let root = Arc::clone(&working_dir);
+            async move {
             crate::path::run_blocking(move || {
                 search(
                     &root,
@@ -62,6 +63,7 @@ pub fn tool() -> Arc<dyn Tool> {
                 )
             })
             .await
+            }
         },
     )
 }

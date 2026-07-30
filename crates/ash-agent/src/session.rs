@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use crate::agent::{compact_with_adapter, run_agent_turn_persisted};
 use crate::context::estimate_request_tokens;
 use crate::{
-    AgentConfig, AgentRuntime, ContextCheckpoint, ConversationEntry, ConversationLog,
-    ConversationMetadata, ConversationStore,
+    AcceptedInput, AgentConfig, AgentInput, AgentRuntime, ContextCheckpoint, ConversationEntry,
+    ConversationLog, ConversationMetadata, ConversationStore,
 };
 
 pub struct ResumedSession {
@@ -130,8 +130,9 @@ impl AgentSession {
             id,
         ));
         for message in &messages {
+            let revision = store.revision();
             store
-                .append(ConversationEntry::Message(message.clone()))
+                .append(revision, ConversationEntry::Message(message.clone()))
                 .await?;
         }
 
@@ -171,11 +172,36 @@ impl AgentSession {
         events: mpsc::Sender<Event>,
         cancel: CancellationToken,
     ) -> Result<StopReason, ash_core::AshError> {
-        let input = input.into();
-        let user_message = Message::user(&input);
+        self.submit_input(AgentInput::user(input.into()), events, cancel)
+            .await
+    }
+
+    pub async fn submit_input(
+        &mut self,
+        input: AgentInput,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> Result<StopReason, ash_core::AshError> {
+        if input.content.is_empty() {
+            return Err(ash_core::AshError::Config(
+                "agent input content cannot be empty".to_string(),
+            ));
+        }
+        if let Some(key) = input.idempotency_key.as_deref() {
+            if self.log.contains_idempotency_key(key) {
+                return Err(ash_core::AshError::Config(format!(
+                    "duplicate agent input idempotency key: {key}"
+                )));
+            }
+        }
+        let user_message = Message::user_content(input.content.clone());
+        let input_entry = ConversationEntry::InputAccepted(AcceptedInput {
+            input,
+            message: user_message,
+        });
         if let Err(error) = self
             .store
-            .append(ConversationEntry::Message(user_message.clone()))
+            .append(self.log.revision(), input_entry.clone())
             .await
         {
             let _ = events.send(Event::Error(error.to_string())).await;
@@ -186,8 +212,7 @@ impl AgentSession {
                 .await;
             return Err(error);
         }
-        self.log
-            .push(ConversationEntry::Message(user_message.clone()));
+        self.log.push(input_entry);
         let mut model_context = self.log.model_context();
         let result = run_agent_turn_persisted(
             self.runtime.model(),
@@ -212,7 +237,9 @@ impl AgentSession {
         let Some((turn_start, prompt)) = last_user_turn(&messages) else {
             return Ok(None);
         };
-        self.store.append(ConversationEntry::TurnRolledBack).await?;
+        self.store
+            .append(self.log.revision(), ConversationEntry::TurnRolledBack)
+            .await?;
         self.log = self.store.load().await?;
         debug_assert_eq!(self.log.messages().len(), turn_start);
         Ok(Some(prompt))
@@ -249,7 +276,10 @@ impl AgentSession {
         };
         let checkpoint = ContextCheckpoint::from_model_context(&compacted.messages)?;
         self.store
-            .append(ConversationEntry::ContextCheckpoint(checkpoint.clone()))
+            .append(
+                self.log.revision(),
+                ConversationEntry::ContextCheckpoint(checkpoint.clone()),
+            )
             .await?;
         self.log
             .push(ConversationEntry::ContextCheckpoint(checkpoint));
@@ -340,6 +370,7 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -369,9 +400,10 @@ mod tests {
     ) -> AgentSession {
         let mut session = AgentSession::new(config, runtime);
         for message in messages {
+            let revision = session.store.revision();
             session
                 .store
-                .append(ConversationEntry::Message(message.clone()))
+                .append(revision, ConversationEntry::Message(message.clone()))
                 .await
                 .unwrap();
             session
@@ -520,7 +552,7 @@ mod tests {
             saved_id,
         ));
         saved
-            .append(ConversationEntry::Message(saved_message))
+            .append(saved.revision(), ConversationEntry::Message(saved_message))
             .await
             .unwrap();
 

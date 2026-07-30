@@ -1,10 +1,18 @@
 use ash_core::{Message, MessageContent, MessageId};
 use serde::{Deserialize, Serialize};
 
+use crate::{AgentInput, ConversationRevision};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
     pub summary: Message,
     pub tail_start_id: Option<MessageId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcceptedInput {
+    pub input: AgentInput,
+    pub message: Message,
 }
 
 impl ContextCheckpoint {
@@ -22,6 +30,7 @@ impl ContextCheckpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ConversationEntry {
+    InputAccepted(AcceptedInput),
     Message(Message),
     ContextCheckpoint(ContextCheckpoint),
     TurnRolledBack,
@@ -54,6 +63,20 @@ impl ConversationLog {
         &self.entries
     }
 
+    pub fn revision(&self) -> ConversationRevision {
+        ConversationRevision::from_entry_count(self.entries.len())
+    }
+
+    pub fn contains_idempotency_key(&self, key: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::InputAccepted(AcceptedInput { input, .. })
+                    if input.idempotency_key.as_deref() == Some(key)
+            )
+        })
+    }
+
     pub fn push(&mut self, entry: ConversationEntry) {
         self.entries.push(entry);
     }
@@ -62,6 +85,7 @@ impl ConversationLog {
         active_entries(&self.entries)
             .into_iter()
             .filter_map(|entry| match entry {
+                ConversationEntry::InputAccepted(input) => Some(input.message.clone()),
                 ConversationEntry::Message(message) => Some(message.clone()),
                 ConversationEntry::ContextCheckpoint(_) | ConversationEntry::TurnRolledBack => None,
             })
@@ -73,6 +97,10 @@ impl ConversationLog {
         let mut model_context = Vec::new();
         for entry in active_entries(&self.entries) {
             match entry {
+                ConversationEntry::InputAccepted(input) => {
+                    messages.push(input.message.clone());
+                    model_context.push(input.message.clone());
+                }
                 ConversationEntry::Message(message) => {
                     messages.push(message.clone());
                     model_context.push(message.clone());
@@ -92,9 +120,9 @@ fn active_entries(entries: &[ConversationEntry]) -> Vec<&ConversationEntry> {
     for entry in entries {
         match entry {
             ConversationEntry::TurnRolledBack => rollback_last_turn(&mut active),
-            ConversationEntry::Message(_) | ConversationEntry::ContextCheckpoint(_) => {
-                active.push(entry)
-            }
+            ConversationEntry::InputAccepted(_)
+            | ConversationEntry::Message(_)
+            | ConversationEntry::ContextCheckpoint(_) => active.push(entry),
         }
     }
     active
@@ -104,7 +132,13 @@ fn rollback_last_turn(entries: &mut Vec<&ConversationEntry>) {
     let Some(turn_start) = entries.iter().rposition(|entry| {
         matches!(
             entry,
-            ConversationEntry::Message(Message {
+            ConversationEntry::InputAccepted(AcceptedInput {
+                message: Message {
+                    content: MessageContent::User(_),
+                    ..
+                },
+                ..
+            }) | ConversationEntry::Message(Message {
                 content: MessageContent::User(_),
                 ..
             })
@@ -185,5 +219,24 @@ mod tests {
             [first.id, answer.id]
         );
         assert_eq!(log.model_context().len(), 2);
+    }
+
+    #[test]
+    fn input_entries_preserve_trigger_metadata_and_idempotency() {
+        let mut input = AgentInput::with_trigger(crate::Trigger::Heartbeat, "check health");
+        input.idempotency_key = Some("heartbeat:42".to_string());
+        input
+            .metadata
+            .insert("source".to_string(), serde_json::json!("scheduler"));
+        let message = Message::user_content(input.content.clone());
+        let mut log = ConversationLog::new();
+        log.push(ConversationEntry::InputAccepted(AcceptedInput {
+            input,
+            message: message.clone(),
+        }));
+
+        assert!(log.contains_idempotency_key("heartbeat:42"));
+        assert_eq!(log.messages()[0].id, message.id);
+        assert_eq!(log.model_context()[0].id, message.id);
     }
 }

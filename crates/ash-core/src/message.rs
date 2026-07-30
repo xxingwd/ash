@@ -65,6 +65,36 @@ impl Default for AgentId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
+pub struct RunId(Uuid);
+
+impl RunId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
+pub struct TurnId(Uuid);
+
+impl TurnId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TurnId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -152,10 +182,14 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: &str) -> Self {
+        Self::user_content(vec![Content::Text(text.to_string())])
+    }
+
+    pub fn user_content(content: Vec<Content>) -> Self {
         Self {
             id: MessageId::new(),
             role: Role::User,
-            content: MessageContent::User(vec![Content::Text(text.to_string())]),
+            content: MessageContent::User(content),
         }
     }
 

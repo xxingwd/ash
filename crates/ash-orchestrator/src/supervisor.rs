@@ -1,6 +1,6 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use ash_agent::{run_agent_turn, AgentConfig};
+use ash_agent::{run_agent_turn, AgentConfig, AgentDefinition, AgentScope};
 use ash_core::{
     define_tool, AgentId, CancellationToken, ContentBlock, Message, MessageContent, ModelClient,
     SessionId, StopReason, Tool, ToolContext, ToolError,
@@ -99,25 +99,22 @@ impl FromStr for AgentRole {
 
 impl ChildAgentFactory for InheritedAgentFactory {
     fn create(&self, request: ChildAgentRequest) -> Result<ChildAgent, ToolError> {
-        let config = AgentConfig {
-            system_prompt: Some(subagent_system_prompt(
-                self.system_prompt.as_deref(),
-                request.role,
-                &request.parent_path,
-                &request.task_name,
-            )),
-            tools: self.tools.clone(),
-            model: self.model_id.clone(),
-            max_turns: self.max_turns,
-            working_dir: request.working_dir,
-            max_context_tokens: self.max_context_tokens,
-            max_tool_duration: request.max_duration,
+        let mut definition = self.definition.clone();
+        definition.system_prompt = Some(subagent_system_prompt(
+            self.system_prompt.as_deref(),
+            request.role,
+            &request.parent_path,
+            &request.task_name,
+        ));
+        let scope = AgentScope {
+            working_dir: self.scope.working_dir.clone(),
+            max_tool_duration: self.scope.max_tool_duration,
             agent_path: request.task_name,
             root_session_id: Some(request.root_session_id),
         };
         Ok(ChildAgent {
             model: Arc::clone(&self.model),
-            config,
+            config: AgentConfig::from_parts(definition, scope),
             messages: request.messages,
         })
     }
@@ -163,8 +160,6 @@ pub struct ChildAgentRequest {
     pub parent_path: String,
     pub task_name: String,
     pub messages: Vec<Message>,
-    pub working_dir: std::path::PathBuf,
-    pub max_duration: Duration,
     pub root_session_id: SessionId,
 }
 
@@ -181,10 +176,8 @@ pub trait ChildAgentFactory: Send + Sync {
 struct InheritedAgentFactory {
     model: Arc<dyn ModelClient>,
     system_prompt: Option<String>,
-    tools: Vec<Arc<dyn Tool>>,
-    model_id: ash_core::ModelId,
-    max_turns: u32,
-    max_context_tokens: usize,
+    definition: AgentDefinition,
+    scope: AgentScope,
 }
 
 #[derive(Default)]
@@ -694,8 +687,6 @@ impl Supervisor {
             parent_path,
             task_name: task_name.clone(),
             messages,
-            working_dir: context.working_dir,
-            max_duration: context.max_duration,
             root_session_id: context.agent.root_session_id,
         })?;
         child.config.tools.extend(self.tools());
@@ -802,7 +793,10 @@ impl Supervisor {
     }
 
     async fn wait(&self, context: &ToolContext, args: WaitAgentArgs) -> Result<String, ToolError> {
-        let max_timeout_ms = u64::try_from(context.max_duration.as_millis())
+        let remaining = context
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let max_timeout_ms = u64::try_from(remaining.as_millis())
             .unwrap_or(u64::MAX)
             .min(MAX_WAIT_TIMEOUT_MS);
         let timeout_ms = args
@@ -968,10 +962,8 @@ pub fn install_subagent_tools(config: &mut AgentConfig, model: Arc<dyn ModelClie
     let factory = Arc::new(InheritedAgentFactory {
         model,
         system_prompt: config.system_prompt.clone(),
-        tools: config.tools.clone(),
-        model_id: config.model.clone(),
-        max_turns: config.max_turns,
-        max_context_tokens: config.max_context_tokens,
+        definition: config.definition(),
+        scope: config.scope(),
     });
     let supervisor = Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory);
     config.tools.extend(supervisor.tools());
@@ -1145,8 +1137,8 @@ fn json_output(value: &serde_json::Value) -> Result<String, ToolError> {
 mod tests {
     use std::path::PathBuf;
 
-    use ash_core::{AgentToolContext, ModelId, Protocol, ProviderConfig};
-    use ash_protocol::create_adapter;
+    use ash_core::{AgentToolContext, ModelId};
+    use ash_protocol::{create_adapter, Protocol, ProviderConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -1159,6 +1151,7 @@ mod tests {
             max_turns: 10,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(ash_agent::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1168,8 +1161,11 @@ mod tests {
     fn test_context(root_session_id: SessionId) -> ToolContext {
         let config = test_config();
         ToolContext {
-            working_dir: config.working_dir,
-            max_duration: config.max_tool_duration,
+            session_id: root_session_id,
+            run_id: ash_core::RunId::new(),
+            turn_id: ash_core::TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + config.max_tool_duration,
             agent: AgentToolContext {
                 root_session_id,
                 agent_path: "/root".to_string(),
@@ -1191,11 +1187,9 @@ mod tests {
         config.max_turns = max_turns;
         let factory = Arc::new(InheritedAgentFactory {
             model,
-            system_prompt: config.system_prompt,
-            tools: config.tools,
-            model_id: config.model,
-            max_turns: config.max_turns,
-            max_context_tokens: config.max_context_tokens,
+            system_prompt: config.system_prompt.clone(),
+            definition: config.definition(),
+            scope: config.scope(),
         });
         Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory)
     }
@@ -1578,8 +1572,11 @@ mod tests {
         let supervisor = test_supervisor(test_model(Some(format!("http://{address}"))), 2);
         let root_session_id = SessionId::new();
         let context = ToolContext {
-            working_dir: PathBuf::from("."),
-            max_duration: Duration::from_secs(5),
+            session_id: root_session_id,
+            run_id: ash_core::RunId::new(),
+            turn_id: ash_core::TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
                 root_session_id,
                 agent_path: "/root".to_string(),

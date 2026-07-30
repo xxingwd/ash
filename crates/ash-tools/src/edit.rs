@@ -1,4 +1,8 @@
-use std::{io::Read, path::Path, sync::Arc};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{define_tool, Tool, ToolError};
 use schemars::JsonSchema;
@@ -21,18 +25,21 @@ struct EditArgs {
     edits: Vec<Replacement>,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "edit",
         "Edit one file using one or more exact replacements. Every edits[].oldText must be unique and non-overlapping in the original file; replacements are not applied incrementally.",
-        |ctx, args: EditArgs| async move {
+        move |_ctx, args: EditArgs| {
+            let working_dir = Arc::clone(&working_dir);
+            async move {
             let count = args.edits.len();
-            let path = edit_file(&ctx.working_dir, &args.path, args.edits).await?;
+            let path = edit_file(&working_dir, &args.path, args.edits).await?;
             Ok(format!(
                 "Successfully replaced {} block(s) in {}.",
                 count,
                 path.display()
             ))
+            }
         },
     )
 }

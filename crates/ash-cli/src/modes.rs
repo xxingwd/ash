@@ -3,10 +3,8 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, AgentConfig, AgentRuntime, AgentSession,
     MessageHistoryStore, Skill, DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{
-    CancellationToken, Event, Message, MessageId, ModelId, Protocol, ProviderConfig, SessionId,
-};
-use ash_protocol::create_adapter;
+use ash_core::{CancellationToken, Event, Message, MessageId, ModelId, SessionId};
+use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::UiCommand;
 use futures::StreamExt;
 use owo_colors::OwoColorize;
@@ -91,6 +89,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         .transpose()?;
     let system_prompt = build_system_prompt(&working_dir, &skills, active_skill.as_ref())?;
     let mut tools = ash_tools::tools(
+        working_dir.clone(),
         active_skill
             .as_ref()
             .and_then(|skill| skill.tools.as_deref()),
@@ -109,6 +108,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         max_turns: 100,
         working_dir,
         max_context_tokens,
+        context_policy: std::sync::Arc::new(ash_agent::CodingContextPolicy),
         max_tool_duration: std::time::Duration::from_secs(120),
         agent_path: "/root".to_string(),
         root_session_id: None,

@@ -9,8 +9,8 @@ use tracing::warn;
 #[cfg(test)]
 use crate::AgentConfig;
 use crate::{
-    ContextCheckpoint, ConversationEntry, ConversationLog, ConversationMetadata,
-    ConversationRepository, ConversationStore,
+    AcceptedInput, ContextCheckpoint, ConversationEntry, ConversationLog, ConversationMetadata,
+    ConversationRepository, ConversationRevision, ConversationStore,
 };
 
 const SESSION_FORMAT_VERSION: u32 = 1;
@@ -79,6 +79,7 @@ struct ContextCompactedRecord {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum SessionRecord {
     SessionMeta(SessionMetadata),
+    InputAccepted(AcceptedInput),
     UserMessage(Message),
     AssistantMessage(Message),
     ToolResult(Message),
@@ -97,6 +98,7 @@ impl SessionRecord {
 
     fn from_entry(entry: ConversationEntry) -> Self {
         match entry {
+            ConversationEntry::InputAccepted(input) => Self::InputAccepted(input),
             ConversationEntry::Message(message) => Self::from_message(&message),
             ConversationEntry::ContextCheckpoint(checkpoint) => {
                 Self::ContextCompacted(ContextCompactedRecord {
@@ -110,6 +112,7 @@ impl SessionRecord {
 
     fn into_entry(self) -> Option<ConversationEntry> {
         match self {
+            Self::InputAccepted(input) => Some(ConversationEntry::InputAccepted(input)),
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
             | Self::ToolResult(message) => Some(ConversationEntry::Message(message)),
@@ -215,6 +218,7 @@ pub(crate) struct SessionStore {
     path: PathBuf,
     metadata: SessionMetadata,
     file: Option<tokio::fs::File>,
+    revision: ConversationRevision,
 }
 
 pub struct JsonlConversationRepository {
@@ -271,6 +275,7 @@ impl SessionStore {
             path,
             metadata: SessionMetadata::from_config(config, session_id, created_at, model_backend),
             file: None,
+            revision: ConversationRevision::initial(),
         }
     }
 
@@ -282,6 +287,7 @@ impl SessionStore {
             path,
             metadata: SessionMetadata::from_metadata(metadata, created_at),
             file: None,
+            revision: ConversationRevision::initial(),
         }
     }
 
@@ -301,8 +307,9 @@ impl SessionStore {
         &mut self,
         message: &Message,
     ) -> Result<(), ash_core::AshError> {
-        self.append(ConversationEntry::Message(message.clone()))
+        self.append(self.revision, ConversationEntry::Message(message.clone()))
             .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -310,10 +317,14 @@ impl SessionStore {
         &mut self,
         compacted_messages: &[Message],
     ) -> Result<(), ash_core::AshError> {
-        self.append(ConversationEntry::ContextCheckpoint(
-            ContextCheckpoint::from_model_context(compacted_messages)?,
-        ))
+        self.append(
+            self.revision,
+            ConversationEntry::ContextCheckpoint(ContextCheckpoint::from_model_context(
+                compacted_messages,
+            )?),
+        )
         .await
+        .map(|_| ())
     }
 
     async fn append_record(&mut self, record: SessionRecord) -> Result<(), ash_core::AshError> {
@@ -360,7 +371,9 @@ impl SessionStore {
                 "session store has no persisted turn to roll back".to_string(),
             ));
         }
-        self.append(ConversationEntry::TurnRolledBack).await
+        self.append(self.revision, ConversationEntry::TurnRolledBack)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -412,6 +425,7 @@ impl SessionStore {
             path: stored.path.clone(),
             metadata: stored.metadata.clone(),
             file: Some(file),
+            revision: stored.log.revision(),
         })
     }
 }
@@ -422,13 +436,30 @@ impl ConversationStore for SessionStore {
         self.metadata.session_id
     }
 
-    async fn append(&mut self, entry: ConversationEntry) -> Result<(), ash_core::AshError> {
+    fn revision(&self) -> ConversationRevision {
+        self.revision
+    }
+
+    async fn append(
+        &mut self,
+        expected_revision: ConversationRevision,
+        entry: ConversationEntry,
+    ) -> Result<ConversationRevision, ash_core::AshError> {
+        if expected_revision != self.revision {
+            return Err(ash_core::AshError::Config(format!(
+                "conversation revision conflict: expected {}, actual {}",
+                expected_revision.value(),
+                self.revision.value()
+            )));
+        }
         if matches!(&entry, ConversationEntry::TurnRolledBack) && self.file.is_none() {
             return Err(ash_core::AshError::Config(
                 "session store has no persisted turn to roll back".to_string(),
             ));
         }
-        self.append_record(SessionRecord::from_entry(entry)).await
+        self.append_record(SessionRecord::from_entry(entry)).await?;
+        self.revision = self.revision.next();
+        Ok(self.revision)
     }
 
     async fn load(&self) -> Result<ConversationLog, ash_core::AshError> {
@@ -588,6 +619,7 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
+            context_policy: std::sync::Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -644,6 +676,33 @@ mod tests {
         assert_eq!(loaded.metadata.session_id, session_id);
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.model_context().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_append_from_a_stale_revision() {
+        let directory = TempDir::new().unwrap();
+        let mut store = SessionStore::new_in(
+            &config(directory.path().to_path_buf()),
+            SessionId::new(),
+            directory.path(),
+        );
+        let stale_revision = store.revision();
+        store.append_message(&Message::user("first")).await.unwrap();
+
+        let error = ConversationStore::append(
+            &mut store,
+            stale_revision,
+            ConversationEntry::Message(Message::user("stale")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("conversation revision conflict"));
+        assert_eq!(store.revision().value(), 1);
+        assert_eq!(
+            read_session(store.path()).await.unwrap().messages().len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{define_tool, Tool, ToolError};
 use schemars::JsonSchema;
@@ -12,17 +15,20 @@ struct WriteArgs {
     content: String,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "write",
         "Write complete content to a file. Creates missing parent directories and overwrites an existing file; use edit for local changes.",
-        |ctx, args: WriteArgs| async move {
-            let path = write_file(&ctx.working_dir, &args.path, &args.content).await?;
+        move |_ctx, args: WriteArgs| {
+            let working_dir = Arc::clone(&working_dir);
+            async move {
+            let path = write_file(&working_dir, &args.path, &args.content).await?;
             Ok(format!(
                 "Wrote {} bytes to {}.",
                 args.content.len(),
                 path.display()
             ))
+            }
         },
     )
 }

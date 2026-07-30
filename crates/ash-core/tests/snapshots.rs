@@ -133,13 +133,6 @@ fn test_model_id_display() {
 }
 
 #[test]
-fn test_protocol_display() {
-    assert_eq!(Protocol::AnthropicMessages.to_string(), "AnthropicMessages");
-    assert_eq!(Protocol::OpenaiCompletions.to_string(), "OpenaiCompletions");
-    assert_eq!(Protocol::OpenaiResponses.to_string(), "OpenaiResponses");
-}
-
-#[test]
 fn test_role_display() {
     assert_eq!(Role::User.to_string(), "User");
     assert_eq!(Role::Assistant.to_string(), "Assistant");

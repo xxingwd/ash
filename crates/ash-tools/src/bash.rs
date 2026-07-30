@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -19,11 +20,13 @@ struct BashArgs {
     timeout: Option<f64>,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "bash",
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
-        |ctx, args: BashArgs| async move {
+        move |_ctx, args: BashArgs| {
+            let working_dir = Arc::clone(&working_dir);
+            async move {
             let timeout = args.timeout.map(parse_timeout).transpose()?;
             let stdout = tempfile::Builder::new()
                 .prefix("ash-bash-stdout-")
@@ -36,7 +39,7 @@ pub fn tool() -> Arc<dyn Tool> {
             let mut command = tokio::process::Command::new("bash");
             command
                 .args(["-c", &args.command])
-                .current_dir(&ctx.working_dir)
+                .current_dir(working_dir.as_path())
                 .stdout(Stdio::from(stdout.reopen().map_err(|error| {
                     ToolError::Execution(format!("cannot capture stdout: {error}"))
                 })?))
@@ -68,6 +71,7 @@ pub fn tool() -> Arc<dyn Tool> {
                 Err(ToolError::Execution(format!(
                     "{rendered}\n\nCommand exited with {code}"
                 )))
+            }
             }
         },
     )

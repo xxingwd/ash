@@ -30,7 +30,10 @@ pub fn tool() -> Arc<dyn Tool> {
             let client = client.clone();
             async move {
                 let url = parse_url(&args.url)?;
-                let timeout = parse_timeout(args.timeout, ctx.max_duration)?;
+                let remaining = ctx
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                let timeout = parse_timeout(args.timeout, remaining)?;
                 tokio::time::timeout(timeout, fetch(&client, url))
                     .await
                     .map_err(|_| ToolError::Timeout(timeout))?

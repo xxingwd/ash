@@ -1,4 +1,8 @@
-use std::{io::Read, path::Path, sync::Arc};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{define_tool, Content, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
@@ -95,12 +99,13 @@ impl TextReadState {
     }
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "read",
         "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Supported images: jpg, png, gif, webp, and bmp.",
-        |ctx, args: ReadArgs| async move {
-            read_file(&ctx.working_dir, &args.path, args.offset, args.limit).await
+        move |_ctx, args: ReadArgs| {
+            let working_dir = Arc::clone(&working_dir);
+            async move { read_file(&working_dir, &args.path, args.offset, args.limit).await }
         },
     )
 }

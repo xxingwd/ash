@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{define_tool, Tool, ToolError};
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
@@ -17,16 +20,18 @@ struct GlobArgs {
     path: Option<String>,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "glob",
         "Find files by glob pattern inside the working directory. Respects ignore files and returns at most 100 workspace-relative paths.",
-        |ctx, args: GlobArgs| async move {
-            let root = ctx.working_dir;
+        move |_ctx, args: GlobArgs| {
+            let root = Arc::clone(&working_dir);
+            async move {
             crate::path::run_blocking(move || {
                 find_files(&root, args.path.as_deref().unwrap_or("."), &args.pattern)
             })
             .await
+            }
         },
     )
 }

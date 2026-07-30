@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 pub use tokio_util::sync::CancellationToken;
 
-use crate::{error::ToolError, Content, Message, SessionId};
+use crate::{error::ToolError, Content, Message, RunId, SessionId, TurnId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -13,10 +13,11 @@ pub struct ToolDefinition {
 
 #[derive(Clone)]
 pub struct ToolContext {
-    /// Workspace boundary shared by every built-in tool.
-    pub working_dir: std::path::PathBuf,
-    /// Framework safety cap; a tool may impose a stricter per-call limit.
-    pub max_duration: Duration,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub turn_id: TurnId,
+    pub cancellation: CancellationToken,
+    pub deadline: std::time::Instant,
     /// Context needed only by agent-aware extension tools.
     pub agent: AgentToolContext,
 }

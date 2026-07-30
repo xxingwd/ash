@@ -9,10 +9,13 @@ mod webfetch;
 mod write;
 
 use ash_core::{Tool, ToolError};
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-pub fn tools(enabled: Option<&[String]>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
-    let tools = all_tools();
+pub fn tools(
+    working_dir: impl Into<PathBuf>,
+    enabled: Option<&[String]>,
+) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+    let tools = all_tools(Arc::new(working_dir.into()));
     let Some(names) = enabled else {
         return Ok(tools);
     };
@@ -41,14 +44,14 @@ pub fn tools(enabled: Option<&[String]>) -> Result<Vec<Arc<dyn Tool>>, ToolError
         .collect())
 }
 
-fn all_tools() -> Vec<Arc<dyn Tool>> {
+fn all_tools(working_dir: Arc<PathBuf>) -> Vec<Arc<dyn Tool>> {
     vec![
-        read::tool(),
-        glob::tool(),
-        grep::tool(),
-        bash::tool(),
-        edit::tool(),
-        write::tool(),
+        read::tool(Arc::clone(&working_dir)),
+        glob::tool(Arc::clone(&working_dir)),
+        grep::tool(Arc::clone(&working_dir)),
+        bash::tool(Arc::clone(&working_dir)),
+        edit::tool(Arc::clone(&working_dir)),
+        write::tool(working_dir),
         webfetch::tool(),
     ]
 }
@@ -61,7 +64,7 @@ mod tests {
 
     #[test]
     fn exposes_the_supported_tools_by_default() {
-        let names = tools(None)
+        let names = tools(".", None)
             .unwrap()
             .into_iter()
             .map(|tool| tool.name().to_string())
@@ -76,7 +79,7 @@ mod tests {
     #[test]
     fn selects_explicit_optional_tools_without_a_second_filtering_step() {
         let enabled = vec!["read".to_string(), "webfetch".to_string()];
-        let names = tools(Some(&enabled))
+        let names = tools(".", Some(&enabled))
             .unwrap()
             .into_iter()
             .map(|tool| tool.name().to_string())
@@ -87,7 +90,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tool_names() {
-        let error = tools(Some(&["read".into(), "reed".into()])).err().unwrap();
+        let error = tools(".", Some(&["read".into(), "reed".into()]))
+            .err()
+            .unwrap();
 
         assert!(error.to_string().contains("unknown tool(s): reed"));
         assert!(error.to_string().contains("available tools: read, glob"));
@@ -95,7 +100,7 @@ mod tests {
 
     #[test]
     fn builtin_schemas_expose_only_the_supported_arguments() {
-        let definitions = tools(None)
+        let definitions = tools(".", None)
             .unwrap()
             .into_iter()
             .map(|tool| (tool.name().to_string(), tool.definition()))

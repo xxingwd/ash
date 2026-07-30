@@ -4,6 +4,27 @@ use ash_core::{ModelId, SessionId, SessionSummary};
 
 use crate::{ConversationEntry, ConversationLog};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ConversationRevision(u64);
+
+impl ConversationRevision {
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    pub(crate) fn from_entry_count(count: usize) -> Self {
+        Self(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConversationMetadata {
     pub session_id: SessionId,
@@ -19,7 +40,12 @@ pub struct ConversationMetadata {
 #[async_trait::async_trait]
 pub trait ConversationStore: Send {
     fn session_id(&self) -> SessionId;
-    async fn append(&mut self, entry: ConversationEntry) -> Result<(), ash_core::AshError>;
+    fn revision(&self) -> ConversationRevision;
+    async fn append(
+        &mut self,
+        expected_revision: ConversationRevision,
+        entry: ConversationEntry,
+    ) -> Result<ConversationRevision, ash_core::AshError>;
     async fn load(&self) -> Result<ConversationLog, ash_core::AshError>;
 }
 

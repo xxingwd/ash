@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
-use ash_core::{
-    ContentBlock, MessageContent, ProtocolError, ProviderConfig, StopReason, ToolCallId,
-};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, StreamItem};
+use crate::{
+    model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, ProviderConfig, StreamItem,
+};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
@@ -282,10 +282,8 @@ impl sse::Decoder for AnthropicDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::Decoder;
-    use ash_core::{
-        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Protocol, Role,
-    };
+    use crate::{sse::Decoder, Protocol};
+    use ash_core::{Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role};
     use secrecy::SecretString;
 
     #[test]

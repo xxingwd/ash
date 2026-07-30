@@ -1,7 +1,7 @@
 use ash_core::{
     AgentToolContext, CancellationToken, ContentBlock, Event, Message, MessageContent, ModelClient,
-    ModelRequest, ModelStream, ModelStreamEvent, Role, SessionId, StopReason, ToolCallId,
-    ToolContext, ToolDefinition, ToolError, ToolOutput,
+    ModelRequest, ModelStream, ModelStreamEvent, Role, RunId, SessionId, StopReason, ToolCallId,
+    ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId,
 };
 use futures::StreamExt;
 use std::time::Instant;
@@ -9,11 +9,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
+#[cfg(test)]
+use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
 use crate::{
-    context::{
-        apply_summary, count_output_tokens, estimate_request_tokens, needs_compaction,
-        plan_compaction, prune_tool_outputs, summary_output_tokens,
-    },
+    context::{count_output_tokens, estimate_request_tokens},
+    context_policy::{CodingContextPolicy, ContextRequest},
     conversation::{ContextCheckpoint, ConversationEntry},
     AgentConfig, ConversationStore,
 };
@@ -21,7 +21,6 @@ use crate::{
 const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
 const AGENT_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the agent ...\n";
-const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding sessions. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
 
 struct PendingToolCall {
     id: ToolCallId,
@@ -81,10 +80,27 @@ struct AgentTurnRunner<'config, 'store> {
     config: &'config AgentConfig,
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
-    session_id: SessionId,
+    ids: ExecutionIds,
     model: &'config dyn ModelClient,
     store: Option<&'store mut dyn ConversationStore>,
     tool_defs: Vec<ToolDefinition>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExecutionIds {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub turn_id: TurnId,
+}
+
+impl ExecutionIds {
+    fn for_session(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            run_id: RunId::new(),
+            turn_id: TurnId::new(),
+        }
+    }
 }
 
 impl StreamTermination {
@@ -144,65 +160,25 @@ pub(crate) async fn compact_with_adapter(
         .iter()
         .map(|tool| tool.definition())
         .collect::<Vec<_>>();
-    let before_tokens = estimate_request_tokens(config.system_prompt.as_deref(), messages, &tools);
-    let Some(plan) = plan_compaction(messages, config.max_context_tokens) else {
-        return Ok(None);
-    };
-    let mut stream = model.stream(ModelRequest {
-        model: config.model.clone(),
-        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-        messages: vec![Message::user(&plan.summary_prompt)],
-        tools: Vec::new(),
-        max_tokens: Some(summary_output_tokens(config.max_context_tokens)),
-    })?;
-    let summary = collect_compaction_summary(&mut stream, cancel).await?;
-    let compacted = apply_summary(&summary, plan.tail);
-    let after_tokens = estimate_request_tokens(config.system_prompt.as_deref(), &compacted, &tools);
-    if after_tokens >= before_tokens {
-        return Ok(None);
-    }
-    Ok(Some(CompactedHistory {
-        messages: compacted,
-        before_tokens,
-        after_tokens,
-        dropped_messages: plan.compacted_messages,
-    }))
-}
-
-async fn collect_compaction_summary(
-    stream: &mut ModelStream,
-    cancel: &CancellationToken,
-) -> Result<String, ash_core::AshError> {
-    let mut summary = String::new();
-    loop {
-        let next = tokio::select! {
-            _ = cancel.cancelled() => return Err(ash_core::AshError::Cancelled),
-            next = stream.next() => next,
-        };
-        let Some(item) = next else {
-            break;
-        };
-        match item? {
-            ModelStreamEvent::TextDelta(text) => summary.push_str(&text),
-            ModelStreamEvent::ThinkingDelta(_)
-            | ModelStreamEvent::Usage { .. }
-            | ModelStreamEvent::Stop(_) => {}
-            ModelStreamEvent::ToolCall { .. } => {
-                return Err(ash_core::ProtocolError::InvalidResponse(
-                    "compaction model unexpectedly requested a tool".to_string(),
-                )
-                .into());
-            }
-        }
-    }
-    let summary = summary.trim();
-    if summary.is_empty() {
-        return Err(ash_core::ProtocolError::InvalidResponse(
-            "compaction model returned an empty summary".to_string(),
+    let update = CodingContextPolicy
+        .compact(
+            ContextRequest {
+                model: config.model.clone(),
+                system_prompt: config.system_prompt.clone(),
+                messages: messages.to_vec(),
+                tools,
+                max_context_tokens: config.max_context_tokens,
+            },
+            model,
+            cancel,
         )
-        .into());
-    }
-    Ok(summary.to_string())
+        .await?;
+    Ok(update.map(|compacted| CompactedHistory {
+        messages: compacted.messages,
+        before_tokens: compacted.update.before_tokens,
+        after_tokens: compacted.update.after_tokens,
+        dropped_messages: compacted.update.dropped_messages,
+    }))
 }
 
 pub async fn run_agent_loop(
@@ -230,7 +206,26 @@ pub async fn run_agent_turn(
     cancel: CancellationToken,
     session_id: SessionId,
 ) -> Result<StopReason, ash_core::AshError> {
-    run_agent_turn_inner(model, config, messages, tx, cancel, session_id, None).await
+    run_agent_turn_identified(
+        model,
+        config,
+        messages,
+        tx,
+        cancel,
+        ExecutionIds::for_session(session_id),
+    )
+    .await
+}
+
+pub(crate) async fn run_agent_turn_identified(
+    model: &dyn ModelClient,
+    config: &AgentConfig,
+    messages: &mut Vec<Message>,
+    tx: mpsc::Sender<Event>,
+    cancel: CancellationToken,
+    ids: ExecutionIds,
+) -> Result<StopReason, ash_core::AshError> {
+    run_agent_turn_inner(model, ids, config, messages, tx, cancel, None).await
 }
 
 pub(crate) async fn run_agent_turn_persisted(
@@ -242,29 +237,34 @@ pub(crate) async fn run_agent_turn_persisted(
     session_id: SessionId,
     store: &mut dyn ConversationStore,
 ) -> Result<StopReason, ash_core::AshError> {
-    run_agent_turn_inner(model, config, messages, tx, cancel, session_id, Some(store)).await
+    run_agent_turn_inner(
+        model,
+        ExecutionIds::for_session(session_id),
+        config,
+        messages,
+        tx,
+        cancel,
+        Some(store),
+    )
+    .await
 }
 
 async fn run_agent_turn_inner(
     model: &dyn ModelClient,
+    ids: ExecutionIds,
     config: &AgentConfig,
     messages: &mut Vec<Message>,
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
-    session_id: SessionId,
     store: Option<&mut dyn ConversationStore>,
 ) -> Result<StopReason, ash_core::AshError> {
-    let _ = tx.send(Event::AgentStarted { session_id }).await;
-    let result = run_with_adapter(
-        config,
-        messages,
-        tx.clone(),
-        cancel,
-        session_id,
-        model,
-        store,
-    )
-    .await;
+    let _ = tx
+        .send(Event::AgentStarted {
+            session_id: ids.session_id,
+        })
+        .await;
+    let result =
+        run_with_identifiers(config, messages, tx.clone(), cancel, ids, model, store).await;
 
     match result {
         Ok(reason) => {
@@ -287,6 +287,7 @@ async fn run_agent_turn_inner(
     }
 }
 
+#[cfg(test)]
 async fn run_with_adapter(
     config: &AgentConfig,
     messages: &mut Vec<Message>,
@@ -296,7 +297,28 @@ async fn run_with_adapter(
     model: &dyn ModelClient,
     store: Option<&mut dyn ConversationStore>,
 ) -> Result<StopReason, ash_core::AshError> {
-    AgentTurnRunner::new(config, tx, cancel, session_id, model, store)
+    run_with_identifiers(
+        config,
+        messages,
+        tx,
+        cancel,
+        ExecutionIds::for_session(session_id),
+        model,
+        store,
+    )
+    .await
+}
+
+async fn run_with_identifiers(
+    config: &AgentConfig,
+    messages: &mut Vec<Message>,
+    tx: mpsc::Sender<Event>,
+    cancel: CancellationToken,
+    ids: ExecutionIds,
+    model: &dyn ModelClient,
+    store: Option<&mut dyn ConversationStore>,
+) -> Result<StopReason, ash_core::AshError> {
+    AgentTurnRunner::new(config, tx, cancel, ids, model, store)
         .run(messages)
         .await
 }
@@ -306,7 +328,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         config: &'config AgentConfig,
         tx: mpsc::Sender<Event>,
         cancel: CancellationToken,
-        session_id: SessionId,
+        ids: ExecutionIds,
         model: &'config dyn ModelClient,
         store: Option<&'store mut dyn ConversationStore>,
     ) -> Self {
@@ -315,7 +337,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             config,
             tx,
             cancel,
-            session_id,
+            ids,
             model,
             store,
             tool_defs,
@@ -382,37 +404,43 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         &mut self,
         messages: &mut Vec<Message>,
     ) -> Result<(), ash_core::AshError> {
-        if let Some(pruned) = prune_tool_outputs(messages) {
-            *messages = pruned;
-        }
-
-        let estimated_context = estimate_request_tokens(
-            self.config.system_prompt.as_deref(),
-            messages,
-            &self.tool_defs,
-        );
-        if !needs_compaction(estimated_context, self.config.max_context_tokens) {
-            return Ok(());
-        }
-        let Some(compacted) =
-            compact_with_adapter(self.config, messages, self.model, &self.cancel).await?
-        else {
+        let prepared = self
+            .config
+            .context_policy
+            .prepare(
+                ContextRequest {
+                    model: self.config.model.clone(),
+                    system_prompt: self.config.system_prompt.clone(),
+                    messages: std::mem::take(messages),
+                    tools: self.tool_defs.clone(),
+                    max_context_tokens: self.config.max_context_tokens,
+                },
+                self.model,
+                &self.cancel,
+            )
+            .await?;
+        let update = prepared.update;
+        *messages = prepared.messages;
+        let Some(update) = update else {
             return Ok(());
         };
         if let Some(store) = self.store.as_deref_mut() {
+            let revision = store.revision();
             store
-                .append(ConversationEntry::ContextCheckpoint(
-                    ContextCheckpoint::from_model_context(&compacted.messages)?,
-                ))
+                .append(
+                    revision,
+                    ConversationEntry::ContextCheckpoint(ContextCheckpoint::from_model_context(
+                        messages,
+                    )?),
+                )
                 .await?;
         }
-        *messages = compacted.messages;
         let _ = self
             .tx
             .send(Event::ContextCompacted {
-                before_tokens: u64::try_from(compacted.before_tokens).unwrap_or(u64::MAX),
-                after_tokens: u64::try_from(compacted.after_tokens).unwrap_or(u64::MAX),
-                dropped_messages: u64::try_from(compacted.dropped_messages).unwrap_or(u64::MAX),
+                before_tokens: u64::try_from(update.before_tokens).unwrap_or(u64::MAX),
+                after_tokens: u64::try_from(update.after_tokens).unwrap_or(u64::MAX),
+                dropped_messages: u64::try_from(update.dropped_messages).unwrap_or(u64::MAX),
                 automatic: true,
             })
             .await;
@@ -434,9 +462,11 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
         match self.store.as_deref_mut() {
             Some(store) => {
+                let revision = store.revision();
                 store
-                    .append(ConversationEntry::Message(message.clone()))
+                    .append(revision, ConversationEntry::Message(message.clone()))
                     .await
+                    .map(|_| ())
             }
             None => Ok(()),
         }
@@ -503,10 +533,13 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             return Err(ToolError::Execution(format!("unknown tool: {name}")));
         };
         let context = ToolContext {
-            working_dir: self.config.working_dir.clone(),
-            max_duration: self.config.max_tool_duration,
+            session_id: self.ids.session_id,
+            run_id: self.ids.run_id,
+            turn_id: self.ids.turn_id,
+            cancellation: self.cancel.clone(),
+            deadline: Instant::now() + self.config.max_tool_duration,
             agent: AgentToolContext {
-                root_session_id: self.config.root_session_id.unwrap_or(self.session_id),
+                root_session_id: self.config.root_session_id.unwrap_or(self.ids.session_id),
                 agent_path: self.config.agent_path.clone(),
                 messages: messages.to_vec(),
             },
@@ -814,6 +847,7 @@ mod tests {
             max_turns: 4,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -871,6 +905,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 1_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -955,6 +990,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 120_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1040,6 +1076,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1116,6 +1153,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1171,6 +1209,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1231,6 +1270,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             root_session_id: None,
@@ -1287,6 +1327,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::CodingContextPolicy),
             max_tool_duration: Duration::from_secs(30),
             agent_path: "/root".to_string(),
             root_session_id: None,
