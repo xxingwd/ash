@@ -668,7 +668,7 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
-            context_policy: std::sync::Arc::new(crate::CodingContextPolicy),
+            context_policy: std::sync::Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             tree_id: None,

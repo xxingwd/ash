@@ -6,9 +6,8 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{
-    model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, ProviderConfig, StreamItem,
-};
+use crate::{model_config, sse, ProviderConfig};
+use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
 
 pub struct ResponsesAdapter {
     config: ProviderConfig,
@@ -31,7 +30,7 @@ impl ResponsesAdapter {
             .trim_end_matches('/')
     }
 
-    fn build_request(&self, req: &LlmRequest) -> Result<Value, ProtocolError> {
+    fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
         let mut input = Vec::new();
         let mut index = 0;
         while index < req.messages.len() {
@@ -159,8 +158,8 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
         .collect::<Vec<_>>())
 }
 
-impl ProtocolAdapter for ResponsesAdapter {
-    fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ProtocolError> {
+impl ModelClient for ResponsesAdapter {
+    fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
         let body = self.build_request(&req)?;
         let request = self
             .client
@@ -193,7 +192,7 @@ impl ResponsesDecoder {
             .unwrap_or_else(|| format!("output: {}", event["output_index"].as_u64().unwrap_or(0)))
     }
 
-    fn emit_call(&mut self, key: &str) -> Result<Option<StreamItem>, ProtocolError> {
+    fn emit_call(&mut self, key: &str) -> Result<Option<ModelStreamEvent>, ProtocolError> {
         if self.emitted_calls.contains(key) {
             return Ok(None);
         }
@@ -207,7 +206,7 @@ impl ResponsesDecoder {
                 ProtocolError::InvalidResponse(format!("invalid Responses tool arguments: {error}"))
             })?
         };
-        let item = StreamItem::ToolCall {
+        let item = ModelStreamEvent::ToolCall {
             id: if call.call_id.is_empty() {
                 ToolCallId::new()
             } else {
@@ -234,21 +233,21 @@ impl sse::Decoder for ResponsesDecoder {
         match event["type"].as_str().unwrap_or_default() {
             "response.output_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    items.push(StreamItem::TextDelta(delta.to_string()));
+                    items.push(ModelStreamEvent::TextDelta(delta.to_string()));
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     self.streamed_reasoning_summaries
                         .insert(event["summary_index"].as_u64().unwrap_or(0));
-                    items.push(StreamItem::ThinkingDelta(delta.to_string()));
+                    items.push(ModelStreamEvent::ThinkingDelta(delta.to_string()));
                 }
             }
             "response.reasoning_summary_text.done" => {
                 let summary_index = event["summary_index"].as_u64().unwrap_or(0);
                 if !self.streamed_reasoning_summaries.contains(&summary_index) {
                     if let Some(text) = event["text"].as_str() {
-                        items.push(StreamItem::ThinkingDelta(text.to_string()));
+                        items.push(ModelStreamEvent::ThinkingDelta(text.to_string()));
                     }
                 }
             }
@@ -316,7 +315,7 @@ impl sse::Decoder for ResponsesDecoder {
                 let response = &event["response"];
                 let usage = response.get("usage").unwrap_or(&event["usage"]);
                 if !usage.is_null() {
-                    items.push(StreamItem::Usage {
+                    items.push(ModelStreamEvent::Usage {
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                     });
@@ -328,7 +327,7 @@ impl sse::Decoder for ResponsesDecoder {
                 } else {
                     StopReason::EndTurn
                 };
-                items.push(StreamItem::Stop(reason));
+                items.push(ModelStreamEvent::Stop(reason));
                 finished = true;
             }
             "response.failed" => {
@@ -383,7 +382,7 @@ mod tests {
 
         assert_eq!(
             items,
-            vec![StreamItem::ToolCall {
+            vec![ModelStreamEvent::ToolCall {
                 id: ToolCallId::from_provider("call_1"),
                 name: "read".into(),
                 arguments: json!({"path": "Cargo.toml"}),
@@ -415,7 +414,10 @@ mod tests {
             .unwrap()
             .into_items();
 
-        assert_eq!(delta, vec![StreamItem::ThinkingDelta("checking".into())]);
+        assert_eq!(
+            delta,
+            vec![ModelStreamEvent::ThinkingDelta("checking".into())]
+        );
         assert!(done.is_empty());
     }
 
@@ -429,7 +431,10 @@ mod tests {
             .unwrap()
             .into_items();
 
-        assert_eq!(items, vec![StreamItem::ThinkingDelta("checked".into())]);
+        assert_eq!(
+            items,
+            vec![ModelStreamEvent::ThinkingDelta("checked".into())]
+        );
     }
 
     #[test]
@@ -446,11 +451,11 @@ mod tests {
     #[test]
     fn omits_persisted_thoughts_from_responses_history() {
         let adapter = ResponsesAdapter::new(ProviderConfig {
-            protocol: Protocol::OpenaiResponses,
+            protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = LlmRequest {
+        let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
             messages: vec![Message {
@@ -477,11 +482,11 @@ mod tests {
     #[test]
     fn sends_tool_images_after_all_response_function_outputs() {
         let adapter = ResponsesAdapter::new(ProviderConfig {
-            protocol: Protocol::OpenaiResponses,
+            protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = LlmRequest {
+        let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
             messages: vec![

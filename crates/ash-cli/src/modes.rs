@@ -92,7 +92,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         tools,
         max_turns: 100,
         max_context_tokens,
-        context_policy: std::sync::Arc::new(ash_agent::CodingContextPolicy),
+        context_policy: std::sync::Arc::new(ash_agent::DefaultContextPolicy),
     };
     let options = ThreadOptions {
         working_dir,
@@ -432,8 +432,8 @@ mod tests {
     fn protocol_names_have_one_parser() {
         for protocol in [
             Protocol::AnthropicMessages,
-            Protocol::OpenaiCompletions,
-            Protocol::OpenaiResponses,
+            Protocol::Completions,
+            Protocol::Responses,
         ] {
             let name = protocol.as_cli_name();
             assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);

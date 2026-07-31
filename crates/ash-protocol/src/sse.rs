@@ -1,25 +1,23 @@
-use ash_core::ProtocolError;
+use ash_core::{ModelStream, ModelStreamEvent, ProtocolError};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
 
-use crate::{ProtocolStream, StreamItem};
-
 pub(crate) enum DecodeResult {
-    Continue(Vec<StreamItem>),
-    Finished(Vec<StreamItem>),
+    Continue(Vec<ModelStreamEvent>),
+    Finished(Vec<ModelStreamEvent>),
 }
 
 impl DecodeResult {
-    pub(crate) fn continuing(items: Vec<StreamItem>) -> Self {
+    pub(crate) fn continuing(items: Vec<ModelStreamEvent>) -> Self {
         Self::Continue(items)
     }
 
-    pub(crate) fn finished(items: Vec<StreamItem>) -> Self {
+    pub(crate) fn finished(items: Vec<ModelStreamEvent>) -> Self {
         Self::Finished(items)
     }
 
-    fn into_parts(self) -> (Vec<StreamItem>, bool) {
+    fn into_parts(self) -> (Vec<ModelStreamEvent>, bool) {
         match self {
             Self::Continue(items) => (items, false),
             Self::Finished(items) => (items, true),
@@ -27,7 +25,7 @@ impl DecodeResult {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_items(self) -> Vec<StreamItem> {
+    pub(crate) fn into_items(self) -> Vec<ModelStreamEvent> {
         self.into_parts().0
     }
 }
@@ -39,7 +37,7 @@ pub(crate) trait Decoder: Send + 'static {
 pub(crate) fn stream<D>(
     request: RequestBuilder,
     mut decoder: D,
-) -> Result<ProtocolStream, ProtocolError>
+) -> Result<ModelStream, ProtocolError>
 where
     D: Decoder,
 {

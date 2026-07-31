@@ -6,9 +6,8 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{
-    model_config, sse, LlmRequest, ProtocolAdapter, ProtocolStream, ProviderConfig, StreamItem,
-};
+use crate::{model_config, sse, ProviderConfig};
+use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
 
 pub struct CompletionsAdapter {
     config: ProviderConfig,
@@ -31,7 +30,7 @@ impl CompletionsAdapter {
             .trim_end_matches('/')
     }
 
-    fn build_request(&self, req: &LlmRequest) -> Result<Value, ProtocolError> {
+    fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
         let mut messages = Vec::new();
         if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
@@ -171,8 +170,8 @@ fn chat_content(contents: &[ash_core::Content]) -> Value {
         .collect::<Vec<_>>())
 }
 
-impl ProtocolAdapter for CompletionsAdapter {
-    fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ProtocolError> {
+impl ModelClient for CompletionsAdapter {
+    fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
         let body = self.build_request(&req)?;
         let request = self
             .client
@@ -196,7 +195,7 @@ struct PendingCall {
 }
 
 impl CompletionsDecoder {
-    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<StreamItem>, ProtocolError> {
+    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<ModelStreamEvent>, ProtocolError> {
         let mut items = Vec::new();
         for (_, call) in std::mem::take(&mut self.calls) {
             let arguments = if call.arguments.trim().is_empty() {
@@ -208,7 +207,7 @@ impl CompletionsDecoder {
                     ))
                 })?
             };
-            items.push(StreamItem::ToolCall {
+            items.push(ModelStreamEvent::ToolCall {
                 id: if call.id.is_empty() {
                     ToolCallId::new()
                 } else {
@@ -218,7 +217,7 @@ impl CompletionsDecoder {
                 arguments,
             });
         }
-        items.push(StreamItem::Stop(reason));
+        items.push(ModelStreamEvent::Stop(reason));
         Ok(items)
     }
 }
@@ -235,7 +234,7 @@ impl sse::Decoder for CompletionsDecoder {
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
-            items.push(StreamItem::Usage {
+            items.push(ModelStreamEvent::Usage {
                 input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
                 output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
             });
@@ -253,13 +252,13 @@ impl sse::Decoder for CompletionsDecoder {
             .find_map(|field| delta[field].as_str())
             .filter(|reasoning| !reasoning.is_empty())
         {
-            items.push(StreamItem::ThinkingDelta(reasoning.to_string()));
+            items.push(ModelStreamEvent::ThinkingDelta(reasoning.to_string()));
         }
         if let Some(content) = delta["content"]
             .as_str()
             .filter(|content| !content.is_empty())
         {
-            items.push(StreamItem::TextDelta(content.to_string()));
+            items.push(ModelStreamEvent::TextDelta(content.to_string()));
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
@@ -318,12 +317,12 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                StreamItem::ToolCall {
+                ModelStreamEvent::ToolCall {
                     id: ToolCallId::from_provider("call_7"),
                     name: "bash".into(),
                     arguments: json!({"command": "pwd"}),
                 },
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]
         );
     }
@@ -341,8 +340,8 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                StreamItem::ThinkingDelta("inspect first".into()),
-                StreamItem::TextDelta("done".into()),
+                ModelStreamEvent::ThinkingDelta("inspect first".into()),
+                ModelStreamEvent::TextDelta("done".into()),
             ]
         );
     }
@@ -350,11 +349,11 @@ mod tests {
     #[test]
     fn omits_persisted_thoughts_from_chat_completion_history() {
         let adapter = CompletionsAdapter::new(ProviderConfig {
-            protocol: Protocol::OpenaiCompletions,
+            protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = LlmRequest {
+        let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
             messages: vec![Message {
@@ -381,11 +380,11 @@ mod tests {
     #[test]
     fn sends_tool_images_after_all_chat_completion_tool_results() {
         let adapter = CompletionsAdapter::new(ProviderConfig {
-            protocol: Protocol::OpenaiCompletions,
+            protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = LlmRequest {
+        let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
             messages: vec![

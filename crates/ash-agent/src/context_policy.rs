@@ -47,9 +47,9 @@ pub trait ContextPolicy: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CodingContextPolicy;
+pub struct DefaultContextPolicy;
 
-impl CodingContextPolicy {
+impl DefaultContextPolicy {
     pub(crate) async fn compact(
         &self,
         request: ContextRequest,
@@ -118,7 +118,7 @@ impl CodingContextPolicy {
 }
 
 #[async_trait::async_trait]
-impl ContextPolicy for CodingContextPolicy {
+impl ContextPolicy for DefaultContextPolicy {
     async fn prepare(
         &self,
         mut request: ContextRequest,

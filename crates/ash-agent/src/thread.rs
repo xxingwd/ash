@@ -823,9 +823,8 @@ mod tests {
     };
 
     use ash_core::{
-        ContentBlock, MessageContent, MessageId, ModelClient as ProtocolAdapter, ModelId,
-        ModelRequest as LlmRequest, ModelStream as ProtocolStream, ModelStreamEvent as StreamItem,
-        Role, ToolCallId,
+        ContentBlock, MessageContent, MessageId, ModelClient, ModelId, ModelRequest, ModelStream,
+        ModelStreamEvent, Role, ToolCallId,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -833,28 +832,28 @@ mod tests {
     use super::*;
 
     struct MockAdapter {
-        responses: Mutex<VecDeque<Vec<StreamItem>>>,
-        requests: Arc<Mutex<Vec<LlmRequest>>>,
+        responses: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     struct DelayedAdapter {
         calls: AtomicUsize,
-        requests: Arc<Mutex<Vec<LlmRequest>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
-    impl ProtocolAdapter for DelayedAdapter {
-        fn stream(&self, request: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+    impl ModelClient for DelayedAdapter {
+        fn stream(&self, request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
             self.requests.lock().unwrap().push(request);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 Ok(Box::pin(futures::stream::once(async {
                     tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(StreamItem::Stop(StopReason::EndTurn))
+                    Ok(ModelStreamEvent::Stop(StopReason::EndTurn))
                 })))
             } else {
                 Ok(Box::pin(futures::stream::iter([
-                    Ok(StreamItem::TextDelta("done".to_string())),
-                    Ok(StreamItem::Stop(StopReason::EndTurn)),
+                    Ok(ModelStreamEvent::TextDelta("done".to_string())),
+                    Ok(ModelStreamEvent::Stop(StopReason::EndTurn)),
                 ])))
             }
         }
@@ -892,8 +891,8 @@ mod tests {
         }
     }
 
-    impl ProtocolAdapter for MockAdapter {
-        fn stream(&self, request: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+    impl ModelClient for MockAdapter {
+        fn stream(&self, request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
             self.requests.lock().unwrap().push(request);
             let items = self.responses.lock().unwrap().pop_front().unwrap();
             Ok(Box::pin(futures::stream::iter(items.into_iter().map(Ok))))
@@ -908,7 +907,7 @@ mod tests {
             max_turns: 10,
             working_dir,
             max_context_tokens: 1000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1157,8 +1156,8 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                StreamItem::TextDelta("condensed facts".to_string()),
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::TextDelta("condensed facts".to_string()),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: requests.clone(),
         };
@@ -1218,7 +1217,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![StreamItem::Stop(
+                responses: Mutex::new(VecDeque::from([vec![ModelStreamEvent::Stop(
                     StopReason::EndTurn,
                 )]])),
                 requests,
@@ -1251,7 +1250,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![StreamItem::Stop(
+                responses: Mutex::new(VecDeque::from([vec![ModelStreamEvent::Stop(
                     StopReason::EndTurn,
                 )]])),
                 requests: Arc::new(Mutex::new(Vec::new())),
@@ -1343,8 +1342,8 @@ mod tests {
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
                 responses: Mutex::new(VecDeque::from([vec![
-                    StreamItem::TextDelta("done".to_string()),
-                    StreamItem::Stop(StopReason::EndTurn),
+                    ModelStreamEvent::TextDelta("done".to_string()),
+                    ModelStreamEvent::Stop(StopReason::EndTurn),
                 ]])),
                 requests: requests.clone(),
             }),

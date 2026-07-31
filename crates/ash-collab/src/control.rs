@@ -1126,7 +1126,7 @@ mod tests {
             model: ModelId::new("test-model"),
             max_turns: 10,
             max_context_tokens: 200_000,
-            context_policy: Arc::new(ash_agent::CodingContextPolicy),
+            context_policy: Arc::new(ash_agent::DefaultContextPolicy),
         }
     }
 
@@ -1154,7 +1154,7 @@ mod tests {
 
     fn test_model(base_url: Option<String>) -> Arc<dyn ModelClient> {
         create_adapter(ProviderConfig {
-            protocol: Protocol::OpenaiResponses,
+            protocol: Protocol::Responses,
             api_key: "test".into(),
             base_url,
         })

@@ -13,7 +13,7 @@ use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
 use crate::store::ThreadPersistence;
 use crate::{
     context::{count_output_tokens, estimate_request_tokens},
-    context_policy::{CodingContextPolicy, ContextRequest},
+    context_policy::{ContextRequest, DefaultContextPolicy},
     log::{ContextCheckpoint, Record},
     AcceptedInput, Input, RunConfig,
 };
@@ -180,7 +180,7 @@ pub(crate) async fn compact_with_adapter(
         .iter()
         .map(|tool| tool.definition())
         .collect::<Vec<_>>();
-    let update = CodingContextPolicy
+    let update = DefaultContextPolicy
         .compact(
             ContextRequest {
                 model: config.model.clone(),
@@ -671,9 +671,8 @@ mod tests {
     };
 
     use ash_core::{
-        Content, ModelClient as ProtocolAdapter, ModelId, ModelRequest as LlmRequest,
-        ModelStream as ProtocolStream, ModelStreamEvent as StreamItem, Tool, ToolCallId,
-        ToolContext, ToolError,
+        Content, ModelClient, ModelId, ModelRequest, ModelStream, ModelStreamEvent, Tool,
+        ToolCallId, ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
@@ -718,12 +717,12 @@ mod tests {
     }
 
     struct MockAdapter {
-        responses: Mutex<VecDeque<Vec<StreamItem>>>,
-        requests: Arc<Mutex<Vec<LlmRequest>>>,
+        responses: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
-    impl ProtocolAdapter for MockAdapter {
-        fn stream(&self, req: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+    impl ModelClient for MockAdapter {
+        fn stream(&self, req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
             self.requests.lock().unwrap().push(req);
             let items = self.responses.lock().unwrap().pop_front().unwrap();
             Ok(Box::pin(futures::stream::iter(items.into_iter().map(Ok))))
@@ -794,16 +793,16 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
-                    StreamItem::ToolCall {
+                    ModelStreamEvent::ToolCall {
                         id: ToolCallId::from_provider("call_1"),
                         name: "echo".into(),
                         arguments: serde_json::json!({"value": "hello"}),
                     },
-                    StreamItem::Stop(StopReason::EndTurn),
+                    ModelStreamEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
-                    StreamItem::TextDelta("done".into()),
-                    StreamItem::Stop(StopReason::EndTurn),
+                    ModelStreamEvent::TextDelta("done".into()),
+                    ModelStreamEvent::Stop(StopReason::EndTurn),
                 ],
             ])),
             requests: requests.clone(),
@@ -815,7 +814,7 @@ mod tests {
             max_turns: 4,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -860,12 +859,12 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
-                    StreamItem::TextDelta("condensed facts".into()),
-                    StreamItem::Stop(StopReason::EndTurn),
+                    ModelStreamEvent::TextDelta("condensed facts".into()),
+                    ModelStreamEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
-                    StreamItem::TextDelta("done".into()),
-                    StreamItem::Stop(StopReason::EndTurn),
+                    ModelStreamEvent::TextDelta("done".into()),
+                    ModelStreamEvent::Stop(StopReason::EndTurn),
                 ],
             ])),
             requests: requests.clone(),
@@ -877,7 +876,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 1_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -949,8 +948,8 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                StreamItem::TextDelta("done".into()),
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::TextDelta("done".into()),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: requests.clone(),
         };
@@ -961,7 +960,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 120_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1028,16 +1027,16 @@ mod tests {
     async fn aggregates_usage_for_each_model_call() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                StreamItem::Usage {
+                ModelStreamEvent::Usage {
                     input_tokens: 120,
                     output_tokens: 0,
                 },
-                StreamItem::ThinkingDelta("checking".into()),
-                StreamItem::Usage {
+                ModelStreamEvent::ThinkingDelta("checking".into()),
+                ModelStreamEvent::Usage {
                     input_tokens: 0,
                     output_tokens: 25,
                 },
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1048,7 +1047,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1113,9 +1112,9 @@ mod tests {
     async fn persists_reasoning_blocks_in_thread_history() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                StreamItem::ThinkingDelta("inspect first".into()),
-                StreamItem::TextDelta("done".into()),
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::ThinkingDelta("inspect first".into()),
+                ModelStreamEvent::TextDelta("done".into()),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1126,7 +1125,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1167,10 +1166,10 @@ mod tests {
     async fn cancellation_preserves_partial_assistant_text() {
         struct PendingAdapter;
 
-        impl ProtocolAdapter for PendingAdapter {
-            fn stream(&self, _req: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+        impl ModelClient for PendingAdapter {
+            fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
                 Ok(Box::pin(
-                    futures::stream::iter([Ok(StreamItem::TextDelta("partial".into()))])
+                    futures::stream::iter([Ok(ModelStreamEvent::TextDelta("partial".into()))])
                         .chain(futures::stream::pending()),
                 ))
             }
@@ -1183,7 +1182,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1226,11 +1225,11 @@ mod tests {
     async fn protocol_errors_preserve_partial_assistant_content() {
         struct FailingAdapter;
 
-        impl ProtocolAdapter for FailingAdapter {
-            fn stream(&self, _req: LlmRequest) -> Result<ProtocolStream, ash_core::ProtocolError> {
+        impl ModelClient for FailingAdapter {
+            fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
                 Ok(Box::pin(futures::stream::iter([
-                    Ok(StreamItem::ThinkingDelta("checking".into())),
-                    Ok(StreamItem::TextDelta("partial".into())),
+                    Ok(ModelStreamEvent::ThinkingDelta("checking".into())),
+                    Ok(ModelStreamEvent::TextDelta("partial".into())),
                     Err(ash_core::ProtocolError::InvalidResponse(
                         "stream ended badly".into(),
                     )),
@@ -1245,7 +1244,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
@@ -1287,12 +1286,12 @@ mod tests {
     async fn cancellation_completes_an_active_tool_call() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                StreamItem::ToolCall {
+                ModelStreamEvent::ToolCall {
                     id: ToolCallId::from_provider("call_1"),
                     name: "blocking".into(),
                     arguments: serde_json::json!({}),
                 },
-                StreamItem::Stop(StopReason::EndTurn),
+                ModelStreamEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1303,7 +1302,7 @@ mod tests {
             max_turns: 1,
             working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::CodingContextPolicy),
+            context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(30),
             agent_path: "/root".to_string(),
             tree_id: None,
