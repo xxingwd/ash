@@ -1,175 +1,88 @@
 use std::sync::Arc;
 
-use ash_core::{
-    CancellationToken, Event, Message, ModelClient, RunId, SessionId, StopReason, TurnId,
-};
-use futures::StreamExt;
+use ash_core::{Message, ModelClient, ThreadId, ThreadSummary, TurnId};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    agent::{run_agent_turn_identified, ExecutionIds},
-    AgentConfig, AgentInput, AgentSession, ConversationRepository, JsonlConversationRepository,
-    SharedConversationRepository,
+    agent::RunConfig, Agent, Extension, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
+    ThreadState, ThreadStore, TurnContext, TurnOutcome, TurnPatch,
 };
 
+/// A routed event emitted by a thread. `sequence` is monotonic within one thread.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RunEvent {
-    pub session_id: SessionId,
-    pub run_id: RunId,
-    pub turn_id: TurnId,
+pub struct Event {
+    pub thread_id: ThreadId,
+    pub turn_id: Option<TurnId>,
     pub sequence: u64,
     pub timestamp: String,
-    pub event: Event,
+    pub kind: ash_core::EventKind,
 }
 
-pub struct AgentRun {
-    pub session_id: SessionId,
-    pub run_id: RunId,
-    pub turn_id: TurnId,
-    pub events: ReceiverStream<RunEvent>,
-    cancellation: CancellationToken,
-    completion: oneshot::Receiver<Result<StopReason, ash_core::AshError>>,
-}
-
-impl AgentRun {
-    pub fn cancel(&self) {
-        self.cancellation.cancel();
-    }
-
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
-
-    pub async fn wait(mut self) -> Result<StopReason, ash_core::AshError> {
-        loop {
-            tokio::select! {
-                result = &mut self.completion => return completion_result(result),
-                event = self.events.next() => {
-                    if event.is_none() {
-                        return completion_result(self.completion.await);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn completion_result(
-    result: Result<Result<StopReason, ash_core::AshError>, oneshot::error::RecvError>,
-) -> Result<StopReason, ash_core::AshError> {
-    result.map_err(|_| {
-        ash_core::AshError::Config("agent run ended without a completion result".to_string())
-    })?
-}
-
-/// Shared, provider-neutral dependencies used to create agent sessions.
+/// Provider-neutral dependencies and the only entry point for creating threads.
 #[derive(Clone)]
-pub struct AgentRuntime {
+pub struct Runtime {
     model: Arc<dyn ModelClient>,
     model_backend: Arc<str>,
-    conversations: SharedConversationRepository,
+    threads: SharedThreadStore,
+    extensions: Arc<Vec<Arc<dyn Extension>>>,
 }
 
-impl AgentRuntime {
+impl Runtime {
     pub fn new(model: Arc<dyn ModelClient>, model_backend: impl Into<String>) -> Self {
         Self {
             model,
             model_backend: Arc::from(model_backend.into()),
-            conversations: Arc::new(JsonlConversationRepository::default()),
+            threads: Arc::new(JsonlThreadStore::default()),
+            extensions: Arc::new(Vec::new()),
         }
     }
 
-    pub fn with_conversation_repository(
-        mut self,
-        conversations: Arc<dyn ConversationRepository>,
-    ) -> Self {
-        self.conversations = conversations;
+    pub fn with_thread_store(mut self, threads: Arc<dyn ThreadStore>) -> Self {
+        self.threads = threads;
         self
     }
 
-    pub fn create_session(&self, config: impl Into<AgentConfig>) -> AgentSession {
-        AgentSession::new(config.into(), self.clone())
+    pub fn with_extension(mut self, extension: Arc<dyn Extension>) -> Self {
+        Arc::make_mut(&mut self.extensions).push(extension);
+        self
     }
 
-    pub fn start(
+    pub fn start(&self, agent: Agent, options: ThreadOptions) -> Thread {
+        Thread::spawn(ThreadState::new(
+            RunConfig::new(&agent, &options),
+            self.clone(),
+        ))
+    }
+
+    pub async fn start_with_history(
         &self,
-        config: impl Into<AgentConfig>,
+        agent: Agent,
+        options: ThreadOptions,
         history: Vec<Message>,
-        input: AgentInput,
-    ) -> Result<AgentRun, ash_core::AshError> {
-        self.start_in_session(config, history, input, SessionId::new())
+    ) -> Result<Thread, ash_core::AshError> {
+        let mut state = ThreadState::new(RunConfig::new(&agent, &options), self.clone());
+        state.seed(history).await?;
+        Ok(Thread::spawn(state))
     }
 
-    pub fn start_in_session(
+    pub async fn resume(
         &self,
-        config: impl Into<AgentConfig>,
-        mut history: Vec<Message>,
-        input: AgentInput,
-        session_id: SessionId,
-    ) -> Result<AgentRun, ash_core::AshError> {
-        let config = config.into();
-        if input.content.is_empty() {
-            return Err(ash_core::AshError::Config(
-                "agent input content cannot be empty".to_string(),
-            ));
+        agent: Agent,
+        options: ThreadOptions,
+        thread_id: ThreadId,
+    ) -> Result<Option<Thread>, ash_core::AshError> {
+        let mut state = ThreadState::new(RunConfig::new(&agent, &options), self.clone());
+        if !state.resume(thread_id).await? {
+            return Ok(None);
         }
-        history.push(input.into_message());
-        let run_id = RunId::new();
-        let turn_id = TurnId::new();
-        let cancellation = CancellationToken::new();
-        let (payload_tx, mut payload_rx) = mpsc::channel(64);
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let (completion_tx, completion) = oneshot::channel();
-        let model = self.model_client();
-        let run_cancel = cancellation.clone();
+        Ok(Some(Thread::spawn(state)))
+    }
 
-        tokio::spawn(async move {
-            let result = run_agent_turn_identified(
-                model.as_ref(),
-                &config,
-                &mut history,
-                payload_tx,
-                run_cancel,
-                ExecutionIds {
-                    session_id,
-                    run_id,
-                    turn_id,
-                },
-            )
-            .await;
-            let _ = completion_tx.send(result);
-        });
-        tokio::spawn(async move {
-            let mut sequence = 0_u64;
-            while let Some(event) = payload_rx.recv().await {
-                sequence = sequence.saturating_add(1);
-                if event_tx
-                    .send(RunEvent {
-                        session_id,
-                        run_id,
-                        turn_id,
-                        sequence,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        event,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Ok(AgentRun {
-            session_id,
-            run_id,
-            turn_id,
-            events: ReceiverStream::new(event_rx),
-            cancellation,
-            completion,
-        })
+    pub async fn threads(
+        &self,
+        excluded: Option<ThreadId>,
+    ) -> Result<Vec<ThreadSummary>, ash_core::AshError> {
+        self.threads.list(excluded).await
     }
 
     pub fn model_client(&self) -> Arc<dyn ModelClient> {
@@ -184,102 +97,37 @@ impl AgentRuntime {
         self.model.as_ref()
     }
 
-    pub(crate) fn conversations(&self) -> &dyn ConversationRepository {
-        self.conversations.as_ref()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
-
-    use ash_core::{ModelRequest, ModelStream, ModelStreamEvent, ProtocolError, StopReason};
-    use futures::StreamExt;
-
-    use super::*;
-    use crate::{CodingContextPolicy, Trigger};
-
-    struct TestModel;
-
-    impl ModelClient for TestModel {
-        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ProtocolError> {
-            Ok(Box::pin(futures::stream::iter([
-                Ok(ModelStreamEvent::TextDelta("done".to_string())),
-                Ok(ModelStreamEvent::Stop(StopReason::EndTurn)),
-            ])))
-        }
+    pub(crate) fn thread_store_handle(&self) -> SharedThreadStore {
+        Arc::clone(&self.threads)
     }
 
-    struct BurstModel;
-
-    impl ModelClient for BurstModel {
-        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ProtocolError> {
-            let mut events = (0..200)
-                .map(|index| Ok(ModelStreamEvent::TextDelta(index.to_string())))
-                .collect::<Vec<_>>();
-            events.push(Ok(ModelStreamEvent::Stop(StopReason::EndTurn)));
-            Ok(Box::pin(futures::stream::iter(events)))
+    pub(crate) async fn prepare_turn(
+        &self,
+        turn: &TurnContext,
+    ) -> Result<TurnPatch, ash_core::AshError> {
+        let mut combined = TurnPatch::default();
+        for extension in self.extensions.iter() {
+            let patch = extension.prepare(turn).await?;
+            combined.context.extend(patch.context);
+            combined.tools.extend(patch.tools);
         }
+        Ok(combined)
     }
 
-    fn config() -> AgentConfig {
-        AgentConfig {
-            system_prompt: None,
-            tools: Vec::new(),
-            model: ash_core::ModelId::new("test"),
-            max_turns: 1,
-            working_dir: PathBuf::from("."),
-            max_context_tokens: 10_000,
-            context_policy: Arc::new(CodingContextPolicy),
-            max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            root_session_id: None,
+    pub(crate) async fn complete_turn(
+        &self,
+        turn: &TurnContext,
+        outcome: &TurnOutcome,
+    ) -> Result<(), ash_core::AshError> {
+        let mut first_error = None;
+        for extension in self.extensions.iter() {
+            if let Err(error) = extension.complete(turn, outcome).await {
+                first_error.get_or_insert(error);
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn run_events_have_stable_identifiers_and_monotonic_sequences() {
-        let runtime = AgentRuntime::new(Arc::new(TestModel), "test");
-        let mut run = runtime
-            .start(
-                config(),
-                Vec::new(),
-                AgentInput::with_trigger(Trigger::Scheduled, "run maintenance"),
-            )
-            .unwrap();
-        let session_id = run.session_id;
-        let run_id = run.run_id;
-        let turn_id = run.turn_id;
-        let mut events = Vec::new();
-        while let Some(event) = run.events.next().await {
-            events.push(event);
+        if let Some(error) = first_error {
+            return Err(error);
         }
-
-        assert_eq!(run.wait().await.unwrap(), StopReason::EndTurn);
-        assert!(!events.is_empty());
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event.session_id, session_id);
-            assert_eq!(event.run_id, run_id);
-            assert_eq!(event.turn_id, turn_id);
-            assert_eq!(event.sequence, u64::try_from(index + 1).unwrap());
-        }
-        assert!(events
-            .iter()
-            .any(|event| matches!(&event.event, Event::TextDelta(text) if text == "done")));
-    }
-
-    #[tokio::test]
-    async fn wait_drains_unconsumed_events_without_deadlocking() {
-        let runtime = AgentRuntime::new(Arc::new(BurstModel), "test");
-        let run = runtime
-            .start(config(), Vec::new(), AgentInput::user("run"))
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), run.wait())
-            .await
-            .expect("run should not depend on an external event consumer")
-            .unwrap();
-
-        assert_eq!(result, StopReason::EndTurn);
+        Ok(())
     }
 }

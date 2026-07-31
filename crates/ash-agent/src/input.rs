@@ -1,47 +1,61 @@
-use ash_core::{Content, Message};
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Where an input originated. Delivery policy is expressed by the Thread API.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Trigger {
+pub enum InputSource {
+    #[default]
     User,
-    Steering,
-    FollowUp,
-    Scheduled,
+    Schedule,
     Heartbeat,
+    Agent,
     System,
-    ChildAgent,
+    Custom(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentInput {
-    pub trigger: Trigger,
-    pub content: Vec<Content>,
+pub struct Input {
+    pub source: InputSource,
+    pub content: Vec<ash_core::Content>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    #[serde(default)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
-impl AgentInput {
+impl Input {
     pub fn user(text: impl Into<String>) -> Self {
+        Self::from_text(InputSource::User, text)
+    }
+
+    pub fn from_text(source: InputSource, text: impl Into<String>) -> Self {
         Self {
-            trigger: Trigger::User,
-            content: vec![Content::Text(text.into())],
+            source,
+            content: vec![ash_core::Content::Text(text.into())],
             idempotency_key: None,
-            metadata: serde_json::Map::new(),
+            metadata: BTreeMap::new(),
         }
     }
 
-    pub fn with_trigger(trigger: Trigger, text: impl Into<String>) -> Self {
-        Self {
-            trigger,
-            content: vec![Content::Text(text.into())],
-            idempotency_key: None,
-            metadata: serde_json::Map::new(),
-        }
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+            || self.content.iter().all(|content| match content {
+                ash_core::Content::Text(text) => text.is_empty(),
+                ash_core::Content::Image { data, .. } => data.is_empty(),
+            })
     }
+}
 
-    pub fn into_message(self) -> Message {
-        Message::user_content(self.content)
+impl From<String> for Input {
+    fn from(value: String) -> Self {
+        Self::user(value)
+    }
+}
+
+impl From<&str> for Input {
+    fn from(value: &str) -> Self {
+        Self::user(value)
     }
 }

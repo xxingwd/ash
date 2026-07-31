@@ -12,7 +12,7 @@ ash-core = { workspace = true }
 ash-protocol = { workspace = true }
 ash-tools = { workspace = true }
 ash-agent = { workspace = true }
-ash-orchestrator = { workspace = true }
+ash-collab = { workspace = true }
 ash-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

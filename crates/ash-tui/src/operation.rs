@@ -1,4 +1,4 @@
-use ash_core::Event;
+use ash_core::EventKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackgroundAction {
@@ -12,7 +12,7 @@ pub(crate) enum BackgroundAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubmissionPolicy {
     Start,
-    Queue,
+    Enqueue,
     Block,
 }
 
@@ -99,7 +99,7 @@ impl OperationState {
     pub(crate) fn submission_policy(&self) -> SubmissionPolicy {
         match self.current {
             Operation::Idle => SubmissionPolicy::Start,
-            Operation::Turn(TurnOperation::Running { .. }) => SubmissionPolicy::Queue,
+            Operation::Turn(TurnOperation::Running { .. }) => SubmissionPolicy::Enqueue,
             Operation::Turn(TurnOperation::Cancelling | TurnOperation::RollingBack(_))
             | Operation::Background(_) => SubmissionPolicy::Block,
         }
@@ -144,11 +144,11 @@ impl OperationState {
         }
     }
 
-    pub(crate) fn route_event(&mut self, event: &Event) -> EventRoute {
+    pub(crate) fn route_event(&mut self, event: &EventKind) -> EventRoute {
         match (&mut self.current, event) {
             (
                 Operation::Turn(TurnOperation::RollingBack(rollback)),
-                Event::AgentFinished { .. },
+                EventKind::TurnCompleted { .. },
             ) => {
                 rollback.stage = RollbackStage::AwaitingResult;
                 EventRoute::Render
@@ -158,9 +158,9 @@ impl OperationState {
                     stage: RollbackStage::AwaitingTurn,
                     ..
                 })),
-                Event::Error(_),
+                EventKind::Error(_),
             ) => EventRoute::Ignore,
-            (Operation::Background(_), Event::AgentFinished { .. }) => EventRoute::Ignore,
+            (Operation::Background(_), EventKind::TurnCompleted { .. }) => EventRoute::Ignore,
             (operation, event)
                 if suppresses_turn_output(operation) && is_turn_output_event(event) =>
             {
@@ -235,15 +235,15 @@ fn suppresses_turn_output(operation: &Operation) -> bool {
     )
 }
 
-fn is_turn_output_event(event: &Event) -> bool {
+fn is_turn_output_event(event: &EventKind) -> bool {
     matches!(
         event,
-        Event::AgentStarted { .. }
-            | Event::TextDelta(_)
-            | Event::Thinking(_)
-            | Event::ToolCallStart { .. }
-            | Event::ToolCallEnd { .. }
-            | Event::Usage { .. }
+        EventKind::TurnStarted
+            | EventKind::TextDelta(_)
+            | EventKind::Thinking(_)
+            | EventKind::ToolCallStart { .. }
+            | EventKind::ToolCallEnd { .. }
+            | EventKind::Usage { .. }
     )
 }
 
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(state.submission_policy(), SubmissionPolicy::Start);
 
         state.start_turn(Some("question".into()));
-        assert_eq!(state.submission_policy(), SubmissionPolicy::Queue);
+        assert_eq!(state.submission_policy(), SubmissionPolicy::Enqueue);
 
         assert_eq!(
             state.begin_cancellation(true),
@@ -300,21 +300,21 @@ mod tests {
         );
 
         assert_eq!(
-            state.route_event(&Event::TextDelta("late".into())),
+            state.route_event(&EventKind::TextDelta("late".into())),
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&Event::Error("cancelled".into())),
+            state.route_event(&EventKind::Error("cancelled".into())),
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&Event::AgentFinished {
+            state.route_event(&EventKind::TurnCompleted {
                 reason: StopReason::Aborted,
             }),
             EventRoute::Render
         );
         assert_eq!(
-            state.route_event(&Event::TextDelta("rollback result".into())),
+            state.route_event(&EventKind::TextDelta("rollback result".into())),
             EventRoute::Handle
         );
         assert_eq!(
@@ -331,17 +331,17 @@ mod tests {
 
         assert!(!state.shows_activity());
         assert_eq!(
-            state.route_event(&Event::Thinking("late".into())),
+            state.route_event(&EventKind::Thinking("late".into())),
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&Event::AgentFinished {
+            state.route_event(&EventKind::TurnCompleted {
                 reason: StopReason::EndTurn,
             }),
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&Event::Error("list failed".into())),
+            state.route_event(&EventKind::Error("list failed".into())),
             EventRoute::Handle
         );
         assert_eq!(

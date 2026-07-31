@@ -2,11 +2,11 @@ use derive_more::Display;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{AgentId, Message, MessageId, SessionId, ToolCallId};
+use crate::message::{AgentId, Message, MessageId, ThreadId, ToolCallId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSummary {
-    pub session_id: SessionId,
+pub struct ThreadSummary {
+    pub thread_id: ThreadId,
     pub title: String,
     pub created_at: String,
 }
@@ -18,7 +18,7 @@ pub struct ForkPoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, EnumAsInner)]
-pub enum Event {
+pub enum EventKind {
     TextDelta(String),
     ToolCallStart {
         id: ToolCallId,
@@ -39,25 +39,23 @@ pub enum Event {
         generation_ms: u64,
         estimated: bool,
     },
-    AgentStarted {
-        session_id: SessionId,
-    },
-    AgentFinished {
+    TurnStarted,
+    TurnCompleted {
         reason: StopReason,
     },
-    SessionRestored {
+    ThreadRestored {
         model: String,
         protocol: String,
         working_dir: std::path::PathBuf,
         messages: Vec<Message>,
     },
-    SessionsListed {
-        sessions: Vec<SessionSummary>,
+    ThreadsListed {
+        threads: Vec<ThreadSummary>,
     },
     ForkPointsListed {
         points: Vec<ForkPoint>,
     },
-    SessionForked {
+    ThreadForked {
         model: String,
         protocol: String,
         working_dir: std::path::PathBuf,
@@ -99,14 +97,14 @@ mod tests {
     #[test]
     fn serialized_events_require_complete_payloads() {
         let id = ToolCallId::new();
-        assert!(serde_json::from_value::<Event>(serde_json::json!({
+        assert!(serde_json::from_value::<EventKind>(serde_json::json!({
             "ToolCallStart": {
                 "id": id,
                 "name": "read"
             }
         }))
         .is_err());
-        assert!(serde_json::from_value::<Event>(serde_json::json!({
+        assert!(serde_json::from_value::<EventKind>(serde_json::json!({
             "ContextCompacted": {
                 "before_tokens": 100,
                 "after_tokens": 50,

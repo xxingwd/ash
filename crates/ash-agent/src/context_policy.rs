@@ -9,7 +9,7 @@ use crate::context::{
     summary_output_tokens,
 };
 
-pub(crate) const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding sessions. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
+pub(crate) const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding threads. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
 
 #[derive(Clone)]
 pub struct ContextRequest {

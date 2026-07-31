@@ -1,7 +1,7 @@
-use ash_core::{Message, MessageContent, MessageId};
+use ash_core::{Message, MessageContent, MessageId, StopReason, TurnId};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentInput, ConversationRevision};
+use crate::{Input, Version};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
@@ -11,7 +11,8 @@ pub struct ContextCheckpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcceptedInput {
-    pub input: AgentInput,
+    pub turn_id: TurnId,
+    pub input: Input,
     pub message: Message,
 }
 
@@ -29,55 +30,55 @@ impl ContextCheckpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum ConversationEntry {
+pub enum Record {
+    TurnStarted { turn_id: TurnId },
     InputAccepted(AcceptedInput),
     Message(Message),
     ContextCheckpoint(ContextCheckpoint),
+    TurnCompleted { turn_id: TurnId, reason: StopReason },
+    TurnFailed { turn_id: TurnId, error: String },
     TurnRolledBack,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ConversationLog {
-    entries: Vec<ConversationEntry>,
+pub struct ThreadLog {
+    entries: Vec<Record>,
 }
 
-impl ConversationLog {
+impl ThreadLog {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn from_messages(messages: impl IntoIterator<Item = Message>) -> Self {
         Self {
-            entries: messages
-                .into_iter()
-                .map(ConversationEntry::Message)
-                .collect(),
+            entries: messages.into_iter().map(Record::Message).collect(),
         }
     }
 
-    pub(crate) fn from_entries(entries: Vec<ConversationEntry>) -> Self {
+    pub(crate) fn from_entries(entries: Vec<Record>) -> Self {
         Self { entries }
     }
 
-    pub fn entries(&self) -> &[ConversationEntry] {
+    pub fn entries(&self) -> &[Record] {
         &self.entries
     }
 
-    pub fn revision(&self) -> ConversationRevision {
-        ConversationRevision::from_entry_count(self.entries.len())
+    pub fn revision(&self) -> Version {
+        Version::from_entry_count(self.entries.len())
     }
 
     pub fn contains_idempotency_key(&self, key: &str) -> bool {
         self.entries.iter().any(|entry| {
             matches!(
                 entry,
-                ConversationEntry::InputAccepted(AcceptedInput { input, .. })
+                Record::InputAccepted(AcceptedInput { input, .. })
                     if input.idempotency_key.as_deref() == Some(key)
             )
         })
     }
 
-    pub fn push(&mut self, entry: ConversationEntry) {
+    pub fn push(&mut self, entry: Record) {
         self.entries.push(entry);
     }
 
@@ -85,9 +86,13 @@ impl ConversationLog {
         active_entries(&self.entries)
             .into_iter()
             .filter_map(|entry| match entry {
-                ConversationEntry::InputAccepted(input) => Some(input.message.clone()),
-                ConversationEntry::Message(message) => Some(message.clone()),
-                ConversationEntry::ContextCheckpoint(_) | ConversationEntry::TurnRolledBack => None,
+                Record::InputAccepted(input) => Some(input.message.clone()),
+                Record::Message(message) => Some(message.clone()),
+                Record::TurnStarted { .. }
+                | Record::ContextCheckpoint(_)
+                | Record::TurnCompleted { .. }
+                | Record::TurnFailed { .. }
+                | Record::TurnRolledBack => None,
             })
             .collect()
     }
@@ -97,48 +102,54 @@ impl ConversationLog {
         let mut model_context = Vec::new();
         for entry in active_entries(&self.entries) {
             match entry {
-                ConversationEntry::InputAccepted(input) => {
+                Record::InputAccepted(input) => {
                     messages.push(input.message.clone());
                     model_context.push(input.message.clone());
                 }
-                ConversationEntry::Message(message) => {
+                Record::Message(message) => {
                     messages.push(message.clone());
                     model_context.push(message.clone());
                 }
-                ConversationEntry::ContextCheckpoint(checkpoint) => {
+                Record::ContextCheckpoint(checkpoint) => {
                     model_context = apply_checkpoint(&messages, checkpoint);
                 }
-                ConversationEntry::TurnRolledBack => {}
+                Record::TurnStarted { .. }
+                | Record::TurnCompleted { .. }
+                | Record::TurnFailed { .. }
+                | Record::TurnRolledBack => {}
             }
         }
         model_context
     }
 }
 
-fn active_entries(entries: &[ConversationEntry]) -> Vec<&ConversationEntry> {
+fn active_entries(entries: &[Record]) -> Vec<&Record> {
     let mut active = Vec::new();
     for entry in entries {
         match entry {
-            ConversationEntry::TurnRolledBack => rollback_last_turn(&mut active),
-            ConversationEntry::InputAccepted(_)
-            | ConversationEntry::Message(_)
-            | ConversationEntry::ContextCheckpoint(_) => active.push(entry),
+            Record::TurnRolledBack => rollback_last_turn(&mut active),
+            Record::InputAccepted(_)
+            | Record::Message(_)
+            | Record::ContextCheckpoint(_)
+            | Record::TurnStarted { .. }
+            | Record::TurnCompleted { .. }
+            | Record::TurnFailed { .. } => active.push(entry),
         }
     }
     active
 }
 
-fn rollback_last_turn(entries: &mut Vec<&ConversationEntry>) {
+fn rollback_last_turn(entries: &mut Vec<&Record>) {
     let Some(turn_start) = entries.iter().rposition(|entry| {
         matches!(
             entry,
-            ConversationEntry::InputAccepted(AcceptedInput {
+            Record::InputAccepted(AcceptedInput {
                 message: Message {
                     content: MessageContent::User(_),
                     ..
                 },
                 ..
-            }) | ConversationEntry::Message(Message {
+            }) | Record::Message(Message {
                 content: MessageContent::User(_),
                 ..
             })
@@ -174,9 +185,8 @@ mod tests {
         let answer = Message::assistant_text("answer");
         let recent = Message::user("recent");
         let summary = Message::system("summary");
-        let mut log =
-            ConversationLog::from_messages([first.clone(), answer.clone(), recent.clone()]);
-        log.push(ConversationEntry::ContextCheckpoint(ContextCheckpoint {
+        let mut log = ThreadLog::from_messages([first.clone(), answer.clone(), recent.clone()]);
+        log.push(Record::ContextCheckpoint(ContextCheckpoint {
             summary: summary.clone(),
             tail_start_id: Some(recent.id),
         }));
@@ -202,13 +212,13 @@ mod tests {
         let first = Message::user("first");
         let answer = Message::assistant_text("answer");
         let second = Message::user("second");
-        let mut log = ConversationLog::from_messages([
+        let mut log = ThreadLog::from_messages([
             first.clone(),
             answer.clone(),
             second,
             Message::assistant_text("second answer"),
         ]);
-        log.push(ConversationEntry::TurnRolledBack);
+        log.push(Record::TurnRolledBack);
 
         assert_eq!(log.entries().len(), 5);
         assert_eq!(
@@ -223,14 +233,15 @@ mod tests {
 
     #[test]
     fn input_entries_preserve_trigger_metadata_and_idempotency() {
-        let mut input = AgentInput::with_trigger(crate::Trigger::Heartbeat, "check health");
+        let mut input = Input::from_text(crate::InputSource::Heartbeat, "check health");
         input.idempotency_key = Some("heartbeat:42".to_string());
         input
             .metadata
             .insert("source".to_string(), serde_json::json!("scheduler"));
         let message = Message::user_content(input.content.clone());
-        let mut log = ConversationLog::new();
-        log.push(ConversationEntry::InputAccepted(AcceptedInput {
+        let mut log = ThreadLog::new();
+        log.push(Record::InputAccepted(AcceptedInput {
+            turn_id: TurnId::new(),
             input,
             message: message.clone(),
         }));

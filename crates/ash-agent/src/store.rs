@@ -1,13 +1,13 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use ash_core::{ModelId, SessionId, SessionSummary};
+use ash_core::{ModelId, ThreadId, ThreadSummary};
 
-use crate::{ConversationEntry, ConversationLog};
+use crate::{Record, ThreadLog};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ConversationRevision(u64);
+pub struct Version(u64);
 
-impl ConversationRevision {
+impl Version {
     pub const fn initial() -> Self {
         Self(0)
     }
@@ -16,8 +16,11 @@ impl ConversationRevision {
         self.0
     }
 
-    pub(crate) fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+    pub(crate) fn advance(self, count: usize) -> Self {
+        Self(
+            self.0
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX)),
+        )
     }
 
     pub(crate) fn from_entry_count(count: usize) -> Self {
@@ -26,8 +29,8 @@ impl ConversationRevision {
 }
 
 #[derive(Clone, Debug)]
-pub struct ConversationMetadata {
-    pub session_id: SessionId,
+pub struct ThreadMetadata {
+    pub thread_id: ThreadId,
     pub model_backend: String,
     pub model: ModelId,
     pub working_dir: PathBuf,
@@ -37,31 +40,66 @@ pub struct ConversationMetadata {
     pub max_tool_duration: Duration,
 }
 
-#[async_trait::async_trait]
-pub trait ConversationStore: Send {
-    fn session_id(&self) -> SessionId;
-    fn revision(&self) -> ConversationRevision;
-    async fn append(
-        &mut self,
-        expected_revision: ConversationRevision,
-        entry: ConversationEntry,
-    ) -> Result<ConversationRevision, ash_core::AshError>;
-    async fn load(&self) -> Result<ConversationLog, ash_core::AshError>;
+#[derive(Clone, Debug)]
+pub struct StoredThread {
+    pub metadata: ThreadMetadata,
+    pub log: ThreadLog,
+    pub version: Version,
 }
 
+/// Durable, storage-neutral boundary for thread state.
+///
+/// `create` and `append` persist each record slice as one ordered version change.
+/// Implementations must reject stale `expected_version` values.
 #[async_trait::async_trait]
-pub trait ConversationRepository: Send + Sync {
-    fn create(&self, metadata: ConversationMetadata) -> Box<dyn ConversationStore>;
-
-    async fn open(
+pub trait ThreadStore: Send + Sync {
+    async fn create(
         &self,
-        session_id: SessionId,
-    ) -> Result<Option<Box<dyn ConversationStore>>, ash_core::AshError>;
+        metadata: ThreadMetadata,
+        records: &[Record],
+    ) -> Result<Version, ash_core::AshError>;
+
+    async fn load(&self, thread_id: ThreadId) -> Result<Option<StoredThread>, ash_core::AshError>;
+
+    async fn append(
+        &self,
+        thread_id: ThreadId,
+        expected_version: Version,
+        records: &[Record],
+    ) -> Result<Version, ash_core::AshError>;
 
     async fn list(
         &self,
-        excluded_session: Option<SessionId>,
-    ) -> Result<Vec<SessionSummary>, ash_core::AshError>;
+        excluded_thread: Option<ThreadId>,
+    ) -> Result<Vec<ThreadSummary>, ash_core::AshError>;
 }
 
-pub type SharedConversationRepository = Arc<dyn ConversationRepository>;
+pub type SharedThreadStore = Arc<dyn ThreadStore>;
+
+pub(crate) struct ThreadPersistence {
+    store: SharedThreadStore,
+    thread_id: ThreadId,
+    version: Version,
+}
+
+impl ThreadPersistence {
+    pub(crate) fn new(store: SharedThreadStore, thread_id: ThreadId, version: Version) -> Self {
+        Self {
+            store,
+            thread_id,
+            version,
+        }
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+
+    pub(crate) async fn append(&mut self, records: &[Record]) -> Result<(), ash_core::AshError> {
+        self.version = self
+            .store
+            .append(self.thread_id, self.version, records)
+            .await?;
+        Ok(())
+    }
+}

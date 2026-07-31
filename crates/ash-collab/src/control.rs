@@ -1,9 +1,9 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use ash_agent::{run_agent_turn, AgentConfig, AgentDefinition, AgentScope};
+use ash_agent::{Agent, Input, InputSource, Runtime, Thread, ThreadOptions};
 use ash_core::{
-    define_tool, AgentId, CancellationToken, ContentBlock, Message, MessageContent, ModelClient,
-    SessionId, StopReason, Tool, ToolContext, ToolError,
+    define_tool, CancellationToken, ContentBlock, Message, MessageContent, StopReason, ThreadId,
+    Tool, ToolContext, ToolError, TreeId,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -97,8 +97,8 @@ impl FromStr for AgentRole {
     }
 }
 
-impl ChildAgentFactory for InheritedAgentFactory {
-    fn create(&self, request: ChildAgentRequest) -> Result<ChildAgent, ToolError> {
+impl AgentSpawner for InheritedAgentSpawner {
+    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError> {
         let mut definition = self.definition.clone();
         definition.system_prompt = Some(subagent_system_prompt(
             self.system_prompt.as_deref(),
@@ -106,16 +106,18 @@ impl ChildAgentFactory for InheritedAgentFactory {
             &request.parent_path,
             &request.task_name,
         ));
-        let scope = AgentScope {
+        let scope = ThreadOptions {
             working_dir: self.scope.working_dir.clone(),
-            max_tool_duration: self.scope.max_tool_duration,
-            agent_path: request.task_name,
-            root_session_id: Some(request.root_session_id),
+            tool_timeout: self.scope.tool_timeout,
+            path: request.task_name,
+            tree_id: Some(request.tree_id),
+            metadata: self.scope.metadata.clone(),
         };
         Ok(ChildAgent {
-            model: Arc::clone(&self.model),
-            config: AgentConfig::from_parts(definition, scope),
-            messages: request.messages,
+            runtime: self.runtime.clone(),
+            agent: definition,
+            options: scope,
+            history: request.messages,
         })
     }
 }
@@ -132,7 +134,7 @@ pub enum AgentStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSnapshot {
-    pub agent_id: AgentId,
+    pub agent_id: ThreadId,
     pub task_name: String,
     pub agent_type: AgentRole,
     pub status: AgentStatus,
@@ -144,56 +146,57 @@ pub struct AgentSnapshot {
 }
 
 #[derive(Clone)]
-pub struct Supervisor {
-    inner: Arc<SupervisorInner>,
+pub struct AgentControl {
+    inner: Arc<ControlInner>,
 }
 
-struct SupervisorInner {
-    state: Mutex<SupervisorState>,
+struct ControlInner {
+    state: Mutex<ControlState>,
     updates: Notify,
     max_concurrent_children: usize,
-    factory: Option<Arc<dyn ChildAgentFactory>>,
+    spawner: Option<Arc<dyn AgentSpawner>>,
 }
 
-pub struct ChildAgentRequest {
+pub struct SpawnRequest {
     pub role: AgentRole,
     pub parent_path: String,
     pub task_name: String,
     pub messages: Vec<Message>,
-    pub root_session_id: SessionId,
+    pub tree_id: TreeId,
 }
 
 pub struct ChildAgent {
-    pub model: Arc<dyn ModelClient>,
-    pub config: AgentConfig,
-    pub messages: Vec<Message>,
+    pub runtime: Runtime,
+    pub agent: Agent,
+    pub options: ThreadOptions,
+    pub history: Vec<Message>,
 }
 
-pub trait ChildAgentFactory: Send + Sync {
-    fn create(&self, request: ChildAgentRequest) -> Result<ChildAgent, ToolError>;
+pub trait AgentSpawner: Send + Sync {
+    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError>;
 }
 
-struct InheritedAgentFactory {
-    model: Arc<dyn ModelClient>,
+struct InheritedAgentSpawner {
+    runtime: Runtime,
     system_prompt: Option<String>,
-    definition: AgentDefinition,
-    scope: AgentScope,
+    definition: Agent,
+    scope: ThreadOptions,
 }
 
 #[derive(Default)]
-struct SupervisorState {
-    sessions: HashMap<SessionId, ChildSession>,
+struct ControlState {
+    threads: HashMap<TreeId, ChildSession>,
 }
 
 #[derive(Default)]
 struct ChildSession {
-    agents: HashMap<AgentId, ChildRecord>,
+    agents: HashMap<ThreadId, ChildRecord>,
     next_completion_revision: u64,
     wait_cursors: HashMap<String, u64>,
 }
 
 struct ChildRecord {
-    id: AgentId,
+    id: ThreadId,
     task_name: String,
     role: AgentRole,
     state: ChildState,
@@ -306,18 +309,6 @@ enum ChildCommand {
     Followup(String),
 }
 
-impl ChildCommand {
-    fn triggers_turn(&self) -> bool {
-        matches!(self, Self::Followup(_))
-    }
-
-    fn into_message(self) -> String {
-        match self {
-            Self::Queue(message) | Self::Followup(message) => message,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MessageDelivery {
     Queue,
@@ -341,21 +332,17 @@ impl MessageDelivery {
     }
 }
 
-impl SupervisorState {
-    fn active_count(&self, root_session_id: SessionId) -> usize {
-        self.sessions
-            .get(&root_session_id)
+impl ControlState {
+    fn active_count(&self, tree_id: TreeId) -> usize {
+        self.threads
+            .get(&tree_id)
             .map_or(0, ChildSession::active_count)
     }
 
-    fn snapshots(
-        &self,
-        root_session_id: SessionId,
-        path_prefix: Option<&str>,
-    ) -> Vec<AgentSnapshot> {
+    fn snapshots(&self, tree_id: TreeId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
         let mut agents = self
-            .sessions
-            .get(&root_session_id)
+            .threads
+            .get(&tree_id)
             .into_iter()
             .flat_map(|session| session.agents.values())
             .filter(|record| path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix)))
@@ -365,20 +352,15 @@ impl SupervisorState {
         agents
     }
 
-    fn wait_snapshot(&mut self, root_session_id: SessionId, waiter: &str) -> WaitSnapshot {
-        self.sessions
-            .get_mut(&root_session_id)
+    fn wait_snapshot(&mut self, tree_id: TreeId, waiter: &str) -> WaitSnapshot {
+        self.threads
+            .get_mut(&tree_id)
             .map_or_else(WaitSnapshot::empty, |session| session.wait_snapshot(waiter))
     }
 
-    fn finish_turn(
-        &mut self,
-        root_session_id: SessionId,
-        agent_id: AgentId,
-        completed: ChildState,
-    ) -> bool {
-        self.sessions
-            .get_mut(&root_session_id)
+    fn finish_turn(&mut self, tree_id: TreeId, agent_id: ThreadId, completed: ChildState) -> bool {
+        self.threads
+            .get_mut(&tree_id)
             .is_some_and(|session| session.finish_turn(agent_id, completed))
     }
 }
@@ -415,7 +397,7 @@ impl ChildSession {
         }
     }
 
-    fn finish_turn(&mut self, agent_id: AgentId, completed: ChildState) -> bool {
+    fn finish_turn(&mut self, agent_id: ThreadId, completed: ChildState) -> bool {
         let Some(record) = self.agents.get_mut(&agent_id) else {
             return false;
         };
@@ -513,34 +495,31 @@ impl ForkMode {
     }
 }
 
-impl Default for Supervisor {
+impl Default for AgentControl {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_CONCURRENT_CHILDREN)
     }
 }
 
-impl Supervisor {
+impl AgentControl {
     pub fn new(max_concurrent_children: usize) -> Self {
-        Self::new_with_factory(max_concurrent_children, None)
+        Self::new_with_spawner(max_concurrent_children, None)
     }
 
-    pub fn with_factory(
-        max_concurrent_children: usize,
-        factory: Arc<dyn ChildAgentFactory>,
-    ) -> Self {
-        Self::new_with_factory(max_concurrent_children, Some(factory))
+    pub fn with_spawner(max_concurrent_children: usize, spawner: Arc<dyn AgentSpawner>) -> Self {
+        Self::new_with_spawner(max_concurrent_children, Some(spawner))
     }
 
-    fn new_with_factory(
+    fn new_with_spawner(
         max_concurrent_children: usize,
-        factory: Option<Arc<dyn ChildAgentFactory>>,
+        spawner: Option<Arc<dyn AgentSpawner>>,
     ) -> Self {
         Self {
-            inner: Arc::new(SupervisorInner {
-                state: Mutex::new(SupervisorState::default()),
+            inner: Arc::new(ControlInner {
+                state: Mutex::new(ControlState::default()),
                 updates: Notify::new(),
                 max_concurrent_children,
-                factory,
+                spawner,
             }),
         }
     }
@@ -555,8 +534,8 @@ impl Supervisor {
             "spawn_agent",
             &spawn_description,
             move |context, args: SpawnAgentArgs| {
-                let supervisor = spawn.clone();
-                async move { supervisor.spawn(context, args).await }
+                let control = spawn.clone();
+                async move { control.spawn(context, args).await }
             },
         );
 
@@ -565,9 +544,9 @@ impl Supervisor {
             "send_message",
             "Send a message to an existing agent. The message is queued promptly and does not trigger a new turn.",
             move |context, args: MessageAgentArgs| {
-                let supervisor = send.clone();
+                let control = send.clone();
                 async move {
-                    supervisor
+                    control
                         .send_message(&context, args, MessageDelivery::Queue)
                         .await
                 }
@@ -579,9 +558,9 @@ impl Supervisor {
             "followup_task",
             "Reuse an existing agent for context-dependent work. Send a follow-up task and trigger another turn when it is idle; if it is running, queue the task for its next turn. Prefer this over spawning a replacement agent for related work.",
             move |context, args: MessageAgentArgs| {
-                let supervisor = followup.clone();
+                let control = followup.clone();
                 async move {
-                    supervisor
+                    control
                         .send_message(&context, args, MessageDelivery::Followup)
                         .await
                 }
@@ -593,8 +572,8 @@ impl Supervisor {
             "interrupt_agent",
             "Interrupt an agent's current turn and return its previous status. The agent remains available for follow-up tasks.",
             move |context, args: InterruptAgentArgs| {
-                let supervisor = interrupt.clone();
-                async move { supervisor.interrupt(&context, args).await }
+                let control = interrupt.clone();
+                async move { control.interrupt(&context, args).await }
             },
         );
 
@@ -603,8 +582,8 @@ impl Supervisor {
             "list_agents",
             "List agents in the current root session, optionally filtered by canonical task-path prefix.",
             move |context, args: ListAgentsArgs| {
-                let supervisor = list.clone();
-                async move { supervisor.list(&context, args).await }
+                let control = list.clone();
+                async move { control.list(&context, args).await }
             },
         );
 
@@ -613,8 +592,8 @@ impl Supervisor {
             "wait_agent",
             "Wait for an agent update only when its result is required for your next step. Completed updates include the final message so it can be reviewed and integrated.",
             move |context, args: WaitAgentArgs| {
-                let supervisor = wait.clone();
-                async move { supervisor.wait(&context, args).await }
+                let control = wait.clone();
+                async move { control.wait(&context, args).await }
             },
         );
 
@@ -637,17 +616,32 @@ impl Supervisor {
         }
         let role = args.agent_type.unwrap_or(AgentRole::Default);
         let fork_mode = ForkMode::parse(args.fork_turns.as_deref())?;
-        let parent_path = normalized_agent_path(&context.agent.agent_path);
+        let parent_path = normalized_agent_path(&context.agent.path);
         let task_name = format!("{parent_path}/{}", args.task_name);
-        let id = AgentId::new();
         let (command_tx, command_rx) = mpsc::channel(32);
+
+        let messages = fork_messages(&context.agent.messages, fork_mode);
+        let spawner = self.inner.spawner.as_ref().ok_or_else(|| {
+            ToolError::Execution("sub-agent spawner is not configured".to_string())
+        })?;
+        let mut child = spawner.spawn(SpawnRequest {
+            role,
+            parent_path,
+            task_name: task_name.clone(),
+            messages,
+            tree_id: context.agent.tree_id,
+        })?;
+        child.agent.tools.extend(self.tools());
+        let thread = child
+            .runtime
+            .start_with_history(child.agent, child.options, child.history)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let id = thread.id();
 
         {
             let mut state = self.inner.state.lock().await;
-            let session = state
-                .sessions
-                .entry(context.agent.root_session_id)
-                .or_default();
+            let session = state.threads.entry(context.agent.tree_id).or_default();
             if session.active_count() >= self.inner.max_concurrent_children {
                 return Err(ToolError::Execution(format!(
                     "maximum of {} concurrent sub-agents reached",
@@ -677,24 +671,12 @@ impl Supervisor {
             );
         }
 
-        let mut messages = fork_messages(&context.agent.messages, fork_mode);
-        messages.push(Message::user(&args.message));
-        let factory = self.inner.factory.as_ref().ok_or_else(|| {
-            ToolError::Execution("sub-agent factory is not configured".to_string())
-        })?;
-        let mut child = factory.create(ChildAgentRequest {
-            role,
-            parent_path,
-            task_name: task_name.clone(),
-            messages,
-            root_session_id: context.agent.root_session_id,
-        })?;
-        child.config.tools.extend(self.tools());
-        let supervisor = self.clone();
-        let root_session_id = context.agent.root_session_id;
+        let control = self.clone();
+        let tree_id = context.agent.tree_id;
+        let initial_input = args.message.clone();
         tokio::spawn(async move {
-            supervisor
-                .run_child(root_session_id, id, child, command_rx)
+            control
+                .run_child(tree_id, id, thread, initial_input, command_rx)
                 .await;
         });
         self.inner.updates.notify_waiters();
@@ -719,8 +701,8 @@ impl Supervisor {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.root_session_id,
-                &context.agent.agent_path,
+                context.agent.tree_id,
+                &context.agent.path,
                 &args.target,
             )?;
             (record.task_name.clone(), record.command_tx.clone())
@@ -731,11 +713,11 @@ impl Supervisor {
             .map_err(|_| ToolError::Execution(format!("agent is no longer available: {target}")))?;
         {
             let mut state = self.inner.state.lock().await;
-            let active_count = state.active_count(context.agent.root_session_id);
+            let active_count = state.active_count(context.agent.tree_id);
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.root_session_id,
-                &context.agent.agent_path,
+                context.agent.tree_id,
+                &context.agent.path,
                 &target,
             )?;
             if delivery.needs_new_slot(&record.state)
@@ -766,8 +748,8 @@ impl Supervisor {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.root_session_id,
-                &context.agent.agent_path,
+                context.agent.tree_id,
+                &context.agent.path,
                 &args.target,
             )?;
             (
@@ -787,7 +769,7 @@ impl Supervisor {
 
     async fn list(&self, context: &ToolContext, args: ListAgentsArgs) -> Result<String, ToolError> {
         let agents = self
-            .snapshots(context.agent.root_session_id, args.path_prefix.as_deref())
+            .snapshots(context.agent.tree_id, args.path_prefix.as_deref())
             .await;
         json_output(&serde_json::json!({ "agents": agents }))
     }
@@ -813,7 +795,7 @@ impl Supervisor {
                 .state
                 .lock()
                 .await
-                .wait_snapshot(context.agent.root_session_id, &context.agent.agent_path);
+                .wait_snapshot(context.agent.tree_id, &context.agent.path);
             if snapshot.agents.is_empty() || snapshot.has_update {
                 return json_output(&serde_json::json!({
                     "agents": snapshot.agents,
@@ -831,7 +813,7 @@ impl Supervisor {
                     .state
                     .lock()
                     .await
-                    .wait_snapshot(context.agent.root_session_id, &context.agent.agent_path);
+                    .wait_snapshot(context.agent.tree_id, &context.agent.path);
                 return json_output(&serde_json::json!({
                     "agents": snapshot.agents,
                     "timed_out": !snapshot.has_update,
@@ -840,79 +822,72 @@ impl Supervisor {
         }
     }
 
-    async fn snapshots(
-        &self,
-        root_session_id: SessionId,
-        path_prefix: Option<&str>,
-    ) -> Vec<AgentSnapshot> {
+    async fn snapshots(&self, tree_id: TreeId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
         self.inner
             .state
             .lock()
             .await
-            .snapshots(root_session_id, path_prefix)
+            .snapshots(tree_id, path_prefix)
     }
 
     async fn run_child(
         &self,
-        root_session_id: SessionId,
-        agent_id: AgentId,
-        child: ChildAgent,
+        tree_id: TreeId,
+        agent_id: ThreadId,
+        thread: Thread,
+        initial_input: String,
         mut command_rx: mpsc::Receiver<ChildCommand>,
     ) {
-        let ChildAgent {
-            model,
-            config,
-            mut messages,
-        } = child;
-        self.run_child_turn(
-            root_session_id,
-            agent_id,
-            model.as_ref(),
-            &config,
-            &mut messages,
-        )
-        .await;
-        let mut queued_messages = Vec::new();
+        self.run_child_turn(tree_id, agent_id, &thread, initial_input)
+            .await;
 
         while let Some(command) = command_rx.recv().await {
-            let triggers_turn = command.triggers_turn();
-            queued_messages.push(command.into_message());
-            if !triggers_turn {
-                continue;
+            match command {
+                ChildCommand::Queue(message) => {
+                    let _ = thread
+                        .notify(Input::from_text(InputSource::Agent, message))
+                        .await;
+                }
+                ChildCommand::Followup(message) => {
+                    self.run_child_turn(tree_id, agent_id, &thread, message)
+                        .await;
+                }
             }
-            while let Ok(command) = command_rx.try_recv() {
-                queued_messages.push(command.into_message());
-            }
-            messages.extend(
-                queued_messages
-                    .drain(..)
-                    .map(|message| Message::user(&message)),
-            );
-            self.run_child_turn(
-                root_session_id,
-                agent_id,
-                model.as_ref(),
-                &config,
-                &mut messages,
-            )
-            .await;
         }
     }
 
     async fn run_child_turn(
         &self,
-        root_session_id: SessionId,
-        agent_id: AgentId,
-        model: &dyn ModelClient,
-        config: &AgentConfig,
-        messages: &mut Vec<Message>,
+        tree_id: TreeId,
+        agent_id: ThreadId,
+        thread: &Thread,
+        input: String,
     ) {
-        let cancel = CancellationToken::new();
+        let turn = match thread
+            .submit(Input::from_text(InputSource::Agent, input))
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                let mut state = self.inner.state.lock().await;
+                let _ = state.finish_turn(
+                    tree_id,
+                    agent_id,
+                    ChildState::Errored {
+                        final_message: None,
+                        error: error.to_string(),
+                    },
+                );
+                self.inner.updates.notify_waiters();
+                return;
+            }
+        };
+        let cancel = turn.cancellation_token();
         {
             let mut state = self.inner.state.lock().await;
             let Some(record) = state
-                .sessions
-                .get_mut(&root_session_id)
+                .threads
+                .get_mut(&tree_id)
                 .and_then(|session| session.agents.get_mut(&agent_id))
             else {
                 return;
@@ -921,11 +896,12 @@ impl Supervisor {
         }
         self.inner.updates.notify_waiters();
 
-        let (event_tx, event_rx) = mpsc::channel(1);
-        drop(event_rx);
-        let result =
-            run_agent_turn(model, config, messages, event_tx, cancel, SessionId::new()).await;
-        let final_message = final_assistant_message(messages);
+        let result = turn.wait().await;
+        let final_message = thread
+            .messages()
+            .await
+            .ok()
+            .and_then(|messages| final_assistant_message(&messages));
 
         let completed = match result {
             Ok(StopReason::Aborted) => ChildState::Interrupted(final_message),
@@ -936,7 +912,7 @@ impl Supervisor {
             },
         };
         let mut state = self.inner.state.lock().await;
-        if !state.finish_turn(root_session_id, agent_id, completed) {
+        if !state.finish_turn(tree_id, agent_id, completed) {
             return;
         }
         drop(state);
@@ -944,29 +920,29 @@ impl Supervisor {
     }
 }
 
-pub fn install_subagent_tools(config: &mut AgentConfig, model: Arc<dyn ModelClient>) {
+pub fn install_subagent_tools(agent: &mut Agent, options: ThreadOptions, runtime: Runtime) {
     if COLLABORATION_TOOL_NAMES
         .iter()
-        .all(|name| config.tools.iter().any(|tool| tool.name() == *name))
+        .all(|name| agent.tools.iter().any(|tool| tool.name() == *name))
     {
         return;
     }
-    config
+    agent
         .tools
         .retain(|tool| !COLLABORATION_TOOL_NAMES.contains(&tool.name()));
-    let system_prompt = config.system_prompt.get_or_insert_with(String::new);
+    let system_prompt = agent.system_prompt.get_or_insert_with(String::new);
     if !system_prompt.trim().is_empty() {
         system_prompt.push_str("\n\n");
     }
     system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
-    let factory = Arc::new(InheritedAgentFactory {
-        model,
-        system_prompt: config.system_prompt.clone(),
-        definition: config.definition(),
-        scope: config.scope(),
+    let spawner = Arc::new(InheritedAgentSpawner {
+        runtime,
+        system_prompt: agent.system_prompt.clone(),
+        definition: agent.clone(),
+        scope: options,
     });
-    let supervisor = Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory);
-    config.tools.extend(supervisor.tools());
+    let control = AgentControl::with_spawner(DEFAULT_MAX_CONCURRENT_CHILDREN, spawner);
+    agent.tools.extend(control.tools());
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -997,15 +973,15 @@ fn normalized_agent_path(agent_path: &str) -> String {
 }
 
 fn resolve_target_mut<'a>(
-    state: &'a mut SupervisorState,
-    root_session_id: SessionId,
+    state: &'a mut ControlState,
+    tree_id: TreeId,
     current_agent_path: &str,
     target: &str,
 ) -> Result<&'a mut ChildRecord, ToolError> {
-    let session = state.sessions.get_mut(&root_session_id).ok_or_else(|| {
+    let session = state.threads.get_mut(&tree_id).ok_or_else(|| {
         ToolError::Execution("no sub-agents exist in the current session".to_string())
     })?;
-    if let Ok(agent_id) = AgentId::from_str(target) {
+    if let Ok(agent_id) = ThreadId::from_str(target) {
         return session
             .agents
             .get_mut(&agent_id)
@@ -1137,38 +1113,40 @@ fn json_output(value: &serde_json::Value) -> Result<String, ToolError> {
 mod tests {
     use std::path::PathBuf;
 
-    use ash_core::{AgentToolContext, ModelId};
+    use ash_core::{AgentToolContext, ModelClient, ModelId};
     use ash_protocol::{create_adapter, Protocol, ProviderConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
-    fn test_config() -> AgentConfig {
-        AgentConfig {
+    fn test_agent() -> Agent {
+        Agent {
             system_prompt: Some("base prompt".to_string()),
             tools: Vec::new(),
             model: ModelId::new("test-model"),
             max_turns: 10,
-            working_dir: PathBuf::from("."),
             max_context_tokens: 200_000,
             context_policy: Arc::new(ash_agent::CodingContextPolicy),
-            max_tool_duration: Duration::from_secs(5),
-            agent_path: "/root".to_string(),
-            root_session_id: None,
         }
     }
 
-    fn test_context(root_session_id: SessionId) -> ToolContext {
-        let config = test_config();
+    fn test_options() -> ThreadOptions {
+        ThreadOptions {
+            working_dir: PathBuf::from("."),
+            tool_timeout: Duration::from_secs(5),
+            ..ThreadOptions::default()
+        }
+    }
+
+    fn test_context(tree_id: TreeId) -> ToolContext {
         ToolContext {
-            session_id: root_session_id,
-            run_id: ash_core::RunId::new(),
+            thread_id: ThreadId::new(),
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
-            deadline: std::time::Instant::now() + config.max_tool_duration,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                root_session_id,
-                agent_path: "/root".to_string(),
+                tree_id,
+                path: "/root".to_string(),
                 messages: Vec::new(),
             },
         }
@@ -1182,16 +1160,17 @@ mod tests {
         })
     }
 
-    fn test_supervisor(model: Arc<dyn ModelClient>, max_turns: u32) -> Supervisor {
-        let mut config = test_config();
-        config.max_turns = max_turns;
-        let factory = Arc::new(InheritedAgentFactory {
-            model,
-            system_prompt: config.system_prompt.clone(),
-            definition: config.definition(),
-            scope: config.scope(),
+    fn test_control(model: Arc<dyn ModelClient>, max_turns: u32) -> AgentControl {
+        let mut agent = test_agent();
+        agent.max_turns = max_turns;
+        let options = test_options();
+        let spawner = Arc::new(InheritedAgentSpawner {
+            runtime: Runtime::new(model, "test"),
+            system_prompt: agent.system_prompt.clone(),
+            definition: agent,
+            scope: options,
         });
-        Supervisor::with_factory(DEFAULT_MAX_CONCURRENT_CHILDREN, factory)
+        AgentControl::with_spawner(DEFAULT_MAX_CONCURRENT_CHILDREN, spawner)
     }
 
     #[test]
@@ -1204,10 +1183,12 @@ mod tests {
 
     #[test]
     fn installs_the_codex_style_collaboration_tools_and_prompt() {
-        let mut config = test_config();
-        install_subagent_tools(&mut config, test_model(None));
-        install_subagent_tools(&mut config, test_model(None));
-        let names = config
+        let mut agent = test_agent();
+        let options = test_options();
+        let runtime = Runtime::new(test_model(None), "test");
+        install_subagent_tools(&mut agent, options.clone(), runtime.clone());
+        install_subagent_tools(&mut agent, options, runtime);
+        let names = agent
             .tools
             .iter()
             .map(|tool| tool.name())
@@ -1223,7 +1204,7 @@ mod tests {
                 "wait_agent",
             ]
         );
-        let spawn = config.tools[0].definition();
+        let spawn = agent.tools[0].definition();
         assert!(spawn.description.contains("explorer"));
         assert!(spawn.description.contains("worker"));
         assert!(spawn.description.contains("same round"));
@@ -1233,18 +1214,18 @@ mod tests {
                 .get(property)
                 .is_some());
         }
-        assert!(config
+        assert!(agent
             .system_prompt
             .as_deref()
             .unwrap()
             .contains("<multi_agent_mode>"));
-        assert!(config
+        assert!(agent
             .system_prompt
             .as_deref()
             .unwrap()
             .contains("Delegation is proactive"));
         assert_eq!(
-            config
+            agent
                 .system_prompt
                 .as_deref()
                 .unwrap()
@@ -1276,18 +1257,18 @@ mod tests {
 
     #[tokio::test]
     async fn failed_delivery_does_not_change_the_agent_lifecycle() {
-        let supervisor = Supervisor::default();
-        let root_session_id = SessionId::new();
-        let agent_id = AgentId::new();
+        let control = AgentControl::default();
+        let tree_id = TreeId::new();
+        let agent_id = ThreadId::new();
         let (command_tx, command_rx) = mpsc::channel(1);
         drop(command_rx);
-        supervisor
+        control
             .inner
             .state
             .lock()
             .await
-            .sessions
-            .entry(root_session_id)
+            .threads
+            .entry(tree_id)
             .or_default()
             .agents
             .insert(
@@ -1303,9 +1284,9 @@ mod tests {
                 },
             );
 
-        let result = supervisor
+        let result = control
             .send_message(
-                &test_context(root_session_id),
+                &test_context(tree_id),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "follow up".to_string(),
@@ -1315,7 +1296,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let agents = supervisor.snapshots(root_session_id, None).await;
+        let agents = control.snapshots(tree_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
         assert_eq!(agents[0].last_task_message, "original");
     }
@@ -1401,17 +1382,17 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_agent_trees_by_root_session() {
-        let supervisor = Supervisor::default();
-        let root = SessionId::new();
-        let other_root = SessionId::new();
-        let agent_id = AgentId::new();
+        let control = AgentControl::default();
+        let root = TreeId::new();
+        let other_root = TreeId::new();
+        let agent_id = ThreadId::new();
         let (command_tx, _command_rx) = mpsc::channel(1);
-        supervisor
+        control
             .inner
             .state
             .lock()
             .await
-            .sessions
+            .threads
             .entry(root)
             .or_default()
             .agents
@@ -1428,21 +1409,21 @@ mod tests {
                 },
             );
 
-        assert_eq!(supervisor.snapshots(root, None).await.len(), 1);
-        assert!(supervisor.snapshots(other_root, None).await.is_empty());
+        assert_eq!(control.snapshots(root, None).await.len(), 1);
+        assert!(control.snapshots(other_root, None).await.is_empty());
     }
 
     #[tokio::test]
     async fn wait_returns_each_completion_only_once() {
-        let supervisor = Supervisor::default();
-        let root_session_id = SessionId::new();
-        let completed_id = AgentId::new();
-        let running_id = AgentId::new();
+        let control = AgentControl::default();
+        let tree_id = TreeId::new();
+        let completed_id = ThreadId::new();
+        let running_id = ThreadId::new();
         let (completed_tx, _completed_rx) = mpsc::channel(1);
         let (running_tx, _running_rx) = mpsc::channel(1);
         {
-            let mut state = supervisor.inner.state.lock().await;
-            let session = state.sessions.entry(root_session_id).or_default();
+            let mut state = control.inner.state.lock().await;
+            let session = state.threads.entry(tree_id).or_default();
             session.next_completion_revision = 1;
             session.agents.insert(
                 completed_id,
@@ -1470,8 +1451,8 @@ mod tests {
             );
         }
 
-        let context = test_context(root_session_id);
-        let first = supervisor
+        let context = test_context(tree_id);
+        let first = control
             .wait(
                 &context,
                 WaitAgentArgs {
@@ -1486,10 +1467,10 @@ mod tests {
                 .unwrap()
         );
 
-        let waiting_supervisor = supervisor.clone();
+        let waiting_control = control.clone();
         let waiting_context = context.clone();
         let waiting = tokio::spawn(async move {
-            waiting_supervisor
+            waiting_control
                 .wait(
                     &waiting_context,
                     WaitAgentArgs {
@@ -1502,14 +1483,14 @@ mod tests {
         assert!(!waiting.is_finished());
 
         {
-            let mut state = supervisor.inner.state.lock().await;
+            let mut state = control.inner.state.lock().await;
             assert!(state.finish_turn(
-                root_session_id,
+                tree_id,
                 running_id,
                 ChildState::Completed(Some("second result".to_string())),
             ));
         }
-        supervisor.inner.updates.notify_waiters();
+        control.inner.updates.notify_waiters();
 
         let second = tokio::time::timeout(Duration::from_secs(1), waiting)
             .await
@@ -1569,22 +1550,21 @@ mod tests {
             requests
         });
 
-        let supervisor = test_supervisor(test_model(Some(format!("http://{address}"))), 2);
-        let root_session_id = SessionId::new();
+        let control = test_control(test_model(Some(format!("http://{address}"))), 2);
+        let tree_id = TreeId::new();
         let context = ToolContext {
-            session_id: root_session_id,
-            run_id: ash_core::RunId::new(),
+            thread_id: ThreadId::new(),
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                root_session_id,
-                agent_path: "/root".to_string(),
+                tree_id,
+                path: "/root".to_string(),
                 messages: vec![Message::user("delegate this")],
             },
         };
         let followup_context = context.clone();
-        supervisor
+        control
             .spawn(
                 context,
                 SpawnAgentArgs {
@@ -1599,7 +1579,7 @@ mod tests {
 
         let completed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let agents = supervisor.snapshots(root_session_id, None).await;
+                let agents = control.snapshots(tree_id, None).await;
                 if agents
                     .first()
                     .is_some_and(|agent| agent.status == AgentStatus::Completed)
@@ -1613,7 +1593,7 @@ mod tests {
         .unwrap();
         assert_eq!(completed[0].final_message.as_deref(), Some("child done"));
 
-        supervisor
+        control
             .send_message(
                 &followup_context,
                 MessageAgentArgs {
@@ -1626,7 +1606,7 @@ mod tests {
             .unwrap();
         let followed_up = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let agents = supervisor.snapshots(root_session_id, None).await;
+                let agents = control.snapshots(tree_id, None).await;
                 if agents.first().is_some_and(|agent| {
                     agent.status == AgentStatus::Completed
                         && agent.final_message.as_deref() == Some("followup done")

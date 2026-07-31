@@ -5,7 +5,7 @@ members = [
     "crates/ash-protocol",
     "crates/ash-tools",
     "crates/ash-agent",
-    "crates/ash-orchestrator",
+    "crates/ash-collab",
     "crates/ash-tui",
     "crates/ash-cli",
 ]
@@ -21,7 +21,7 @@ ash-core = { path = "crates/ash-core" }
 ash-protocol = { path = "crates/ash-protocol" }
 ash-tools = { path = "crates/ash-tools" }
 ash-agent = { path = "crates/ash-agent" }
-ash-orchestrator = { path = "crates/ash-orchestrator" }
+ash-collab = { path = "crates/ash-collab" }
 ash-tui = { path = "crates/ash-tui" }
 
 # Async

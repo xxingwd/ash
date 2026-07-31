@@ -116,9 +116,9 @@ impl Skill {
         })
     }
 
-    pub fn apply_overrides(&self, config: &mut crate::AgentConfig) {
+    pub fn apply_overrides(&self, agent: &mut crate::Agent) {
         if let Some(model) = &self.model {
-            config.model = model.clone();
+            agent.model = model.clone();
         }
     }
 

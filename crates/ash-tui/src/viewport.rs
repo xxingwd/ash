@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::{ForkPoint, SessionSummary};
+use ash_core::{ForkPoint, ThreadSummary};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Position, Rect},
@@ -854,20 +854,20 @@ fn render_command_menu(
 
 fn render_session_menu(
     area: Rect,
-    sessions: &[SessionSummary],
+    threads: &[ThreadSummary],
     selected: usize,
     buffer: &mut Buffer,
 ) {
-    let visible = usize::from(area.height).min(sessions.len());
+    let visible = usize::from(area.height).min(threads.len());
     if visible == 0 {
         return;
     }
-    let selected = selected.min(sessions.len().saturating_sub(1));
+    let selected = selected.min(threads.len().saturating_sub(1));
     let start = selected
         .saturating_add(1)
         .saturating_sub(visible)
-        .min(sessions.len().saturating_sub(visible));
-    for (offset, session) in sessions[start..start + visible].iter().enumerate() {
+        .min(threads.len().saturating_sub(visible));
+    for (offset, session) in threads[start..start + visible].iter().enumerate() {
         let index = start + offset;
         let selected_style = Style::default()
             .fg(Color::Cyan)
@@ -947,7 +947,7 @@ fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &
 mod tests {
     use std::path::Path;
 
-    use ash_core::{MessageId, SessionId};
+    use ash_core::{MessageId, ThreadId};
 
     use super::*;
     use crate::markdown::render_markdown;
@@ -1103,19 +1103,19 @@ mod tests {
 
     #[test]
     fn session_picker_renders_multiple_rows_below_the_composer() {
-        let sessions = [
-            SessionSummary {
-                session_id: SessionId::new(),
+        let threads = [
+            ThreadSummary {
+                thread_id: ThreadId::new(),
                 title: "继续这个中文会话".to_string(),
                 created_at: "2026-07-14 09:00".to_string(),
             },
-            SessionSummary {
-                session_id: SessionId::new(),
+            ThreadSummary {
+                thread_id: ThreadId::new(),
                 title: "Inspect the session picker".to_string(),
                 created_at: "2026-07-15 12:30".to_string(),
             },
-            SessionSummary {
-                session_id: SessionId::new(),
+            ThreadSummary {
+                thread_id: ThreadId::new(),
                 title: "Third saved chat".to_string(),
                 created_at: "2026-07-16 18:45".to_string(),
             },
@@ -1145,7 +1145,7 @@ mod tests {
         let baseline = render(input);
         let frame = render(ViewportInput {
             menu: MenuView::Sessions {
-                items: &sessions,
+                items: &threads,
                 selected: 1,
             },
             ..input

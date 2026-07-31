@@ -127,8 +127,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash-agent",
+ "ash-collab",
  "ash-core",
- "ash-orchestrator",
  "ash-protocol",
  "ash-tools",
  "ash-tui",
@@ -140,6 +140,24 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ash-collab"
+version = "0.1.0"
+dependencies = [
+ "ash-agent",
+ "ash-core",
+ "ash-protocol",
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -159,24 +177,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "ash-orchestrator"
-version = "0.1.0"
-dependencies = [
- "ash-agent",
- "ash-core",
- "ash-protocol",
- "async-trait",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
  "uuid",
 ]
 

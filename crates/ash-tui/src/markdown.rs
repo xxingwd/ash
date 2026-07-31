@@ -1,4 +1,6 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line as RatatuiLine, Span as RatatuiSpan},
@@ -255,24 +257,24 @@ impl MarkdownWriter {
         self.item_marker_used = false;
     }
 
-    fn handle_table_event(&mut self, event: Event<'_>) -> bool {
+    fn handle_table_event(&mut self, event: MarkdownEvent<'_>) -> bool {
         let Some(table) = self.table.as_mut() else {
             return false;
         };
         match event {
-            Event::Start(Tag::TableHead) => {
+            MarkdownEvent::Start(Tag::TableHead) => {
                 table.in_head = true;
                 table.row.clear();
             }
-            Event::End(TagEnd::TableHead) => {
+            MarkdownEvent::End(TagEnd::TableHead) => {
                 if !table.cell.is_empty() {
                     table.row.push(std::mem::take(&mut table.cell));
                 }
                 table.header = Some(std::mem::take(&mut table.row));
                 table.in_head = false;
             }
-            Event::Start(Tag::TableRow) => table.row.clear(),
-            Event::End(TagEnd::TableRow) => {
+            MarkdownEvent::Start(Tag::TableRow) => table.row.clear(),
+            MarkdownEvent::End(TagEnd::TableRow) => {
                 if !table.cell.is_empty() {
                     table.row.push(std::mem::take(&mut table.cell));
                 }
@@ -283,19 +285,19 @@ impl MarkdownWriter {
                     table.rows.push(row);
                 }
             }
-            Event::Start(Tag::TableCell) => table.cell.clear(),
-            Event::End(TagEnd::TableCell) => {
+            MarkdownEvent::Start(Tag::TableCell) => table.cell.clear(),
+            MarkdownEvent::End(TagEnd::TableCell) => {
                 table.row.push(table.cell.trim().to_string());
                 table.cell.clear();
             }
-            Event::Text(text) | Event::Code(text) | Event::Html(text) => {
+            MarkdownEvent::Text(text) | MarkdownEvent::Code(text) | MarkdownEvent::Html(text) => {
                 if !table.cell.is_empty() {
                     table.cell.push(' ');
                 }
                 table.cell.push_str(text.trim());
             }
-            Event::SoftBreak | Event::HardBreak => table.cell.push(' '),
-            Event::End(TagEnd::Table) => return true,
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => table.cell.push(' '),
+            MarkdownEvent::End(TagEnd::Table) => return true,
             _ => {}
         }
         false
@@ -383,30 +385,30 @@ impl MarkdownWriter {
             }
 
             match event {
-                Event::Start(Tag::Paragraph) => self.block_gap(),
-                Event::End(TagEnd::Paragraph) => {
+                MarkdownEvent::Start(Tag::Paragraph) => self.block_gap(),
+                MarkdownEvent::End(TagEnd::Paragraph) => {
                     self.finish_line();
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::Heading { level, .. }) => {
+                MarkdownEvent::Start(Tag::Heading { level, .. }) => {
                     self.block_gap();
                     self.push_style(heading_style(level));
                 }
-                Event::End(TagEnd::Heading(_)) => {
+                MarkdownEvent::End(TagEnd::Heading(_)) => {
                     self.finish_line();
                     self.pop_style();
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::BlockQuote(_)) => {
+                MarkdownEvent::Start(Tag::BlockQuote(_)) => {
                     self.block_gap();
                     self.blockquote_depth += 1;
                 }
-                Event::End(TagEnd::BlockQuote(_)) => {
+                MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
                     self.finish_line();
                     self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::CodeBlock(kind)) => {
+                MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
                     self.block_gap();
                     self.code_block = true;
                     if let CodeBlockKind::Fenced(language) = kind {
@@ -420,56 +422,56 @@ impl MarkdownWriter {
                         }
                     }
                 }
-                Event::End(TagEnd::CodeBlock) => {
+                MarkdownEvent::End(TagEnd::CodeBlock) => {
                     self.finish_line();
                     self.code_block = false;
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::List(start)) => {
+                MarkdownEvent::Start(Tag::List(start)) => {
                     if self.lists.is_empty() {
                         self.block_gap();
                     }
                     self.lists.push(ListState { next: start });
                     self.list_needs_blank_before_next_item.push(false);
                 }
-                Event::End(TagEnd::List(_)) => {
+                MarkdownEvent::End(TagEnd::List(_)) => {
                     self.lists.pop();
                     self.list_needs_blank_before_next_item.pop();
                     self.needs_block_gap = true;
                 }
-                Event::Start(Tag::Item) => self.start_item(),
-                Event::End(TagEnd::Item) => self.finish_item(),
-                Event::Start(Tag::Emphasis) => {
+                MarkdownEvent::Start(Tag::Item) => self.start_item(),
+                MarkdownEvent::End(TagEnd::Item) => self.finish_item(),
+                MarkdownEvent::Start(Tag::Emphasis) => {
                     self.push_style(Style::default().add_modifier(Modifier::ITALIC))
                 }
-                Event::End(TagEnd::Emphasis) => self.pop_style(),
-                Event::Start(Tag::Strong) => {
+                MarkdownEvent::End(TagEnd::Emphasis) => self.pop_style(),
+                MarkdownEvent::Start(Tag::Strong) => {
                     self.push_style(Style::default().add_modifier(Modifier::BOLD))
                 }
-                Event::End(TagEnd::Strong) => self.pop_style(),
-                Event::Start(Tag::Strikethrough) => {
+                MarkdownEvent::End(TagEnd::Strong) => self.pop_style(),
+                MarkdownEvent::Start(Tag::Strikethrough) => {
                     self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
                 }
-                Event::End(TagEnd::Strikethrough) => self.pop_style(),
-                Event::Start(Tag::Link { .. }) => self.push_style(
+                MarkdownEvent::End(TagEnd::Strikethrough) => self.pop_style(),
+                MarkdownEvent::Start(Tag::Link { .. }) => self.push_style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                Event::End(TagEnd::Link) => self.pop_style(),
-                Event::Start(Tag::Table(_)) => {
+                MarkdownEvent::End(TagEnd::Link) => self.pop_style(),
+                MarkdownEvent::Start(Tag::Table(_)) => {
                     self.block_gap();
                     self.table = Some(TableState::default());
                 }
-                Event::Text(text) | Event::Html(text) => self.push_text(&text),
-                Event::Code(code) => {
+                MarkdownEvent::Text(text) | MarkdownEvent::Html(text) => self.push_text(&text),
+                MarkdownEvent::Code(code) => {
                     let style = Style::default().fg(Color::Cyan);
                     self.push_style(style);
                     self.push_text(&code);
                     self.pop_style();
                 }
-                Event::SoftBreak | Event::HardBreak => self.force_line_break(),
-                Event::Rule => {
+                MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => self.force_line_break(),
+                MarkdownEvent::Rule => {
                     self.block_gap();
                     self.lines.push(LogicalLine {
                         spans: vec![StyledSpan {
@@ -480,13 +482,13 @@ impl MarkdownWriter {
                     });
                     self.needs_block_gap = true;
                 }
-                Event::TaskListMarker(checked) => {
+                MarkdownEvent::TaskListMarker(checked) => {
                     self.push_text(if checked { "[x] " } else { "[ ] " });
                 }
-                Event::FootnoteReference(reference) => {
+                MarkdownEvent::FootnoteReference(reference) => {
                     self.push_text(&format!("[{reference}]"));
                 }
-                Event::InlineHtml(html) => self.push_text(&html),
+                MarkdownEvent::InlineHtml(html) => self.push_text(&html),
                 _ => {}
             }
         }

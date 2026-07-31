@@ -101,7 +101,7 @@ stream.set_nodelay(true)?;  // ← 必须
 let ws = tokio_tungstenite::accept_async(stream).await?;
 ```
 
-### 场景 4：ash-orchestrator 的测试 TCP Server
+### 场景 4：ash-collab 的测试 TCP Server
 
 `supervisor.rs` 中的测试 TCP Listener（935–973 行）使用 raw `TcpStream` 未设 `set_nodelay`。测试环境通常是 localhost，RTT ≈ 0，不会触发 Nagle 延迟；但如果测试改为跨网络或 Docker，可能出现偶发延迟。
 

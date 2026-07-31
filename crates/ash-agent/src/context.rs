@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, Role, ToolCallId, ToolDefinition};
 
-use crate::{config::COMPACTION_TRIGGER_PERCENT, skill::SKILL_TOOL_NAME};
+use crate::{agent::COMPACTION_TRIGGER_PERCENT, skill::SKILL_TOOL_NAME};
 
 const CHARS_PER_TOKEN: usize = 4;
 const TOKENS_PER_MESSAGE_OVERHEAD: usize = 4;

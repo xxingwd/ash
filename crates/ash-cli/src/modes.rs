@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, AgentConfig, AgentRuntime, AgentSession,
-    MessageHistoryStore, Skill, DEFAULT_MAX_CONTEXT_TOKENS,
+    build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
+    ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{CancellationToken, Event, Message, MessageId, ModelId, SessionId};
+use ash_core::{CancellationToken, EventKind, MessageId, ModelId, ThreadId, TurnId};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::UiCommand;
 use futures::StreamExt;
@@ -12,37 +12,24 @@ use secrecy::SecretString;
 
 use crate::Cli;
 
-#[derive(Debug, Eq, PartialEq)]
-enum TurnOutcome {
-    Continue { deferred_submission: Option<String> },
-    Rollback,
-    Exit,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ActiveTurnCommand {
-    Defer(String),
-    Cancel,
-    CancelAndRollback,
-    Reject,
-    Exit,
-}
-
 struct InteractiveController {
-    session: AgentSession,
-    event_tx: tokio::sync::mpsc::Sender<Event>,
+    thread: Thread,
+    agent: Agent,
+    options: ThreadOptions,
+    runtime: Runtime,
+    event_tx: tokio::sync::mpsc::Sender<EventKind>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
     history_store: MessageHistoryStore,
 }
 
 struct AgentSetup {
-    config: AgentConfig,
-    runtime: AgentRuntime,
+    agent: Agent,
+    options: ThreadOptions,
+    runtime: Runtime,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     let setup = build_config(&cli)?;
-
     if cli.print {
         run_print(setup, cli.prompt).await
     } else {
@@ -57,9 +44,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         .or_else(|| env_value("ASH_PROTOCOL"))
         .unwrap_or_else(|| "anthropic".into());
     let protocol = parse_protocol(&protocol_name)?;
-
     let api_key = env_value("ASH_API_KEY").context("set ASH_API_KEY in the process environment")?;
-
     let model = cli.model.clone().or_else(|| env_value("ASH_MODEL"));
     let model = match model {
         Some(model) => model,
@@ -101,26 +86,30 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         api_key: SecretString::from(api_key),
         base_url,
     };
-    let mut config = AgentConfig {
+    let mut agent = Agent {
         system_prompt: Some(system_prompt),
         model: ModelId::new(model),
         tools,
         max_turns: 100,
-        working_dir,
         max_context_tokens,
         context_policy: std::sync::Arc::new(ash_agent::CodingContextPolicy),
-        max_tool_duration: std::time::Duration::from_secs(120),
-        agent_path: "/root".to_string(),
-        root_session_id: None,
     };
-
+    let options = ThreadOptions {
+        working_dir,
+        tool_timeout: std::time::Duration::from_secs(120),
+        ..ThreadOptions::default()
+    };
     if let Some(skill) = active_skill {
-        skill.apply_overrides(&mut config);
+        skill.apply_overrides(&mut agent);
     }
-    let runtime = AgentRuntime::new(create_adapter(provider), protocol.as_cli_name());
-    ash_orchestrator::install_subagent_tools(&mut config, runtime.model_client());
+    let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
+    ash_collab::install_subagent_tools(&mut agent, options.clone(), runtime.clone());
 
-    Ok(AgentSetup { config, runtime })
+    Ok(AgentSetup {
+        agent,
+        options,
+        runtime,
+    })
 }
 
 fn parse_protocol(name: &str) -> Result<Protocol> {
@@ -158,50 +147,65 @@ fn resolve_max_context_tokens(configured: Option<usize>) -> Result<usize> {
 
 async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
     let input = match prompt {
-        Some(p) => p,
+        Some(prompt) => prompt,
         None => {
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            buf
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input
         }
     };
+    let thread = setup.runtime.start(setup.agent, setup.options);
+    let mut events = thread.events();
+    let turn = thread.submit(input).await?;
+    let mut completion = Box::pin(turn.wait());
 
-    let messages = vec![Message::user(&input)];
-    let mut stream = Agent::run(setup.runtime.model_client(), setup.config, messages);
-
-    while let Some(event) = stream.next().await {
-        match event {
-            ash_core::Event::TextDelta(t) => print!("{t}"),
-            ash_core::Event::ToolCallStart { name, .. } => {
-                eprintln!("{}", format!("[tool: {name}]").cyan());
+    loop {
+        tokio::select! {
+            biased;
+            event = events.next() => match event {
+                Some(Ok(event)) => print_event(event.kind),
+                Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
+                None => break,
+            },
+            result = &mut completion => {
+                result?;
+                break;
             }
-            ash_core::Event::ToolCallEnd {
-                is_error: true,
-                output,
-                ..
-            } => eprintln!("{}", format!("[error: {output}]").red()),
-            ash_core::Event::Error(e) => {
-                eprintln!("{}", format!("[error: {e}]").red());
-            }
-            _ => {}
         }
     }
-
     println!();
     Ok(())
 }
 
-async fn run_interactive(setup: AgentSetup) -> Result<()> {
-    let AgentSetup { config, runtime } = setup;
-    let protocol = runtime.model_backend().to_string();
-    let model = config.model.as_str().to_string();
-    let working_dir = config.working_dir.clone();
-    let context_limit = Some(u64::try_from(config.max_context_tokens).unwrap_or(u64::MAX));
-    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
+fn print_event(event: EventKind) {
+    match event {
+        EventKind::TextDelta(text) => print!("{text}"),
+        EventKind::ToolCallStart { name, .. } => {
+            eprintln!("{}", format!("[tool: {name}]").cyan());
+        }
+        EventKind::ToolCallEnd {
+            is_error: true,
+            output,
+            ..
+        } => eprintln!("{}", format!("[error: {output}]").red()),
+        EventKind::Error(error) => eprintln!("{}", format!("[error: {error}]").red()),
+        _ => {}
+    }
+}
 
+async fn run_interactive(setup: AgentSetup) -> Result<()> {
+    let AgentSetup {
+        agent,
+        options,
+        runtime,
+    } = setup;
+    let protocol = runtime.model_backend().to_string();
+    let model = agent.model.as_str().to_string();
+    let working_dir = options.working_dir.clone();
+    let context_limit = Some(u64::try_from(agent.max_context_tokens).unwrap_or(u64::MAX));
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
     let event_rx = tokio_stream::wrappers::ReceiverStream::new(event_rx);
-
     let history_store = MessageHistoryStore::default();
     let input_history = match history_store.load().await {
         Ok(history) => history,
@@ -214,13 +218,17 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         .with_context_limit(context_limit)
         .with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
+    let thread = runtime.start(agent.clone(), options.clone());
 
-    InteractiveController::new(
-        runtime.create_session(config),
+    InteractiveController {
+        thread,
+        agent,
+        options,
+        runtime,
         event_tx,
         command_rx,
         history_store,
-    )
+    }
     .run()
     .await;
 
@@ -229,112 +237,92 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
 }
 
 impl InteractiveController {
-    fn new(
-        session: AgentSession,
-        event_tx: tokio::sync::mpsc::Sender<Event>,
-        command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
-        history_store: MessageHistoryStore,
-    ) -> Self {
-        Self {
-            session,
-            event_tx,
-            command_rx,
-            history_store,
-        }
-    }
-
     async fn run(mut self) {
-        let mut deferred_submission = None;
-
-        'controller: loop {
-            let command = match deferred_submission.take() {
-                Some(input) => UiCommand::Submit(input),
-                None => match self.command_rx.recv().await {
-                    Some(command) => command,
-                    None => break,
-                },
-            };
-            match command {
-                UiCommand::Submit(input) => {
-                    if let Err(error) = self.history_store.append(self.session.id(), &input).await {
-                        tracing::warn!(%error, "failed to persist input history");
-                    }
-                    match self.run_active_turn(input).await {
-                        TurnOutcome::Continue {
-                            deferred_submission: next,
-                        } => deferred_submission = next,
-                        TurnOutcome::Rollback => {
-                            deferred_submission = None;
-                            self.rollback_last_turn().await;
-                        }
-                        TurnOutcome::Exit => break 'controller,
-                    }
-                }
-                UiCommand::CancelAndRollback => {
-                    deferred_submission = None;
-                    self.rollback_last_turn().await;
-                }
-                UiCommand::Cancel => {}
-                UiCommand::Compact => {
-                    deferred_submission = None;
-                    self.compact_session().await;
-                }
-                UiCommand::NewSession => {
-                    self.session.reset();
-                    deferred_submission = None;
-                }
-                UiCommand::ListSessions => self.list_sessions().await,
-                UiCommand::ListForkPoints => self.list_fork_points().await,
-                UiCommand::ResumeSession(session_id) => {
-                    deferred_submission = None;
-                    self.resume_session(session_id).await;
-                }
-                UiCommand::ForkSession(message_id) => {
-                    deferred_submission = None;
-                    self.fork_session(message_id).await;
-                }
-                UiCommand::Exit => break,
-            }
-        }
-    }
-
-    async fn run_active_turn(&mut self, input: String) -> TurnOutcome {
-        let cancel = CancellationToken::new();
-        let mut deferred_submission = None;
-        let mut turn = Box::pin(
-            self.session
-                .submit(input, self.event_tx.clone(), cancel.clone()),
-        );
+        let mut events = self.thread.events();
+        let mut turns = std::collections::HashMap::<TurnId, CancellationToken>::new();
+        let mut active = None;
+        let mut rollback_after_cancel = false;
         loop {
             tokio::select! {
-                _ = &mut turn => {
-                    break TurnOutcome::Continue { deferred_submission };
-                }
-                command = self.command_rx.recv() => match classify_active_command(command) {
-                    ActiveTurnCommand::Defer(input) => deferred_submission = Some(input),
-                    ActiveTurnCommand::Reject => {
-                        let _ = self.event_tx
-                            .send(Event::Error(
-                                "That command is unavailable while working.".to_string(),
-                            ))
-                            .await;
+                biased;
+                event = events.next() => match event {
+                    Some(Ok(event)) => {
+                        if matches!(event.kind, EventKind::TurnStarted) {
+                            active = event.turn_id;
+                        }
+                        let completed = matches!(event.kind, EventKind::TurnCompleted { .. });
+                        let completed_turn = event.turn_id;
+                        let _ = self.event_tx.send(event.kind).await;
+                        if completed {
+                            if let Some(turn_id) = completed_turn {
+                                turns.remove(&turn_id);
+                            }
+                            active = None;
+                            if rollback_after_cancel {
+                                rollback_after_cancel = false;
+                                self.rollback_last_turn().await;
+                            }
+                        }
                     }
-                    ActiveTurnCommand::Cancel => {
-                        cancel.cancel();
-                        let _ = (&mut turn).await;
-                        break TurnOutcome::Continue {
-                            deferred_submission: None,
-                        };
-                    }
-                    ActiveTurnCommand::CancelAndRollback => {
-                        cancel.cancel();
-                        let _ = (&mut turn).await;
-                        break TurnOutcome::Rollback;
-                    }
-                    ActiveTurnCommand::Exit => {
-                        cancel.cancel();
-                        let _ = (&mut turn).await;
-                        break TurnOutcome::Exit;
+                    Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
+                    None => break,
+                },
+                command = self.command_rx.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        UiCommand::Submit(input) => {
+                            if let Err(error) = self.history_store.append(self.thread.id(), &input).await {
+                                tracing::warn!(%error, "failed to persist input history");
+                            }
+                            match self.thread.submit(input).await {
+                                Ok(turn) => {
+                                    turns.insert(turn.id(), turn.cancellation_token());
+                                }
+                                Err(error) => {
+                                    let _ = self.event_tx.send(EventKind::Error(error.to_string())).await;
+                                }
+                            }
+                        }
+                        UiCommand::Cancel => {
+                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
+                                cancel.cancel();
+                            }
+                        }
+                        UiCommand::CancelAndRollback => {
+                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
+                                rollback_after_cancel = true;
+                                cancel.cancel();
+                            } else {
+                                self.rollback_last_turn().await;
+                            }
+                        }
+                        UiCommand::Compact => self.compact_thread().await,
+                        UiCommand::NewSession => {
+                            self.thread = self.runtime.start(self.agent.clone(), self.options.clone());
+                            events = self.thread.events();
+                            turns.clear();
+                            active = None;
+                        }
+                        UiCommand::ListSessions => self.list_threads().await,
+                        UiCommand::ListForkPoints => self.list_fork_points().await,
+                        UiCommand::ResumeSession(thread_id) => {
+                            self.resume_thread(thread_id).await;
+                            events = self.thread.events();
+                            turns.clear();
+                            active = None;
+                        }
+                        UiCommand::ForkSession(message_id) => {
+                            self.fork_thread(message_id).await;
+                            events = self.thread.events();
+                            turns.clear();
+                            active = None;
+                        }
+                        UiCommand::Exit => {
+                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
+                                cancel.cancel();
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -342,95 +330,90 @@ impl InteractiveController {
     }
 
     async fn rollback_last_turn(&mut self) {
-        let event = match self.session.rollback_last_turn().await {
+        let event = match self.thread.rollback().await {
             Ok(Some(prompt)) => {
-                if let Err(error) = self.history_store.undo(self.session.id(), &prompt).await {
+                if let Err(error) = self.history_store.undo(self.thread.id(), &prompt).await {
                     tracing::warn!(%error, "failed to undo input history entry");
                 }
-                Event::TurnRolledBack { prompt }
+                EventKind::TurnRolledBack { prompt }
             }
-            Ok(None) => Event::Error("No submitted turn is available to undo.".to_string()),
-            Err(error) => Event::Error(format!("Failed to undo the last turn: {error}")),
+            Ok(None) => EventKind::Error("No submitted turn is available to undo.".to_string()),
+            Err(error) => EventKind::Error(format!("Failed to undo the last turn: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn compact_session(&mut self) {
-        let event = match self.session.compact().await {
-            Ok(result) => Event::ContextCompacted {
+    async fn compact_thread(&mut self) {
+        let event = match self.thread.compact().await {
+            Ok(result) => EventKind::ContextCompacted {
                 before_tokens: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
                 after_tokens: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
                 dropped_messages: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
                 automatic: false,
             },
-            Err(error) => Event::Error(format!("Failed to compact context: {error}")),
+            Err(error) => EventKind::Error(format!("Failed to compact context: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn list_sessions(&self) {
-        let event = match self.session.resumable_sessions().await {
-            Ok(sessions) => Event::SessionsListed { sessions },
-            Err(error) => Event::Error(format!("Failed to list saved chats: {error}")),
+    async fn list_threads(&self) {
+        let event = match self.runtime.threads(Some(self.thread.id())).await {
+            Ok(threads) => EventKind::ThreadsListed { threads },
+            Err(error) => EventKind::Error(format!("Failed to list saved chats: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
 
     async fn list_fork_points(&self) {
-        let _ = self
-            .event_tx
-            .send(Event::ForkPointsListed {
-                points: self.session.fork_points(),
-            })
-            .await;
-    }
-
-    async fn resume_session(&mut self, session_id: SessionId) {
-        let event = match self.session.resume(session_id).await {
-            Ok(Some(restored)) => Event::SessionRestored {
-                model: restored.model,
-                protocol: restored.protocol,
-                working_dir: restored.working_dir,
-                messages: restored.messages,
-            },
-            Ok(None) => Event::Error("That saved chat is no longer available.".to_string()),
-            Err(error) => Event::Error(format!("Failed to resume saved chat: {error}")),
+        let event = match self.thread.fork_points().await {
+            Ok(points) => EventKind::ForkPointsListed { points },
+            Err(error) => EventKind::Error(format!("Failed to list fork points: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn fork_session(&mut self, message_id: MessageId) {
-        let event = match self.session.fork_at(message_id).await {
-            Ok(Some(forked)) => Event::SessionForked {
-                model: forked.model,
-                protocol: forked.protocol,
-                working_dir: forked.working_dir,
-                messages: forked.messages,
-                prompt: forked.prompt,
-            },
-            Ok(None) => {
-                Event::Error("That prompt is no longer available to fork from.".to_string())
+    async fn resume_thread(&mut self, thread_id: ThreadId) {
+        let event = match self
+            .runtime
+            .resume(self.agent.clone(), self.options.clone(), thread_id)
+            .await
+        {
+            Ok(Some(thread)) => {
+                self.thread = thread;
+                match self.thread.messages().await {
+                    Ok(messages) => EventKind::ThreadRestored {
+                        model: self.agent.model.as_str().to_string(),
+                        protocol: self.runtime.model_backend().to_string(),
+                        working_dir: self.options.working_dir.clone(),
+                        messages,
+                    },
+                    Err(error) => EventKind::Error(format!("Failed to restore chat: {error}")),
+                }
             }
-            Err(error) => Event::Error(format!("Failed to fork the current chat: {error}")),
+            Ok(None) => EventKind::Error("That saved chat is no longer available.".to_string()),
+            Err(error) => EventKind::Error(format!("Failed to resume saved chat: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
-}
 
-fn classify_active_command(command: Option<UiCommand>) -> ActiveTurnCommand {
-    match command {
-        Some(UiCommand::Submit(input)) => ActiveTurnCommand::Defer(input),
-        Some(UiCommand::Cancel) => ActiveTurnCommand::Cancel,
-        Some(UiCommand::CancelAndRollback) => ActiveTurnCommand::CancelAndRollback,
-        Some(
-            UiCommand::NewSession
-            | UiCommand::Compact
-            | UiCommand::ListSessions
-            | UiCommand::ListForkPoints
-            | UiCommand::ResumeSession(_)
-            | UiCommand::ForkSession(_),
-        ) => ActiveTurnCommand::Reject,
-        Some(UiCommand::Exit) | None => ActiveTurnCommand::Exit,
+    async fn fork_thread(&mut self, message_id: MessageId) {
+        let event = match self.thread.fork_at(message_id).await {
+            Ok(Some(forked)) => {
+                self.thread = forked.thread;
+                EventKind::ThreadForked {
+                    model: forked.model,
+                    protocol: forked.protocol,
+                    working_dir: forked.working_dir,
+                    messages: forked.messages,
+                    prompt: forked.prompt,
+                }
+            }
+            Ok(None) => {
+                EventKind::Error("That prompt is no longer available to fork from.".to_string())
+            }
+            Err(error) => EventKind::Error(format!("Failed to fork the current chat: {error}")),
+        };
+        let _ = self.event_tx.send(event).await;
     }
 }
 
@@ -456,50 +439,5 @@ mod tests {
             assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);
         }
         assert!(parse_protocol("responses").is_err());
-    }
-
-    #[test]
-    fn active_turn_commands_have_one_explicit_policy() {
-        assert_eq!(
-            classify_active_command(Some(UiCommand::Submit("next".into()))),
-            ActiveTurnCommand::Defer("next".into())
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::Cancel)),
-            ActiveTurnCommand::Cancel
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::CancelAndRollback)),
-            ActiveTurnCommand::CancelAndRollback
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::NewSession)),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::ListForkPoints)),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::Compact)),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::ListSessions)),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::ResumeSession(SessionId::new()))),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::ForkSession(MessageId::new()))),
-            ActiveTurnCommand::Reject
-        );
-        assert_eq!(
-            classify_active_command(Some(UiCommand::Exit)),
-            ActiveTurnCommand::Exit
-        );
-        assert_eq!(classify_active_command(None), ActiveTurnCommand::Exit);
     }
 }

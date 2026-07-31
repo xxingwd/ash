@@ -1,39 +1,36 @@
 pub mod agent;
-pub mod config;
 pub mod context;
 pub mod context_policy;
-pub mod conversation;
+mod engine;
+pub mod extension;
 pub mod input;
+mod jsonl;
+pub mod log;
 pub mod mcp;
 mod message_history;
 mod project;
 pub mod prompt;
 pub mod runtime;
-pub mod session;
-mod session_store;
 pub mod skill;
 pub mod store;
+pub mod thread;
 
-pub use agent::{run_agent_loop, run_agent_turn, Agent};
-pub use config::{
-    AgentConfig, AgentDefinition, AgentScope, COMPACTION_TRIGGER_PERCENT,
-    DEFAULT_MAX_CONTEXT_TOKENS,
-};
+pub(crate) use agent::RunConfig;
+pub use agent::{Agent, ThreadOptions, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_CONTEXT_TOKENS};
 pub use context::{count_tokens, estimate_tokens};
 pub use context_policy::{
     CodingContextPolicy, ContextPolicy, ContextRequest, ContextUpdate, PassthroughContextPolicy,
     PreparedContext,
 };
-pub use conversation::{AcceptedInput, ContextCheckpoint, ConversationEntry, ConversationLog};
-pub use input::{AgentInput, Trigger};
+pub use extension::{Extension, TurnContext, TurnOutcome, TurnPatch, TurnStatus};
+pub use input::{Input, InputSource};
+pub use jsonl::JsonlThreadStore;
+pub use log::{AcceptedInput, ContextCheckpoint, Record, ThreadLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;
-pub use runtime::{AgentRun, AgentRuntime, RunEvent};
-pub use session::{AgentSession, ContextCompaction, ForkedSession, ResumedSession};
-pub use session_store::JsonlConversationRepository;
+pub use runtime::{Event, Runtime};
 pub use skill::{tool as skill_tool, Skill};
-pub use store::{
-    ConversationMetadata, ConversationRepository, ConversationRevision, ConversationStore,
-    SharedConversationRepository,
-};
+pub use store::{SharedThreadStore, StoredThread, ThreadMetadata, ThreadStore, Version};
+pub(crate) use thread::ThreadState;
+pub use thread::{ContextCompaction, Fork, Thread, Turn};

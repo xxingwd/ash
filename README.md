@@ -116,10 +116,10 @@ Review the relevant code and report concrete findings.
 ## 会话历史
 
 交互会话按“一会话一文件”保存为 JSONL。Linux 默认目录为
-`~/.local/share/ash/sessions/`，文件名直接包含本地日期和时间：
+`~/.local/share/ash/threads/`，文件名直接包含本地日期和时间：
 
 ```text
-session-2026-07-14T16-30-25.123-<session-id>.jsonl
+thread-2026-07-14T16-30-25.123-<thread-id>.jsonl
 ```
 
 普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。

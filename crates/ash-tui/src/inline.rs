@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use ash_core::{Content, ContentBlock, ForkPoint, Message, MessageContent, SessionSummary};
+use ash_core::{Content, ContentBlock, ForkPoint, Message, MessageContent, ThreadSummary};
 use crossterm::terminal;
 use ratatui::layout::Position;
 use serde_json::Value;
@@ -179,7 +179,7 @@ enum RenderedMenu {
         selected: usize,
     },
     Sessions {
-        items: Vec<SessionSummary>,
+        items: Vec<ThreadSummary>,
         selected: usize,
     },
     ForkPoints {

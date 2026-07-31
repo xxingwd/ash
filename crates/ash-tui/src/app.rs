@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{Event, MessageId, SessionId};
+use ash_core::{EventKind, MessageId, ThreadId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -33,7 +33,7 @@ pub enum UiCommand {
     NewSession,
     ListSessions,
     ListForkPoints,
-    ResumeSession(SessionId),
+    ResumeSession(ThreadId),
     ForkSession(MessageId),
     Exit,
 }
@@ -42,7 +42,7 @@ struct AppState {
     input: InputState,
     operation: OperationState,
     menu: ComposerMenuState,
-    queue: VecDeque<String>,
+    pending_inputs: VecDeque<String>,
 }
 
 enum LoopAction {
@@ -55,7 +55,7 @@ enum LoopAction {
 enum SessionPickerAction {
     KeepOpen,
     Close,
-    Resume(SessionId),
+    Resume(ThreadId),
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +71,7 @@ impl AppState {
             input: InputState::with_history(input_history),
             operation: OperationState::default(),
             menu: ComposerMenuState::default(),
-            queue: VecDeque::new(),
+            pending_inputs: VecDeque::new(),
         }
     }
 
@@ -88,15 +88,7 @@ impl AppState {
             input: &self.input,
             menu: self.menu.view(),
             busy: self.operation.shows_activity(),
-            queued_messages: self.queue.len(),
-        }
-    }
-
-    fn finish_cancellation(&mut self) {
-        if self.input.is_empty() {
-            if let Some(input) = self.queue.pop_front() {
-                self.input.set_text(input);
-            }
+            queued_messages: self.pending_inputs.len(),
         }
     }
 
@@ -147,7 +139,7 @@ impl App {
 
     pub async fn run(
         mut self,
-        mut events: impl futures::Stream<Item = Event> + Unpin,
+        mut events: impl futures::Stream<Item = EventKind> + Unpin,
         commands: tokio::sync::mpsc::Sender<UiCommand>,
     ) -> anyhow::Result<()> {
         let mut terminal = TerminalUi::enter(
@@ -215,12 +207,20 @@ impl App {
 async fn handle_agent_event(
     state: &mut AppState,
     terminal: &mut TerminalUi,
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    event: Event,
+    _commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    event: EventKind,
 ) -> anyhow::Result<LoopAction> {
     match event {
-        Event::AgentStarted { .. } => {
-            let start = state.operation.agent_started();
+        EventKind::TurnStarted => {
+            let start = if state.operation.is_busy() {
+                state.operation.agent_started()
+            } else if let Some(input) = state.pending_inputs.pop_front() {
+                state.operation.start_turn(Some(input.clone()));
+                terminal.commit_input(&input)?;
+                AgentStart::StartedTurn
+            } else {
+                state.operation.agent_started()
+            };
             terminal.agent_started()?;
             state.render(terminal)?;
             Ok(match start {
@@ -228,21 +228,21 @@ async fn handle_agent_event(
                 AgentStart::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
-        Event::TextDelta(text) => {
+        EventKind::TextDelta(text) => {
             terminal.text(&text);
             Ok(LoopAction::Continue)
         }
-        Event::Thinking(text) => {
+        EventKind::Thinking(text) => {
             terminal.thinking(&text);
             Ok(LoopAction::Continue)
         }
-        Event::ToolCallStart {
+        EventKind::ToolCallStart {
             name, arguments, ..
         } => {
             terminal.tool_start(&name, &arguments)?;
             Ok(LoopAction::Continue)
         }
-        Event::ToolCallEnd {
+        EventKind::ToolCallEnd {
             name,
             arguments,
             output,
@@ -252,7 +252,7 @@ async fn handle_agent_event(
             terminal.tool_end(&name, &arguments, &output, is_error)?;
             Ok(LoopAction::Continue)
         }
-        Event::Error(error) => {
+        EventKind::Error(error) => {
             terminal.error(&error)?;
             match state.operation.complete_failed_action() {
                 FailureCompletion::FinishedOperation => {
@@ -263,27 +263,23 @@ async fn handle_agent_event(
             }
             Ok(LoopAction::Continue)
         }
-        Event::AgentFinished { .. } => {
+        EventKind::TurnCompleted { .. } => {
             let Some(completion) = state.operation.complete_turn() else {
                 return Ok(LoopAction::Continue);
             };
             terminal.finish_response()?;
             match completion {
                 TurnCompletion::Cancelled => {
-                    state.finish_cancellation();
                     state.render(terminal)?;
                     Ok(LoopAction::Continue)
                 }
-                TurnCompletion::Completed => match state.queue.pop_front() {
-                    Some(input) => start_message(state, terminal, commands, input).await,
-                    None => {
-                        state.render(terminal)?;
-                        Ok(LoopAction::Continue)
-                    }
-                },
+                TurnCompletion::Completed => {
+                    state.render(terminal)?;
+                    Ok(LoopAction::Continue)
+                }
             }
         }
-        Event::TurnRolledBack { prompt } => {
+        EventKind::TurnRolledBack { prompt } => {
             let rollback = state.operation.finish_rollback();
             if state.input.text() != prompt {
                 state.input.restore_submission(prompt);
@@ -294,7 +290,7 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::ContextCompacted {
+        EventKind::ContextCompacted {
             before_tokens,
             after_tokens,
             dropped_messages,
@@ -309,7 +305,7 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::SessionRestored {
+        EventKind::ThreadRestored {
             model,
             protocol,
             working_dir,
@@ -321,19 +317,19 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::SessionsListed { sessions } => {
+        EventKind::ThreadsListed { threads } => {
             state
                 .operation
                 .finish_background(BackgroundAction::ListSessions);
-            if sessions.is_empty() {
+            if threads.is_empty() {
                 terminal.command_output("No saved chats are available to resume.")?;
             } else {
-                state.menu.open_sessions(sessions);
+                state.menu.open_threads(threads);
             }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::ForkPointsListed { points } => {
+        EventKind::ForkPointsListed { points } => {
             state
                 .operation
                 .finish_background(BackgroundAction::ListForkPoints);
@@ -345,7 +341,7 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::SessionForked {
+        EventKind::ThreadForked {
             model,
             protocol,
             working_dir,
@@ -359,7 +355,7 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        Event::Usage {
+        EventKind::Usage {
             input_tokens,
             output_tokens,
             generation_ms,
@@ -368,7 +364,9 @@ async fn handle_agent_event(
             terminal.record_usage(input_tokens, output_tokens, generation_ms, estimated)?;
             Ok(LoopAction::Continue)
         }
-        Event::ChildSpawned { .. } | Event::ChildCompleted { .. } => Ok(LoopAction::Continue),
+        EventKind::ChildSpawned { .. } | EventKind::ChildCompleted { .. } => {
+            Ok(LoopAction::Continue)
+        }
     }
 }
 
@@ -403,10 +401,10 @@ fn handle_mouse(
     terminal: &mut TerminalUi,
     mouse: crossterm::event::MouseEvent,
 ) -> anyhow::Result<LoopAction> {
-    if let Some(sessions) = state.menu.visible_session_picker_mut() {
+    if let Some(threads) = state.menu.visible_session_picker_mut() {
         match mouse.kind {
-            MouseEventKind::ScrollUp => sessions.move_up(),
-            MouseEventKind::ScrollDown => sessions.move_down(),
+            MouseEventKind::ScrollUp => threads.move_up(),
+            MouseEventKind::ScrollDown => threads.move_down(),
             _ => return Ok(LoopAction::Continue),
         }
         state.render(terminal)?;
@@ -532,47 +530,47 @@ async fn handle_session_key(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     key: KeyEvent,
 ) -> anyhow::Result<LoopAction> {
-    let Some(sessions) = state.menu.visible_session_picker_mut() else {
+    let Some(threads) = state.menu.visible_session_picker_mut() else {
         return Ok(LoopAction::Continue);
     };
     let action = match key.code {
         KeyCode::Esc => SessionPickerAction::Close,
         KeyCode::Up => {
-            sessions.move_up();
+            threads.move_up();
             SessionPickerAction::KeepOpen
         }
         KeyCode::Down => {
-            sessions.move_down();
+            threads.move_down();
             SessionPickerAction::KeepOpen
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            sessions.move_up();
+            threads.move_up();
             SessionPickerAction::KeepOpen
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            sessions.move_down();
+            threads.move_down();
             SessionPickerAction::KeepOpen
         }
-        KeyCode::Enter => match sessions.selected_session_id() {
-            Some(session_id) => SessionPickerAction::Resume(session_id),
+        KeyCode::Enter => match threads.selected_thread_id() {
+            Some(thread_id) => SessionPickerAction::Resume(thread_id),
             None => SessionPickerAction::Close,
         },
         _ => return Ok(LoopAction::Continue),
     };
     match action {
         SessionPickerAction::KeepOpen => {}
-        SessionPickerAction::Close => state.menu.close_sessions(),
+        SessionPickerAction::Close => state.menu.close_threads(),
         SessionPickerAction::Resume(_) => {
-            state.menu.close_sessions();
+            state.menu.close_threads();
             state.operation.start_background(BackgroundAction::Resume);
         }
     }
     state.render(terminal)?;
-    let SessionPickerAction::Resume(session_id) = action else {
+    let SessionPickerAction::Resume(thread_id) = action else {
         return Ok(LoopAction::Continue);
     };
     if commands
-        .send(UiCommand::ResumeSession(session_id))
+        .send(UiCommand::ResumeSession(thread_id))
         .await
         .is_err()
     {
@@ -751,8 +749,16 @@ async fn submit_message(
     input: String,
 ) -> anyhow::Result<LoopAction> {
     match state.operation.submission_policy() {
-        SubmissionPolicy::Queue => {
-            state.queue.push_back(input);
+        SubmissionPolicy::Enqueue => {
+            if commands
+                .send(UiCommand::Submit(input.clone()))
+                .await
+                .is_err()
+            {
+                return Ok(LoopAction::Exit);
+            }
+            state.pending_inputs.push_back(input.clone());
+            state.input.record_submission(&input);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -857,7 +863,7 @@ mod tests {
         let mut state = AppState::new(Vec::new());
         state.input.set_text("/");
         state.operation.start_turn(Some("question".into()));
-        state.queue.push_back("next".into());
+        state.pending_inputs.push_back("next".into());
 
         state.sync_menu();
         let view = state.view();
@@ -877,22 +883,23 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_restores_the_next_queued_prompt_without_losing_the_rest() {
+    fn cancellation_keeps_the_core_owned_pending_projection() {
         let mut state = AppState::new(Vec::new());
         state.operation.start_turn(None);
         state.operation.begin_cancellation(true);
-        state.queue.push_back("next".into());
-        state.queue.push_back("later".into());
+        state.pending_inputs.push_back("next".into());
+        state.pending_inputs.push_back("later".into());
 
         assert_eq!(
             state.operation.complete_turn(),
             Some(TurnCompletion::Cancelled)
         );
-        state.finish_cancellation();
-
         assert!(!state.operation.is_busy());
-        assert_eq!(state.input.text(), "next");
-        assert_eq!(state.queue, VecDeque::from(["later".to_string()]));
+        assert!(state.input.is_empty());
+        assert_eq!(
+            state.pending_inputs,
+            VecDeque::from(["next".to_string(), "later".to_string()])
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use ash_core::{ForkPoint, SessionSummary};
+use ash_core::{ForkPoint, ThreadSummary};
 
 use crate::{
     fork_picker::ForkPickerState,
@@ -15,7 +15,7 @@ pub(crate) enum MenuView<'a> {
         selected: usize,
     },
     Sessions {
-        items: &'a [SessionSummary],
+        items: &'a [ThreadSummary],
         selected: usize,
     },
     ForkPoints {
@@ -62,7 +62,7 @@ impl ComposerMenuState {
                 selected: completion.selected_index(),
             },
             Self::Sessions(picker) if picker.is_visible() => MenuView::Sessions {
-                items: picker.sessions(),
+                items: picker.threads(),
                 selected: picker.selected_index(),
             },
             Self::ForkPoints(picker) if picker.is_visible() => MenuView::ForkPoints {
@@ -106,9 +106,9 @@ impl ComposerMenuState {
         self.session_picker_is_visible() || self.fork_picker_is_visible()
     }
 
-    pub(crate) fn open_sessions(&mut self, sessions: Vec<SessionSummary>) {
+    pub(crate) fn open_threads(&mut self, threads: Vec<ThreadSummary>) {
         let mut picker = SessionPickerState::default();
-        picker.open(sessions);
+        picker.open(threads);
         *self = Self::Sessions(picker);
     }
 
@@ -118,7 +118,7 @@ impl ComposerMenuState {
         *self = Self::ForkPoints(picker);
     }
 
-    pub(crate) fn close_sessions(&mut self) {
+    pub(crate) fn close_threads(&mut self) {
         if matches!(self, Self::Sessions(_)) {
             *self = Self::default();
         }
@@ -133,7 +133,7 @@ impl ComposerMenuState {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{ForkPoint, MessageId, SessionId, SessionSummary};
+    use ash_core::{ForkPoint, MessageId, ThreadId, ThreadSummary};
 
     use super::*;
 
@@ -143,8 +143,8 @@ mod tests {
         menu.sync_commands("/", 1, false);
         assert!(matches!(menu.view(), MenuView::Commands { .. }));
 
-        menu.open_sessions(vec![SessionSummary {
-            session_id: SessionId::new(),
+        menu.open_threads(vec![ThreadSummary {
+            thread_id: ThreadId::new(),
             title: "saved chat".to_string(),
             created_at: "2026-07-28 12:00".to_string(),
         }]);

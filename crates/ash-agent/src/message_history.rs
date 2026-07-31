@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ash_core::SessionId;
+use ash_core::ThreadId;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -10,27 +10,27 @@ const MAX_LOADED_ENTRIES: usize = 1000;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessageHistoryRecord {
-    Submitted { session_id: SessionId, text: String },
-    Undone { session_id: SessionId, text: String },
+    Submitted { thread_id: ThreadId, text: String },
+    Undone { thread_id: ThreadId, text: String },
 }
 
 #[derive(Default)]
 struct MessageHistoryReplay {
-    entries: Vec<(SessionId, String)>,
+    entries: Vec<(ThreadId, String)>,
 }
 
 impl MessageHistoryReplay {
     fn apply(&mut self, record: MessageHistoryRecord) {
         match record {
-            MessageHistoryRecord::Submitted { session_id, text } => {
-                self.entries.push((session_id, text));
+            MessageHistoryRecord::Submitted { thread_id, text } => {
+                self.entries.push((thread_id, text));
             }
-            MessageHistoryRecord::Undone { session_id, text } => {
+            MessageHistoryRecord::Undone { thread_id, text } => {
                 if let Some(index) =
                     self.entries
                         .iter()
-                        .rposition(|(stored_session, stored_text)| {
-                            *stored_session == session_id && stored_text == &text
+                        .rposition(|(stored_thread, stored_text)| {
+                            *stored_thread == thread_id && stored_text == &text
                         })
                 {
                     self.entries.remove(index);
@@ -62,24 +62,20 @@ impl Default for MessageHistoryStore {
 }
 
 impl MessageHistoryStore {
-    pub async fn append(
-        &self,
-        session_id: SessionId,
-        text: &str,
-    ) -> Result<(), ash_core::AshError> {
+    pub async fn append(&self, thread_id: ThreadId, text: &str) -> Result<(), ash_core::AshError> {
         if text.trim().is_empty() {
             return Ok(());
         }
         let entry = MessageHistoryRecord::Submitted {
-            session_id,
+            thread_id,
             text: text.to_string(),
         };
         self.append_entry(&entry).await
     }
 
-    pub async fn undo(&self, session_id: SessionId, text: &str) -> Result<(), ash_core::AshError> {
+    pub async fn undo(&self, thread_id: ThreadId, text: &str) -> Result<(), ash_core::AshError> {
         let entry = MessageHistoryRecord::Undone {
-            session_id,
+            thread_id,
             text: text.to_string(),
         };
         self.append_entry(&entry).await
@@ -135,12 +131,9 @@ mod tests {
         let store = MessageHistoryStore {
             path: directory.path().join("history.jsonl"),
         };
+        store.append(ThreadId::new(), "first prompt").await.unwrap();
         store
-            .append(SessionId::new(), "first prompt")
-            .await
-            .unwrap();
-        store
-            .append(SessionId::new(), "second prompt")
+            .append(ThreadId::new(), "second prompt")
             .await
             .unwrap();
         let contents = tokio::fs::read_to_string(&store.path).await.unwrap();
@@ -158,10 +151,10 @@ mod tests {
         let store = MessageHistoryStore {
             path: directory.path().join("history.jsonl"),
         };
-        let session_id = SessionId::new();
-        store.append(session_id, "first prompt").await.unwrap();
-        store.append(session_id, "second prompt").await.unwrap();
-        store.undo(session_id, "second prompt").await.unwrap();
+        let thread_id = ThreadId::new();
+        store.append(thread_id, "first prompt").await.unwrap();
+        store.append(thread_id, "second prompt").await.unwrap();
+        store.undo(thread_id, "second prompt").await.unwrap();
 
         assert_eq!(store.load().await.unwrap(), vec!["first prompt"]);
     }

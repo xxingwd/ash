@@ -66,21 +66,6 @@ impl Default for AgentId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
-pub struct RunId(Uuid);
-
-impl RunId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for RunId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
 pub struct TurnId(Uuid);
 
 impl TurnId {
@@ -108,17 +93,46 @@ impl Default for TurnId {
     Into,
     derive_more::Display,
 )]
-pub struct SessionId(Uuid);
+pub struct ThreadId(Uuid);
 
-impl SessionId {
+impl ThreadId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 }
 
-impl Default for SessionId {
+impl Default for ThreadId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::str::FromStr for ThreadId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
+pub struct TreeId(Uuid);
+
+impl TreeId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TreeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<ThreadId> for TreeId {
+    fn from(value: ThreadId) -> Self {
+        Self(value.0)
     }
 }
 

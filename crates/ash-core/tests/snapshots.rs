@@ -88,13 +88,13 @@ fn test_text_content_snapshot() {
 
 #[test]
 fn test_event_text_delta_snapshot() {
-    let event = Event::TextDelta("Hello".to_string());
+    let event = EventKind::TextDelta("Hello".to_string());
     assert_json_snapshot!("event_text_delta", event);
 }
 
 #[test]
 fn test_event_tool_call_start_snapshot() {
-    let event = Event::ToolCallStart {
+    let event = EventKind::ToolCallStart {
         id: ToolCallId::new(),
         name: "read".to_string(),
         arguments: serde_json::json!({"path": "README.md"}),
@@ -106,7 +106,7 @@ fn test_event_tool_call_start_snapshot() {
 
 #[test]
 fn test_event_usage_snapshot() {
-    let event = Event::Usage {
+    let event = EventKind::Usage {
         input_tokens: 100,
         output_tokens: 50,
         generation_ms: 1_250,
@@ -117,7 +117,7 @@ fn test_event_usage_snapshot() {
 
 #[test]
 fn test_event_context_compacted_snapshot() {
-    let event = Event::ContextCompacted {
+    let event = EventKind::ContextCompacted {
         before_tokens: 180_000,
         after_tokens: 12_000,
         dropped_messages: 42,
