@@ -31,11 +31,11 @@ impl RenderedLine {
         }
     }
 
-    pub(crate) fn ratatui_line(&self) -> RatatuiLine<'static> {
+    pub(crate) fn ratatui_line(&self) -> RatatuiLine<'_> {
         RatatuiLine::from(
             self.spans
                 .iter()
-                .map(|span| RatatuiSpan::styled(span.text.clone(), span.style))
+                .map(|span| RatatuiSpan::styled(span.text.as_str(), span.style))
                 .collect::<Vec<_>>(),
         )
     }
@@ -43,6 +43,66 @@ impl RenderedLine {
     #[cfg(test)]
     pub(crate) fn plain_text(&self) -> String {
         self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamingMarkdownCache {
+    width: Option<u16>,
+    stable_source_len: usize,
+    stable_lines: Vec<RenderedLine>,
+}
+
+impl StreamingMarkdownCache {
+    pub(crate) fn update(&mut self, source: &str, width: u16) -> Vec<RenderedLine> {
+        let width = width.max(1);
+        if self.width != Some(width) || self.stable_source_len > source.len() {
+            self.width = Some(width);
+            self.stable_source_len = 0;
+            self.stable_lines.clear();
+        }
+
+        let remaining = &source[self.stable_source_len..];
+        if let Some(split) = stable_markdown_split(remaining) {
+            let fragment = render_markdown(&remaining[..split], width);
+            if !fragment.is_empty() {
+                if !self.stable_lines.is_empty() {
+                    self.stable_lines.push(RenderedLine::default());
+                }
+                self.stable_lines.extend(fragment);
+            }
+            self.stable_source_len += split;
+        }
+
+        render_markdown(&source[self.stable_source_len..], width)
+    }
+
+    pub(crate) fn stable_lines(&self) -> &[RenderedLine] {
+        &self.stable_lines
+    }
+
+    pub(crate) fn latest_lines(&self, tail: &[RenderedLine], maximum: usize) -> Vec<RenderedLine> {
+        let has_gap = !self.stable_lines.is_empty() && !tail.is_empty();
+        let total = self
+            .stable_lines
+            .len()
+            .saturating_add(usize::from(has_gap))
+            .saturating_add(tail.len());
+        let start = total.saturating_sub(maximum);
+        (start..total)
+            .filter_map(|index| {
+                if index < self.stable_lines.len() {
+                    return self.stable_lines.get(index).cloned();
+                }
+                if has_gap && index == self.stable_lines.len() {
+                    return Some(RenderedLine::default());
+                }
+                let tail_index = index
+                    .saturating_sub(self.stable_lines.len())
+                    .saturating_sub(usize::from(has_gap));
+                tail.get(tail_index).cloned()
+            })
+            .collect()
     }
 }
 
@@ -371,12 +431,7 @@ impl MarkdownWriter {
     }
 
     fn run(mut self, source: &str) -> Vec<RenderedLine> {
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_STRIKETHROUGH);
-        options.insert(Options::ENABLE_TABLES);
-        options.insert(Options::ENABLE_TASKLISTS);
-
-        for event in Parser::new_ext(source, options) {
+        for event in Parser::new_ext(source, markdown_options()) {
             if self.table.is_some() {
                 if self.handle_table_event(event) {
                     self.finish_table();
@@ -579,12 +634,145 @@ pub(crate) fn render_markdown(source: &str, width: u16) -> Vec<RenderedLine> {
     MarkdownWriter::new(usize::from(width.max(1))).run(source)
 }
 
+fn markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options
+}
+
+fn stable_markdown_split(source: &str) -> Option<usize> {
+    let mut block_depth = 0usize;
+    let mut top_level_starts = Vec::new();
+    let mut contains_html_block = false;
+
+    for (event, range) in Parser::new_ext(source, markdown_options()).into_offset_iter() {
+        match event {
+            MarkdownEvent::Start(tag) if is_block_tag(&tag) => {
+                contains_html_block |= matches!(tag, Tag::HtmlBlock);
+                if block_depth == 0 {
+                    top_level_starts.push(range.start);
+                }
+                block_depth += 1;
+            }
+            MarkdownEvent::End(tag) if is_block_end(tag) => {
+                block_depth = block_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    if contains_html_block {
+        return None;
+    }
+
+    // A blank line prevents an incomplete table row or list continuation from
+    // retroactively changing a block that has already been cached.
+    top_level_starts
+        .get(1..)?
+        .iter()
+        .rev()
+        .copied()
+        .find(|start| follows_blank_line(source, *start))
+}
+
+fn follows_blank_line(source: &str, start: usize) -> bool {
+    let Some(before) = source.get(..start) else {
+        return false;
+    };
+    let before = before.strip_suffix('\n').unwrap_or(before);
+    before
+        .rsplit_once('\n')
+        .map_or(before, |(_, line)| line)
+        .trim_matches([' ', '\t', '\r'])
+        .is_empty()
+}
+
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_block_end(tag: TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn text(lines: &[RenderedLine]) -> Vec<String> {
         lines.iter().map(RenderedLine::plain_text).collect()
+    }
+
+    fn assert_streaming_matches_full(source: &str, width: u16) {
+        let mut cache = StreamingMarkdownCache::default();
+        for (end, _) in source
+            .char_indices()
+            .skip(1)
+            .chain(std::iter::once((source.len(), '\0')))
+        {
+            let prefix = &source[..end];
+            let tail = cache.update(prefix, width);
+            let mut actual = cache.stable_lines().to_vec();
+            if !actual.is_empty() && !tail.is_empty() {
+                actual.push(RenderedLine::default());
+            }
+            actual.extend(tail);
+            assert_eq!(actual, render_markdown(prefix, width), "prefix: {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_cache_matches_full_render_for_block_markdown() {
+        for source in [
+            "## One\n## Two\n\nParagraph with **bold** and `code`.",
+            "> first\n>\n> second\n\nAfter the quote.",
+            "Before\n\n```rust\nfn main() {\n\n}\n```\n\nAfter",
+            "1. First paragraph\n\n   Second paragraph\n\n2. Next item\n\nAfter",
+            "- outer\n  - inner\n  - next\n- final\n\nAfter",
+            "| Name | State |\n|---|---|\n| ash | ready |\n\nAfter",
+            "Before\n\n---\n\nAfter\n\nAnother paragraph",
+            "<section>\nhtml block\n</section>\n\nAfter",
+        ] {
+            assert_streaming_matches_full(source, 40);
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{cell::RefCell, path::PathBuf, sync::Arc};
 
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     history_block::HistoryBlock,
-    markdown::render_markdown,
+    markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{read_group_detail, read_group_summary, tool_call_summary},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
@@ -31,14 +31,19 @@ pub(crate) struct LiveBlock {
 #[derive(Clone, Debug)]
 struct RenderCache {
     width: u16,
+    source_len: Option<usize>,
     buffer: Arc<Buffer>,
+    streaming_markdown: Option<StreamingMarkdownCache>,
 }
 
 #[derive(Clone, Debug)]
 enum LiveBlockKind {
     Welcome(PathBuf),
     History(HistoryBlock),
-    Assistant(String),
+    Assistant {
+        source: String,
+        streaming: bool,
+    },
     Thought {
         elapsed_seconds: u64,
     },
@@ -61,7 +66,13 @@ impl LiveBlock {
     }
 
     pub(crate) fn assistant(id: u64, source: String) -> Self {
-        Self::new(id, LiveBlockKind::Assistant(source))
+        Self::new(
+            id,
+            LiveBlockKind::Assistant {
+                source,
+                streaming: false,
+            },
+        )
     }
 
     pub(crate) fn thought(id: u64, elapsed_seconds: u64) -> Self {
@@ -123,12 +134,24 @@ impl LiveBlock {
     }
 
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
-        let LiveBlockKind::Assistant(current) = &mut self.kind else {
+        let LiveBlockKind::Assistant {
+            source: current,
+            streaming,
+        } = &mut self.kind
+        else {
             return false;
         };
         current.push_str(source);
-        self.invalidate();
+        *streaming = true;
         true
+    }
+
+    pub(crate) fn finalize_markdown(&mut self) {
+        let LiveBlockKind::Assistant { streaming, .. } = &mut self.kind else {
+            return;
+        };
+        *streaming = false;
+        self.invalidate();
     }
 
     pub(crate) fn try_append_tool(
@@ -153,20 +176,54 @@ impl LiveBlock {
 
     pub(crate) fn render(&self, width: u16) -> Arc<Buffer> {
         let width = width.max(1);
+        let source_len = self.source_len();
         if let Some(buffer) = self
             .cache
             .borrow()
             .as_ref()
-            .filter(|cached| cached.width == width)
+            .filter(|cached| cached.width == width && cached.source_len == source_len)
             .map(|cached| Arc::clone(&cached.buffer))
         {
             return buffer;
         }
 
-        let buffer = Arc::new(self.render_uncached(width));
+        let previous = self.cache.borrow_mut().take();
+        let (buffer, streaming_markdown) = match &self.kind {
+            LiveBlockKind::Assistant {
+                source,
+                streaming: true,
+            } => {
+                let previous = previous.filter(|cached| cached.width == width);
+                let (previous_buffer, mut markdown) = previous.map_or_else(
+                    || (None, StreamingMarkdownCache::default()),
+                    |cached| {
+                        (
+                            Some(cached.buffer),
+                            cached.streaming_markdown.unwrap_or_default(),
+                        )
+                    },
+                );
+                let dirty_from = markdown.stable_lines().len();
+                let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
+                let tail = markdown.update(source, content_width);
+                let buffer = update_markdown_buffer(
+                    previous_buffer,
+                    markdown.stable_lines(),
+                    &tail,
+                    Style::default(),
+                    width,
+                    dirty_from,
+                );
+                (buffer, Some(markdown))
+            }
+            _ => (self.render_uncached(width), None),
+        };
+        let buffer = Arc::new(buffer);
         self.cache.replace(Some(RenderCache {
             width,
+            source_len,
             buffer: Arc::clone(&buffer),
+            streaming_markdown,
         }));
         buffer
     }
@@ -179,7 +236,7 @@ impl LiveBlock {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
             LiveBlockKind::History(block) => block.render(width),
-            LiveBlockKind::Assistant(source) => {
+            LiveBlockKind::Assistant { source, .. } => {
                 render_markdown_block(source, Style::default(), width)
             }
             LiveBlockKind::Thought { elapsed_seconds } => render_thought(*elapsed_seconds, width),
@@ -195,6 +252,13 @@ impl LiveBlock {
 
     fn invalidate(&mut self) {
         self.cache.get_mut().take();
+    }
+
+    fn source_len(&self) -> Option<usize> {
+        match &self.kind {
+            LiveBlockKind::Assistant { source, .. } => Some(source.len()),
+            _ => None,
+        }
     }
 }
 
@@ -262,25 +326,110 @@ fn styled_welcome_line(line: &WelcomeLine) -> Line<'static> {
 
 fn render_markdown_block(source: &str, style: Style, width: u16) -> Buffer {
     let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let mut lines = render_markdown(source, content_width);
-    for line in &mut lines {
-        line.patch_style(style);
-    }
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
+    let lines = render_markdown(source, content_width);
+    render_markdown_lines(&[], &lines, style, width)
+}
+
+fn render_markdown_lines(
+    stable: &[RenderedLine],
+    tail: &[RenderedLine],
+    style: Style,
+    width: u16,
+) -> Buffer {
+    let height = u16::try_from(markdown_line_count(stable, tail))
+        .unwrap_or(u16::MAX)
+        .max(1);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
-    for (index, rendered) in lines.iter().take(usize::from(height)).enumerate() {
+    render_markdown_rows(&mut buffer, stable, tail, style, width, 0);
+    buffer
+}
+
+fn update_markdown_buffer(
+    previous: Option<Arc<Buffer>>,
+    stable: &[RenderedLine],
+    tail: &[RenderedLine],
+    style: Style,
+    width: u16,
+    dirty_from: usize,
+) -> Buffer {
+    let width = width.max(1);
+    let height = u16::try_from(markdown_line_count(stable, tail))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let (mut buffer, dirty_from) = match previous
+        .and_then(|buffer| Arc::try_unwrap(buffer).ok())
+        .filter(|buffer| buffer.area.width == width)
+    {
+        Some(buffer) => (buffer, dirty_from),
+        None => (Buffer::empty(Rect::new(0, 0, width, height)), 0),
+    };
+    buffer.area = Rect::new(0, 0, width, height);
+    buffer
+        .content
+        .resize(usize::from(width) * usize::from(height), Cell::EMPTY);
+
+    let dirty_from = dirty_from.min(usize::from(height));
+    let dirty_cell = dirty_from.saturating_mul(usize::from(width));
+    for cell in &mut buffer.content[dirty_cell..] {
+        *cell = Cell::EMPTY;
+    }
+    render_markdown_rows(&mut buffer, stable, tail, style, width, dirty_from);
+    buffer
+}
+
+fn render_markdown_rows(
+    buffer: &mut Buffer,
+    stable: &[RenderedLine],
+    tail: &[RenderedLine],
+    style: Style,
+    width: u16,
+    start: usize,
+) {
+    let height = buffer.area.height;
+    let line_count = markdown_line_count(stable, tail).min(usize::from(height));
+    for index in start..line_count {
         let Ok(y) = u16::try_from(index) else {
             break;
+        };
+        let Some(rendered) = markdown_line(stable, tail, index) else {
+            continue;
         };
         let mut spans = vec![if index == 0 {
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
         } else {
             Span::raw("  ")
         }];
-        spans.extend(rendered.ratatui_line().spans);
+        spans.extend(rendered.ratatui_line().spans.into_iter().map(|mut span| {
+            span.style = span.style.patch(style);
+            span
+        }));
         buffer.set_line(0, y, &Line::from(spans), width);
     }
-    buffer
+}
+
+fn markdown_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
+    stable
+        .len()
+        .saturating_add(usize::from(!stable.is_empty() && !tail.is_empty()))
+        .saturating_add(tail.len())
+}
+
+fn markdown_line<'a>(
+    stable: &'a [RenderedLine],
+    tail: &'a [RenderedLine],
+    index: usize,
+) -> Option<&'a RenderedLine> {
+    if index < stable.len() {
+        return stable.get(index);
+    }
+    let has_gap = !stable.is_empty() && !tail.is_empty();
+    if has_gap && index == stable.len() {
+        return None;
+    }
+    let tail_index = index
+        .saturating_sub(stable.len())
+        .saturating_sub(usize::from(has_gap));
+    tail.get(tail_index)
 }
 
 fn render_tool(name: &str, arguments: &Value, output: &str, is_error: bool, width: u16) -> Buffer {
@@ -426,6 +575,79 @@ mod tests {
         assert!(block.append_markdown_source(" world"));
         let updated = block.render(40);
         assert!(!std::sync::Arc::ptr_eq(&first, &updated));
+    }
+
+    #[test]
+    fn streaming_markdown_matches_full_render_after_each_append() {
+        let chunks = [
+            "## Head",
+            "ing\n\n",
+            "A paragraph with **bo",
+            "ld** and `code`.\n\n",
+            "- first item\n",
+            "- second item\n\n",
+            "```rust\nfn main() {}\n",
+            "```\n\n",
+            "| Name | State |\n|---|---|\n",
+            "| ash | ready |",
+        ];
+        let mut source = String::new();
+        let mut block = LiveBlock::assistant(1, String::new());
+
+        for chunk in chunks {
+            source.push_str(chunk);
+            assert!(block.append_markdown_source(chunk));
+            assert_eq!(
+                block.render(80).as_ref(),
+                &render_markdown_block(&source, Style::default(), 80)
+            );
+        }
+
+        let cache = block.cache.borrow();
+        assert!(cache
+            .as_ref()
+            .and_then(|cache| cache.streaming_markdown.as_ref())
+            .is_some_and(|cache| !cache.stable_lines().is_empty()));
+    }
+
+    #[test]
+    fn streaming_markdown_falls_back_when_a_previous_buffer_is_still_borrowed() {
+        let mut block = LiveBlock::assistant(1, String::new());
+        assert!(block.append_markdown_source("First paragraph.\n\nSecond paragraph."));
+        let retained = block.render(80);
+        assert!(block.append_markdown_source("\n\nThird paragraph."));
+
+        let updated = block.render(80);
+
+        assert!(!Arc::ptr_eq(&retained, &updated));
+        assert_eq!(
+            updated.as_ref(),
+            &render_markdown_block(
+                "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.",
+                Style::default(),
+                80,
+            )
+        );
+    }
+
+    #[test]
+    fn finalizing_stream_reparses_cross_block_reference_links() {
+        let mut block = LiveBlock::assistant(1, String::new());
+        assert!(block.append_markdown_source("Read [the docs][docs].\n\nNext paragraph."));
+        let _ = block.render(80);
+        assert!(block.append_markdown_source("\n\n[docs]: https://example.com/docs"));
+        let _ = block.render(80);
+
+        block.finalize_markdown();
+
+        assert_eq!(
+            block.render(80).as_ref(),
+            &render_markdown_block(
+                "Read [the docs][docs].\n\nNext paragraph.\n\n[docs]: https://example.com/docs",
+                Style::default(),
+                80,
+            )
+        );
     }
 
     #[test]

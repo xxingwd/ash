@@ -3,7 +3,7 @@ use std::time::Instant;
 use ratatui::style::{Modifier, Style};
 
 use crate::{
-    markdown::{render_markdown, RenderedLine},
+    markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::sanitize_terminal_text,
 };
 
@@ -27,6 +27,7 @@ enum StreamMode {
         source: String,
         started_at: Instant,
         lines: Vec<RenderedLine>,
+        markdown_cache: StreamingMarkdownCache,
     },
 }
 
@@ -70,6 +71,7 @@ impl StreamState {
             source: String::new(),
             started_at: Instant::now(),
             lines: Vec::new(),
+            markdown_cache: StreamingMarkdownCache::default(),
         };
         finished
     }
@@ -95,11 +97,17 @@ impl StreamState {
             source,
             started_at,
             lines,
+            markdown_cache,
         } = &mut self.mode
         else {
             return;
         };
-        *lines = render_reasoning_view(source, started_at.elapsed().as_secs(), width);
+        *lines = render_reasoning_view(
+            source,
+            started_at.elapsed().as_secs(),
+            width,
+            markdown_cache,
+        );
     }
 
     pub(crate) fn take_refresh(&mut self) -> Option<StreamRefresh> {
@@ -179,7 +187,12 @@ pub(crate) fn format_elapsed(elapsed_seconds: u64) -> String {
     )
 }
 
-fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<RenderedLine> {
+fn render_reasoning_view(
+    source: &str,
+    elapsed_seconds: u64,
+    width: u16,
+    markdown_cache: &mut StreamingMarkdownCache,
+) -> Vec<RenderedLine> {
     let mut header = render_markdown(
         &format!("Thinking ({})", format_elapsed(elapsed_seconds)),
         width,
@@ -187,14 +200,11 @@ fn render_reasoning_view(source: &str, elapsed_seconds: u64, width: u16) -> Vec<
     for line in &mut header {
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
-    let mut body = render_markdown(source, width);
-    while body.first().is_some_and(RenderedLine::is_blank) {
-        body.remove(0);
-    }
+    let tail = markdown_cache.update(source, width);
+    let mut body = markdown_cache.latest_lines(&tail, MAX_VISIBLE_REASONING_LINES);
     while body.last().is_some_and(RenderedLine::is_blank) {
         body.pop();
     }
-    body = body.split_off(body.len().saturating_sub(MAX_VISIBLE_REASONING_LINES));
     for line in &mut body {
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
@@ -215,7 +225,12 @@ mod tests {
 
     #[test]
     fn reasoning_view_keeps_a_timed_header_and_scrolls_the_latest_five_lines() {
-        let lines = render_reasoning_view("one\ntwo\nthree\nfour\nfive\nsix", 3, 80);
+        let lines = render_reasoning_view(
+            "one\ntwo\nthree\nfour\nfive\nsix",
+            3,
+            80,
+            &mut StreamingMarkdownCache::default(),
+        );
         let text = lines
             .iter()
             .map(RenderedLine::plain_text)
@@ -228,7 +243,12 @@ mod tests {
 
     #[test]
     fn reasoning_view_counts_wrapped_rows_toward_the_five_line_window() {
-        let lines = render_reasoning_view("12345\n67890\nabc\ndef", 3, 3);
+        let lines = render_reasoning_view(
+            "12345\n67890\nabc\ndef",
+            3,
+            3,
+            &mut StreamingMarkdownCache::default(),
+        );
         let text = lines
             .iter()
             .map(RenderedLine::plain_text)
@@ -239,7 +259,7 @@ mod tests {
 
     #[test]
     fn reasoning_view_uses_the_completed_thought_style() {
-        let lines = render_reasoning_view("detail", 3, 80);
+        let lines = render_reasoning_view("detail", 3, 80, &mut StreamingMarkdownCache::default());
         for line in &lines {
             for span in line.ratatui_line().spans {
                 assert!(span.style.add_modifier.contains(Modifier::DIM));

@@ -689,7 +689,11 @@ impl TerminalUi {
     fn commit_finished_stream(&mut self, finished: Option<FinishedStream>) {
         match finished {
             Some(FinishedStream::Assistant { pending, block_id }) => {
-                let _ = self.append_assistant(pending, block_id);
+                if let Some(id) = self.append_assistant(pending, block_id) {
+                    if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+                        block.finalize_markdown();
+                    }
+                }
             }
             Some(FinishedStream::Thought { elapsed_seconds }) => {
                 self.push_thought_block(elapsed_seconds)
