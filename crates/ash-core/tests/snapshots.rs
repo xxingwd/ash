@@ -93,6 +93,21 @@ fn test_event_text_delta_snapshot() {
 }
 
 #[test]
+fn test_event_envelope_snapshot() {
+    let event = Event {
+        thread_id: ThreadId::new(),
+        turn_id: Some(TurnId::new()),
+        sequence: 3,
+        timestamp: "2026-07-31T06:15:28Z".to_string(),
+        kind: EventKind::TextDelta("Hello".to_string()),
+    };
+    assert_json_snapshot!("event_envelope", event, {
+        ".thread_id" => "[uuid]",
+        ".turn_id" => "[uuid]",
+    });
+}
+
+#[test]
 fn test_event_tool_call_start_snapshot() {
     let event = EventKind::ToolCallStart {
         id: ToolCallId::new(),

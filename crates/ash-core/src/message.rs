@@ -156,13 +156,13 @@ pub enum Role {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
     Image { media_type: String, data: Vec<u8> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
 pub enum ContentBlock {
     Text(String),
     Thought {
@@ -176,7 +176,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
 pub enum MessageContent {
     User(Vec<Content>),
     Assistant(Vec<ContentBlock>),
@@ -187,7 +187,7 @@ pub enum MessageContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
     pub role: Role,

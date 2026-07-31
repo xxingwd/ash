@@ -17,6 +17,7 @@ pub mod thread;
 
 pub(crate) use agent::RunConfig;
 pub use agent::{Agent, ThreadOptions, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_CONTEXT_TOKENS};
+pub use ash_core::Event;
 pub use context::{count_tokens, estimate_tokens};
 pub use context_policy::{
     CodingContextPolicy, ContextPolicy, ContextRequest, ContextUpdate, PassthroughContextPolicy,
@@ -29,7 +30,7 @@ pub use log::{AcceptedInput, ContextCheckpoint, Record, ThreadLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;
-pub use runtime::{Event, Runtime};
+pub use runtime::Runtime;
 pub use skill::{tool as skill_tool, Skill};
 pub use store::{SharedThreadStore, StoredThread, ThreadMetadata, ThreadStore, Version};
 pub(crate) use thread::ThreadState;

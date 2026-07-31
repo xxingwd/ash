@@ -1,22 +1,11 @@
 use std::sync::Arc;
 
-use ash_core::{Message, ModelClient, ThreadId, ThreadSummary, TurnId};
-use serde::{Deserialize, Serialize};
+use ash_core::{Message, ModelClient, ThreadId, ThreadSummary};
 
 use crate::{
     agent::RunConfig, Agent, Extension, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
     ThreadState, ThreadStore, TurnContext, TurnOutcome, TurnPatch,
 };
-
-/// A routed event emitted by a thread. `sequence` is monotonic within one thread.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Event {
-    pub thread_id: ThreadId,
-    pub turn_id: Option<TurnId>,
-    pub sequence: u64,
-    pub timestamp: String,
-    pub kind: ash_core::EventKind,
-}
 
 /// Provider-neutral dependencies and the only entry point for creating threads.
 #[derive(Clone)]

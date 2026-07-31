@@ -2,7 +2,17 @@ use derive_more::Display;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{AgentId, Message, MessageId, ThreadId, ToolCallId};
+use crate::message::{AgentId, Message, MessageId, ThreadId, ToolCallId, TurnId};
+
+/// A routed event emitted by a thread. `sequence` is monotonic within one thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub thread_id: ThreadId,
+    pub turn_id: Option<TurnId>,
+    pub sequence: u64,
+    pub timestamp: String,
+    pub kind: EventKind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadSummary {
@@ -17,7 +27,7 @@ pub struct ForkPoint {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, EnumAsInner)]
 pub enum EventKind {
     TextDelta(String),
     ToolCallStart {
