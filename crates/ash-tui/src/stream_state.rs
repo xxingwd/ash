@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use ratatui::style::{Modifier, Style};
 
@@ -20,7 +20,8 @@ enum StreamMode {
     #[default]
     Idle,
     Assistant {
-        pending: String,
+        incomplete: String,
+        queued_lines: VecDeque<String>,
         block_id: Option<u64>,
     },
     Reasoning {
@@ -56,7 +57,8 @@ impl StreamState {
         }
         let finished = self.finish();
         self.mode = StreamMode::Assistant {
-            pending: String::new(),
+            incomplete: String::new(),
+            queued_lines: VecDeque::new(),
             block_id: None,
         };
         finished
@@ -77,11 +79,19 @@ impl StreamState {
     }
 
     pub(crate) fn push_assistant(&mut self, delta: &str) {
-        let StreamMode::Assistant { pending, .. } = &mut self.mode else {
+        let StreamMode::Assistant {
+            incomplete,
+            queued_lines,
+            ..
+        } = &mut self.mode
+        else {
             return;
         };
-        pending.push_str(&sanitize_terminal_text(delta));
-        self.dirty = true;
+        incomplete.push_str(&sanitize_terminal_text(delta));
+        if let Some(last_newline) = incomplete.rfind('\n') {
+            let completed = incomplete.drain(..=last_newline).collect::<String>();
+            queued_lines.extend(completed.split_inclusive('\n').map(str::to_owned));
+        }
     }
 
     pub(crate) fn push_reasoning(&mut self, delta: &str) {
@@ -111,18 +121,21 @@ impl StreamState {
     }
 
     pub(crate) fn take_refresh(&mut self) -> Option<StreamRefresh> {
-        if !std::mem::take(&mut self.dirty) {
-            return None;
-        }
         match &mut self.mode {
-            StreamMode::Assistant { pending, block_id } if !pending.is_empty() => {
-                Some(StreamRefresh::Assistant {
-                    pending: std::mem::take(pending),
+            StreamMode::Assistant {
+                queued_lines,
+                block_id,
+                ..
+            } => queued_lines
+                .pop_front()
+                .map(|pending| StreamRefresh::Assistant {
+                    pending,
                     block_id: *block_id,
-                })
+                }),
+            StreamMode::Reasoning { .. } if std::mem::take(&mut self.dirty) => {
+                Some(StreamRefresh::Reasoning)
             }
-            StreamMode::Reasoning { .. } => Some(StreamRefresh::Reasoning),
-            StreamMode::Idle | StreamMode::Assistant { .. } => None,
+            StreamMode::Idle | StreamMode::Reasoning { .. } => None,
         }
     }
 
@@ -145,7 +158,11 @@ impl StreamState {
 
     pub(crate) fn has_content(&self) -> bool {
         match &self.mode {
-            StreamMode::Assistant { pending, .. } => !pending.is_empty(),
+            StreamMode::Assistant {
+                incomplete,
+                queued_lines,
+                ..
+            } => !incomplete.is_empty() || !queued_lines.is_empty(),
             StreamMode::Reasoning { source, .. } => !source.trim().is_empty(),
             StreamMode::Idle => false,
         }
@@ -155,7 +172,15 @@ impl StreamState {
         self.dirty = false;
         match std::mem::take(&mut self.mode) {
             StreamMode::Idle => None,
-            StreamMode::Assistant { pending, block_id } => {
+            StreamMode::Assistant {
+                incomplete,
+                queued_lines,
+                block_id,
+            } => {
+                let pending = queued_lines
+                    .into_iter()
+                    .chain(std::iter::once(incomplete))
+                    .collect();
                 Some(FinishedStream::Assistant { pending, block_id })
             }
             StreamMode::Reasoning {
@@ -284,6 +309,47 @@ mod tests {
         ));
         assert!(stream.is_reasoning());
         assert!(stream.active_lines().is_empty());
+    }
+
+    #[test]
+    fn assistant_waits_for_a_newline_before_refreshing() {
+        let mut stream = StreamState::default();
+        stream.start_assistant();
+
+        stream.push_assistant("first");
+        assert!(stream.take_refresh().is_none());
+
+        stream.push_assistant(" line\nsecond\nthird");
+        assert!(matches!(
+            stream.take_refresh(),
+            Some(StreamRefresh::Assistant { pending, .. }) if pending == "first line\n"
+        ));
+        assert!(matches!(
+            stream.take_refresh(),
+            Some(StreamRefresh::Assistant { pending, .. }) if pending == "second\n"
+        ));
+        assert!(stream.take_refresh().is_none());
+        assert!(matches!(
+            stream.finish(),
+            Some(FinishedStream::Assistant { pending, .. }) if pending == "third"
+        ));
+    }
+
+    #[test]
+    fn assistant_drains_one_complete_line_per_refresh() {
+        let mut stream = StreamState::default();
+        stream.start_assistant();
+        stream.push_assistant("one\ntwo\nthree\n");
+
+        let lines = (0..3)
+            .filter_map(|_| match stream.take_refresh() {
+                Some(StreamRefresh::Assistant { pending, .. }) => Some(pending),
+                Some(StreamRefresh::Reasoning) | None => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, ["one\n", "two\n", "three\n"]);
+        assert!(stream.take_refresh().is_none());
     }
 
     #[test]

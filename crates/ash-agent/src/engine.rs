@@ -34,25 +34,10 @@ struct CollectedResponse {
     outcome: ResponseOutcome,
 }
 
-enum StreamTermination {
-    Completed(StopReason),
-    Cancelled,
-    Failed(ash_core::ProtocolError),
-}
-
 enum ResponseOutcome {
     Finished(StopReason),
-    ToolCalls {
-        calls: Vec<PendingToolCall>,
-        after_tools: AfterToolCalls,
-    },
+    ToolCalls(Vec<PendingToolCall>),
     Failed(ash_core::ProtocolError),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AfterToolCalls {
-    Continue,
-    Abort,
 }
 
 pub(crate) struct CompactedHistory {
@@ -119,24 +104,6 @@ impl TurnExecution {
             tx,
             cancel,
             steering,
-        }
-    }
-}
-
-impl StreamTermination {
-    fn resolve(self, calls: Vec<PendingToolCall>) -> ResponseOutcome {
-        match (self, calls.is_empty()) {
-            (Self::Completed(reason), true) => ResponseOutcome::Finished(reason),
-            (Self::Completed(_), false) => ResponseOutcome::ToolCalls {
-                calls,
-                after_tools: AfterToolCalls::Continue,
-            },
-            (Self::Cancelled, true) => ResponseOutcome::Finished(StopReason::Aborted),
-            (Self::Cancelled, false) => ResponseOutcome::ToolCalls {
-                calls,
-                after_tools: AfterToolCalls::Abort,
-            },
-            (Self::Failed(error), _) => ResponseOutcome::Failed(error),
         }
     }
 }
@@ -299,19 +266,21 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 messages.push(message);
             }
 
+            let mut stop_reason = None;
             match outcome {
-                ResponseOutcome::Finished(reason) => {
-                    if !self.apply_steering(messages).await? {
-                        return Ok(reason);
-                    }
-                }
+                ResponseOutcome::Finished(reason) => stop_reason = Some(reason),
                 ResponseOutcome::Failed(error) => return Err(error.into()),
-                ResponseOutcome::ToolCalls { calls, after_tools } => {
+                ResponseOutcome::ToolCalls(calls) => {
                     self.execute_tool_calls(messages, calls).await?;
-                    if after_tools == AfterToolCalls::Abort || self.cancel.is_cancelled() {
+                    if self.cancel.is_cancelled() {
                         return Ok(StopReason::Aborted);
                     }
-                    self.apply_steering(messages).await?;
+                }
+            }
+            let has_steering = self.apply_steering(messages).await?;
+            if let Some(reason) = stop_reason {
+                if !has_steering {
+                    return Ok(reason);
                 }
             }
         }
@@ -510,14 +479,16 @@ async fn collect_response(
 ) -> CollectedResponse {
     let mut blocks = Vec::new();
     let mut thought_started_at = None;
-    let mut termination = StreamTermination::Completed(StopReason::EndTurn);
+    let mut stop_reason = StopReason::EndTurn;
+    let mut cancelled = false;
+    let mut failure = None;
     let mut usage = UsageAccumulator::default();
     let mut first_output_at = None;
 
     loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => {
-                termination = StreamTermination::Cancelled;
+                cancelled = true;
                 None
             },
             next = stream.next() => next,
@@ -528,7 +499,7 @@ async fn collect_response(
         let item = match item {
             Ok(item) => item,
             Err(stream_error) => {
-                termination = StreamTermination::Failed(stream_error);
+                failure = Some(stream_error);
                 break;
             }
         };
@@ -573,12 +544,12 @@ async fn collect_response(
                 input_tokens,
                 output_tokens,
             } => usage.record(input_tokens, output_tokens),
-            ModelStreamEvent::Stop(reason) => termination = StreamTermination::Completed(reason),
+            ModelStreamEvent::Stop(reason) => stop_reason = reason,
         }
     }
     finish_open_thought(&mut blocks, &mut thought_started_at);
 
-    let calls = blocks
+    let calls: Vec<PendingToolCall> = blocks
         .iter()
         .filter_map(|block| match block {
             ContentBlock::ToolCall {
@@ -598,6 +569,18 @@ async fn collect_response(
         role: Role::Assistant,
         content: MessageContent::Assistant(blocks),
     });
+    let outcome = if let Some(error) = failure {
+        ResponseOutcome::Failed(error)
+    } else if calls.is_empty() {
+        ResponseOutcome::Finished(if cancelled {
+            StopReason::Aborted
+        } else {
+            stop_reason
+        })
+    } else {
+        ResponseOutcome::ToolCalls(calls)
+    };
+
     CollectedResponse {
         message,
         usage: UsageAccumulator {
@@ -610,7 +593,7 @@ async fn collect_response(
             .unwrap_or(u64::MAX),
             ..usage
         },
-        outcome: termination.resolve(calls),
+        outcome,
     }
 }
 

@@ -805,15 +805,9 @@ fn render_command_menu(
     selected: usize,
     buffer: &mut Buffer,
 ) {
-    let visible = usize::from(area.height).min(items.len());
-    if visible == 0 {
+    let Some(window) = menu_window(items.len(), selected, usize::from(area.height)) else {
         return;
-    }
-    let selected = selected.min(items.len().saturating_sub(1));
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible)
-        .min(items.len().saturating_sub(visible));
+    };
     let name_width = items
         .iter()
         .map(|item| UnicodeWidthStr::width(item.name))
@@ -822,17 +816,21 @@ fn render_command_menu(
     let description_column = COMMAND_NAME_PREFIX_COLUMNS
         .saturating_add(name_width)
         .saturating_add(MENU_COLUMN_GAP);
-    for (offset, item) in items[start..start + visible].iter().enumerate() {
-        let index = start + offset;
+    for (offset, item) in items[window.start..window.end()].iter().enumerate() {
+        let index = window.start + offset;
         let selected_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let style = if index == selected {
+        let style = if index == window.selected {
             selected_style
         } else {
             Style::default()
         };
-        let prefix = if index == selected { "› " } else { "  " };
+        let prefix = if index == window.selected {
+            "› "
+        } else {
+            "  "
+        };
         let mut spans = vec![Span::styled(
             format!("{prefix}/{:<name_width$}", item.name),
             style,
@@ -858,21 +856,19 @@ fn render_session_menu(
     selected: usize,
     buffer: &mut Buffer,
 ) {
-    let visible = usize::from(area.height).min(threads.len());
-    if visible == 0 {
+    let Some(window) = menu_window(threads.len(), selected, usize::from(area.height)) else {
         return;
-    }
-    let selected = selected.min(threads.len().saturating_sub(1));
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible)
-        .min(threads.len().saturating_sub(visible));
-    for (offset, session) in threads[start..start + visible].iter().enumerate() {
-        let index = start + offset;
+    };
+    for (offset, session) in threads[window.start..window.end()].iter().enumerate() {
+        let index = window.start + offset;
         let selected_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let prefix = if index == selected { "› " } else { "  " };
+        let prefix = if index == window.selected {
+            "› "
+        } else {
+            "  "
+        };
         let created_width = UnicodeWidthStr::width(session.created_at.as_str());
         let show_created = usize::from(area.width)
             > created_width.saturating_add(SESSION_CREATED_MIN_LEFT_COLUMNS);
@@ -886,7 +882,7 @@ fn render_session_menu(
         };
         let title = truncate_end(&session.title, title_width);
         let title_used = UnicodeWidthStr::width(title.as_str());
-        let style = if index == selected {
+        let style = if index == window.selected {
             selected_style
         } else {
             Style::default()
@@ -911,26 +907,24 @@ fn render_session_menu(
 }
 
 fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &mut Buffer) {
-    let visible = usize::from(area.height).min(points.len());
-    if visible == 0 {
+    let Some(window) = menu_window(points.len(), selected, usize::from(area.height)) else {
         return;
-    }
-    let selected = selected.min(points.len().saturating_sub(1));
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible)
-        .min(points.len().saturating_sub(visible));
+    };
     let prompt_width = usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS);
-    for (offset, point) in points[start..start + visible].iter().enumerate() {
-        let index = start + offset;
-        let style = if index == selected {
+    for (offset, point) in points[window.start..window.end()].iter().enumerate() {
+        let index = window.start + offset;
+        let style = if index == window.selected {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let prefix = if index == selected { "› " } else { "  " };
+        let prefix = if index == window.selected {
+            "› "
+        } else {
+            "  "
+        };
         let prompt = sanitize_single_line(&point.prompt);
         let line = Line::from(vec![
             Span::styled(prefix, style),
@@ -941,6 +935,35 @@ fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &
             .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
         buffer.set_line(area.x, y, &line, area.width);
     }
+}
+
+struct MenuWindow {
+    start: usize,
+    visible: usize,
+    selected: usize,
+}
+
+impl MenuWindow {
+    fn end(&self) -> usize {
+        self.start + self.visible
+    }
+}
+
+fn menu_window(items_len: usize, selected: usize, max_visible: usize) -> Option<MenuWindow> {
+    let visible = max_visible.min(items_len);
+    if visible == 0 {
+        return None;
+    }
+    let selected = selected.min(items_len.saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(items_len.saturating_sub(visible));
+    Some(MenuWindow {
+        start,
+        visible,
+        selected,
+    })
 }
 
 #[cfg(test)]
@@ -1026,6 +1049,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1077,6 +1101,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         };
         let baseline = render(input);
@@ -1140,6 +1165,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         };
         let baseline = render(input);
@@ -1203,6 +1229,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1233,6 +1260,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1265,6 +1293,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1302,6 +1331,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1339,6 +1369,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1377,6 +1408,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1417,6 +1449,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 
@@ -1460,6 +1493,7 @@ mod tests {
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
             context_estimated: false,
+
             context_limit: None,
         });
 

@@ -64,6 +64,19 @@ enum Command {
     },
 }
 
+impl Command {
+    fn defer_while_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Rollback(_)
+                | Self::Compact(_)
+                | Self::Messages(_)
+                | Self::ForkPoints(_)
+                | Self::Fork { .. }
+        )
+    }
+}
+
 impl Thread {
     pub(crate) fn spawn(state: ThreadState) -> Self {
         let id = state.id();
@@ -341,9 +354,11 @@ async fn run_turn(
 }
 
 async fn handle_idle_command(state: &mut ThreadState, command: Command, queues: &mut ActorQueues) {
+    let command = match enqueue_immediate(command, queues) {
+        Ok(()) => return,
+        Err(command) => command,
+    };
     match command {
-        Command::Submit(turn) => queues.turns.push_back(turn),
-        Command::Notify(input) => queues.inbox.push(input),
         Command::Steer { reply, .. } => {
             let _ = reply.send(Err(ash_core::AshError::Config(
                 "the target turn is no longer active".to_string(),
@@ -374,6 +389,9 @@ async fn handle_idle_command(state: &mut ThreadState, command: Command, queues: 
             });
             let _ = reply.send(result);
         }
+        Command::Submit(_) | Command::Notify(_) => {
+            unreachable!("immediate commands are queued before idle handling")
+        }
     }
 }
 
@@ -383,9 +401,15 @@ fn handle_active_command(
     queues: &mut ActorQueues,
     steer: &mpsc::UnboundedSender<Input>,
 ) {
+    if command.defer_while_active() {
+        queues.commands.push_back(command);
+        return;
+    }
+    let command = match enqueue_immediate(command, queues) {
+        Ok(()) => return,
+        Err(command) => command,
+    };
     match command {
-        Command::Submit(turn) => queues.turns.push_back(turn),
-        Command::Notify(input) => queues.inbox.push(input),
         Command::Steer {
             turn_id,
             input,
@@ -399,22 +423,23 @@ fn handle_active_command(
                 "the target turn is not active".to_string(),
             )));
         }
-        Command::Rollback(reply) => {
-            queues.commands.push_back(Command::Rollback(reply));
-        }
-        Command::Compact(reply) => {
-            queues.commands.push_back(Command::Compact(reply));
-        }
-        Command::Messages(reply) => {
-            queues.commands.push_back(Command::Messages(reply));
-        }
-        Command::ForkPoints(reply) => {
-            queues.commands.push_back(Command::ForkPoints(reply));
-        }
-        command @ Command::Fork { .. } => {
-            queues.commands.push_back(command);
-        }
+        Command::Submit(_)
+        | Command::Notify(_)
+        | Command::Rollback(_)
+        | Command::Compact(_)
+        | Command::Messages(_)
+        | Command::ForkPoints(_)
+        | Command::Fork { .. } => unreachable!("active command routing handles this variant first"),
     }
+}
+
+fn enqueue_immediate(command: Command, queues: &mut ActorQueues) -> Result<(), Command> {
+    match command {
+        Command::Submit(turn) => queues.turns.push_back(turn),
+        Command::Notify(input) => queues.inbox.push(input),
+        command => return Err(command),
+    }
+    Ok(())
 }
 
 fn publish(
