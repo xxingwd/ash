@@ -58,6 +58,9 @@ pub enum EventKind {
         protocol: String,
         working_dir: std::path::PathBuf,
         messages: Vec<Message>,
+        /// Estimated token count of the restored context (local estimate;
+        /// no API usage is available for a restored session).
+        context_tokens: Option<u64>,
     },
     ThreadsListed {
         threads: Vec<ThreadSummary>,
@@ -71,9 +74,13 @@ pub enum EventKind {
         working_dir: std::path::PathBuf,
         messages: Vec<Message>,
         prompt: String,
+        /// Estimated token count of the forked context (local estimate).
+        context_tokens: Option<u64>,
     },
     TurnRolledBack {
         prompt: String,
+        /// Estimated token count of the context after rollback.
+        context_tokens: Option<u64>,
     },
     ContextCompacted {
         before_tokens: u64,

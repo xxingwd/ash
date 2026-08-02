@@ -70,6 +70,8 @@ impl TurnUsage {
 
 #[derive(Debug, Default)]
 struct UsageState {
+    /// Latest known model-context size: an API-reported usage value when
+    /// available, otherwise a local estimate (resume, fork, rollback, compact).
     context_tokens: Option<u64>,
     context_estimated: bool,
     turn: TurnUsage,
@@ -97,6 +99,14 @@ impl UsageState {
     }
 
     fn set_compacted_context(&mut self, tokens: u64) {
+        self.context_tokens = Some(tokens);
+        self.context_estimated = true;
+    }
+
+    /// Record a locally estimated context size (restore, fork, rollback) so
+    /// the status line reflects current occupancy before any API usage is
+    /// reported for the new history.
+    fn set_estimated_context(&mut self, tokens: u64) {
         self.context_tokens = Some(tokens);
         self.context_estimated = true;
     }
@@ -343,6 +353,13 @@ impl TerminalUi {
         self.redraw()
     }
 
+    /// Update the status-line context occupancy after a rollback, without
+    /// clearing the transcript (unlike `restore_session`).
+    pub fn record_rollback_context(&mut self, tokens: u64) -> io::Result<()> {
+        self.usage.set_estimated_context(tokens);
+        self.redraw()
+    }
+
     pub fn start_new_session(&mut self) -> io::Result<()> {
         self.begin_fresh_viewport()?;
         self.enqueue_welcome();
@@ -378,11 +395,18 @@ impl TerminalUi {
         protocol: &str,
         model: &str,
         working_dir: &Path,
+        context_tokens: Option<u64>,
     ) -> io::Result<()> {
         self.begin_fresh_viewport()?;
         self.session.update(protocol, model, working_dir);
         self.enqueue_welcome();
         self.push_restored_messages(messages);
+        // `begin_fresh_viewport` resets usage; restore the estimated context
+        // size so the status line reflects current occupancy before any API
+        // usage is reported for the new history.
+        if let Some(tokens) = context_tokens {
+            self.usage.set_estimated_context(tokens);
+        }
         self.commit_transcript_to_scrollback()
     }
 
@@ -1047,6 +1071,14 @@ mod tests {
         assert_eq!(turn.input_tokens, 250);
         assert_eq!(turn.output_tokens, 50);
         assert_eq!(turn.generation_ms, 1_000);
+    }
+
+    #[test]
+    fn estimated_context_sets_tokens() {
+        let mut usage = UsageState::default();
+        usage.set_estimated_context(42_000);
+        assert_eq!(usage.context_tokens, Some(42_000));
+        assert!(usage.context_estimated);
     }
 
     #[test]

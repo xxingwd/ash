@@ -4,7 +4,7 @@ use ash_core::{ModelId, Tool, TreeId};
 
 use crate::ContextPolicy;
 
-pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 200_000;
+pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
 
 /// Immutable behavior shared by every thread that runs this agent.

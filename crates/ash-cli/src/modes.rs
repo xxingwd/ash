@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
-    ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
+    build_system_prompt, estimate_request_tokens, skill_tool, Agent, MessageHistoryStore, Runtime,
+    Skill, Thread, ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_core::{CancellationToken, EventKind, MessageId, ModelId, ThreadId, TurnId};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
@@ -335,7 +335,16 @@ impl InteractiveController {
                 if let Err(error) = self.history_store.undo(self.thread.id(), &prompt).await {
                     tracing::warn!(%error, "failed to undo input history entry");
                 }
-                EventKind::TurnRolledBack { prompt }
+                let context_tokens = self
+                    .thread
+                    .messages()
+                    .await
+                    .ok()
+                    .and_then(|messages| self.estimated_context_tokens(&messages));
+                EventKind::TurnRolledBack {
+                    prompt,
+                    context_tokens,
+                }
             }
             Ok(None) => EventKind::Error("No submitted turn is available to undo.".to_string()),
             Err(error) => EventKind::Error(format!("Failed to undo the last turn: {error}")),
@@ -372,6 +381,19 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
+    /// Estimate the model-context size for a given message history, using the
+    /// same estimator the runtime uses when the API does not report usage.
+    fn estimated_context_tokens(&self, messages: &[ash_core::Message]) -> Option<u64> {
+        let tools = self
+            .agent
+            .tools
+            .iter()
+            .map(|tool| tool.definition())
+            .collect::<Vec<_>>();
+        let tokens = estimate_request_tokens(self.agent.system_prompt.as_deref(), messages, &tools);
+        u64::try_from(tokens).ok()
+    }
+
     async fn resume_thread(&mut self, thread_id: ThreadId) {
         let event = match self
             .runtime
@@ -385,6 +407,7 @@ impl InteractiveController {
                         model: self.agent.model.as_str().to_string(),
                         protocol: self.runtime.model_backend().to_string(),
                         working_dir: self.options.working_dir.clone(),
+                        context_tokens: self.estimated_context_tokens(&messages),
                         messages,
                     },
                     Err(error) => EventKind::Error(format!("Failed to restore chat: {error}")),
@@ -404,6 +427,7 @@ impl InteractiveController {
                     model: forked.model,
                     protocol: forked.protocol,
                     working_dir: forked.working_dir,
+                    context_tokens: self.estimated_context_tokens(&forked.messages),
                     messages: forked.messages,
                     prompt: forked.prompt,
                 }
@@ -422,8 +446,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_context_limit_defaults_to_200k() {
-        assert_eq!(resolve_max_context_tokens(None).unwrap(), 200_000);
+    fn model_context_limit_defaults_to_one_million() {
+        // DeepSeek-V4 serves a 1M-token context window; that is the default
+        // budget we reserve for the model context projection.
+        assert_eq!(resolve_max_context_tokens(None).unwrap(), 1_000_000);
         assert_eq!(resolve_max_context_tokens(Some(64_000)).unwrap(), 64_000);
         assert!(resolve_max_context_tokens(Some(0)).is_err());
     }

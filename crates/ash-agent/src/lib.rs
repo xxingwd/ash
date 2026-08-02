@@ -18,7 +18,7 @@ pub mod thread;
 pub(crate) use agent::RunConfig;
 pub use agent::{Agent, ThreadOptions, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_CONTEXT_TOKENS};
 pub use ash_core::Event;
-pub use context::{count_tokens, estimate_tokens};
+pub use context::{count_tokens, estimate_request_tokens, estimate_tokens};
 pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PassthroughContextPolicy,
     PreparedContext,

@@ -10,6 +10,7 @@ use crossterm::event::{
 use futures::StreamExt;
 
 use crate::{
+    fork_picker::ForkPickerState,
     inline::{TerminalUi, TerminalView},
     input::InputState,
     menu::ComposerMenuState,
@@ -17,10 +18,12 @@ use crate::{
         AgentStart, BackgroundAction, Cancellation, EventRoute, FailureCompletion, OperationState,
         RollbackCompletion, SubmissionPolicy, TurnCompletion,
     },
-    slash_command::{self, ParsedInput, SlashCommand},
+    session_picker::SessionPickerState,
+    slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
 };
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Pace complete assistant lines so streaming remains readable rather than tracking every delta.
+const STREAM_COMMIT_INTERVAL: Duration = Duration::from_millis(45);
 const STATUS_INTERVAL: Duration = Duration::from_millis(350);
 const MOUSE_SCROLL_ROWS: u16 = 3;
 
@@ -52,17 +55,45 @@ enum LoopAction {
 }
 
 #[derive(Clone, Copy)]
-enum SessionPickerAction {
+enum PickerAction<T> {
     KeepOpen,
     Close,
-    Resume(ThreadId),
+    Confirm(T),
 }
 
-#[derive(Clone, Copy)]
-enum ForkPickerAction {
-    KeepOpen,
-    Close,
-    Fork(MessageId),
+trait PickerNavigation {
+    fn move_up(&mut self);
+    fn move_down(&mut self);
+}
+
+impl PickerNavigation for SessionPickerState {
+    fn move_up(&mut self) {
+        SessionPickerState::move_up(self);
+    }
+
+    fn move_down(&mut self) {
+        SessionPickerState::move_down(self);
+    }
+}
+
+impl PickerNavigation for ForkPickerState {
+    fn move_up(&mut self) {
+        ForkPickerState::move_up(self);
+    }
+
+    fn move_down(&mut self) {
+        ForkPickerState::move_down(self);
+    }
+}
+
+impl PickerNavigation for CommandCompletionState {
+    fn move_up(&mut self) {
+        CommandCompletionState::move_up(self);
+    }
+
+    fn move_down(&mut self) {
+        CommandCompletionState::move_down(self);
+    }
 }
 
 impl AppState {
@@ -150,9 +181,11 @@ impl App {
         )?;
         let mut state = AppState::new(std::mem::take(&mut self.input_history));
         let mut keys = EventStream::new();
-        let mut render_tick =
-            tokio::time::interval_at(tokio::time::Instant::now() + FRAME_INTERVAL, FRAME_INTERVAL);
-        render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stream_commit_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + STREAM_COMMIT_INTERVAL,
+            STREAM_COMMIT_INTERVAL,
+        );
+        stream_commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut status_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + STATUS_INTERVAL,
             STATUS_INTERVAL,
@@ -163,7 +196,7 @@ impl App {
 
         loop {
             tokio::select! {
-                _ = render_tick.tick(), if state.operation.shows_activity() => terminal.refresh_content()?,
+                _ = stream_commit_tick.tick(), if state.operation.shows_activity() => terminal.refresh_content()?,
                 _ = status_tick.tick(), if state.operation.shows_activity() => terminal.refresh_status()?,
                 event = events.next() => {
                     let Some(event) = event else { break };
@@ -178,7 +211,7 @@ impl App {
                     match handle_agent_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
-                            render_tick.reset();
+                            stream_commit_tick.reset();
                             status_tick.reset();
                         }
                         LoopAction::Exit => break,
@@ -190,7 +223,7 @@ impl App {
                     match handle_terminal_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
-                            render_tick.reset();
+                            stream_commit_tick.reset();
                             status_tick.reset();
                         }
                         LoopAction::Exit => break,
@@ -279,13 +312,19 @@ async fn handle_agent_event(
                 }
             }
         }
-        EventKind::TurnRolledBack { prompt } => {
+        EventKind::TurnRolledBack {
+            prompt,
+            context_tokens,
+        } => {
             let rollback = state.operation.finish_rollback();
             if state.input.text() != prompt {
                 state.input.restore_submission(prompt);
             }
             if rollback == RollbackCompletion::ReplayViewport {
                 terminal.rollback_turn()?;
+            }
+            if let Some(tokens) = context_tokens {
+                terminal.record_rollback_context(tokens)?;
             }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -310,10 +349,11 @@ async fn handle_agent_event(
             protocol,
             working_dir,
             messages,
+            context_tokens,
         } => {
             state.menu.close_picker();
             state.operation.finish();
-            terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
+            terminal.restore_session(&messages, &protocol, &model, &working_dir, context_tokens)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -347,10 +387,11 @@ async fn handle_agent_event(
             working_dir,
             messages,
             prompt,
+            context_tokens,
         } => {
             state.menu.close_picker();
             state.operation.finish_background(BackgroundAction::Fork);
-            terminal.restore_session(&messages, &protocol, &model, &working_dir)?;
+            terminal.restore_session(&messages, &protocol, &model, &working_dir, context_tokens)?;
             state.input.set_text(prompt);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -401,31 +442,28 @@ fn handle_mouse(
     terminal: &mut TerminalUi,
     mouse: crossterm::event::MouseEvent,
 ) -> anyhow::Result<LoopAction> {
-    if let Some(threads) = state.menu.visible_session_picker_mut() {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => threads.move_up(),
-            MouseEventKind::ScrollDown => threads.move_down(),
-            _ => return Ok(LoopAction::Continue),
+    if let Some(should_render) =
+        picker_mouse_action(state.menu.visible_session_picker_mut(), mouse.kind)
+    {
+        if should_render {
+            state.render(terminal)?;
         }
-        state.render(terminal)?;
         return Ok(LoopAction::Continue);
     }
-    if let Some(points) = state.menu.visible_fork_picker_mut() {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => points.move_up(),
-            MouseEventKind::ScrollDown => points.move_down(),
-            _ => return Ok(LoopAction::Continue),
+    if let Some(should_render) =
+        picker_mouse_action(state.menu.visible_fork_picker_mut(), mouse.kind)
+    {
+        if should_render {
+            state.render(terminal)?;
         }
-        state.render(terminal)?;
         return Ok(LoopAction::Continue);
     }
-    if let Some(completion) = state.menu.visible_completion_mut() {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => completion.move_up(),
-            MouseEventKind::ScrollDown => completion.move_down(),
-            _ => return Ok(LoopAction::Continue),
+    if let Some(should_render) =
+        picker_mouse_action(state.menu.visible_completion_mut(), mouse.kind)
+    {
+        if should_render {
+            state.render(terminal)?;
         }
-        state.render(terminal)?;
         return Ok(LoopAction::Continue);
     }
 
@@ -444,6 +482,23 @@ fn handle_mouse(
         _ => {}
     }
     Ok(LoopAction::Continue)
+}
+
+fn picker_mouse_action(
+    picker: Option<&mut impl PickerNavigation>,
+    kind: MouseEventKind,
+) -> Option<bool> {
+    let picker = picker?;
+    Some(scroll_picker(picker, kind))
+}
+
+fn scroll_picker(picker: &mut impl PickerNavigation, kind: MouseEventKind) -> bool {
+    match kind {
+        MouseEventKind::ScrollUp => picker.move_up(),
+        MouseEventKind::ScrollDown => picker.move_down(),
+        _ => return false,
+    }
+    true
 }
 
 async fn handle_key(
@@ -533,40 +588,20 @@ async fn handle_session_key(
     let Some(threads) = state.menu.visible_session_picker_mut() else {
         return Ok(LoopAction::Continue);
     };
-    let action = match key.code {
-        KeyCode::Esc => SessionPickerAction::Close,
-        KeyCode::Up => {
-            threads.move_up();
-            SessionPickerAction::KeepOpen
-        }
-        KeyCode::Down => {
-            threads.move_down();
-            SessionPickerAction::KeepOpen
-        }
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            threads.move_up();
-            SessionPickerAction::KeepOpen
-        }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            threads.move_down();
-            SessionPickerAction::KeepOpen
-        }
-        KeyCode::Enter => match threads.selected_thread_id() {
-            Some(thread_id) => SessionPickerAction::Resume(thread_id),
-            None => SessionPickerAction::Close,
-        },
-        _ => return Ok(LoopAction::Continue),
+    let Some(action) = picker_key_action(threads, key, SessionPickerState::selected_thread_id)
+    else {
+        return Ok(LoopAction::Continue);
     };
     match action {
-        SessionPickerAction::KeepOpen => {}
-        SessionPickerAction::Close => state.menu.close_threads(),
-        SessionPickerAction::Resume(_) => {
+        PickerAction::KeepOpen => {}
+        PickerAction::Close => state.menu.close_threads(),
+        PickerAction::Confirm(_) => {
             state.menu.close_threads();
             state.operation.start_background(BackgroundAction::Resume);
         }
     }
     state.render(terminal)?;
-    let SessionPickerAction::Resume(thread_id) = action else {
+    let PickerAction::Confirm(thread_id) = action else {
         return Ok(LoopAction::Continue);
     };
     if commands
@@ -588,40 +623,19 @@ async fn handle_fork_key(
     let Some(points) = state.menu.visible_fork_picker_mut() else {
         return Ok(LoopAction::Continue);
     };
-    let action = match key.code {
-        KeyCode::Esc => ForkPickerAction::Close,
-        KeyCode::Up => {
-            points.move_up();
-            ForkPickerAction::KeepOpen
-        }
-        KeyCode::Down => {
-            points.move_down();
-            ForkPickerAction::KeepOpen
-        }
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            points.move_up();
-            ForkPickerAction::KeepOpen
-        }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            points.move_down();
-            ForkPickerAction::KeepOpen
-        }
-        KeyCode::Enter => match points.selected_message_id() {
-            Some(message_id) => ForkPickerAction::Fork(message_id),
-            None => ForkPickerAction::Close,
-        },
-        _ => return Ok(LoopAction::Continue),
+    let Some(action) = picker_key_action(points, key, ForkPickerState::selected_message_id) else {
+        return Ok(LoopAction::Continue);
     };
     match action {
-        ForkPickerAction::KeepOpen => {}
-        ForkPickerAction::Close => state.menu.close_picker(),
-        ForkPickerAction::Fork(_) => {
+        PickerAction::KeepOpen => {}
+        PickerAction::Close => state.menu.close_picker(),
+        PickerAction::Confirm(_) => {
             state.menu.close_picker();
             state.operation.start_background(BackgroundAction::Fork);
         }
     }
     state.render(terminal)?;
-    let ForkPickerAction::Fork(message_id) = action else {
+    let PickerAction::Confirm(message_id) = action else {
         return Ok(LoopAction::Continue);
     };
     if commands
@@ -632,6 +646,42 @@ async fn handle_fork_key(
         return Ok(LoopAction::Exit);
     }
     Ok(LoopAction::Continue)
+}
+
+fn picker_key_action<P, T>(
+    picker: &mut P,
+    key: KeyEvent,
+    selected: impl FnOnce(&P) -> Option<T>,
+) -> Option<PickerAction<T>>
+where
+    P: PickerNavigation,
+    T: Copy,
+{
+    match key.code {
+        KeyCode::Esc => Some(PickerAction::Close),
+        KeyCode::Up => {
+            picker.move_up();
+            Some(PickerAction::KeepOpen)
+        }
+        KeyCode::Down => {
+            picker.move_down();
+            Some(PickerAction::KeepOpen)
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.move_up();
+            Some(PickerAction::KeepOpen)
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.move_down();
+            Some(PickerAction::KeepOpen)
+        }
+        KeyCode::Enter => Some(
+            selected(picker)
+                .map(PickerAction::Confirm)
+                .unwrap_or(PickerAction::Close),
+        ),
+        _ => None,
+    }
 }
 
 fn handle_completion_key(

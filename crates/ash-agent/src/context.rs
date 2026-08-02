@@ -90,7 +90,12 @@ pub fn count_output_tokens(message: &Message) -> usize {
     estimate_character_count(message_characters(message, ThoughtAccounting::Include))
 }
 
-pub(crate) fn estimate_request_tokens(
+/// Estimate the token count of a full request: system prompt + tools + messages.
+///
+/// This is the single estimation entry point used both at runtime (when the
+/// API does not report usage) and when recomputing the current context size
+/// after restore, rollback, or fork.
+pub fn estimate_request_tokens(
     system_prompt: Option<&str>,
     messages: &[Message],
     tools: &[ToolDefinition],
