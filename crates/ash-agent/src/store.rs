@@ -1,8 +1,20 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ash_core::{ModelId, ThreadId, ThreadSummary};
+use serde::{Deserialize, Serialize};
 
 use crate::{Record, ThreadLog};
+
+/// Whether a thread belongs to the interactive root session or to a spawned
+/// sub-agent. Sub-agent threads are hidden from the session list and cannot
+/// be resumed as root sessions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    #[default]
+    Root,
+    Subagent,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Version(u64);
@@ -38,6 +50,7 @@ pub struct ThreadMetadata {
     pub max_turns: u32,
     pub max_context_tokens: usize,
     pub max_tool_duration: Duration,
+    pub kind: ThreadKind,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +93,10 @@ pub(crate) struct ThreadPersistence {
     store: SharedThreadStore,
     thread_id: ThreadId,
     version: Version,
+    /// Records appended through this persistence handle. The caller replays
+    /// them into its in-memory log so it stays in sync without reloading the
+    /// thread from disk.
+    appended: Vec<Record>,
 }
 
 impl ThreadPersistence {
@@ -88,6 +105,7 @@ impl ThreadPersistence {
             store,
             thread_id,
             version,
+            appended: Vec::new(),
         }
     }
 
@@ -95,11 +113,16 @@ impl ThreadPersistence {
         self.version
     }
 
+    pub(crate) fn take_appended(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.appended)
+    }
+
     pub(crate) async fn append(&mut self, records: &[Record]) -> Result<(), ash_core::AshError> {
         self.version = self
             .store
             .append(self.thread_id, self.version, records)
             .await?;
+        self.appended.extend(records.iter().cloned());
         Ok(())
     }
 }

@@ -2,14 +2,13 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use ash_agent::{Agent, Input, InputSource, Runtime, Thread, ThreadOptions};
 use ash_core::{
-    define_tool, CancellationToken, ContentBlock, Message, MessageContent, StopReason, ThreadId,
-    Tool, ToolContext, ToolError, TreeId,
+    define_tool, CancellationToken, ContentBlock, Message, MessageContent, StopReason,
+    SubagentSnapshot, SubagentState, ThreadId, Tool, ToolContext, ToolError, TreeId,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 3;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
 const COLLABORATION_TOOL_NAMES: [&str; 6] = [
@@ -111,7 +110,7 @@ impl AgentSpawner for InheritedAgentSpawner {
             tool_timeout: self.scope.tool_timeout,
             path: request.task_name,
             tree_id: Some(request.tree_id),
-            metadata: self.scope.metadata.clone(),
+            metadata: subagent_metadata(&self.scope.metadata),
         };
         Ok(ChildAgent {
             runtime: self.runtime.clone(),
@@ -120,6 +119,16 @@ impl AgentSpawner for InheritedAgentSpawner {
             history: request.messages,
         })
     }
+}
+
+/// Stamp the child thread with the `kind=subagent` marker so its persisted
+/// record stays hidden from the session list and cannot be resumed.
+fn subagent_metadata(
+    base: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = base.clone();
+    metadata.insert("kind".to_string(), serde_json::json!("subagent"));
+    metadata
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -145,6 +154,29 @@ pub struct AgentSnapshot {
     pub error: Option<String>,
 }
 
+impl From<AgentSnapshot> for SubagentSnapshot {
+    fn from(snapshot: AgentSnapshot) -> Self {
+        Self {
+            task_name: snapshot.task_name,
+            agent_type: snapshot.agent_type.name().to_string(),
+            state: snapshot.status.into(),
+            last_task_message: snapshot.last_task_message,
+        }
+    }
+}
+
+impl From<AgentStatus> for SubagentState {
+    fn from(status: AgentStatus) -> Self {
+        match status {
+            AgentStatus::Pending => Self::Pending,
+            AgentStatus::Running => Self::Running,
+            AgentStatus::Completed => Self::Completed,
+            AgentStatus::Interrupted => Self::Interrupted,
+            AgentStatus::Errored => Self::Errored,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentControl {
     inner: Arc<ControlInner>,
@@ -153,8 +185,9 @@ pub struct AgentControl {
 struct ControlInner {
     state: Mutex<ControlState>,
     updates: Notify,
-    max_concurrent_children: usize,
+    max_concurrent_children: Option<usize>,
     spawner: Option<Arc<dyn AgentSpawner>>,
+    subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
 }
 
 pub struct SpawnRequest {
@@ -497,31 +530,57 @@ impl ForkMode {
 
 impl Default for AgentControl {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_CHILDREN)
+        Self::new(None)
     }
 }
 
 impl AgentControl {
-    pub fn new(max_concurrent_children: usize) -> Self {
+    pub fn new(max_concurrent_children: Option<usize>) -> Self {
         Self::new_with_spawner(max_concurrent_children, None)
     }
 
-    pub fn with_spawner(max_concurrent_children: usize, spawner: Arc<dyn AgentSpawner>) -> Self {
+    pub fn with_spawner(
+        max_concurrent_children: Option<usize>,
+        spawner: Arc<dyn AgentSpawner>,
+    ) -> Self {
         Self::new_with_spawner(max_concurrent_children, Some(spawner))
     }
 
     fn new_with_spawner(
-        max_concurrent_children: usize,
+        max_concurrent_children: Option<usize>,
         spawner: Option<Arc<dyn AgentSpawner>>,
     ) -> Self {
+        let (subagent_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(ControlInner {
                 state: Mutex::new(ControlState::default()),
                 updates: Notify::new(),
                 max_concurrent_children,
                 spawner,
+                subagent_tx,
             }),
         }
+    }
+
+    /// Subscribe to display-oriented snapshots of every sub-agent managed by
+    /// this control. The receiver is updated whenever a sub-agent is spawned,
+    /// transitions state, or receives a follow-up message.
+    pub fn subscribe(&self) -> watch::Receiver<Vec<SubagentSnapshot>> {
+        self.inner.subagent_tx.subscribe()
+    }
+
+    /// Publish the current sub-agent snapshots to subscribers.
+    async fn publish(&self) {
+        let state = self.inner.state.lock().await;
+        let snapshots = state
+            .threads
+            .values()
+            .flat_map(|session| session.agents.values())
+            .map(ChildRecord::snapshot)
+            .map(SubagentSnapshot::from)
+            .collect();
+        drop(state);
+        let _ = self.inner.subagent_tx.send(snapshots);
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -642,11 +701,12 @@ impl AgentControl {
         {
             let mut state = self.inner.state.lock().await;
             let session = state.threads.entry(context.agent.tree_id).or_default();
-            if session.active_count() >= self.inner.max_concurrent_children {
-                return Err(ToolError::Execution(format!(
-                    "maximum of {} concurrent sub-agents reached",
-                    self.inner.max_concurrent_children
-                )));
+            if let Some(max) = self.inner.max_concurrent_children {
+                if session.active_count() >= max {
+                    return Err(ToolError::Execution(format!(
+                        "maximum of {max} concurrent sub-agents reached"
+                    )));
+                }
             }
             if session
                 .agents
@@ -680,6 +740,7 @@ impl AgentControl {
                 .await;
         });
         self.inner.updates.notify_waiters();
+        self.publish().await;
 
         json_output(&serde_json::json!({
             "agent_id": id,
@@ -721,17 +782,21 @@ impl AgentControl {
                 &target,
             )?;
             if delivery.needs_new_slot(&record.state)
-                && active_count >= self.inner.max_concurrent_children
+                && self
+                    .inner
+                    .max_concurrent_children
+                    .is_some_and(|max| active_count >= max)
             {
                 return Err(ToolError::Execution(format!(
                     "maximum of {} concurrent sub-agents reached",
-                    self.inner.max_concurrent_children
+                    self.inner.max_concurrent_children.unwrap_or_default()
                 )));
             }
             record.prepare_delivery(delivery, &args.message);
             permit.send(delivery.command(args.message));
         }
         self.inner.updates.notify_waiters();
+        self.publish().await;
         json_output(&serde_json::json!({
             "target": target,
             "queued": true,
@@ -878,7 +943,9 @@ impl AgentControl {
                         error: error.to_string(),
                     },
                 );
+                drop(state);
                 self.inner.updates.notify_waiters();
+                self.publish().await;
                 return;
             }
         };
@@ -895,6 +962,7 @@ impl AgentControl {
             record.state = ChildState::Running(cancel.clone());
         }
         self.inner.updates.notify_waiters();
+        self.publish().await;
 
         let result = turn.wait().await;
         let final_message = thread
@@ -917,15 +985,21 @@ impl AgentControl {
         }
         drop(state);
         self.inner.updates.notify_waiters();
+        self.publish().await;
     }
 }
 
-pub fn install_subagent_tools(agent: &mut Agent, options: ThreadOptions, runtime: Runtime) {
+pub fn install_subagent_tools(
+    agent: &mut Agent,
+    options: ThreadOptions,
+    runtime: Runtime,
+    max_concurrent_children: Option<usize>,
+) -> Option<Arc<AgentControl>> {
     if COLLABORATION_TOOL_NAMES
         .iter()
         .all(|name| agent.tools.iter().any(|tool| tool.name() == *name))
     {
-        return;
+        return None;
     }
     agent
         .tools
@@ -941,8 +1015,9 @@ pub fn install_subagent_tools(agent: &mut Agent, options: ThreadOptions, runtime
         definition: agent.clone(),
         scope: options,
     });
-    let control = AgentControl::with_spawner(DEFAULT_MAX_CONCURRENT_CHILDREN, spawner);
+    let control = AgentControl::with_spawner(max_concurrent_children, spawner);
     agent.tools.extend(control.tools());
+    Some(Arc::new(control))
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -1160,17 +1235,26 @@ mod tests {
         })
     }
 
-    fn test_control(model: Arc<dyn ModelClient>, max_turns: u32) -> AgentControl {
+    fn test_control(
+        model: Arc<dyn ModelClient>,
+        max_turns: u32,
+    ) -> (AgentControl, tempfile::TempDir) {
+        // Keep test thread files out of the real data directory
+        // (`~/.local/share/ash/threads`); the returned TempDir stays alive for
+        // the whole test so spawned sub-agents keep a valid store.
+        let directory = tempfile::TempDir::new().expect("create temp thread directory");
+        let runtime = Runtime::new(model, "test")
+            .with_thread_store(Arc::new(ash_agent::JsonlThreadStore::new(directory.path())));
         let mut agent = test_agent();
         agent.max_turns = max_turns;
         let options = test_options();
         let spawner = Arc::new(InheritedAgentSpawner {
-            runtime: Runtime::new(model, "test"),
+            runtime,
             system_prompt: agent.system_prompt.clone(),
             definition: agent,
             scope: options,
         });
-        AgentControl::with_spawner(DEFAULT_MAX_CONCURRENT_CHILDREN, spawner)
+        (AgentControl::with_spawner(None, spawner), directory)
     }
 
     #[test]
@@ -1186,8 +1270,8 @@ mod tests {
         let mut agent = test_agent();
         let options = test_options();
         let runtime = Runtime::new(test_model(None), "test");
-        install_subagent_tools(&mut agent, options.clone(), runtime.clone());
-        install_subagent_tools(&mut agent, options, runtime);
+        install_subagent_tools(&mut agent, options.clone(), runtime.clone(), None);
+        install_subagent_tools(&mut agent, options, runtime, None);
         let names = agent
             .tools
             .iter()
@@ -1550,7 +1634,7 @@ mod tests {
             requests
         });
 
-        let control = test_control(test_model(Some(format!("http://{address}"))), 2);
+        let (control, _directory) = test_control(test_model(Some(format!("http://{address}"))), 2);
         let tree_id = TreeId::new();
         let context = ToolContext {
             thread_id: ThreadId::new(),
@@ -1629,5 +1713,161 @@ mod tests {
         assert!(requests[0].contains("Inspect the parser."));
         assert!(requests[1].contains("child done"));
         assert!(requests[1].contains("Confirm the finding."));
+    }
+
+    /// Answers each accepted connection with a single completed model response
+    /// and returns the base URL plus a handle to the collected request bodies.
+    async fn mock_model_server(
+        responses: &[&str],
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let (address_tx, address_rx) = tokio::sync::oneshot::channel();
+        let responses = responses
+            .iter()
+            .map(|answer| answer.to_string())
+            .collect::<Vec<_>>();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let _ = address_tx.send(address);
+            let mut requests = Vec::new();
+            for answer in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let body = format!(
+                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{answer}\"}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+        let address = address_rx.await.unwrap();
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn subscribers_receive_subagent_snapshot_updates() {
+        let (base_url, _server) = mock_model_server(&["child done"]).await;
+        let (control, _directory) = test_control(test_model(Some(base_url)), 1);
+        let tree_id = TreeId::new();
+        let mut snapshots = control.subscribe();
+        let context = ToolContext {
+            thread_id: ThreadId::new(),
+            turn_id: ash_core::TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            agent: AgentToolContext {
+                tree_id,
+                path: "/root".to_string(),
+                messages: vec![Message::user("delegate this")],
+            },
+        };
+        control
+            .spawn(
+                context,
+                SpawnAgentArgs {
+                    task_name: "inspect".to_string(),
+                    message: "Inspect the parser.".to_string(),
+                    agent_type: Some(AgentRole::Explorer),
+                    fork_turns: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if snapshots.has_changed().unwrap_or(false) {
+                    let latest = snapshots.borrow_and_update();
+                    if latest.iter().any(|snapshot| {
+                        snapshot.task_name == "/root/inspect"
+                            && snapshot.agent_type == "explorer"
+                            && snapshot.state == SubagentState::Completed
+                    }) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sub-agent snapshots never reached Completed");
+    }
+
+    #[tokio::test]
+    async fn default_configuration_allows_more_than_three_concurrent_subagents() {
+        let (base_url, _server) = mock_model_server(&["a", "b", "c", "d"]).await;
+        let (control, _directory) = test_control(test_model(Some(base_url)), 1);
+        let tree_id = TreeId::new();
+        let context = ToolContext {
+            thread_id: ThreadId::new(),
+            turn_id: ash_core::TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            agent: AgentToolContext {
+                tree_id,
+                path: "/root".to_string(),
+                messages: vec![Message::user("delegate this")],
+            },
+        };
+        for index in 0..4 {
+            control
+                .spawn(
+                    context.clone(),
+                    SpawnAgentArgs {
+                        task_name: format!("worker_{index}"),
+                        message: format!("Do task {index}."),
+                        agent_type: None,
+                        fork_turns: None,
+                    },
+                )
+                .await
+                .expect("spawning a fourth concurrent sub-agent should not be limited by default");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let agents = control.snapshots(tree_id, None).await;
+                if agents.len() == 4
+                    && agents
+                        .iter()
+                        .all(|agent| agent.status == AgentStatus::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all four sub-agents should complete");
     }
 }

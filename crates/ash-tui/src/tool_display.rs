@@ -9,14 +9,6 @@ pub(crate) fn read_group_detail(name: &str, arguments: &Value) -> Option<String>
     (name == "read").then(|| path_argument(arguments))
 }
 
-pub(crate) fn tool_activity_summary(name: &str, arguments: &Value, max_width: u16) -> String {
-    let phrase = tool_phrase(name, arguments);
-    truncate_end(
-        &join_parts(phrase.running, &phrase.detail),
-        usize::from(max_width.max(1)),
-    )
-}
-
 pub(crate) fn tool_call_summary(
     name: &str,
     arguments: &Value,
@@ -52,7 +44,6 @@ pub(crate) fn read_group_summary(details: &[String], max_width: u16) -> (String,
 }
 
 struct ToolPhrase {
-    running: &'static str,
     completed: &'static str,
     failed: &'static str,
     detail: String,
@@ -60,62 +51,41 @@ struct ToolPhrase {
 
 fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     match name {
-        "read" => phrase("Reading", "Read", "reading", path_argument(arguments)),
-        "write" => phrase("Writing", "Wrote", "writing", path_argument(arguments)),
-        "edit" => phrase("Editing", "Edited", "editing", path_argument(arguments)),
-        "glob" => phrase(
-            "Finding",
-            "Found",
-            "finding",
-            string_argument(arguments, "pattern"),
-        ),
+        "read" => phrase("Read", "reading", path_argument(arguments)),
+        "write" => phrase("Wrote", "writing", path_argument(arguments)),
+        "edit" => phrase("Edited", "editing", path_argument(arguments)),
+        "glob" => phrase("Found", "finding", string_argument(arguments, "pattern")),
         "grep" => phrase(
-            "Searching",
             "Searched",
             "searching",
             string_argument(arguments, "pattern"),
         ),
-        "webfetch" => phrase("Fetching", "Fetched", "fetching", url_argument(arguments)),
-        "bash" => phrase(
-            "Running",
-            "Ran",
-            "running",
-            string_argument(arguments, "command"),
-        ),
-        "skill" => phrase(
-            "Loading",
-            "Loaded",
-            "loading",
-            string_argument(arguments, "name"),
-        ),
+        "webfetch" => phrase("Fetched", "fetching", url_argument(arguments)),
+        "bash" => phrase("Ran", "running", string_argument(arguments, "command")),
+        "skill" => phrase("Loaded", "loading", string_argument(arguments, "name")),
         "spawn_agent" => phrase(
-            "Spawning",
             "Spawned",
             "spawning",
             string_argument(arguments, "task_name"),
         ),
         "send_message" => phrase(
-            "Messaging",
             "Messaged",
             "messaging",
             string_argument(arguments, "target"),
         ),
         "followup_task" => phrase(
-            "Continuing",
             "Continued",
             "continuing",
             string_argument(arguments, "target"),
         ),
         "interrupt_agent" => phrase(
-            "Interrupting",
             "Interrupted",
             "interrupting",
             string_argument(arguments, "target"),
         ),
-        "list_agents" => phrase("Listing", "Listed", "listing", "agents".to_string()),
-        "wait_agent" => phrase("Waiting", "Waited", "waiting", "for agents".to_string()),
+        "list_agents" => phrase("Listed", "listing", "agents".to_string()),
+        "wait_agent" => phrase("Waited", "waiting", "for agents".to_string()),
         _ => phrase(
-            "Running",
             "Ran",
             "running",
             sanitize_single_line(name).replace('_', " "),
@@ -123,14 +93,8 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     }
 }
 
-fn phrase(
-    running: &'static str,
-    completed: &'static str,
-    failed: &'static str,
-    detail: String,
-) -> ToolPhrase {
+fn phrase(completed: &'static str, failed: &'static str, detail: String) -> ToolPhrase {
     ToolPhrase {
-        running,
         completed,
         failed,
         detail,

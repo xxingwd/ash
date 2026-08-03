@@ -519,6 +519,9 @@ impl ThreadState {
         let Some(stored) = self.store.load(thread_id).await? else {
             return Ok(false);
         };
+        if stored.metadata.kind == crate::ThreadKind::Subagent {
+            return Ok(false);
+        }
         self.restore(stored);
         Ok(true)
     }
@@ -666,23 +669,15 @@ impl ThreadState {
         )
         .await;
         self.version = persistence.version();
+        // Replay what this turn appended into the in-memory log instead of
+        // reloading the thread from disk (which scans the whole directory and
+        // visibly delays `TurnCompleted` after the last delta).
+        let appended = persistence.take_appended();
         drop(persistence);
-        let completed_messages = match self.store.load(self.id).await {
-            Ok(Some(stored)) => stored.log.messages(),
-            Ok(None) => {
-                let error = thread_closed();
-                if result.is_ok() {
-                    result = Err(error);
-                }
-                self.log.messages()
-            }
-            Err(error) => {
-                if result.is_ok() {
-                    result = Err(error);
-                }
-                self.log.messages()
-            }
-        };
+        for record in appended {
+            self.log.push(record);
+        }
+        let completed_messages = self.log.messages();
         let status = match &result {
             Ok(reason) => TurnStatus::Completed(reason.clone()),
             Err(error) => TurnStatus::Failed(error.to_string()),
@@ -707,15 +702,6 @@ impl ThreadState {
             },
         };
         let terminal_result = self.append(&[terminal]).await;
-        match self.store.load(self.id).await {
-            Ok(Some(stored)) => {
-                self.log = stored.log;
-                self.version = stored.version;
-            }
-            Err(error) if result.is_ok() => return Err(error),
-            Ok(None) if result.is_ok() => return Err(thread_closed()),
-            Ok(None) | Err(_) => {}
-        }
         if let Err(error) = terminal_result {
             if result.is_ok() {
                 return Err(error);
@@ -809,6 +795,23 @@ fn thread_metadata(config: &RunConfig, runtime: &Runtime, thread_id: ThreadId) -
         max_turns: config.max_turns,
         max_context_tokens: config.max_context_tokens,
         max_tool_duration: config.max_tool_duration,
+        kind: thread_kind(config),
+    }
+}
+
+/// Read the thread-kind marker from `ThreadOptions.metadata`. The
+/// collaboration layer stamps `"kind": "subagent"` when spawning a child so
+/// its thread stays out of the session list.
+pub(crate) fn thread_kind(config: &RunConfig) -> crate::ThreadKind {
+    if config
+        .metadata
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("subagent")
+    {
+        crate::ThreadKind::Subagent
+    } else {
+        crate::ThreadKind::Root
     }
 }
 

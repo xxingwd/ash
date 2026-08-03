@@ -30,6 +30,8 @@ pub(crate) struct FileMetadata {
     pub max_turns: u32,
     pub max_context_tokens: usize,
     pub tool_timeout_ms: u64,
+    #[serde(default)]
+    pub kind: crate::ThreadKind,
 }
 
 impl FileMetadata {
@@ -52,6 +54,7 @@ impl FileMetadata {
             max_context_tokens: config.max_context_tokens,
             tool_timeout_ms: u64::try_from(config.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
+            kind: config_kind(config),
         }
     }
 
@@ -68,7 +71,22 @@ impl FileMetadata {
             max_context_tokens: metadata.max_context_tokens,
             tool_timeout_ms: u64::try_from(metadata.max_tool_duration.as_millis())
                 .unwrap_or(u64::MAX),
+            kind: metadata.kind,
         }
+    }
+}
+
+#[cfg(test)]
+fn config_kind(config: &RunConfig) -> crate::ThreadKind {
+    if config
+        .metadata
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("subagent")
+    {
+        crate::ThreadKind::Subagent
+    } else {
+        crate::ThreadKind::Root
     }
 }
 
@@ -528,7 +546,9 @@ impl ThreadStore for JsonlThreadStore {
             .await?
             .into_iter()
             .filter(|stored| {
-                stored.has_user_message() && Some(stored.metadata.thread_id) != excluded_thread
+                stored.metadata.kind != crate::ThreadKind::Subagent
+                    && stored.has_user_message()
+                    && Some(stored.metadata.thread_id) != excluded_thread
             })
             .map(|stored| thread_summary(&stored))
             .collect())
@@ -545,6 +565,7 @@ fn thread_metadata(metadata: &FileMetadata) -> ThreadMetadata {
         max_turns: metadata.max_turns,
         max_context_tokens: metadata.max_context_tokens,
         max_tool_duration: std::time::Duration::from_millis(metadata.tool_timeout_ms),
+        kind: metadata.kind,
     }
 }
 
@@ -893,5 +914,56 @@ mod tests {
         assert_eq!(summaries[0].thread_id, thread_id);
         assert_eq!(summaries[0].title, "First thread title with details");
         assert_eq!(summaries[0].created_at.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn hides_subagent_threads_from_the_session_list() {
+        let directory = TempDir::new().unwrap();
+        let threads_dir = directory.path().join("threads");
+        let root_id = ThreadId::new();
+        let subagent_id = ThreadId::new();
+        let cfg = config(directory.path().to_path_buf());
+        let metadata = |id: ThreadId, kind: crate::ThreadKind| ThreadMetadata {
+            thread_id: id,
+            model_backend: "custom".to_string(),
+            model: cfg.model.clone(),
+            working_dir: cfg.working_dir.clone(),
+            system_prompt: cfg.system_prompt.clone(),
+            max_turns: cfg.max_turns,
+            max_context_tokens: cfg.max_context_tokens,
+            max_tool_duration: cfg.max_tool_duration,
+            kind,
+        };
+        let records = |id: ThreadId| {
+            vec![Record::Message(Message {
+                id: ash_core::MessageId::new(),
+                role: ash_core::Role::User,
+                content: ash_core::MessageContent::User(vec![ash_core::Content::Text(format!(
+                    "task {id}"
+                ))]),
+            })]
+        };
+
+        let store = JsonlThreadStore::new(threads_dir);
+        store
+            .create(
+                metadata(root_id, crate::ThreadKind::Root),
+                &records(root_id),
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                metadata(subagent_id, crate::ThreadKind::Subagent),
+                &records(subagent_id),
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list(None).await.unwrap();
+        assert!(listed.iter().any(|summary| summary.thread_id == root_id));
+        assert!(!listed
+            .iter()
+            .any(|summary| summary.thread_id == subagent_id));
     }
 }

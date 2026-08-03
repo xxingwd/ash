@@ -1,3 +1,4 @@
+mod ansi;
 pub mod app;
 mod block_layout;
 mod buffer;

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{EventKind, MessageId, ThreadId};
+use ash_core::{EventKind, MessageId, SubagentSnapshot, ThreadId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -23,7 +23,6 @@ use crate::{
 };
 
 /// Pace complete assistant lines so streaming remains readable rather than tracking every delta.
-const STREAM_COMMIT_INTERVAL: Duration = Duration::from_millis(45);
 const STATUS_INTERVAL: Duration = Duration::from_millis(350);
 const MOUSE_SCROLL_ROWS: u16 = 3;
 
@@ -46,6 +45,8 @@ struct AppState {
     operation: OperationState,
     menu: ComposerMenuState,
     pending_inputs: VecDeque<String>,
+    subagent_rx: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
+    subagents: Vec<SubagentSnapshot>,
 }
 
 enum LoopAction {
@@ -103,6 +104,17 @@ impl AppState {
             operation: OperationState::default(),
             menu: ComposerMenuState::default(),
             pending_inputs: VecDeque::new(),
+            subagent_rx: None,
+            subagents: Vec::new(),
+        }
+    }
+
+    fn refresh_subagents(&mut self) {
+        let Some(receiver) = &mut self.subagent_rx else {
+            return;
+        };
+        if receiver.has_changed().unwrap_or(false) {
+            self.subagents = receiver.borrow_and_update().clone();
         }
     }
 
@@ -145,6 +157,7 @@ pub struct App {
     working_dir: PathBuf,
     context_limit: Option<u64>,
     input_history: Vec<String>,
+    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
 }
 
 impl App {
@@ -155,6 +168,7 @@ impl App {
             working_dir,
             context_limit: None,
             input_history: Vec::new(),
+            subagent_monitor: None,
         }
     }
 
@@ -165,6 +179,14 @@ impl App {
 
     pub fn with_input_history(mut self, input_history: Vec<String>) -> Self {
         self.input_history = input_history;
+        self
+    }
+
+    pub fn with_subagent_monitor(
+        mut self,
+        subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
+    ) -> Self {
+        self.subagent_monitor = subagent_monitor;
         self
     }
 
@@ -180,12 +202,8 @@ impl App {
             self.context_limit,
         )?;
         let mut state = AppState::new(std::mem::take(&mut self.input_history));
+        state.subagent_rx = self.subagent_monitor.take();
         let mut keys = EventStream::new();
-        let mut stream_commit_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + STREAM_COMMIT_INTERVAL,
-            STREAM_COMMIT_INTERVAL,
-        );
-        stream_commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut status_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + STATUS_INTERVAL,
             STATUS_INTERVAL,
@@ -196,8 +214,13 @@ impl App {
 
         loop {
             tokio::select! {
-                _ = stream_commit_tick.tick(), if state.operation.shows_activity() => terminal.refresh_content()?,
-                _ = status_tick.tick(), if state.operation.shows_activity() => terminal.refresh_status()?,
+                _ = status_tick.tick() => {
+                    state.refresh_subagents();
+                    terminal.set_subagents(state.subagents.clone())?;
+                    if state.operation.shows_activity() {
+                        terminal.refresh_status()?;
+                    }
+                }
                 event = events.next() => {
                     let Some(event) = event else { break };
                     match state.operation.route_event(&event) {
@@ -211,7 +234,6 @@ impl App {
                     match handle_agent_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
-                            stream_commit_tick.reset();
                             status_tick.reset();
                         }
                         LoopAction::Exit => break,
@@ -223,7 +245,6 @@ impl App {
                     match handle_terminal_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
-                            stream_commit_tick.reset();
                             status_tick.reset();
                         }
                         LoopAction::Exit => break,
@@ -262,11 +283,11 @@ async fn handle_agent_event(
             })
         }
         EventKind::TextDelta(text) => {
-            terminal.text(&text);
+            terminal.text(&text)?;
             Ok(LoopAction::Continue)
         }
         EventKind::Thinking(text) => {
-            terminal.thinking(&text);
+            terminal.thinking(&text)?;
             Ok(LoopAction::Continue)
         }
         EventKind::ToolCallStart {
@@ -536,6 +557,10 @@ async fn handle_key(
         }
         KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
             terminal.scroll_to_bottom()?;
+            return Ok(LoopAction::Continue);
+        }
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            terminal.toggle_tool_expanded()?;
             return Ok(LoopAction::Continue);
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,

@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -16,6 +16,10 @@ use crate::truncate::{self, LimitKind, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 struct BashArgs {
     /// Bash command to execute
     command: String,
+    /// Working directory for the command, relative to the session working
+    /// directory or absolute within it; defaults to the session working
+    /// directory
+    cwd: Option<String>,
     /// Timeout in seconds; omitted means no tool-specific timeout
     timeout: Option<f64>,
 }
@@ -23,11 +27,18 @@ struct BashArgs {
 pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
     define_tool(
         "bash",
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
+        "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
         move |_ctx, args: BashArgs| {
             let working_dir = Arc::clone(&working_dir);
             async move {
             let timeout = args.timeout.map(parse_timeout).transpose()?;
+            let cwd = match args.cwd {
+                Some(requested) => {
+                    let working_dir = Arc::clone(&working_dir);
+                    crate::path::run_blocking(move || resolve_cwd(working_dir.as_path(), &requested)).await?
+                }
+                None => (*working_dir).clone(),
+            };
             let stdout = tempfile::Builder::new()
                 .prefix("ash-bash-stdout-")
                 .tempfile()
@@ -39,7 +50,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
             let mut command = tokio::process::Command::new("bash");
             command
                 .args(["-c", &args.command])
-                .current_dir(working_dir.as_path())
+                .current_dir(cwd)
                 .stdout(Stdio::from(stdout.reopen().map_err(|error| {
                     ToolError::Execution(format!("cannot capture stdout: {error}"))
                 })?))
@@ -75,6 +86,25 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
             }
         },
     )
+}
+
+fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
+    let resolved = crate::path::WorkspacePath::new(root, requested)?
+        .full_path()
+        .to_path_buf();
+    let metadata = std::fs::metadata(&resolved).map_err(|error| {
+        ToolError::Execution(format!(
+            "cannot access working directory {}: {error}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ToolError::Execution(format!(
+            "working directory is not a directory: {}",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 fn parse_timeout(seconds: f64) -> Result<Duration, ToolError> {
@@ -221,6 +251,108 @@ fn output_error(error: std::io::Error) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash_core::{AgentToolContext, CancellationToken, ThreadId, ToolContext, TreeId, TurnId};
+
+    fn test_context() -> ToolContext {
+        ToolContext {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            agent: AgentToolContext {
+                tree_id: TreeId::new(),
+                path: String::new(),
+                messages: Vec::new(),
+            },
+        }
+    }
+
+    async fn run_in(root: &Path, command: &str, cwd: Option<&str>) -> Result<String, ToolError> {
+        let tool = tool(Arc::new(root.to_path_buf()));
+        let mut args = serde_json::Map::new();
+        args.insert("command".into(), serde_json::Value::String(command.into()));
+        if let Some(cwd) = cwd {
+            args.insert("cwd".into(), serde_json::Value::String(cwd.into()));
+        }
+        let output = tool
+            .execute(test_context(), serde_json::Value::Object(args))
+            .await?;
+        Ok(output.text)
+    }
+
+    #[tokio::test]
+    async fn defaults_to_the_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(root.path()).unwrap();
+
+        let output = run_in(root.path(), "pwd", None).await.unwrap();
+
+        assert!(
+            output.contains(expected.to_str().unwrap()),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_in_the_requested_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+
+        let output = run_in(root.path(), "pwd", Some("src")).await.unwrap();
+
+        assert!(output.contains("src"), "unexpected output: {output}");
+    }
+
+    #[tokio::test]
+    async fn resolves_absolute_cwd_within_working_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+
+        let output = run_in(
+            root.path(),
+            "pwd",
+            Some(root.path().join("src").to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("src"), "unexpected output: {output}");
+    }
+
+    #[tokio::test]
+    async fn rejects_cwd_outside_working_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let error = run_in(root.path(), "pwd", Some(outside.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("outside working directory"));
+    }
+
+    #[tokio::test]
+    async fn rejects_cwd_escaping_via_parent() {
+        let root = tempfile::tempdir().unwrap();
+
+        let error = run_in(root.path(), "pwd", Some("../elsewhere"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("escapes working directory"));
+    }
+
+    #[tokio::test]
+    async fn rejects_cwd_that_is_not_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), "x").unwrap();
+
+        let error = run_in(root.path(), "pwd", Some("file.txt"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+    }
 
     #[test]
     fn rejects_invalid_timeouts() {

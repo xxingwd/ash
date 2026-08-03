@@ -672,6 +672,7 @@ mod tests {
             max_turns: config.max_turns,
             max_context_tokens: config.max_context_tokens,
             max_tool_duration: config.max_tool_duration,
+            kind: crate::ThreadKind::Root,
         }
     }
 

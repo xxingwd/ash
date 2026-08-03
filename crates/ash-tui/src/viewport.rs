@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::{ForkPoint, ThreadSummary};
+use ash_core::{ForkPoint, SubagentSnapshot, ThreadSummary};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Position, Rect},
@@ -28,6 +28,7 @@ const MENU_MAX_ROWS: usize = 8;
 const MENU_BORDER_ROWS: u16 = 2;
 const SCREEN_SPACING: u16 = 1;
 const COMPACT_STATUS_WIDTH: u16 = 32;
+const SUBAGENTS_MAX_ROWS: usize = 4;
 const FOOTER_SIDE_PADDING: u16 = 2;
 const FOOTER_COLUMN_GAP: u16 = 3;
 const FOOTER_MIN_LEFT_WIDTH: u16 = 3;
@@ -65,6 +66,8 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) context_tokens: Option<u64>,
     pub(crate) context_estimated: bool,
     pub(crate) context_limit: Option<u64>,
+    pub(crate) tools_expanded: bool,
+    pub(crate) subagents: &'a [SubagentSnapshot],
 }
 
 pub(crate) struct ViewportFrame {
@@ -180,7 +183,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let rendered_blocks = input
         .transcript
         .iter()
-        .map(|block| block.render(width))
+        .map(|block| block.render(width, input.tools_expanded))
         .collect::<Vec<_>>();
     let active =
         (!input.active_lines.is_empty()).then(|| render_active_buffer(width, input.active_lines));
@@ -196,12 +199,18 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
             .unwrap_or(u16::MAX)
             .saturating_add(MENU_BORDER_ROWS)
     };
+    let active_subagents = input
+        .subagents
+        .iter()
+        .filter(|subagent| subagent.state.is_active())
+        .collect::<Vec<_>>();
     let screen_rows = fit_screen_rows(
         ScreenRows {
             transcript: layout.height,
             status: u16::from(input.busy),
             composer: requested_composer_rows,
             menu: menu_rows,
+            subagents: subagent_rows(&active_subagents),
             footer: if menu_rows == 0 { FOOTER_ROWS } else { 0 },
         },
         terminal_height,
@@ -238,6 +247,9 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     let prompt = prompt_window(&input, screen.composer.height);
     render_composer(screen.composer, &prompt, &mut buffer);
+    if !screen.subagents.is_empty() {
+        render_subagents(screen.subagents, &active_subagents, &mut buffer);
+    }
     match input.menu {
         MenuView::None => render_footer(screen.footer, &input, &mut buffer),
         MenuView::Commands { items, selected } => {
@@ -278,6 +290,7 @@ struct ScreenRows {
     status: u16,
     composer: u16,
     menu: u16,
+    subagents: u16,
     footer: u16,
 }
 
@@ -287,6 +300,7 @@ struct ScreenAreas {
     status: Rect,
     composer: Rect,
     menu: Rect,
+    subagents: Rect,
     footer: Rect,
 }
 
@@ -295,6 +309,7 @@ enum ScreenRegion {
     Transcript,
     Status,
     Composer,
+    Subagents,
     Footer,
 }
 
@@ -304,6 +319,7 @@ enum ScreenPart {
     Status,
     Composer,
     Menu,
+    Subagents,
     Footer,
 }
 
@@ -314,6 +330,7 @@ impl ScreenRows {
             ScreenPart::Status => &mut self.status,
             ScreenPart::Composer => &mut self.composer,
             ScreenPart::Menu => &mut self.menu,
+            ScreenPart::Subagents => &mut self.subagents,
             ScreenPart::Footer => &mut self.footer,
         }
     }
@@ -337,11 +354,13 @@ fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> ScreenRows {
         ScreenPart::Footer,
         ScreenPart::Menu,
         ScreenPart::Composer,
+        ScreenPart::Subagents,
     ] {
         rows.shrink_to_fit(part, 1, height);
     }
     for part in [
         ScreenPart::Status,
+        ScreenPart::Subagents,
         ScreenPart::Transcript,
         ScreenPart::Footer,
         ScreenPart::Menu,
@@ -360,6 +379,7 @@ fn screen_height(rows: ScreenRows) -> u32 {
         rows.transcript,
         rows.status,
         rows.composer.saturating_add(rows.menu),
+        rows.subagents,
         rows.footer,
     ];
     let content = values
@@ -377,8 +397,8 @@ fn screen_height(rows: ScreenRows) -> u32 {
 }
 
 fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
-    let mut regions = Vec::with_capacity(4);
-    let mut constraints = Vec::with_capacity(4);
+    let mut regions = Vec::with_capacity(5);
+    let mut constraints = Vec::with_capacity(5);
     for (region, rows) in [
         (ScreenRegion::Transcript, rows.transcript),
         (ScreenRegion::Status, rows.status),
@@ -386,6 +406,7 @@ fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
             ScreenRegion::Composer,
             rows.composer.saturating_add(rows.menu),
         ),
+        (ScreenRegion::Subagents, rows.subagents),
         (ScreenRegion::Footer, rows.footer),
     ] {
         if rows > 0 {
@@ -418,6 +439,7 @@ fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
                 areas.menu = input_surface[1];
             }
             ScreenRegion::Composer => areas.composer = area,
+            ScreenRegion::Subagents => areas.subagents = area,
             ScreenRegion::Footer => areas.footer = area,
         }
     }
@@ -558,6 +580,95 @@ fn transcript_regions(blocks: &[Arc<Buffer>], active_rows: Option<u16>) -> Vec<R
         });
     }
     regions
+}
+
+fn subagent_rows(subagents: &[&SubagentSnapshot]) -> u16 {
+    if subagents.is_empty() {
+        return 0;
+    }
+    let rows = u16::try_from(subagents.len().min(SUBAGENTS_MAX_ROWS)).unwrap_or(u16::MAX);
+    rows.saturating_add(u16::from(subagents.len() > SUBAGENTS_MAX_ROWS))
+}
+
+fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    let visible = subagents.len().min(SUBAGENTS_MAX_ROWS);
+    for (index, subagent) in subagents.iter().take(visible).enumerate() {
+        let state_symbol = subagent_state_symbol(subagent.state);
+        let state_color = subagent_state_color(subagent.state);
+        let message = sanitize_single_line(&subagent.last_task_message);
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{state_symbol} "),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                subagent.task_name.as_str(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" (", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                subagent.agent_type.as_str(),
+                Style::default().fg(state_color),
+            ),
+            Span::styled(")", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(" · ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(message),
+            Span::styled(" (", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                subagent_state_label(subagent.state),
+                Style::default().fg(state_color),
+            ),
+            Span::styled(")", Style::default().add_modifier(Modifier::DIM)),
+        ]);
+        buffer.set_line(area.x, area.y + index as u16, &line, area.width);
+    }
+    if subagents.len() > SUBAGENTS_MAX_ROWS {
+        let more = subagents.len() - SUBAGENTS_MAX_ROWS;
+        buffer.set_line(
+            area.x,
+            area.y + SUBAGENTS_MAX_ROWS as u16,
+            &Line::from(Span::styled(
+                format!("  … and {more} more"),
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            area.width,
+        );
+    }
+}
+
+fn subagent_state_symbol(state: ash_core::SubagentState) -> &'static str {
+    match state {
+        ash_core::SubagentState::Pending => "○",
+        ash_core::SubagentState::Running => "●",
+        ash_core::SubagentState::Completed => "✓",
+        ash_core::SubagentState::Interrupted => "⏸",
+        ash_core::SubagentState::Errored => "✗",
+    }
+}
+
+fn subagent_state_label(state: ash_core::SubagentState) -> &'static str {
+    match state {
+        ash_core::SubagentState::Pending => "pending",
+        ash_core::SubagentState::Running => "running",
+        ash_core::SubagentState::Completed => "done",
+        ash_core::SubagentState::Interrupted => "interrupted",
+        ash_core::SubagentState::Errored => "error",
+    }
+}
+
+fn subagent_state_color(state: ash_core::SubagentState) -> Color {
+    match state {
+        ash_core::SubagentState::Pending => Color::Yellow,
+        ash_core::SubagentState::Running => Color::Cyan,
+        ash_core::SubagentState::Completed => Color::Green,
+        ash_core::SubagentState::Interrupted => Color::Yellow,
+        ash_core::SubagentState::Errored => Color::Red,
+    }
 }
 
 fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
@@ -1000,6 +1111,7 @@ mod tests {
                 status: 1,
                 composer: 1,
                 menu: 0,
+                subagents: 0,
                 footer: 1,
             },
             24,
@@ -1017,6 +1129,7 @@ mod tests {
                 status: 1,
                 composer: 4,
                 menu: 6,
+                subagents: 0,
                 footer: 1,
             },
             1,
@@ -1051,6 +1164,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(frame.buffer.area, Rect::new(0, 0, 80, 24));
@@ -1067,6 +1182,100 @@ mod tests {
                 .bg,
             Color::Reset
         );
+    }
+
+    #[test]
+    fn subagents_render_below_the_composer_and_above_the_footer() {
+        let active = render_markdown("answer", 80);
+        let subagents = [
+            SubagentSnapshot {
+                task_name: "inspect_glob".to_string(),
+                agent_type: "explorer".to_string(),
+                state: ash_core::SubagentState::Running,
+                last_task_message: "Inspect the glob API".to_string(),
+            },
+            SubagentSnapshot {
+                task_name: "fix_bash".to_string(),
+                agent_type: "worker".to_string(),
+                state: ash_core::SubagentState::Pending,
+                last_task_message: "Add cwd to bash".to_string(),
+            },
+        ];
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 24,
+            transcript: &[],
+            scroll_top: None,
+            busy: true,
+            active_lines: &active,
+            status_header: "Working",
+            status_dots: "...",
+            elapsed: "2s",
+            queued: "",
+            prompt_lines: &["draft".to_string()],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 5,
+            menu: MenuView::None,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+
+            context_limit: None,
+            tools_expanded: false,
+            subagents: &subagents,
+        });
+
+        assert_eq!(frame.viewport_height, 10);
+        assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
+        assert!(row_text(&frame.buffer, 6).contains("inspect_glob"));
+        assert!(row_text(&frame.buffer, 6).contains("explorer"));
+        assert!(row_text(&frame.buffer, 6).contains("Inspect the glob API"));
+        assert!(row_text(&frame.buffer, 6).contains("running"));
+        assert!(row_text(&frame.buffer, 7).contains("fix_bash"));
+        assert!(row_text(&frame.buffer, 7).contains("worker"));
+        assert!(row_text(&frame.buffer, 7).contains("pending"));
+    }
+
+    #[test]
+    fn completed_subagents_do_not_occupy_a_row() {
+        let active = render_markdown("answer", 80);
+        let subagents = [SubagentSnapshot {
+            task_name: "inspect_glob".to_string(),
+            agent_type: "explorer".to_string(),
+            state: ash_core::SubagentState::Completed,
+            last_task_message: "Inspect the glob API".to_string(),
+        }];
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 24,
+            transcript: &[],
+            scroll_top: None,
+            busy: false,
+            active_lines: &active,
+            status_header: "",
+            status_dots: "",
+            elapsed: "0s",
+            queued: "",
+            prompt_lines: &["draft".to_string()],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 5,
+            menu: MenuView::None,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_estimated: false,
+
+            context_limit: None,
+            tools_expanded: false,
+            subagents: &subagents,
+        });
+
+        assert_eq!(frame.viewport_height, 5);
+        assert!(!row_text(&frame.buffer, 2).contains("explorer"));
+        assert!(!row_text(&frame.buffer, 4).contains("explorer"));
     }
 
     #[test]
@@ -1103,6 +1312,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
@@ -1167,6 +1378,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         };
         let baseline = render(input);
         let frame = render(ViewportInput {
@@ -1231,6 +1444,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert!(row_text(&frame.buffer, 2).contains("latest prompt continued"));
@@ -1262,6 +1477,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• Thinking (0s)");
@@ -1295,6 +1512,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• restored output");
@@ -1333,6 +1552,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "› hello");
@@ -1371,6 +1592,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "• before");
@@ -1410,6 +1633,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(row_text(&frame.buffer, 0), "› line 2");
@@ -1451,6 +1676,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(frame.scroll_top, 13);
@@ -1495,6 +1722,8 @@ mod tests {
             context_estimated: false,
 
             context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
         });
 
         assert_eq!(frame.scroll_top, 4);

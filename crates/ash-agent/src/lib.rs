@@ -32,6 +32,8 @@ pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;
 pub use runtime::Runtime;
 pub use skill::{tool as skill_tool, Skill};
-pub use store::{SharedThreadStore, StoredThread, ThreadMetadata, ThreadStore, Version};
+pub use store::{
+    SharedThreadStore, StoredThread, ThreadKind, ThreadMetadata, ThreadStore, Version,
+};
 pub(crate) use thread::ThreadState;
 pub use thread::{ContextCompaction, Fork, Thread, Turn};

@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     history_block::HistoryBlock,
@@ -32,6 +33,7 @@ pub(crate) struct LiveBlock {
 struct RenderCache {
     width: u16,
     source_len: Option<usize>,
+    expanded: bool,
     buffer: Arc<Buffer>,
     streaming_markdown: Option<StreamingMarkdownCache>,
 }
@@ -174,14 +176,18 @@ impl LiveBlock {
         true
     }
 
-    pub(crate) fn render(&self, width: u16) -> Arc<Buffer> {
+    pub(crate) fn render(&self, width: u16, expanded: bool) -> Arc<Buffer> {
         let width = width.max(1);
         let source_len = self.source_len();
         if let Some(buffer) = self
             .cache
             .borrow()
             .as_ref()
-            .filter(|cached| cached.width == width && cached.source_len == source_len)
+            .filter(|cached| {
+                cached.width == width
+                    && cached.source_len == source_len
+                    && cached.expanded == expanded
+            })
             .map(|cached| Arc::clone(&cached.buffer))
         {
             return buffer;
@@ -216,12 +222,13 @@ impl LiveBlock {
                 );
                 (buffer, Some(markdown))
             }
-            _ => (self.render_uncached(width), None),
+            _ => (self.render_uncached(width, expanded), None),
         };
         let buffer = Arc::new(buffer);
         self.cache.replace(Some(RenderCache {
             width,
             source_len,
+            expanded,
             buffer: Arc::clone(&buffer),
             streaming_markdown,
         }));
@@ -232,7 +239,7 @@ impl LiveBlock {
         self.cache.replace(None);
     }
 
-    fn render_uncached(&self, width: u16) -> Buffer {
+    fn render_uncached(&self, width: u16, expanded: bool) -> Buffer {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
             LiveBlockKind::History(block) => block.render(width),
@@ -246,7 +253,7 @@ impl LiveBlock {
                 arguments,
                 output,
                 is_error,
-            } => render_tool(name, arguments, output, *is_error, width),
+            } => render_tool(name, arguments, output, *is_error, width, expanded),
         }
     }
 
@@ -432,7 +439,36 @@ fn markdown_line<'a>(
     tail.get(tail_index)
 }
 
-fn render_tool(name: &str, arguments: &Value, output: &str, is_error: bool, width: u16) -> Buffer {
+/// Stack multiple row buffers vertically into one buffer, copying cells from
+/// each row in order. Shared by every tool renderer so the stacking logic
+/// lives in one place.
+fn stack_rows(rows: &[Buffer], width: u16) -> Buffer {
+    let total_height: u16 = rows.iter().map(|row| row.area.height).sum();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), total_height.max(1)));
+    let mut y = 0;
+    for row in rows {
+        for row_y in 0..row.area.height {
+            for x in 0..row.area.width {
+                if let Some(cell) = row.cell((x, row_y)) {
+                    if let Some(target) = buffer.cell_mut((x, y + row_y)) {
+                        *target = cell.clone();
+                    }
+                }
+            }
+        }
+        y += row.area.height;
+    }
+    buffer
+}
+
+fn render_tool(
+    name: &str,
+    arguments: &Value,
+    output: &str,
+    is_error: bool,
+    width: u16,
+    expanded: bool,
+) -> Buffer {
     if !is_error {
         let preview = match name {
             "edit" if !output.is_empty() => Some(output.to_string()),
@@ -446,9 +482,197 @@ fn render_tool(name: &str, arguments: &Value, output: &str, is_error: bool, widt
             return render_change_preview(name, arguments, &preview, width);
         }
     }
+    if name == "bash" {
+        return render_bash_tool(name, arguments, output, is_error, width, expanded);
+    }
     let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
     let (action, detail) = tool_call_summary(name, arguments, is_error, detail_width);
-    render_tool_title(action, detail, is_error, width)
+    let title = render_tool_title(action, detail, is_error, width);
+    if output.is_empty() {
+        return title;
+    }
+    let mut rows = vec![title];
+    // read/edit/write have dedicated previews (ReadGroup / change preview);
+    // every other tool shows its output (errors included, like bash).
+    if name != "read" && name != "edit" && name != "write" {
+        rows.push(render_tool_output(output, width, expanded));
+    }
+    stack_rows(&rows, width)
+}
+
+/// Render a bash tool call: the highlighted command (the "input") inline on
+/// the title row, continuation lines indented below, then a short preview of
+/// the output. The command is syntax highlighted and the output is truncated
+/// at the display layer to a few head/tail lines so the block stays compact.
+fn render_bash_tool(
+    name: &str,
+    arguments: &Value,
+    output: &str,
+    is_error: bool,
+    width: u16,
+    expanded: bool,
+) -> Buffer {
+    let (title, continuation, _command_height) =
+        render_bash_command_line(name, arguments, is_error, width, expanded);
+    let mut rows: Vec<Buffer> = Vec::new();
+    rows.push(title);
+    if let Some(continuation) = continuation {
+        rows.push(continuation);
+    }
+    if !output.is_empty() {
+        rows.push(render_tool_output(output, width, expanded));
+    }
+    stack_rows(&rows, width)
+}
+
+/// Build the title row with the highlighted command merged inline (like
+/// codex: `• Ran <command>` on one line), plus a separate row for the
+/// continuation lines of a multi-line command.
+fn render_bash_command_line(
+    name: &str,
+    arguments: &Value,
+    is_error: bool,
+    width: u16,
+    expanded: bool,
+) -> (Buffer, Option<Buffer>, u16) {
+    use crate::ansi::highlight_bash_command;
+
+    let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
+    let (action, _) = tool_call_summary(name, arguments, is_error, detail_width);
+    let bullet_style = if is_error {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut header_spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
+    header_spans.push(Span::styled(
+        action,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    header_spans.push(Span::raw(" "));
+
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut highlighted = highlight_bash_command(command);
+    if highlighted.is_empty() {
+        highlighted.push(Line::default());
+    }
+
+    // The first highlighted line goes on the title row. If it is too wide it
+    // is wrapped (like the input box does) instead of being truncated by
+    // `set_line`; extra wrapped rows become continuation lines.
+    let first = highlighted.remove(0);
+    let header_prefix: String = header_spans
+        .iter()
+        .map(|span| span.content.to_string())
+        .collect();
+    let header_prefix_width = UnicodeWidthStr::width(header_prefix.as_str());
+    let header_content_width = usize::from(width.max(1))
+        .saturating_sub(header_prefix_width)
+        .max(1);
+    let wrapped_first = crate::ansi::wrap_highlighted_line(&first, header_content_width);
+    let mut iter = wrapped_first.into_iter();
+    let mut first_spans: Vec<Span<'static>> = Vec::new();
+    if let Some(first_row) = iter.next() {
+        let mut spans = header_spans.clone();
+        spans.extend(first_row.spans);
+        first_spans = spans;
+    }
+    // Any remaining wrapped rows become continuation lines, in order.
+    let mut wrapped_tail: Vec<Line<'static>> = iter.collect();
+    wrapped_tail.extend(highlighted);
+    highlighted = wrapped_tail;
+
+    let header_width = width.max(1);
+    let mut title = Buffer::empty(Rect::new(0, 0, header_width, 1));
+    title.set_line(0, 0, &Line::from(first_spans), header_width);
+
+    if highlighted.is_empty() {
+        (title, None, 1)
+    } else {
+        const CONTINUATION_PREFIX: &str = "  │ ";
+        let prefix_width = UnicodeWidthStr::width(CONTINUATION_PREFIX);
+        let content_width = width.saturating_sub(prefix_width as u16).max(1);
+        let shown = truncate_command_lines(&mut highlighted, expanded);
+        let mut continuation = Buffer::empty(Rect::new(0, 0, width.max(1), shown as u16));
+        for (offset, line) in highlighted.drain(..).enumerate() {
+            // Dim the pipe prefix so it matches the `└` output corner; the
+            // command text itself keeps its syntax colors.
+            let mut spans = vec![Span::styled(
+                CONTINUATION_PREFIX,
+                Style::default().add_modifier(Modifier::DIM),
+            )];
+            spans.extend(line.spans);
+            continuation.set_line(0, offset as u16, &Line::from(spans), content_width);
+        }
+        (title, Some(continuation), 1)
+    }
+}
+
+/// Cap the continuation lines of a multi-line command. In compact mode only a
+/// few head/tail lines with an ellipsis marker are kept; in expanded mode the
+/// full command is shown. The first command line already lives on the title
+/// row, so this applies to the remaining lines only.
+fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usize {
+    use ratatui::style::Modifier as RtModifier;
+
+    const COMMAND_MAX_LINES: usize = 5;
+    const COMMAND_EXPANDED_MAX_LINES: usize = 50;
+    let limit = if expanded {
+        COMMAND_EXPANDED_MAX_LINES
+    } else {
+        COMMAND_MAX_LINES
+    };
+    let total = lines.len();
+    if total <= limit {
+        return total;
+    }
+    // Reserve one row for the ellipsis marker, then keep an equal head/tail.
+    let remaining = limit - 1;
+    let half = remaining / 2;
+    let omitted = total - remaining;
+    let mut selected: Vec<Line<'static>> = lines.drain(..half).collect();
+    let mut ellipsis = Line::from(format!("… +{omitted} lines (truncated for display)"));
+    for span in &mut ellipsis.spans {
+        span.style = span.style.add_modifier(RtModifier::DIM);
+    }
+    selected.push(ellipsis);
+    // Drain the tail after the head was removed; the remaining vector now
+    // holds the middle plus tail, so take the last `half` of it.
+    let remaining_after_head = lines.len();
+    selected.extend(lines.drain(remaining_after_head - half..));
+    *lines = selected;
+    limit
+}
+
+/// Render a short preview of tool output: a few head/tail lines with an
+/// ellipsis between them when the output is longer. Expanded mode shows many
+/// more lines. ANSI colors from the tool (e.g. colored bash output) survive
+/// into the rendered spans.
+fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
+    use crate::ansi::split_output;
+
+    const FIRST_PREFIX: &str = "  └ ";
+    const SUBSEQUENT_PREFIX: &str = "    ";
+    let limit = if expanded {
+        crate::ansi::TOOL_OUTPUT_EXPANDED_MAX_LINES
+    } else {
+        crate::ansi::TOOL_OUTPUT_MAX_LINES
+    };
+    let half = limit / 2;
+    let lines = split_output(output, half, half, FIRST_PREFIX, SUBSEQUENT_PREFIX, true);
+    if lines.is_empty() {
+        return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
+    }
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), lines.len() as u16));
+    for (offset, line) in lines.into_iter().enumerate() {
+        buffer.set_line(0, offset as u16, &line, width);
+    }
+    buffer
 }
 
 fn render_tool_title(action: String, detail: String, is_error: bool, width: u16) -> Buffer {
@@ -468,11 +692,22 @@ fn render_tool_title(action: String, detail: String, is_error: bool, width: u16)
         spans.push(Span::raw(" "));
         spans.push(Span::raw(detail));
     }
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), 1));
-    buffer.set_line(0, 0, &Line::from(spans), width);
+    let line = Line::from(spans);
+    // Wrap long titles (e.g. a long grep pattern or path) instead of letting
+    // `set_line` truncate them, consistent with the bash command line.
+    let rows = crate::ansi::wrap_highlighted_line(&line, usize::from(width.max(1)));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), rows.len() as u16));
+    for (offset, row) in rows.into_iter().enumerate() {
+        buffer.set_line(0, offset as u16, &row, width);
+    }
     buffer
 }
 
+/// Append the bash tool output below the tool title: the first 25 lines and
+/// the last 25 lines (with an ellipsis marker between them when truncated),
+/// parsed so ANSI colors from the command output survive into the TUI.
+/// Truncation happens at the display layer only; the agent still receives the
+/// full output for reasoning.
 fn write_preview(content: &str) -> String {
     sanitize_terminal_text(content)
         .lines()
@@ -558,8 +793,8 @@ mod tests {
     fn markdown_blocks_reflow_at_the_current_width() {
         let block = LiveBlock::assistant(1, "a long line that must wrap".to_string());
 
-        let narrow = block.render(10);
-        let wide = block.render(40);
+        let narrow = block.render(10, false);
+        let wide = block.render(40, false);
 
         assert!(narrow.area.height > wide.area.height);
     }
@@ -568,12 +803,12 @@ mod tests {
     fn completed_blocks_reuse_rendering_until_the_content_changes() {
         let mut block = LiveBlock::assistant(1, "hello".to_string());
 
-        let first = block.render(40);
-        let second = block.render(40);
+        let first = block.render(40, false);
+        let second = block.render(40, false);
         assert!(std::sync::Arc::ptr_eq(&first, &second));
 
         assert!(block.append_markdown_source(" world"));
-        let updated = block.render(40);
+        let updated = block.render(40, false);
         assert!(!std::sync::Arc::ptr_eq(&first, &updated));
     }
 
@@ -598,7 +833,7 @@ mod tests {
             source.push_str(chunk);
             assert!(block.append_markdown_source(chunk));
             assert_eq!(
-                block.render(80).as_ref(),
+                block.render(80, false).as_ref(),
                 &render_markdown_block(&source, Style::default(), 80)
             );
         }
@@ -614,10 +849,10 @@ mod tests {
     fn streaming_markdown_falls_back_when_a_previous_buffer_is_still_borrowed() {
         let mut block = LiveBlock::assistant(1, String::new());
         assert!(block.append_markdown_source("First paragraph.\n\nSecond paragraph."));
-        let retained = block.render(80);
+        let retained = block.render(80, false);
         assert!(block.append_markdown_source("\n\nThird paragraph."));
 
-        let updated = block.render(80);
+        let updated = block.render(80, false);
 
         assert!(!Arc::ptr_eq(&retained, &updated));
         assert_eq!(
@@ -634,14 +869,14 @@ mod tests {
     fn finalizing_stream_reparses_cross_block_reference_links() {
         let mut block = LiveBlock::assistant(1, String::new());
         assert!(block.append_markdown_source("Read [the docs][docs].\n\nNext paragraph."));
-        let _ = block.render(80);
+        let _ = block.render(80, false);
         assert!(block.append_markdown_source("\n\n[docs]: https://example.com/docs"));
-        let _ = block.render(80);
+        let _ = block.render(80, false);
 
         block.finalize_markdown();
 
         assert_eq!(
-            block.render(80).as_ref(),
+            block.render(80, false).as_ref(),
             &render_markdown_block(
                 "Read [the docs][docs].\n\nNext paragraph.\n\n[docs]: https://example.com/docs",
                 Style::default(),
@@ -654,9 +889,9 @@ mod tests {
     fn committed_blocks_can_drop_their_render_cache_before_replay() {
         let block = LiveBlock::assistant(1, "hello".to_string());
 
-        let committed = block.render(40);
+        let committed = block.render(40, false);
         block.clear_render_cache();
-        let replayed = block.render(40);
+        let replayed = block.render(40, false);
 
         assert!(!std::sync::Arc::ptr_eq(&committed, &replayed));
         assert_eq!(row_text(&committed, 0), row_text(&replayed, 0));
@@ -675,7 +910,7 @@ mod tests {
     #[test]
     fn completed_thoughts_render_as_a_single_summary_line() {
         let block = LiveBlock::thought(1, 3);
-        let rendered = block.render(40);
+        let rendered = block.render(40, false);
 
         assert_eq!(rendered.area.height, 1);
         assert_eq!(row_text(&rendered, 0), "• Thought for 3s");
@@ -707,7 +942,7 @@ mod tests {
             true,
         ));
 
-        let buffer = block.render(80);
+        let buffer = block.render(80, false);
         let rendered = (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, 0)))
             .map(|cell| cell.symbol())
@@ -733,6 +968,99 @@ mod tests {
     }
 
     #[test]
+    fn bash_output_renders_head_tail_with_ansi_colors() {
+        let output = (1..=120)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "seq 120"}),
+            output,
+            false,
+        );
+        let rendered = block.render(40, false);
+
+        // Title row with the (single-line) command inline, then 2 head +
+        // 1 ellipsis + 2 tail output lines.
+        assert_eq!(rendered.area.height, 1 + 2 + 1 + 2);
+        assert!(row_text(&rendered, 0).contains("seq 120"), "command inline");
+        assert!(row_text(&rendered, 1).contains("line 1"), "head row");
+        assert!(row_text(&rendered, 3).contains("+116 lines"));
+        assert!(row_text(&rendered, 5).contains("line 120"), "tail row");
+    }
+
+    #[test]
+    fn expanded_bash_output_shows_more_lines() {
+        let output = (1..=120)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "seq 120"}),
+            output,
+            false,
+        );
+        // Collapsed: 5 output lines (2 head + 1 ellipsis + 2 tail).
+        assert_eq!(block.render(40, false).area.height, 6);
+        // Expanded: 50 output lines (25 head + 1 ellipsis + 24 tail).
+        let expanded = block.render(40, true);
+        assert_eq!(expanded.area.height, 1 + 51);
+        assert!(row_text(&expanded, 1).contains("line 1"), "head");
+        assert!(row_text(&expanded, 26).contains("+70 lines"), "ellipsis");
+        assert!(row_text(&expanded, 51).contains("line 120"), "tail");
+        // The two render modes are independent of any per-block state.
+        assert_eq!(block.render(40, false).area.height, 6);
+    }
+
+    #[test]
+    fn bash_output_preserves_ansi_colors() {
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "ls --color"}),
+            "\x1b[31mred.txt\x1b[0m\nplain".to_string(),
+            false,
+        );
+        let rendered = block.render(40, false);
+        // Title row (command inline) + two output lines.
+        assert_eq!(rendered.area.height, 3);
+        assert!(row_text(&rendered, 0).contains("ls --color"));
+        // The colored span keeps its foreground.
+        let cells = (0..rendered.area.width)
+            .filter_map(|column| rendered.cell((column, 1)))
+            .collect::<Vec<_>>();
+        assert!(cells.iter().any(|cell| cell.symbol() == "r"));
+        assert!(row_text(&rendered, 2).contains("plain"));
+    }
+
+    #[test]
+    fn multi_line_command_truncates_like_output() {
+        let command = (1..=20)
+            .map(|i| format!("echo step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": command}),
+            "done".to_string(),
+            false,
+        );
+        let rendered = block.render(40, false);
+        // Title (first line inline) + 2 head + 1 ellipsis + 2 tail continuations
+        // + 1 output line.
+        assert_eq!(rendered.area.height, 1 + 5 + 1);
+        assert!(row_text(&rendered, 0).contains("echo step 1"));
+        assert!(row_text(&rendered, 1).contains("echo step 2"));
+        assert!(row_text(&rendered, 3).contains("+15 lines"));
+        assert!(row_text(&rendered, 5).contains("echo step 20"));
+    }
+
+    #[test]
     fn edit_and_write_render_different_change_previews() {
         let edit = LiveBlock::tool(
             1,
@@ -741,7 +1069,7 @@ mod tests {
             "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
             false,
         )
-        .render(60);
+        .render(60, false);
         let write = LiveBlock::tool(
             2,
             "write".to_string(),
@@ -749,7 +1077,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(60);
+        .render(60, false);
 
         assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
@@ -762,7 +1090,7 @@ mod tests {
             String::new(),
             false,
         )
-        .render(1);
+        .render(1, false);
         assert_eq!(tiny.area.width, 1);
     }
 
@@ -805,5 +1133,121 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod generic_output_tests {
+    use super::*;
+
+    fn row_text(buffer: &Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .filter_map(|column| buffer.cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn long_tool_title_wraps_instead_of_truncating() {
+        let pattern = "very long pattern ".repeat(8);
+        let block = LiveBlock::tool(
+            1,
+            "grep".to_string(),
+            serde_json::json!({"pattern": pattern, "path": "src"}),
+            "match".to_string(),
+            false,
+        );
+        // Non-bash titles are pre-truncated by fit_action_and_detail, so they
+        // stay on one row (title + output).
+        let rendered = block.render(30, false);
+        assert_eq!(rendered.area.height, 2);
+        // The bash command line, by contrast, wraps instead of truncating.
+        let bash_block = LiveBlock::tool(
+            2,
+            "bash".to_string(),
+            serde_json::json!({"command": format!("cargo {}", "x".repeat(60))}),
+            "ok".to_string(),
+            false,
+        );
+        assert!(bash_block.render(30, false).area.height > 2);
+    }
+
+    #[test]
+    fn error_tool_output_is_shown_for_all_tools() {
+        // A failed grep keeps its error message visible below the title.
+        let block = LiveBlock::tool(
+            1,
+            "grep".to_string(),
+            serde_json::json!({"pattern": "[", "path": "src"}),
+            "invalid regular expression".to_string(),
+            true,
+        );
+        let rendered = block.render(40, false);
+        assert_eq!(rendered.area.height, 2);
+        assert!(row_text(&rendered, 0).contains("Failed"), "title");
+        assert!(row_text(&rendered, 1).contains("invalid regular"));
+    }
+
+    #[test]
+    fn bash_error_title_says_failed_and_shows_output() {
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "false"}),
+            "exit code 1".to_string(),
+            true,
+        );
+        let rendered = block.render(40, false);
+        assert!(
+            row_text(&rendered, 0).contains("Failed"),
+            "title: {:?}",
+            row_text(&rendered, 0)
+        );
+        assert!(row_text(&rendered, 1).contains("exit code 1"));
+    }
+
+    #[test]
+    fn grep_tool_shows_output_preview() {
+        let output = "src/main.rs:\n  Line 12: let x = 1;\n  Line 34: let y = 2;";
+        let block = LiveBlock::tool(
+            1,
+            "grep".to_string(),
+            serde_json::json!({"pattern": "let x", "path": "src"}),
+            output.to_string(),
+            false,
+        );
+        let rendered = block.render(50, false);
+        assert_eq!(rendered.area.height, 1 + 3);
+        assert!(row_text(&rendered, 0).contains("Searched"));
+        assert!(row_text(&rendered, 1).contains("src/main.rs"));
+        assert!(row_text(&rendered, 2).contains("Line 12"));
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+
+    #[test]
+    fn toggle_expanded_changes_rendered_height() {
+        let output = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "seq 30"}),
+            output,
+            false,
+        );
+        // collapsed: 1 title + 5 output (2+1+2)
+        assert_eq!(block.render(40, false).area.height, 6);
+        // expanded: 1 title + 26 output (13+1+12)... wait 30 lines with 50 limit → all 30 shown
+        assert!(
+            block.render(40, true).area.height > 6,
+            "expanded should be taller, got {}",
+            block.render(40, true).area.height
+        );
     }
 }

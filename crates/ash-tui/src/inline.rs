@@ -5,7 +5,9 @@ use std::{
     time::Instant,
 };
 
-use ash_core::{Content, ContentBlock, ForkPoint, Message, MessageContent, ThreadSummary};
+use ash_core::{
+    Content, ContentBlock, ForkPoint, Message, MessageContent, SubagentSnapshot, ThreadSummary,
+};
 use crossterm::terminal;
 use ratatui::layout::Position;
 use serde_json::Value;
@@ -20,8 +22,7 @@ use crate::{
     menu::MenuView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
-    stream_state::{format_elapsed, FinishedStream, StreamRefresh, StreamState},
-    tool_display::tool_activity_summary,
+    stream_state::{format_elapsed, FinishedStream, StreamState},
     viewport::{self, ViewportInput, COMPOSER_TEXT_COLUMN},
 };
 
@@ -254,6 +255,12 @@ pub(crate) struct TerminalUi {
     view: ViewState,
     history: Vec<LiveBlock>,
     transcript: Vec<LiveBlock>,
+    /// Global display mode for tool output: true renders full output, false
+    /// renders a short preview. Persists across session switches (`Ctrl+o`).
+    tools_expanded: bool,
+    /// Display-only snapshots of the session's sub-agents, refreshed by the
+    /// app from the collaboration control's watch channel.
+    subagents: Vec<SubagentSnapshot>,
     scroll_top: Option<u16>,
     next_block_id: u64,
     status: StatusState,
@@ -262,6 +269,9 @@ pub(crate) struct TerminalUi {
     stream: StreamState,
     current_turn_id: Option<u64>,
     next_turn_id: u64,
+    /// Id of the turn's active streaming assistant block (if any). Deltas are
+    /// appended straight into this block; cleared when the turn commits.
+    assistant_block_id: Option<u64>,
 }
 
 impl TerminalUi {
@@ -278,6 +288,8 @@ impl TerminalUi {
             view: ViewState::default(),
             history: Vec::new(),
             transcript: Vec::new(),
+            tools_expanded: false,
+            subagents: Vec::new(),
             scroll_top: None,
             next_block_id: 1,
             status: StatusState::default(),
@@ -286,6 +298,7 @@ impl TerminalUi {
             stream: StreamState::default(),
             current_turn_id: None,
             next_turn_id: 1,
+            assistant_block_id: None,
         })
     }
 
@@ -486,23 +499,51 @@ impl TerminalUi {
         Ok(())
     }
 
-    pub fn text(&mut self, text: &str) {
-        let finished = self.stream.start_assistant();
-        self.commit_finished_stream(finished);
-        self.status.header = "Working".to_string();
-        self.stream.push_assistant(text);
+    pub fn text(&mut self, text: &str) -> io::Result<()> {
+        self.append_assistant(text.to_string());
+        self.redraw()
     }
 
-    pub fn thinking(&mut self, text: &str) {
+    /// Append one text delta to the turn's streaming assistant block,
+    /// creating it on first use. Deltas go straight into the block's
+    /// incremental markdown renderer; nothing is queued for a later frame.
+    fn append_assistant(&mut self, source: String) {
+        if source.is_empty() {
+            return;
+        }
+        let id = self.assistant_block_id.unwrap_or_else(|| {
+            // Force-finish any in-progress reasoning before the first text
+            // delta: `start_reasoning` is a no-op when already reasoning, so
+            // use `finish` to always solidify the thought into a block.
+            let finished = self.stream.finish();
+            self.commit_finished_stream(finished);
+            let id = self.allocate_block_id();
+            self.push_block(LiveBlock::assistant(id, String::new()));
+            self.assistant_block_id = Some(id);
+            id
+        });
+        if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+            block.append_markdown_source(&source);
+        }
+    }
+
+    pub fn thinking(&mut self, text: &str) -> io::Result<()> {
+        // Reasoning belongs before the assistant text. If text output has
+        // already started (normally impossible), ignore late reasoning deltas
+        // rather than resurrecting a live reasoning area below the text.
+        if self.assistant_block_id.is_some() {
+            return Ok(());
+        }
         let finished = self.stream.start_reasoning();
         self.commit_finished_stream(finished);
         self.stream.push_reasoning(text);
-        self.status.header = "Thinking".to_string();
+        let width = self.markdown_width()?;
+        self.stream.refresh_reasoning(width);
+        self.redraw()
     }
 
-    pub fn tool_start(&mut self, name: &str, arguments: &Value) -> io::Result<()> {
+    pub fn tool_start(&mut self, _name: &str, _arguments: &Value) -> io::Result<()> {
         self.finish_stream();
-        self.status.header = tool_activity_summary(name, arguments, self.markdown_width()?);
         self.redraw()
     }
 
@@ -513,7 +554,6 @@ impl TerminalUi {
         output: &str,
         is_error: bool,
     ) -> io::Result<()> {
-        self.status.header = "Working".to_string();
         self.push_tool_block(
             name.to_string(),
             arguments.clone(),
@@ -537,7 +577,6 @@ impl TerminalUi {
 
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
-        self.status.header = "Failed".to_string();
         self.push_history_block(HistoryBlock::error(error));
         if self.current_turn_id.is_some() {
             self.redraw()
@@ -560,22 +599,6 @@ impl TerminalUi {
         ));
         self.current_turn_id = None;
         self.commit_transcript_to_scrollback()
-    }
-
-    pub fn refresh_content(&mut self) -> io::Result<()> {
-        match self.stream.take_refresh() {
-            Some(StreamRefresh::Assistant { pending, block_id }) => {
-                if let Some(id) = self.append_assistant(pending, block_id) {
-                    self.stream.set_assistant_block_id(id);
-                }
-            }
-            Some(StreamRefresh::Reasoning) => {
-                let width = self.markdown_width()?;
-                self.stream.refresh_reasoning(width);
-            }
-            None => return Ok(()),
-        }
-        self.redraw()
     }
 
     pub fn resize_view(
@@ -606,6 +629,20 @@ impl TerminalUi {
         let (width, height) = terminal_size()?;
         let rows = self.viewport_frame(width, height).page_rows;
         self.scroll_down(rows, width, height)
+    }
+
+    /// Toggle the global tool-output display mode: full output vs short
+    /// preview. Applies to every tool block and persists across session
+    /// switches (`Ctrl+o`).
+    pub fn toggle_tool_expanded(&mut self) -> io::Result<()> {
+        self.tools_expanded = !self.tools_expanded;
+        // Committed blocks are baked into the scrollback surface; rebuilding
+        // it re-renders them at their new height.
+        if !self.history.is_empty() {
+            let (width, height) = terminal_size()?;
+            self.rebuild_scrollback_at(width, height)?;
+        }
+        self.redraw()
     }
 
     pub fn scroll_lines_up(&mut self, rows: u16) -> io::Result<()> {
@@ -682,7 +719,7 @@ impl TerminalUi {
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
-        if !self.view.busy {
+        if !self.view.busy && self.subagents.is_empty() {
             return Ok(());
         }
         self.status.frame = self.status.frame.wrapping_add(1);
@@ -693,6 +730,15 @@ impl TerminalUi {
                 .max(1);
             self.stream.refresh_reasoning(width);
         }
+        self.redraw()
+    }
+
+    /// Replace the displayed sub-agent snapshots and redraw when they changed.
+    pub fn set_subagents(&mut self, subagents: Vec<SubagentSnapshot>) -> io::Result<()> {
+        if self.subagents == subagents {
+            return Ok(());
+        }
+        self.subagents = subagents;
         self.redraw()
     }
 
@@ -708,37 +754,20 @@ impl TerminalUi {
     fn finish_stream(&mut self) {
         let finished = self.stream.finish();
         self.commit_finished_stream(finished);
+        if let Some(id) = self.assistant_block_id.take() {
+            if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+                block.finalize_markdown();
+            }
+        }
     }
 
     fn commit_finished_stream(&mut self, finished: Option<FinishedStream>) {
         match finished {
-            Some(FinishedStream::Assistant { pending, block_id }) => {
-                if let Some(id) = self.append_assistant(pending, block_id) {
-                    if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
-                        block.finalize_markdown();
-                    }
-                }
-            }
             Some(FinishedStream::Thought { elapsed_seconds }) => {
                 self.push_thought_block(elapsed_seconds)
             }
             None => {}
         }
-    }
-
-    fn append_assistant(&mut self, source: String, block_id: Option<u64>) -> Option<u64> {
-        if source.is_empty() {
-            return block_id;
-        }
-        if let Some(id) = block_id {
-            if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
-                let _ = block.append_markdown_source(&source);
-                return Some(id);
-            }
-        }
-        let id = self.allocate_block_id();
-        self.push_block(LiveBlock::assistant(id, source));
-        Some(id)
     }
 
     fn reset_ui_state(&mut self) -> io::Result<()> {
@@ -754,6 +783,7 @@ impl TerminalUi {
         self.status.reset();
         self.current_turn_id = None;
         self.stream.reset();
+        self.assistant_block_id = None;
     }
 
     fn markdown_width(&self) -> io::Result<u16> {
@@ -779,6 +809,7 @@ impl TerminalUi {
 
         let (width, height) = terminal_size()?;
         let render_width = viewport::drawable_width(width);
+        let tools_expanded = self.tools_expanded;
         let committed = std::mem::take(&mut self.transcript);
         let result = self.synchronized(|terminal| {
             terminal.scroll_top = None;
@@ -787,7 +818,12 @@ impl TerminalUi {
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
             terminal.render_viewport(width, height)?;
-            insert_history_blocks(&mut terminal.surface, &committed, render_width)?;
+            insert_history_blocks(
+                &mut terminal.surface,
+                &committed,
+                render_width,
+                tools_expanded,
+            )?;
             terminal.render_viewport(width, height)
         });
         if result.is_ok() {
@@ -800,12 +836,18 @@ impl TerminalUi {
 
     fn rebuild_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
         let render_width = viewport::drawable_width(width);
+        let tools_expanded = self.tools_expanded;
         let history = std::mem::take(&mut self.history);
         let result = self.synchronized(|terminal| {
             terminal.surface.reset()?;
             terminal.selection = None;
             terminal.render_viewport(width, height)?;
-            insert_history_blocks(&mut terminal.surface, &history, render_width)?;
+            insert_history_blocks(
+                &mut terminal.surface,
+                &history,
+                render_width,
+                tools_expanded,
+            )?;
             terminal.render_viewport(width, height)
         });
         for block in &history {
@@ -986,6 +1028,8 @@ impl TerminalUi {
             context_tokens: self.usage.context_tokens,
             context_estimated: self.usage.context_estimated,
             context_limit: self.session.context_limit,
+            tools_expanded: self.tools_expanded,
+            subagents: &self.subagents,
         })
     }
 }
@@ -994,9 +1038,10 @@ fn insert_history_blocks(
     surface: &mut InlineScreen,
     blocks: &[LiveBlock],
     render_width: u16,
+    tools_expanded: bool,
 ) -> io::Result<()> {
     for block in blocks {
-        let buffer = block.render(render_width);
+        let buffer = block.render(render_width, tools_expanded);
         surface.insert_buffer(&buffer, 1)?;
         block.clear_render_cache();
     }

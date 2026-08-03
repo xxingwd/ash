@@ -3,7 +3,9 @@ use ash_agent::{
     build_system_prompt, estimate_request_tokens, skill_tool, Agent, MessageHistoryStore, Runtime,
     Skill, Thread, ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{CancellationToken, EventKind, MessageId, ModelId, ThreadId, TurnId};
+use ash_core::{
+    CancellationToken, EventKind, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId,
+};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::UiCommand;
 use futures::StreamExt;
@@ -26,6 +28,7 @@ struct AgentSetup {
     agent: Agent,
     options: ThreadOptions,
     runtime: Runtime,
+    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -103,12 +106,20 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         skill.apply_overrides(&mut agent);
     }
     let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
-    ash_collab::install_subagent_tools(&mut agent, options.clone(), runtime.clone());
+    let max_concurrent_agents = env_usize("ASH_MAX_CONCURRENT_AGENTS")?;
+    let subagent_monitor = ash_collab::install_subagent_tools(
+        &mut agent,
+        options.clone(),
+        runtime.clone(),
+        max_concurrent_agents,
+    )
+    .map(|control| control.subscribe());
 
     Ok(AgentSetup {
         agent,
         options,
         runtime,
+        subagent_monitor,
     })
 }
 
@@ -198,6 +209,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         agent,
         options,
         runtime,
+        subagent_monitor,
     } = setup;
     let protocol = runtime.model_backend().to_string();
     let model = agent.model.as_str().to_string();
@@ -216,7 +228,8 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
     };
     let app = ash_tui::App::new(protocol, model, working_dir)
         .with_context_limit(context_limit)
-        .with_input_history(input_history);
+        .with_input_history(input_history)
+        .with_subagent_monitor(subagent_monitor);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
     let thread = runtime.start(agent.clone(), options.clone());
 

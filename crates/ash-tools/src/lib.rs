@@ -115,7 +115,10 @@ mod tests {
             property_names(&definitions["grep"]),
             ["include", "path", "pattern"]
         );
-        assert_eq!(property_names(&definitions["bash"]), ["command", "timeout"]);
+        assert_eq!(
+            property_names(&definitions["bash"]),
+            ["command", "cwd", "timeout"]
+        );
         assert_eq!(property_names(&definitions["edit"]), ["edits", "path"]);
         assert_eq!(property_names(&definitions["write"]), ["content", "path"]);
         assert_eq!(property_names(&definitions["webfetch"]), ["timeout", "url"]);

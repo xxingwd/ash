@@ -19,6 +19,8 @@ export ASH_MODEL=gpt-5
 export ASH_BASE_URL=https://api.example.com
 export ASH_API_KEY=...
 export ASH_MODEL_CONFIG='reasoning.effort=high;temperature=0.2'
+# 子代理并发上限（默认不限制）；设置后超过上限的并发派发会被拒绝
+export ASH_MAX_CONCURRENT_AGENTS=8
 cargo run -p ash-cli
 ```
 
