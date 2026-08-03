@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{model_config, sse, ProviderConfig};
-use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
+use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 pub struct CompletionsAdapter {
     config: ProviderConfig,
@@ -195,7 +195,7 @@ struct PendingCall {
 }
 
 impl CompletionsDecoder {
-    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<ModelStreamEvent>, ProtocolError> {
+    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<ModelEvent>, ProtocolError> {
         let mut items = Vec::new();
         for (_, call) in std::mem::take(&mut self.calls) {
             let arguments = if call.arguments.trim().is_empty() {
@@ -207,7 +207,7 @@ impl CompletionsDecoder {
                     ))
                 })?
             };
-            items.push(ModelStreamEvent::ToolCall {
+            items.push(ModelEvent::ToolCall {
                 id: if call.id.is_empty() {
                     ToolCallId::new()
                 } else {
@@ -217,7 +217,7 @@ impl CompletionsDecoder {
                 arguments,
             });
         }
-        items.push(ModelStreamEvent::Stop(reason));
+        items.push(ModelEvent::Stop(reason));
         Ok(items)
     }
 }
@@ -234,10 +234,12 @@ impl sse::Decoder for CompletionsDecoder {
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
-            items.push(ModelStreamEvent::Usage {
+            items.push(ModelEvent::Usage(Usage {
                 input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
                 output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-            });
+                generation_ms: 0,
+                estimated: false,
+            }));
         }
 
         let Some(choice) = chunk["choices"]
@@ -252,13 +254,13 @@ impl sse::Decoder for CompletionsDecoder {
             .find_map(|field| delta[field].as_str())
             .filter(|reasoning| !reasoning.is_empty())
         {
-            items.push(ModelStreamEvent::ThinkingDelta(reasoning.to_string()));
+            items.push(ModelEvent::Reasoning(reasoning.to_string()));
         }
         if let Some(content) = delta["content"]
             .as_str()
             .filter(|content| !content.is_empty())
         {
-            items.push(ModelStreamEvent::TextDelta(content.to_string()));
+            items.push(ModelEvent::Text(content.to_string()));
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
@@ -317,12 +319,12 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                ModelStreamEvent::ToolCall {
+                ModelEvent::ToolCall {
                     id: ToolCallId::from_provider("call_7"),
                     name: "bash".into(),
                     arguments: json!({"command": "pwd"}),
                 },
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]
         );
     }
@@ -340,8 +342,8 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                ModelStreamEvent::ThinkingDelta("inspect first".into()),
-                ModelStreamEvent::TextDelta("done".into()),
+                ModelEvent::Reasoning("inspect first".into()),
+                ModelEvent::Text("done".into()),
             ]
         );
     }

@@ -59,7 +59,7 @@ pub struct ProviderConfig {
 }
 
 /// Provider-neutral model client and stream vocabulary, re-exported for adapter code.
-pub use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
+pub use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 pub fn create_adapter(cfg: ProviderConfig) -> Arc<dyn ModelClient> {
     match cfg.protocol {

@@ -4,7 +4,7 @@ use derive_more::{Display, From, Into};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::{Message, ProtocolError, StopReason, ToolCallId, ToolDefinition};
+use crate::{Message, ProtocolError, StopReason, ToolCallId, ToolDefinition, Usage};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
 pub struct ModelId(String);
@@ -28,24 +28,23 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
 }
 
+/// Provider-neutral streaming event. Incremental by nature; only a terminal
+/// `Stop` is a reliable boundary across reconnects.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ModelStreamEvent {
-    TextDelta(String),
-    ThinkingDelta(String),
+pub enum ModelEvent {
+    Text(String),
+    Reasoning(String),
     ToolCall {
         id: ToolCallId,
         name: String,
         arguments: serde_json::Value,
     },
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-    },
+    Usage(Usage),
     Stop(StopReason),
 }
 
 pub type ModelStream =
-    Pin<Box<dyn Stream<Item = Result<ModelStreamEvent, ProtocolError>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<ModelEvent, ProtocolError>> + Send + 'static>>;
 
 /// Provider-neutral streaming model interface used by the agent runtime.
 pub trait ModelClient: Send + Sync {

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use ash_core::{ModelId, ThreadId, ThreadSummary};
 use serde::{Deserialize, Serialize};
 
-use crate::{Record, ThreadLog};
+use crate::{LogEntry, ThreadLog};
 
 /// Whether a thread belongs to the interactive root session or to a spawned
 /// sub-agent. Sub-agent threads are hidden from the session list and cannot
@@ -62,14 +62,14 @@ pub struct StoredThread {
 
 /// Durable, storage-neutral boundary for thread state.
 ///
-/// `create` and `append` persist each record slice as one ordered version change.
+/// `create` and `append` persist each entry slice as one ordered version change.
 /// Implementations must reject stale `expected_version` values.
 #[async_trait::async_trait]
 pub trait ThreadStore: Send + Sync {
     async fn create(
         &self,
         metadata: ThreadMetadata,
-        records: &[Record],
+        entries: &[LogEntry],
     ) -> Result<Version, ash_core::AshError>;
 
     async fn load(&self, thread_id: ThreadId) -> Result<Option<StoredThread>, ash_core::AshError>;
@@ -78,7 +78,7 @@ pub trait ThreadStore: Send + Sync {
         &self,
         thread_id: ThreadId,
         expected_version: Version,
-        records: &[Record],
+        entries: &[LogEntry],
     ) -> Result<Version, ash_core::AshError>;
 
     async fn list(
@@ -93,10 +93,10 @@ pub(crate) struct ThreadPersistence {
     store: SharedThreadStore,
     thread_id: ThreadId,
     version: Version,
-    /// Records appended through this persistence handle. The caller replays
+    /// Entries appended through this persistence handle. The caller replays
     /// them into its in-memory log so it stays in sync without reloading the
     /// thread from disk.
-    appended: Vec<Record>,
+    appended: Vec<LogEntry>,
 }
 
 impl ThreadPersistence {
@@ -113,16 +113,16 @@ impl ThreadPersistence {
         self.version
     }
 
-    pub(crate) fn take_appended(&mut self) -> Vec<Record> {
+    pub(crate) fn take_appended(&mut self) -> Vec<LogEntry> {
         std::mem::take(&mut self.appended)
     }
 
-    pub(crate) async fn append(&mut self, records: &[Record]) -> Result<(), ash_core::AshError> {
+    pub(crate) async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
         self.version = self
             .store
-            .append(self.thread_id, self.version, records)
+            .append(self.thread_id, self.version, entries)
             .await?;
-        self.appended.extend(records.iter().cloned());
+        self.appended.extend(entries.iter().cloned());
         Ok(())
     }
 }

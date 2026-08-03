@@ -8,6 +8,8 @@ expression: event
   "sequence": 3,
   "timestamp": "2026-07-31T06:15:28Z",
   "kind": {
-    "TextDelta": "Hello"
+    "Live": {
+      "TextDelta": "Hello"
+    }
   }
 }

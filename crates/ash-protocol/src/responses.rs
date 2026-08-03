@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{model_config, sse, ProviderConfig};
-use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
+use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 pub struct ResponsesAdapter {
     config: ProviderConfig,
@@ -192,7 +192,7 @@ impl ResponsesDecoder {
             .unwrap_or_else(|| format!("output: {}", event["output_index"].as_u64().unwrap_or(0)))
     }
 
-    fn emit_call(&mut self, key: &str) -> Result<Option<ModelStreamEvent>, ProtocolError> {
+    fn emit_call(&mut self, key: &str) -> Result<Option<ModelEvent>, ProtocolError> {
         if self.emitted_calls.contains(key) {
             return Ok(None);
         }
@@ -206,7 +206,7 @@ impl ResponsesDecoder {
                 ProtocolError::InvalidResponse(format!("invalid Responses tool arguments: {error}"))
             })?
         };
-        let item = ModelStreamEvent::ToolCall {
+        let item = ModelEvent::ToolCall {
             id: if call.call_id.is_empty() {
                 ToolCallId::new()
             } else {
@@ -233,21 +233,21 @@ impl sse::Decoder for ResponsesDecoder {
         match event["type"].as_str().unwrap_or_default() {
             "response.output_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    items.push(ModelStreamEvent::TextDelta(delta.to_string()));
+                    items.push(ModelEvent::Text(delta.to_string()));
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     self.streamed_reasoning_summaries
                         .insert(event["summary_index"].as_u64().unwrap_or(0));
-                    items.push(ModelStreamEvent::ThinkingDelta(delta.to_string()));
+                    items.push(ModelEvent::Reasoning(delta.to_string()));
                 }
             }
             "response.reasoning_summary_text.done" => {
                 let summary_index = event["summary_index"].as_u64().unwrap_or(0);
                 if !self.streamed_reasoning_summaries.contains(&summary_index) {
                     if let Some(text) = event["text"].as_str() {
-                        items.push(ModelStreamEvent::ThinkingDelta(text.to_string()));
+                        items.push(ModelEvent::Reasoning(text.to_string()));
                     }
                 }
             }
@@ -315,10 +315,12 @@ impl sse::Decoder for ResponsesDecoder {
                 let response = &event["response"];
                 let usage = response.get("usage").unwrap_or(&event["usage"]);
                 if !usage.is_null() {
-                    items.push(ModelStreamEvent::Usage {
+                    items.push(ModelEvent::Usage(Usage {
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    });
+                        generation_ms: 0,
+                        estimated: false,
+                    }));
                 }
                 let reason = if response["incomplete_details"]["reason"].as_str()
                     == Some("max_output_tokens")
@@ -327,7 +329,7 @@ impl sse::Decoder for ResponsesDecoder {
                 } else {
                     StopReason::EndTurn
                 };
-                items.push(ModelStreamEvent::Stop(reason));
+                items.push(ModelEvent::Stop(reason));
                 finished = true;
             }
             "response.failed" => {
@@ -382,7 +384,7 @@ mod tests {
 
         assert_eq!(
             items,
-            vec![ModelStreamEvent::ToolCall {
+            vec![ModelEvent::ToolCall {
                 id: ToolCallId::from_provider("call_1"),
                 name: "read".into(),
                 arguments: json!({"path": "Cargo.toml"}),
@@ -414,10 +416,7 @@ mod tests {
             .unwrap()
             .into_items();
 
-        assert_eq!(
-            delta,
-            vec![ModelStreamEvent::ThinkingDelta("checking".into())]
-        );
+        assert_eq!(delta, vec![ModelEvent::Reasoning("checking".into())]);
         assert!(done.is_empty());
     }
 
@@ -431,10 +430,7 @@ mod tests {
             .unwrap()
             .into_items();
 
-        assert_eq!(
-            items,
-            vec![ModelStreamEvent::ThinkingDelta("checked".into())]
-        );
+        assert_eq!(items, vec![ModelEvent::Reasoning("checked".into())]);
     }
 
     #[test]

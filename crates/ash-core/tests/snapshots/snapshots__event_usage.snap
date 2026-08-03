@@ -1,12 +1,10 @@
 ---
 source: crates/ash-core/tests/snapshots.rs
-expression: event
+expression: usage
 ---
 {
-  "Usage": {
-    "input_tokens": 100,
-    "output_tokens": 50,
-    "generation_ms": 1250,
-    "estimated": false
-  }
+  "input_tokens": 100,
+  "output_tokens": 50,
+  "generation_ms": 1250,
+  "estimated": false
 }

@@ -82,6 +82,9 @@ enum RollbackStage {
 #[derive(Debug)]
 struct Rollback {
     stage: RollbackStage,
+    /// Whether the turn was already removed from the viewport when the
+    /// rollback started (cancel path) or still needs removal (undo path).
+    viewport_removed: bool,
 }
 
 impl OperationState {
@@ -90,10 +93,13 @@ impl OperationState {
     }
 
     pub(crate) fn shows_activity(&self) -> bool {
-        matches!(
-            self.current,
-            Operation::Turn(_) | Operation::Background(BackgroundAction::Compact)
-        )
+        match &self.current {
+            // A cancel-path rollback is still shutting the running turn down;
+            // an undo-path rollback has nothing running to animate.
+            Operation::Turn(TurnOperation::RollingBack(rollback)) => rollback.viewport_removed,
+            Operation::Turn(_) | Operation::Background(BackgroundAction::Compact) => true,
+            Operation::Background(_) | Operation::Idle => false,
+        }
     }
 
     pub(crate) fn submission_policy(&self) -> SubmissionPolicy {
@@ -126,6 +132,16 @@ impl OperationState {
         self.current = Operation::Background(action);
     }
 
+    /// Begin a rollback of the last completed turn (`/undo`), where the turn
+    /// is still visible and must be removed from the viewport when the
+    /// rollback result arrives.
+    pub(crate) fn start_rollback(&mut self) {
+        self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
+            stage: RollbackStage::AwaitingResult,
+            viewport_removed: false,
+        }));
+    }
+
     pub(crate) fn begin_cancellation(&mut self, has_response: bool) -> Option<Cancellation> {
         let current = std::mem::take(&mut self.current);
         let Operation::Turn(TurnOperation::Running { prompt }) = current else {
@@ -139,6 +155,7 @@ impl OperationState {
         } else {
             self.current = Operation::Turn(TurnOperation::RollingBack(Rollback {
                 stage: RollbackStage::AwaitingTurn,
+                viewport_removed: true,
             }));
             Some(Cancellation::RemoveTurn { prompt })
         }
@@ -146,10 +163,7 @@ impl OperationState {
 
     pub(crate) fn route_event(&mut self, event: &EventKind) -> EventRoute {
         match (&mut self.current, event) {
-            (
-                Operation::Turn(TurnOperation::RollingBack(rollback)),
-                EventKind::TurnCompleted { .. },
-            ) => {
+            (Operation::Turn(TurnOperation::RollingBack(rollback)), EventKind::Turn(_)) => {
                 rollback.stage = RollbackStage::AwaitingResult;
                 EventRoute::Render
             }
@@ -160,7 +174,7 @@ impl OperationState {
                 })),
                 EventKind::Error(_),
             ) => EventRoute::Ignore,
-            (Operation::Background(_), EventKind::TurnCompleted { .. }) => EventRoute::Ignore,
+            (Operation::Background(_), EventKind::Turn(_)) => EventRoute::Ignore,
             (operation, event)
                 if suppresses_turn_output(operation) && is_turn_output_event(event) =>
             {
@@ -213,8 +227,13 @@ impl OperationState {
     }
 
     pub(crate) fn finish_rollback(&mut self) -> RollbackCompletion {
-        let viewport_removed =
-            matches!(self.current, Operation::Turn(TurnOperation::RollingBack(_)));
+        let viewport_removed = matches!(
+            self.current,
+            Operation::Turn(TurnOperation::RollingBack(Rollback {
+                viewport_removed: true,
+                ..
+            }))
+        );
         self.finish();
         if viewport_removed {
             RollbackCompletion::ViewportAlreadyRemoved
@@ -236,22 +255,23 @@ fn suppresses_turn_output(operation: &Operation) -> bool {
 }
 
 fn is_turn_output_event(event: &EventKind) -> bool {
-    matches!(
-        event,
-        EventKind::TurnStarted
-            | EventKind::TextDelta(_)
-            | EventKind::Thinking(_)
-            | EventKind::ToolCallStart { .. }
-            | EventKind::ToolCallEnd { .. }
-            | EventKind::Usage { .. }
-    )
+    matches!(event, EventKind::TurnStart | EventKind::Live(_))
 }
 
 #[cfg(test)]
 mod tests {
-    use ash_core::StopReason;
+    use ash_core::{LiveEvent, StopReason, TurnId, TurnResult, TurnView};
 
     use super::*;
+
+    fn turn_event(reason: StopReason) -> EventKind {
+        EventKind::Turn(TurnView {
+            id: TurnId::new(),
+            result: TurnResult::Completed(reason),
+            messages: Vec::new(),
+            usage: None,
+        })
+    }
 
     #[test]
     fn agent_start_reports_whether_the_turn_was_already_tracked() {
@@ -300,7 +320,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.route_event(&EventKind::TextDelta("late".into())),
+            state.route_event(&EventKind::Live(LiveEvent::TextDelta("late".into()))),
             EventRoute::Ignore
         );
         assert_eq!(
@@ -308,13 +328,13 @@ mod tests {
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&EventKind::TurnCompleted {
-                reason: StopReason::Aborted,
-            }),
+            state.route_event(&turn_event(StopReason::Aborted)),
             EventRoute::Render
         );
         assert_eq!(
-            state.route_event(&EventKind::TextDelta("rollback result".into())),
+            state.route_event(&EventKind::Live(LiveEvent::TextDelta(
+                "rollback result".into()
+            ))),
             EventRoute::Handle
         );
         assert_eq!(
@@ -331,13 +351,11 @@ mod tests {
 
         assert!(!state.shows_activity());
         assert_eq!(
-            state.route_event(&EventKind::Thinking("late".into())),
+            state.route_event(&EventKind::Live(LiveEvent::ReasoningDelta("late".into()))),
             EventRoute::Ignore
         );
         assert_eq!(
-            state.route_event(&EventKind::TurnCompleted {
-                reason: StopReason::EndTurn,
-            }),
+            state.route_event(&turn_event(StopReason::EndTurn)),
             EventRoute::Ignore
         );
         assert_eq!(
@@ -359,5 +377,30 @@ mod tests {
             state.finish_rollback(),
             RollbackCompletion::ViewportAlreadyRemoved
         );
+    }
+
+    #[test]
+    fn undo_rollback_replays_the_viewport() {
+        let mut state = OperationState::default();
+        state.start_rollback();
+        assert_eq!(state.submission_policy(), SubmissionPolicy::Block);
+        assert!(!state.shows_activity());
+        assert_eq!(state.finish_rollback(), RollbackCompletion::ReplayViewport);
+        assert!(!state.is_busy());
+    }
+
+    #[test]
+    fn undo_rollback_error_finishes_the_operation() {
+        let mut state = OperationState::default();
+        state.start_rollback();
+        assert_eq!(
+            state.route_event(&EventKind::Error("nothing to undo".into())),
+            EventRoute::Handle
+        );
+        assert_eq!(
+            state.complete_failed_action(),
+            FailureCompletion::FinishedOperation
+        );
+        assert!(!state.is_busy());
     }
 }

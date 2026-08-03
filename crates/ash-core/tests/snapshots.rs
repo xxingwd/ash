@@ -88,7 +88,7 @@ fn test_text_content_snapshot() {
 
 #[test]
 fn test_event_text_delta_snapshot() {
-    let event = EventKind::TextDelta("Hello".to_string());
+    let event = EventKind::Live(LiveEvent::TextDelta("Hello".to_string()));
     assert_json_snapshot!("event_text_delta", event);
 }
 
@@ -99,7 +99,7 @@ fn test_event_envelope_snapshot() {
         turn_id: Some(TurnId::new()),
         sequence: 3,
         timestamp: "2026-07-31T06:15:28Z".to_string(),
-        kind: EventKind::TextDelta("Hello".to_string()),
+        kind: EventKind::Live(LiveEvent::TextDelta("Hello".to_string())),
     };
     assert_json_snapshot!("event_envelope", event, {
         ".thread_id" => "[uuid]",
@@ -109,11 +109,11 @@ fn test_event_envelope_snapshot() {
 
 #[test]
 fn test_event_tool_call_start_snapshot() {
-    let event = EventKind::ToolCallStart {
+    let event = EventKind::Live(LiveEvent::ToolStarted {
         id: ToolCallId::new(),
         name: "read".to_string(),
         arguments: serde_json::json!({"path": "README.md"}),
-    };
+    });
     assert_json_snapshot!("event_tool_call_start", event, {
         ".id" => "[uuid]",
     });
@@ -121,21 +121,21 @@ fn test_event_tool_call_start_snapshot() {
 
 #[test]
 fn test_event_usage_snapshot() {
-    let event = EventKind::Usage {
+    let usage = Usage {
         input_tokens: 100,
         output_tokens: 50,
         generation_ms: 1_250,
         estimated: false,
     };
-    assert_json_snapshot!("event_usage", event);
+    assert_json_snapshot!("event_usage", usage);
 }
 
 #[test]
 fn test_event_context_compacted_snapshot() {
-    let event = EventKind::ContextCompacted {
-        before_tokens: 180_000,
-        after_tokens: 12_000,
-        dropped_messages: 42,
+    let event = EventKind::Compacted {
+        before: 180_000,
+        after: 12_000,
+        dropped: 42,
         automatic: false,
     };
     assert_json_snapshot!("event_context_compacted", event);

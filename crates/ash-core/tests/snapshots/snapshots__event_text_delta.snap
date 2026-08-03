@@ -3,5 +3,7 @@ source: crates/ash-core/tests/snapshots.rs
 expression: event
 ---
 {
-  "TextDelta": "Hello"
+  "Live": {
+    "TextDelta": "Hello"
+  }
 }

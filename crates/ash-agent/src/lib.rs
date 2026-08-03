@@ -23,10 +23,10 @@ pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PassthroughContextPolicy,
     PreparedContext,
 };
-pub use extension::{Extension, TurnContext, TurnOutcome, TurnPatch, TurnStatus};
+pub use extension::{Extension, TurnContext, TurnPatch};
 pub use input::{Input, InputSource};
 pub use jsonl::JsonlThreadStore;
-pub use log::{AcceptedInput, ContextCheckpoint, Record, ThreadLog};
+pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, ThreadLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;
 pub use prompt::build_system_prompt;

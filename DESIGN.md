@@ -65,32 +65,51 @@ inactive turn returns an explicit error.
 
 ## Durable Log
 
-`ThreadLog` is the source for both full user-visible history and compacted model context. Its
-records include:
+`ThreadLog` is the durable append-only log and the only source for full user-visible
+history, compacted model context, and turn views. Its entries are:
 
-- `TurnStarted`;
-- `InputAccepted`;
+- `TurnStart`;
+- `Input`;
 - model and tool-result messages;
 - context checkpoints;
-- `TurnCompleted` or `TurnFailed`;
+- `TurnEnd { result, usage }`;
 - rollback markers.
 
+A turn is the scrollback/replay boundary: `TurnEnd` carries the terminal `TurnResult`
+(completed, failed, or interrupted) plus the optional aggregated `Usage`. A turn left open
+when a session ends is projected as `Interrupted` and never exposed as normal history.
+Live streaming deltas are never persisted.
+
 All inputs in a submitted turn are validated before persistence. Empty input, a previously used
-idempotency key, or duplicate keys within one batch reject the whole turn before `TurnStarted`
+idempotency key, or duplicate keys within one batch reject the whole turn before `TurnStart`
 is written.
 
 `ThreadStore` is the only public persistence boundary:
 
 ```text
-create(metadata, records) -> version
+create(metadata, entries) -> version
 load(thread_id) -> stored thread
-append(thread_id, expected_version, records) -> version
+append(thread_id, expected_version, entries) -> version
 list(excluded_thread) -> summaries
 ```
 
-Record slices represent one ordered version change. Implementations reject stale versions.
-The default `JsonlThreadStore` serializes writes per store, appends records in one batch, and
+Entry slices represent one ordered version change. Implementations reject stale versions.
+The default `JsonlThreadStore` serializes writes per store, appends entries in one batch, and
 can read legacy `session-*`/`session_meta` files while writing `thread-*`/`thread_meta` files.
+
+## Events And Projection
+
+`EventKind` distinguishes live deltas from durable facts and derived views:
+
+- `Live(LiveEvent)` carries ephemeral streaming deltas for the active turn's preview only.
+- `Turn(TurnView)` is emitted when a turn settles and carries its canonical messages, result,
+  and usage; clients use it to commit scrollback.
+- `Restored(ThreadView)` / `ThreadForked` carry the full projection after resume or fork.
+- `Compacted` reports a context-checkpoint change; `TurnRolledBack` reports a rollback.
+
+All memory state is derived from the log through one reducer direction:
+`LogEntry -> ThreadView -> messages / context / turns -> transcript blocks`. The TUI draws
+live deltas as a preview and replaces them with the canonical projection on `Turn`.
 
 ## Context And Memory
 

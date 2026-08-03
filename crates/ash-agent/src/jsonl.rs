@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use ash_core::{
-    Content, Message, MessageContent, MessageId, ModelId, StopReason, ThreadId, ThreadSummary,
-    TurnId,
+    Content, Message, MessageContent, MessageId, ModelId, ThreadId, ThreadSummary, TurnId,
+    TurnResult, Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,8 @@ use tracing::warn;
 #[cfg(test)]
 use crate::RunConfig;
 use crate::{
-    AcceptedInput, ContextCheckpoint, Record, StoredThread, ThreadLog, ThreadMetadata, ThreadStore,
-    Version,
+    AcceptedInput, ContextCheckpoint, LogEntry, StoredThread, ThreadLog, ThreadMetadata,
+    ThreadStore, Version,
 };
 
 const THREAD_FORMAT_VERSION: u32 = 1;
@@ -96,27 +96,26 @@ struct ContextCompactedRecord {
     tail_start_id: Option<MessageId>,
 }
 
+/// One durable entry on disk. Messages are split by role so a thread file is
+/// readable at a glance; `from_entry`/`into_entry` map them to `LogEntry`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum FileRecord {
     #[serde(rename = "thread_meta", alias = "session_meta")]
     ThreadMeta(FileMetadata),
-    TurnStarted {
+    TurnStart {
         turn_id: TurnId,
     },
     InputAccepted(AcceptedInput),
     UserMessage(Message),
     AssistantMessage(Message),
     ToolResult(Message),
-    TurnRolledBack,
-    TurnCompleted {
+    TurnEnd {
         turn_id: TurnId,
-        reason: StopReason,
+        result: TurnResult,
+        usage: Option<Usage>,
     },
-    TurnFailed {
-        turn_id: TurnId,
-        error: String,
-    },
+    Rollback,
     ContextCompacted(ContextCompactedRecord),
 }
 
@@ -129,39 +128,45 @@ impl FileRecord {
         }
     }
 
-    fn from_entry(entry: Record) -> Self {
+    fn from_entry(entry: LogEntry) -> Self {
         match entry {
-            Record::TurnStarted { turn_id } => Self::TurnStarted { turn_id },
-            Record::InputAccepted(input) => Self::InputAccepted(input),
-            Record::Message(message) => Self::from_message(&message),
-            Record::ContextCheckpoint(checkpoint) => {
-                Self::ContextCompacted(ContextCompactedRecord {
-                    summary: checkpoint.summary,
-                    tail_start_id: checkpoint.tail_start_id,
-                })
-            }
-            Record::TurnRolledBack => Self::TurnRolledBack,
-            Record::TurnCompleted { turn_id, reason } => Self::TurnCompleted { turn_id, reason },
-            Record::TurnFailed { turn_id, error } => Self::TurnFailed { turn_id, error },
+            LogEntry::TurnStart(turn_id) => Self::TurnStart { turn_id },
+            LogEntry::Input(input) => Self::InputAccepted(input),
+            LogEntry::Message(message) => Self::from_message(&message),
+            LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(ContextCompactedRecord {
+                summary: checkpoint.summary,
+                tail_start_id: checkpoint.tail_start_id,
+            }),
+            LogEntry::TurnEnd { id, result, usage } => Self::TurnEnd {
+                turn_id: id,
+                result,
+                usage,
+            },
+            LogEntry::Rollback => Self::Rollback,
         }
     }
 
-    fn into_entry(self) -> Option<Record> {
+    fn into_entry(self) -> Option<LogEntry> {
         match self {
-            Self::TurnStarted { turn_id } => Some(Record::TurnStarted { turn_id }),
-            Self::InputAccepted(input) => Some(Record::InputAccepted(input)),
+            Self::TurnStart { turn_id } => Some(LogEntry::TurnStart(turn_id)),
+            Self::InputAccepted(input) => Some(LogEntry::Input(input)),
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
-            | Self::ToolResult(message) => Some(Record::Message(message)),
-            Self::ContextCompacted(record) => Some(Record::ContextCheckpoint(ContextCheckpoint {
+            | Self::ToolResult(message) => Some(LogEntry::Message(message)),
+            Self::ContextCompacted(record) => Some(LogEntry::Checkpoint(ContextCheckpoint {
                 summary: record.summary,
                 tail_start_id: record.tail_start_id,
             })),
-            Self::TurnRolledBack => Some(Record::TurnRolledBack),
-            Self::TurnCompleted { turn_id, reason } => {
-                Some(Record::TurnCompleted { turn_id, reason })
-            }
-            Self::TurnFailed { turn_id, error } => Some(Record::TurnFailed { turn_id, error }),
+            Self::TurnEnd {
+                turn_id,
+                result,
+                usage,
+            } => Some(LogEntry::TurnEnd {
+                id: turn_id,
+                result,
+                usage,
+            }),
+            Self::Rollback => Some(LogEntry::Rollback),
             Self::ThreadMeta(_) => None,
         }
     }
@@ -349,7 +354,7 @@ impl ThreadFile {
         &mut self,
         message: &Message,
     ) -> Result<(), ash_core::AshError> {
-        self.append(self.revision, &[Record::Message(message.clone())])
+        self.append(self.revision, &[LogEntry::Message(message.clone())])
             .await
             .map(|_| ())
     }
@@ -361,9 +366,9 @@ impl ThreadFile {
     ) -> Result<(), ash_core::AshError> {
         self.append(
             self.revision,
-            &[Record::ContextCheckpoint(
-                ContextCheckpoint::from_model_context(compacted_messages)?,
-            )],
+            &[LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
+                compacted_messages,
+            )?)],
         )
         .await
         .map(|_| ())
@@ -377,7 +382,7 @@ impl ThreadFile {
     async fn append(
         &mut self,
         expected_revision: Version,
-        records: &[Record],
+        entries: &[LogEntry],
     ) -> Result<Version, ash_core::AshError> {
         if expected_revision != self.revision {
             return Err(ash_core::AshError::Config(format!(
@@ -386,9 +391,9 @@ impl ThreadFile {
                 self.revision.value()
             )));
         }
-        if records
+        if entries
             .iter()
-            .any(|record| matches!(record, Record::TurnRolledBack))
+            .any(|entry| matches!(entry, LogEntry::Rollback))
             && self.file.is_none()
         {
             return Err(ash_core::AshError::Config(
@@ -401,8 +406,8 @@ impl ThreadFile {
         if is_new {
             push_line(&mut data, FileRecord::ThreadMeta(self.metadata.clone()))?;
         }
-        for record in records.iter().cloned() {
-            push_line(&mut data, FileRecord::from_entry(record))?;
+        for entry in entries.iter().cloned() {
+            push_line(&mut data, FileRecord::from_entry(entry))?;
         }
 
         if is_new {
@@ -423,7 +428,7 @@ impl ThreadFile {
         })?;
         file.write_all(data.as_bytes()).await?;
         file.flush().await?;
-        self.revision = self.revision.advance(records.len());
+        self.revision = self.revision.advance(entries.len());
         Ok(self.revision)
     }
 
@@ -434,7 +439,7 @@ impl ThreadFile {
                 "thread store has no persisted turn to roll back".to_string(),
             ));
         }
-        self.append(self.revision, &[Record::TurnRolledBack])
+        self.append(self.revision, &[LogEntry::Rollback])
             .await
             .map(|_| ())
     }
@@ -501,11 +506,11 @@ impl ThreadStore for JsonlThreadStore {
     async fn create(
         &self,
         metadata: ThreadMetadata,
-        records: &[Record],
+        entries: &[LogEntry],
     ) -> Result<Version, ash_core::AshError> {
         let _guard = self.gate.lock().await;
         let mut thread = ThreadFile::from_metadata(metadata, &self.directory);
-        thread.append(Version::initial(), records).await
+        thread.append(Version::initial(), entries).await
     }
 
     async fn load(&self, thread_id: ThreadId) -> Result<Option<StoredThread>, ash_core::AshError> {
@@ -525,7 +530,7 @@ impl ThreadStore for JsonlThreadStore {
         &self,
         thread_id: ThreadId,
         expected_version: Version,
-        records: &[Record],
+        entries: &[LogEntry],
     ) -> Result<Version, ash_core::AshError> {
         let _guard = self.gate.lock().await;
         let stored = ThreadFile::stored_threads_in(self.directory.clone(), None)
@@ -534,7 +539,7 @@ impl ThreadStore for JsonlThreadStore {
             .find(|stored| stored.metadata.thread_id == thread_id)
             .ok_or_else(|| ash_core::AshError::Config(format!("thread not found: {thread_id}")))?;
         let mut thread = ThreadFile::resume(&stored).await?;
-        thread.append(expected_version, records).await
+        thread.append(expected_version, entries).await
     }
 
     async fn list(
@@ -761,7 +766,7 @@ mod tests {
         store.append_message(&Message::user("first")).await.unwrap();
 
         let error = store
-            .append(stale_revision, &[Record::Message(Message::user("stale"))])
+            .append(stale_revision, &[LogEntry::Message(Message::user("stale"))])
             .await
             .unwrap_err();
 
@@ -804,7 +809,7 @@ mod tests {
         assert!(matches!(&messages[1].content, MessageContent::Assistant(_)));
         let contents = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(contents.contains("second"));
-        assert!(contents.contains("turn_rolled_back"));
+        assert!(contents.contains("\"rollback\""));
         assert!(tokio::fs::metadata(store.path()).await.unwrap().len() > length_before_rollback);
     }
 
@@ -935,7 +940,7 @@ mod tests {
             kind,
         };
         let records = |id: ThreadId| {
-            vec![Record::Message(Message {
+            vec![LogEntry::Message(Message {
                 id: ash_core::MessageId::new(),
                 role: ash_core::Role::User,
                 content: ash_core::MessageContent::User(vec![ash_core::Content::Text(format!(

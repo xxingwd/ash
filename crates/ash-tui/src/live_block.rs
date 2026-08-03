@@ -135,6 +135,20 @@ impl LiveBlock {
             && !matches!(self.kind, LiveBlockKind::History(HistoryBlock::User(_)))
     }
 
+    /// Blocks produced by live streaming for this turn (assistant text,
+    /// reasoning, tool output). They are replaced by the canonical projection
+    /// when the turn settles; user input and error blocks are kept.
+    pub(crate) fn is_streamed_for_turn(&self, turn_id: u64) -> bool {
+        self.belongs_to_turn(turn_id)
+            && matches!(
+                self.kind,
+                LiveBlockKind::Assistant { .. }
+                    | LiveBlockKind::Thought { .. }
+                    | LiveBlockKind::ReadGroup(_)
+                    | LiveBlockKind::Tool { .. }
+            )
+    }
+
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
         let LiveBlockKind::Assistant {
             source: current,

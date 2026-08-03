@@ -1,6 +1,5 @@
 use ash_core::{
-    CancellationToken, Message, ModelClient, ModelId, ModelRequest, ModelStreamEvent,
-    ToolDefinition,
+    CancellationToken, Message, ModelClient, ModelEvent, ModelId, ModelRequest, ToolDefinition,
 };
 use futures::StreamExt;
 
@@ -81,11 +80,9 @@ impl DefaultContextPolicy {
                 break;
             };
             match item? {
-                ModelStreamEvent::TextDelta(text) => summary.push_str(&text),
-                ModelStreamEvent::ThinkingDelta(_)
-                | ModelStreamEvent::Usage { .. }
-                | ModelStreamEvent::Stop(_) => {}
-                ModelStreamEvent::ToolCall { .. } => {
+                ModelEvent::Text(text) => summary.push_str(&text),
+                ModelEvent::Reasoning(_) | ModelEvent::Usage(_) | ModelEvent::Stop(_) => {}
+                ModelEvent::ToolCall { .. } => {
                     return Err(ash_core::ProtocolError::InvalidResponse(
                         "compaction model unexpectedly requested a tool".to_string(),
                     )

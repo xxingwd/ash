@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{model_config, sse, ProviderConfig};
-use ash_core::{ModelClient, ModelRequest, ModelStream, ModelStreamEvent};
+use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
@@ -174,10 +174,12 @@ impl sse::Decoder for AnthropicDecoder {
         match event["type"].as_str().unwrap_or_default() {
             "message_start" => {
                 if let Some(usage) = event["message"].get("usage") {
-                    items.push(ModelStreamEvent::Usage {
+                    items.push(ModelEvent::Usage(Usage {
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    });
+                        generation_ms: 0,
+                        estimated: false,
+                    }));
                 }
             }
             "content_block_start" => {
@@ -203,12 +205,12 @@ impl sse::Decoder for AnthropicDecoder {
                 match delta["type"].as_str() {
                     Some("text_delta") => {
                         if let Some(text) = delta["text"].as_str() {
-                            items.push(ModelStreamEvent::TextDelta(text.to_string()));
+                            items.push(ModelEvent::Text(text.to_string()));
                         }
                     }
                     Some("thinking_delta") => {
                         if let Some(text) = delta["thinking"].as_str() {
-                            items.push(ModelStreamEvent::ThinkingDelta(text.to_string()));
+                            items.push(ModelEvent::Reasoning(text.to_string()));
                         }
                     }
                     Some("input_json_delta") => {
@@ -234,7 +236,7 @@ impl sse::Decoder for AnthropicDecoder {
                             ))
                         })?
                     };
-                    items.push(ModelStreamEvent::ToolCall {
+                    items.push(ModelEvent::ToolCall {
                         id: call.id,
                         name: call.name,
                         arguments,
@@ -243,10 +245,12 @@ impl sse::Decoder for AnthropicDecoder {
             }
             "message_delta" => {
                 if let Some(usage) = event.get("usage") {
-                    items.push(ModelStreamEvent::Usage {
+                    items.push(ModelEvent::Usage(Usage {
                         input_tokens: 0,
                         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    });
+                        generation_ms: 0,
+                        estimated: false,
+                    }));
                 }
                 self.stop = Some(match event["delta"]["stop_reason"].as_str() {
                     Some("max_tokens") => StopReason::MaxTokens,
@@ -254,7 +258,7 @@ impl sse::Decoder for AnthropicDecoder {
                 });
             }
             "message_stop" => {
-                items.push(ModelStreamEvent::Stop(
+                items.push(ModelEvent::Stop(
                     self.stop.take().unwrap_or(StopReason::EndTurn),
                 ));
                 finished = true;
@@ -310,7 +314,7 @@ mod tests {
 
         assert_eq!(
             items,
-            vec![ModelStreamEvent::ToolCall {
+            vec![ModelEvent::ToolCall {
                 id: ToolCallId::from_provider("toolu_123"),
                 name: "read".into(),
                 arguments: json!({"path": "README.md"}),

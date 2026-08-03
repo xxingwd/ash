@@ -8,6 +8,6 @@ pub mod tool;
 pub use error::*;
 pub use event::*;
 pub use message::*;
-pub use model::{ModelClient, ModelId, ModelRequest, ModelStream, ModelStreamEvent};
+pub use model::{ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream};
 pub use subagent::*;
 pub use tool::*;

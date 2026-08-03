@@ -3,6 +3,7 @@ pub(crate) enum SlashCommand {
     New,
     Clear,
     Undo,
+    Fork,
     Compact,
     Resume,
     Status,
@@ -60,8 +61,14 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "undo",
         aliases: &[],
-        description: "choose a prompt to fork from",
+        description: "undo the last submitted prompt",
         command: SlashCommand::Undo,
+    },
+    CommandSpec {
+        name: "fork",
+        aliases: &[],
+        description: "choose a prompt to fork from",
+        command: SlashCommand::Fork,
     },
     CommandSpec {
         name: "compact",
@@ -234,6 +241,7 @@ mod tests {
     fn parses_commands_and_aliases() {
         assert_eq!(parse("/new"), ParsedInput::Command(SlashCommand::New));
         assert_eq!(parse("/undo"), ParsedInput::Command(SlashCommand::Undo));
+        assert_eq!(parse("/fork"), ParsedInput::Command(SlashCommand::Fork));
         assert_eq!(
             parse("/compact"),
             ParsedInput::Command(SlashCommand::Compact)
@@ -262,6 +270,7 @@ mod tests {
         assert!(!SlashCommand::Clear.available_during_task());
         assert!(!SlashCommand::Resume.available_during_task());
         assert!(!SlashCommand::Undo.available_during_task());
+        assert!(!SlashCommand::Fork.available_during_task());
         assert!(!SlashCommand::Compact.available_during_task());
     }
 
@@ -275,6 +284,20 @@ mod tests {
             }]
         );
         assert_eq!(completions("q", false)[0].name, "exit");
+        assert_eq!(
+            completions("fork", false),
+            vec![CommandCompletion {
+                name: "fork",
+                description: "choose a prompt to fork from",
+            }]
+        );
+        assert_eq!(
+            completions("undo", false),
+            vec![CommandCompletion {
+                name: "undo",
+                description: "undo the last submitted prompt",
+            }]
+        );
     }
 
     #[test]

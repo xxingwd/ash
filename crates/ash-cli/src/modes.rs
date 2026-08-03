@@ -4,7 +4,7 @@ use ash_agent::{
     Skill, Thread, ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_core::{
-    CancellationToken, EventKind, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId,
+    CancellationToken, EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId,
 };
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::UiCommand;
@@ -190,15 +190,15 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
 
 fn print_event(event: EventKind) {
     match event {
-        EventKind::TextDelta(text) => print!("{text}"),
-        EventKind::ToolCallStart { name, .. } => {
+        EventKind::Live(LiveEvent::TextDelta(text)) => print!("{text}"),
+        EventKind::Live(LiveEvent::ToolStarted { name, .. }) => {
             eprintln!("{}", format!("[tool: {name}]").cyan());
         }
-        EventKind::ToolCallEnd {
+        EventKind::Live(LiveEvent::ToolFinished {
             is_error: true,
             output,
             ..
-        } => eprintln!("{}", format!("[error: {output}]").red()),
+        }) => eprintln!("{}", format!("[error: {output}]").red()),
         EventKind::Error(error) => eprintln!("{}", format!("[error: {error}]").red()),
         _ => {}
     }
@@ -260,10 +260,10 @@ impl InteractiveController {
                 biased;
                 event = events.next() => match event {
                     Some(Ok(event)) => {
-                        if matches!(event.kind, EventKind::TurnStarted) {
+                        if matches!(event.kind, EventKind::TurnStart) {
                             active = event.turn_id;
                         }
-                        let completed = matches!(event.kind, EventKind::TurnCompleted { .. });
+                        let completed = matches!(event.kind, EventKind::Turn(_));
                         let completed_turn = event.turn_id;
                         let _ = self.event_tx.send(event.kind).await;
                         if completed {
@@ -309,6 +309,7 @@ impl InteractiveController {
                                 self.rollback_last_turn().await;
                             }
                         }
+                        UiCommand::Rollback => self.rollback_last_turn().await,
                         UiCommand::Compact => self.compact_thread().await,
                         UiCommand::NewSession => {
                             self.thread = self.runtime.start(self.agent.clone(), self.options.clone());
@@ -367,10 +368,10 @@ impl InteractiveController {
 
     async fn compact_thread(&mut self) {
         let event = match self.thread.compact().await {
-            Ok(result) => EventKind::ContextCompacted {
-                before_tokens: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
-                after_tokens: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
-                dropped_messages: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
+            Ok(result) => EventKind::Compacted {
+                before: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
+                after: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
+                dropped: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
                 automatic: false,
             },
             Err(error) => EventKind::Error(format!("Failed to compact context: {error}")),
@@ -415,13 +416,10 @@ impl InteractiveController {
         {
             Ok(Some(thread)) => {
                 self.thread = thread;
-                match self.thread.messages().await {
-                    Ok(messages) => EventKind::ThreadRestored {
-                        model: self.agent.model.as_str().to_string(),
-                        protocol: self.runtime.model_backend().to_string(),
-                        working_dir: self.options.working_dir.clone(),
-                        context_tokens: self.estimated_context_tokens(&messages),
-                        messages,
+                match self.thread.view().await {
+                    Ok(view) => EventKind::Restored {
+                        context_tokens: self.estimated_context_tokens(&view.messages),
+                        view,
                     },
                     Err(error) => EventKind::Error(format!("Failed to restore chat: {error}")),
                 }
@@ -436,13 +434,15 @@ impl InteractiveController {
         let event = match self.thread.fork_at(message_id).await {
             Ok(Some(forked)) => {
                 self.thread = forked.thread;
-                EventKind::ThreadForked {
-                    model: forked.model,
-                    protocol: forked.protocol,
-                    working_dir: forked.working_dir,
-                    context_tokens: self.estimated_context_tokens(&forked.messages),
-                    messages: forked.messages,
-                    prompt: forked.prompt,
+                match self.thread.view().await {
+                    Ok(view) => EventKind::ThreadForked {
+                        context_tokens: self.estimated_context_tokens(&view.messages),
+                        view,
+                        prompt: forked.prompt,
+                    },
+                    Err(error) => {
+                        EventKind::Error(format!("Failed to fork the current chat: {error}"))
+                    }
                 }
             }
             Ok(None) => {

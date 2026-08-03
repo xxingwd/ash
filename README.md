@@ -132,11 +132,13 @@ checkpoint 构造压缩上下文。API Key、访问令牌和自定义接口地�
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
 Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
-`/undo` 会列出当前会话的历史用户输入；选中后创建一个新的 fork Session，继承该输入
-之前的消息，并把所选输入恢复到输入框。原 Session 的内存历史和 JSONL 都不会改变。
+`/undo` 会把最近一轮（上一条用户输入及其回答）从模型会话历史和终端 viewport 中移除，
+并把该输入恢复到输入框，便于修改后重新提交。`/fork` 会列出当前会话的历史用户输入；
+选中后创建一个新的 fork Session，继承该输入之前的消息，并把所选输入恢复到输入框。
+原 Session 的内存历史和 JSONL 都不会改变。
 通过 `/new` 或 `/clear` 建立的 Session 会立即获得 ID 和创建时间，但在第一条用户消息
 发出前不会创建文件；会话名称取第一条有效用户消息。
-`/resume` 和 `/undo` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
+`/resume` 和 `/fork` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
 历史单独保存在 `~/.local/share/ash/history.jsonl`。
 
 ## 子 Agent
@@ -176,7 +178,7 @@ viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随
 随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
 resize 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并立即释放
 Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。`/new`、
-`/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 和完成的 `/undo` fork
+`/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 和完成的 `/fork`
 则从对应 Session 消息重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
@@ -204,8 +206,9 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `exit` / `quit`：退出
 
 按下 `Esc` 会从模型会话历史和 live viewport 中移除当前轮，并把问题恢复到输入框；它不会
-反向撤销已经由工具写入文件系统的修改。`/undo` 也不会撤销工具副作用或修改原 Session；
-它会从所选输入之前的历史创建新 Session，随后重放继承的历史并恢复该输入。
+反向撤销已经由工具写入文件系统的修改。`/undo` 同样不会撤销工具副作用；它只移除最近
+一轮并把该输入恢复到输入框。`/fork` 也不会修改原 Session；它会从所选输入之前的历史
+创建新 Session，随后重放继承的历史并恢复该输入。
 
 ## 开发检查
 

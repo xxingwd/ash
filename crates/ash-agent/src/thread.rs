@@ -5,7 +5,7 @@ use std::{
 
 use ash_core::{
     CancellationToken, Content, Event, EventKind, ForkPoint, Message, MessageContent, MessageId,
-    StopReason, ThreadId, TurnId,
+    StopReason, ThreadId, ThreadView, TurnId, TurnResult, TurnView,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -13,8 +13,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
-    AcceptedInput, ContextCheckpoint, Input, Record, RunConfig, Runtime, SharedThreadStore,
-    ThreadLog, ThreadMetadata, TurnContext, TurnOutcome, TurnStatus, Version,
+    AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime, SharedThreadStore,
+    ThreadLog, ThreadMetadata, TurnContext, Version,
 };
 
 #[derive(Clone)]
@@ -57,6 +57,7 @@ enum Command {
     Rollback(oneshot::Sender<Result<Option<String>, ash_core::AshError>>),
     Compact(oneshot::Sender<Result<ContextCompaction, ash_core::AshError>>),
     Messages(oneshot::Sender<Vec<Message>>),
+    View(oneshot::Sender<ThreadView>),
     ForkPoints(oneshot::Sender<Vec<ForkPoint>>),
     Fork {
         message_id: MessageId,
@@ -71,6 +72,7 @@ impl Command {
             Self::Rollback(_)
                 | Self::Compact(_)
                 | Self::Messages(_)
+                | Self::View(_)
                 | Self::ForkPoints(_)
                 | Self::Fork { .. }
         )
@@ -165,6 +167,16 @@ impl Thread {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(Command::Messages(reply))
+            .await
+            .map_err(|_| thread_closed())?;
+        result.await.map_err(|_| thread_closed())
+    }
+
+    /// Full projected state: history, model context, and turn views.
+    pub async fn view(&self) -> Result<ThreadView, ash_core::AshError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(Command::View(reply))
             .await
             .map_err(|_| thread_closed())?;
         result.await.map_err(|_| thread_closed())
@@ -298,17 +310,11 @@ async fn run_turn(
         inputs = std::mem::take(&mut queues.inbox);
     }
     let thread_id = state.id();
-    publish(
-        events,
-        thread_id,
-        Some(id),
-        sequence,
-        EventKind::TurnStarted,
-    );
+    publish(events, thread_id, Some(id), sequence, EventKind::TurnStart);
     let (payload_tx, mut payload_rx) = mpsc::channel(64);
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let execution = state.submit_inputs(id, inputs, steer_rx, payload_tx, cancellation.clone());
-    tokio::pin!(execution);
+    let mut execution = Box::pin(execution);
 
     let result = loop {
         tokio::select! {
@@ -330,26 +336,31 @@ async fn run_turn(
     while let Ok(kind) = payload_rx.try_recv() {
         publish(events, thread_id, Some(id), sequence, kind);
     }
-    if let Err(error) = &result {
-        publish(
-            events,
-            thread_id,
-            Some(id),
-            sequence,
-            EventKind::Error(error.to_string()),
-        );
-    }
-    publish(
-        events,
-        thread_id,
-        Some(id),
-        sequence,
-        EventKind::TurnCompleted {
-            reason: result.as_ref().cloned().unwrap_or(StopReason::Aborted),
-        },
-    );
+    drop(execution);
+    let view = match &result {
+        Ok(view) => view.clone(),
+        Err(error) => {
+            publish(
+                events,
+                thread_id,
+                Some(id),
+                sequence,
+                EventKind::Error(error.to_string()),
+            );
+            state.log.turns().pop().unwrap_or_else(|| TurnView {
+                id,
+                result: TurnResult::Failed(error.to_string()),
+                messages: Vec::new(),
+                usage: None,
+            })
+        }
+    };
+    publish(events, thread_id, Some(id), sequence, EventKind::Turn(view));
     if let Some(completion) = completion {
-        let _ = completion.send(result);
+        let _ = completion.send(result.map(|view| match view.result {
+            TurnResult::Completed(reason) => reason,
+            TurnResult::Failed(_) | TurnResult::Interrupted(_) => StopReason::Aborted,
+        }));
     }
 }
 
@@ -372,6 +383,9 @@ async fn handle_idle_command(state: &mut ThreadState, command: Command, queues: 
         }
         Command::Messages(reply) => {
             let _ = reply.send(state.messages());
+        }
+        Command::View(reply) => {
+            let _ = reply.send(state.view());
         }
         Command::ForkPoints(reply) => {
             let _ = reply.send(state.fork_points());
@@ -428,6 +442,7 @@ fn handle_active_command(
         | Command::Rollback(_)
         | Command::Compact(_)
         | Command::Messages(_)
+        | Command::View(_)
         | Command::ForkPoints(_)
         | Command::Fork { .. } => unreachable!("active command routing handles this variant first"),
     }
@@ -515,6 +530,10 @@ impl ThreadState {
         self.log.messages()
     }
 
+    pub fn view(&self) -> ThreadView {
+        self.log.view()
+    }
+
     pub(crate) async fn resume(&mut self, thread_id: ThreadId) -> Result<bool, ash_core::AshError> {
         let Some(stored) = self.store.load(thread_id).await? else {
             return Ok(false);
@@ -527,11 +546,11 @@ impl ThreadState {
     }
 
     pub(crate) async fn seed(&mut self, messages: Vec<Message>) -> Result<(), ash_core::AshError> {
-        let records = messages
+        let entries = messages
             .into_iter()
-            .map(Record::Message)
+            .map(LogEntry::Message)
             .collect::<Vec<_>>();
-        self.append(&records).await
+        self.append(&entries).await
     }
 
     pub fn fork_points(&self) -> Vec<ForkPoint> {
@@ -601,7 +620,7 @@ impl ThreadState {
         steering: mpsc::UnboundedReceiver<Input>,
         events: mpsc::Sender<EventKind>,
         cancel: CancellationToken,
-    ) -> Result<StopReason, ash_core::AshError> {
+    ) -> Result<TurnView, ash_core::AshError> {
         let turn_inputs = inputs.clone();
         let mut keys = HashSet::new();
         for input in &inputs {
@@ -624,10 +643,10 @@ impl ThreadState {
             ));
         }
         let mut accepted = Vec::with_capacity(inputs.len() + 1);
-        accepted.push(Record::TurnStarted { turn_id });
+        accepted.push(LogEntry::TurnStart(turn_id));
         accepted.extend(inputs.into_iter().map(|input| {
             let message = Message::user_content(input.content.clone());
-            Record::InputAccepted(AcceptedInput {
+            LogEntry::Input(AcceptedInput {
                 turn_id,
                 input,
                 message,
@@ -645,9 +664,10 @@ impl ThreadState {
             Ok(patch) => patch,
             Err(error) => {
                 let _ = self
-                    .append(&[Record::TurnFailed {
-                        turn_id,
-                        error: error.to_string(),
+                    .append(&[LogEntry::TurnEnd {
+                        id: turn_id,
+                        result: TurnResult::Failed(error.to_string()),
+                        usage: None,
                     }])
                     .await;
                 return Err(error);
@@ -668,38 +688,38 @@ impl ThreadState {
             &mut persistence,
         )
         .await;
+        let usage = match &result {
+            Ok((_, usage)) => *usage,
+            Err(_) => None,
+        };
         self.version = persistence.version();
         // Replay what this turn appended into the in-memory log instead of
         // reloading the thread from disk (which scans the whole directory and
-        // visibly delays `TurnCompleted` after the last delta).
+        // visibly delays the turn-completed event after the last delta).
         let appended = persistence.take_appended();
         drop(persistence);
-        for record in appended {
-            self.log.push(record);
+        for entry in appended {
+            self.log.push(entry);
         }
-        let completed_messages = self.log.messages();
-        let status = match &result {
-            Ok(reason) => TurnStatus::Completed(reason.clone()),
-            Err(error) => TurnStatus::Failed(error.to_string()),
+        let mut view = TurnView {
+            id: turn_id,
+            result: match &result {
+                Ok((reason, _)) => TurnResult::Completed(reason.clone()),
+                Err(error) => TurnResult::Failed(error.to_string()),
+            },
+            messages: self.log.turn_messages(turn_id),
+            usage,
         };
-        let outcome = TurnOutcome {
-            status,
-            messages: completed_messages,
-        };
-        if let Err(error) = self.runtime.complete_turn(&turn_context, &outcome).await {
+        if let Err(error) = self.runtime.complete_turn(&turn_context, &view).await {
             if result.is_ok() {
+                view.result = TurnResult::Failed(error.to_string());
                 result = Err(error);
             }
         }
-        let terminal = match &result {
-            Ok(reason) => Record::TurnCompleted {
-                turn_id,
-                reason: reason.clone(),
-            },
-            Err(error) => Record::TurnFailed {
-                turn_id,
-                error: error.to_string(),
-            },
+        let terminal = LogEntry::TurnEnd {
+            id: turn_id,
+            result: view.result.clone(),
+            usage: view.usage,
         };
         let terminal_result = self.append(&[terminal]).await;
         if let Err(error) = terminal_result {
@@ -707,7 +727,7 @@ impl ThreadState {
                 return Err(error);
             }
         }
-        result
+        result.map(|_| view)
     }
 
     pub async fn rollback_last_turn(&mut self) -> Result<Option<String>, ash_core::AshError> {
@@ -715,7 +735,7 @@ impl ThreadState {
         let Some((turn_start, prompt)) = last_user_turn(&messages) else {
             return Ok(None);
         };
-        self.append(&[Record::TurnRolledBack]).await?;
+        self.append(&[LogEntry::Rollback]).await?;
         debug_assert_eq!(self.log.messages().len(), turn_start);
         Ok(Some(prompt))
     }
@@ -750,8 +770,7 @@ impl ThreadState {
             });
         };
         let checkpoint = ContextCheckpoint::from_model_context(&compacted.messages)?;
-        self.append(&[Record::ContextCheckpoint(checkpoint)])
-            .await?;
+        self.append(&[LogEntry::Checkpoint(checkpoint)]).await?;
         Ok(ContextCompaction {
             before_tokens: compacted.before_tokens,
             after_tokens: compacted.after_tokens,
@@ -759,19 +778,19 @@ impl ThreadState {
         })
     }
 
-    async fn append(&mut self, records: &[Record]) -> Result<(), ash_core::AshError> {
-        if records.is_empty() {
+    async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
+        if entries.is_empty() {
             return Ok(());
         }
         self.version = if self.persisted {
-            self.store.append(self.id, self.version, records).await?
+            self.store.append(self.id, self.version, entries).await?
         } else {
-            let version = self.store.create(self.metadata.clone(), records).await?;
+            let version = self.store.create(self.metadata.clone(), entries).await?;
             self.persisted = true;
             version
         };
-        for record in records {
-            self.log.push(record.clone());
+        for entry in entries {
+            self.log.push(entry.clone());
         }
         Ok(())
     }
@@ -851,8 +870,8 @@ mod tests {
     };
 
     use ash_core::{
-        ContentBlock, MessageContent, MessageId, ModelClient, ModelId, ModelRequest, ModelStream,
-        ModelStreamEvent, Role, ToolCallId,
+        ContentBlock, MessageContent, MessageId, ModelClient, ModelEvent, ModelId, ModelRequest,
+        ModelStream, Role, ToolCallId,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -860,7 +879,7 @@ mod tests {
     use super::*;
 
     struct MockAdapter {
-        responses: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        responses: Mutex<VecDeque<Vec<ModelEvent>>>,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
@@ -876,12 +895,12 @@ mod tests {
             if call == 0 {
                 Ok(Box::pin(futures::stream::once(async {
                     tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(ModelStreamEvent::Stop(StopReason::EndTurn))
+                    Ok(ModelEvent::Stop(StopReason::EndTurn))
                 })))
             } else {
                 Ok(Box::pin(futures::stream::iter([
-                    Ok(ModelStreamEvent::TextDelta("done".to_string())),
-                    Ok(ModelStreamEvent::Stop(StopReason::EndTurn)),
+                    Ok(ModelEvent::Text("done".to_string())),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
                 ])))
             }
         }
@@ -907,10 +926,13 @@ mod tests {
         async fn complete(
             &self,
             _turn: &TurnContext,
-            outcome: &TurnOutcome,
+            view: &ash_core::TurnView,
         ) -> Result<(), ash_core::AshError> {
-            assert!(matches!(&outcome.status, TurnStatus::Completed(_)));
-            assert!(outcome
+            assert!(matches!(
+                &view.result,
+                ash_core::TurnResult::Completed(StopReason::EndTurn)
+            ));
+            assert!(view
                 .messages
                 .iter()
                 .any(|message| matches!(message.content, MessageContent::Assistant(_))));
@@ -1108,7 +1130,7 @@ mod tests {
             .thread_store_handle()
             .create(
                 thread_metadata(&config(directory.path().join("old")), &runtime, saved_id),
-                &[Record::Message(saved_message)],
+                &[LogEntry::Message(saved_message)],
             )
             .await
             .unwrap();
@@ -1131,7 +1153,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let mut state = ThreadState::new(config(directory.path().to_path_buf()), runtime());
         let message = Message::user("unpersisted");
-        state.log.push(Record::Message(message));
+        state.log.push(LogEntry::Message(message));
 
         let result = state.rollback_last_turn().await;
 
@@ -1184,8 +1206,8 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelStreamEvent::TextDelta("condensed facts".to_string()),
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                ModelEvent::Text("condensed facts".to_string()),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: requests.clone(),
         };
@@ -1245,7 +1267,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![ModelStreamEvent::Stop(
+                responses: Mutex::new(VecDeque::from([vec![ModelEvent::Stop(
                     StopReason::EndTurn,
                 )]])),
                 requests,
@@ -1278,7 +1300,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![ModelStreamEvent::Stop(
+                responses: Mutex::new(VecDeque::from([vec![ModelEvent::Stop(
                     StopReason::EndTurn,
                 )]])),
                 requests: Arc::new(Mutex::new(Vec::new())),
@@ -1296,7 +1318,7 @@ mod tests {
         let completed = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let event = events.next().await.unwrap().unwrap();
-                if matches!(event.kind, EventKind::TurnCompleted { .. }) {
+                if matches!(event.kind, EventKind::Turn(_)) {
                     break event;
                 }
             }
@@ -1370,8 +1392,8 @@ mod tests {
         let runtime = Runtime::new(
             Arc::new(MockAdapter {
                 responses: Mutex::new(VecDeque::from([vec![
-                    ModelStreamEvent::TextDelta("done".to_string()),
-                    ModelStreamEvent::Stop(StopReason::EndTurn),
+                    ModelEvent::Text("done".to_string()),
+                    ModelEvent::Stop(StopReason::EndTurn),
                 ]])),
                 requests: requests.clone(),
             }),

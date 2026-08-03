@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use ash_core::{Message, ModelClient, ThreadId, ThreadSummary};
+use ash_core::{Message, ModelClient, ThreadId, ThreadSummary, TurnView};
 
 use crate::{
     agent::RunConfig, Agent, Extension, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
-    ThreadState, ThreadStore, TurnContext, TurnOutcome, TurnPatch,
+    ThreadState, ThreadStore, TurnContext, TurnPatch,
 };
 
 /// Provider-neutral dependencies and the only entry point for creating threads.
@@ -106,11 +106,11 @@ impl Runtime {
     pub(crate) async fn complete_turn(
         &self,
         turn: &TurnContext,
-        outcome: &TurnOutcome,
+        view: &TurnView,
     ) -> Result<(), ash_core::AshError> {
         let mut first_error = None;
         for extension in self.extensions.iter() {
-            if let Err(error) = extension.complete(turn, outcome).await {
+            if let Err(error) = extension.complete(turn, view).await {
                 first_error.get_or_insert(error);
             }
         }

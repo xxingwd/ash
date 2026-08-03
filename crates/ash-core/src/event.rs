@@ -2,7 +2,7 @@ use derive_more::Display;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{AgentId, Message, MessageId, ThreadId, ToolCallId, TurnId};
+use crate::message::{Message, MessageId, ThreadId, ToolCallId, TurnId};
 
 /// A routed event emitted by a thread. `sequence` is monotonic within one thread.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,6 +12,67 @@ pub struct Event {
     pub sequence: u64,
     pub timestamp: String,
     pub kind: EventKind,
+}
+
+/// Provider-neutral usage accounting. `estimated` marks locally estimated
+/// values (no API usage was reported); `generation_ms` measures wall-clock
+/// generation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub generation_ms: u64,
+    pub estimated: bool,
+}
+
+/// Terminal result of one turn. `StopReason` alone cannot express failure or
+/// interruption, so the turn boundary carries its own result type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnResult {
+    Completed(StopReason),
+    Failed(String),
+    /// A turn that was left open when the session ended (for example after a
+    /// crash) is never exposed as normal history.
+    Interrupted(String),
+}
+
+/// Completed-turn snapshot: the durable boundary for scrollback, replay, and
+/// resume. `messages` is the canonical set of messages produced by the turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnView {
+    pub id: TurnId,
+    pub result: TurnResult,
+    pub messages: Vec<Message>,
+    pub usage: Option<Usage>,
+}
+
+/// Full projected state of a thread, derived from its durable log. Never
+/// mutated directly; rebuilt from `LogEntry` records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadView {
+    pub messages: Vec<Message>,
+    pub context: Vec<Message>,
+    pub turns: Vec<TurnView>,
+}
+
+/// Ephemeral streaming deltas for the current turn. Never persisted and never
+/// replayed; the UI draws them as a live preview only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LiveEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolStarted {
+        id: ToolCallId,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolFinished {
+        id: ToolCallId,
+        name: String,
+        arguments: serde_json::Value,
+        output: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,38 +90,29 @@ pub struct ForkPoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, EnumAsInner)]
 pub enum EventKind {
-    TextDelta(String),
-    ToolCallStart {
-        id: ToolCallId,
-        name: String,
-        arguments: serde_json::Value,
-    },
-    ToolCallEnd {
-        id: ToolCallId,
-        name: String,
-        arguments: serde_json::Value,
-        output: String,
-        is_error: bool,
-    },
-    Thinking(String),
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-        generation_ms: u64,
-        estimated: bool,
-    },
-    TurnStarted,
-    TurnCompleted {
-        reason: StopReason,
-    },
-    ThreadRestored {
-        model: String,
-        protocol: String,
-        working_dir: std::path::PathBuf,
-        messages: Vec<Message>,
-        /// Estimated token count of the restored context (local estimate;
-        /// no API usage is available for a restored session).
+    /// A turn started executing; its input was already accepted.
+    TurnStart,
+    /// Ephemeral streaming delta for the active turn's live preview.
+    Live(LiveEvent),
+    /// A turn settled: the canonical boundary for committing scrollback.
+    Turn(TurnView),
+    /// A persisted thread was restored; `view` is its full projection.
+    Restored {
+        view: ThreadView,
+        /// Estimated token count of the restored context (local estimate; no
+        /// API usage is available for a restored session).
         context_tokens: Option<u64>,
+    },
+    TurnRolledBack {
+        prompt: String,
+        /// Estimated token count of the context after rollback.
+        context_tokens: Option<u64>,
+    },
+    Compacted {
+        before: u64,
+        after: u64,
+        dropped: u64,
+        automatic: bool,
     },
     ThreadsListed {
         threads: Vec<ThreadSummary>,
@@ -69,32 +121,10 @@ pub enum EventKind {
         points: Vec<ForkPoint>,
     },
     ThreadForked {
-        model: String,
-        protocol: String,
-        working_dir: std::path::PathBuf,
-        messages: Vec<Message>,
+        view: ThreadView,
         prompt: String,
         /// Estimated token count of the forked context (local estimate).
         context_tokens: Option<u64>,
-    },
-    TurnRolledBack {
-        prompt: String,
-        /// Estimated token count of the context after rollback.
-        context_tokens: Option<u64>,
-    },
-    ContextCompacted {
-        before_tokens: u64,
-        after_tokens: u64,
-        dropped_messages: u64,
-        automatic: bool,
-    },
-    ChildSpawned {
-        agent_id: AgentId,
-        task: String,
-    },
-    ChildCompleted {
-        agent_id: AgentId,
-        summary: String,
     },
     Error(String),
 }
@@ -115,17 +145,19 @@ mod tests {
     fn serialized_events_require_complete_payloads() {
         let id = ToolCallId::new();
         assert!(serde_json::from_value::<EventKind>(serde_json::json!({
-            "ToolCallStart": {
-                "id": id,
-                "name": "read"
+            "Live": {
+                "ToolStarted": {
+                    "id": id,
+                    "name": "read"
+                }
             }
         }))
         .is_err());
         assert!(serde_json::from_value::<EventKind>(serde_json::json!({
-            "ContextCompacted": {
-                "before_tokens": 100,
-                "after_tokens": 50,
-                "dropped_messages": 4
+            "Compacted": {
+                "before": 100,
+                "after": 50,
+                "dropped": 4
             }
         }))
         .is_err());

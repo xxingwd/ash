@@ -1,23 +1,23 @@
-use ash_core::{ModelStream, ModelStreamEvent, ProtocolError};
+use ash_core::{ModelEvent, ModelStream, ProtocolError};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
 
 pub(crate) enum DecodeResult {
-    Continue(Vec<ModelStreamEvent>),
-    Finished(Vec<ModelStreamEvent>),
+    Continue(Vec<ModelEvent>),
+    Finished(Vec<ModelEvent>),
 }
 
 impl DecodeResult {
-    pub(crate) fn continuing(items: Vec<ModelStreamEvent>) -> Self {
+    pub(crate) fn continuing(items: Vec<ModelEvent>) -> Self {
         Self::Continue(items)
     }
 
-    pub(crate) fn finished(items: Vec<ModelStreamEvent>) -> Self {
+    pub(crate) fn finished(items: Vec<ModelEvent>) -> Self {
         Self::Finished(items)
     }
 
-    fn into_parts(self) -> (Vec<ModelStreamEvent>, bool) {
+    fn into_parts(self) -> (Vec<ModelEvent>, bool) {
         match self {
             Self::Continue(items) => (items, false),
             Self::Finished(items) => (items, true),
@@ -25,7 +25,7 @@ impl DecodeResult {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_items(self) -> Vec<ModelStreamEvent> {
+    pub(crate) fn into_items(self) -> Vec<ModelEvent> {
         self.into_parts().0
     }
 }

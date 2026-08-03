@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash_core::{Message, StopReason, ThreadId, Tool, TurnId};
+use ash_core::{Message, ThreadId, Tool, TurnId, TurnView};
 
 use crate::Input;
 
@@ -21,18 +21,6 @@ pub struct TurnPatch {
     pub tools: Vec<Arc<dyn Tool>>,
 }
 
-#[derive(Clone, Debug)]
-pub enum TurnStatus {
-    Completed(StopReason),
-    Failed(String),
-}
-
-#[derive(Clone, Debug)]
-pub struct TurnOutcome {
-    pub status: TurnStatus,
-    pub messages: Vec<Message>,
-}
-
 /// Runtime extension point for goals, workflows, memory, and product-specific policy.
 #[async_trait::async_trait]
 pub trait Extension: Send + Sync {
@@ -43,7 +31,7 @@ pub trait Extension: Send + Sync {
     async fn complete(
         &self,
         _turn: &TurnContext,
-        _outcome: &TurnOutcome,
+        _view: &TurnView,
     ) -> Result<(), ash_core::AshError> {
         Ok(())
     }

@@ -1,7 +1,7 @@
 use ash_core::{
-    AgentToolContext, CancellationToken, ContentBlock, EventKind, Message, MessageContent,
-    ModelClient, ModelRequest, ModelStream, ModelStreamEvent, Role, StopReason, ThreadId,
-    ToolCallId, ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId,
+    AgentToolContext, CancellationToken, ContentBlock, EventKind, LiveEvent, Message,
+    MessageContent, ModelClient, ModelEvent, ModelRequest, ModelStream, Role, StopReason, ThreadId,
+    ToolCallId, ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
 };
 use futures::StreamExt;
 use std::time::Instant;
@@ -14,7 +14,7 @@ use crate::store::ThreadPersistence;
 use crate::{
     context::{count_output_tokens, estimate_request_tokens},
     context_policy::{ContextRequest, DefaultContextPolicy},
-    log::{ContextCheckpoint, Record},
+    log::{ContextCheckpoint, LogEntry},
     AcceptedInput, Input, RunConfig,
 };
 
@@ -52,13 +52,6 @@ struct UsageAccumulator {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     generation_ms: u64,
-}
-
-struct FinalUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    generation_ms: u64,
-    estimated: bool,
 }
 
 struct AgentTurnRunner<'config, 'store> {
@@ -124,10 +117,10 @@ impl UsageAccumulator {
         }
     }
 
-    fn finalize(self, input_tokens: u64, output_tokens: u64) -> FinalUsage {
+    fn finalize(self, input_tokens: u64, output_tokens: u64) -> Usage {
         let estimated =
             self.input_tokens.is_none() || (self.output_tokens.is_none() && output_tokens > 0);
-        FinalUsage {
+        Usage {
             input_tokens: self.input_tokens.unwrap_or(input_tokens),
             output_tokens: self.output_tokens.unwrap_or(output_tokens),
             generation_ms: self.generation_ms,
@@ -174,7 +167,7 @@ pub(crate) async fn run_agent_turn_persisted(
     messages: &mut Vec<Message>,
     execution: TurnExecution,
     persistence: &mut ThreadPersistence,
-) -> Result<StopReason, ash_core::AshError> {
+) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     run_agent_turn_inner(model, config, messages, execution, Some(persistence)).await
 }
 
@@ -184,7 +177,7 @@ async fn run_agent_turn_inner(
     messages: &mut Vec<Message>,
     execution: TurnExecution,
     persistence: Option<&mut ThreadPersistence>,
-) -> Result<StopReason, ash_core::AshError> {
+) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     AgentTurnRunner::new(config, model, persistence, execution)
         .run(messages)
         .await
@@ -199,7 +192,7 @@ async fn run_with_adapter(
     thread_id: ThreadId,
     model: &dyn ModelClient,
     persistence: Option<&mut ThreadPersistence>,
-) -> Result<StopReason, ash_core::AshError> {
+) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     let (_, steering) = mpsc::unbounded_channel();
     let execution = TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering);
     run_agent_turn_inner(model, config, messages, execution, persistence).await
@@ -225,10 +218,14 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         }
     }
 
-    async fn run(&mut self, messages: &mut Vec<Message>) -> Result<StopReason, ash_core::AshError> {
+    async fn run(
+        &mut self,
+        messages: &mut Vec<Message>,
+    ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
+        let mut turn_usage: Option<Usage> = None;
         for turn in 0..self.config.max_turns {
             if self.cancel.is_cancelled() {
-                return Ok(StopReason::Aborted);
+                return Ok((StopReason::Aborted, turn_usage));
             }
             debug!(turn = turn + 1, "calling LLM");
 
@@ -259,8 +256,16 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 .map(count_output_tokens)
                 .and_then(|tokens| u64::try_from(tokens).ok())
                 .unwrap_or(0);
-            self.emit_usage(usage.finalize(estimated_input_tokens, estimated_output_tokens))
-                .await;
+            let call_usage = usage.finalize(estimated_input_tokens, estimated_output_tokens);
+            turn_usage = Some(match turn_usage {
+                Some(acc) => Usage {
+                    input_tokens: acc.input_tokens.saturating_add(call_usage.input_tokens),
+                    output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
+                    generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
+                    estimated: acc.estimated || call_usage.estimated,
+                },
+                None => call_usage,
+            });
             if let Some(message) = message {
                 self.persist_message(&message).await?;
                 messages.push(message);
@@ -273,19 +278,19 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 ResponseOutcome::ToolCalls(calls) => {
                     self.execute_tool_calls(messages, calls).await?;
                     if self.cancel.is_cancelled() {
-                        return Ok(StopReason::Aborted);
+                        return Ok((StopReason::Aborted, turn_usage));
                     }
                 }
             }
             let has_steering = self.apply_steering(messages).await?;
             if let Some(reason) = stop_reason {
                 if !has_steering {
-                    return Ok(reason);
+                    return Ok((reason, turn_usage));
                 }
             }
         }
 
-        Ok(StopReason::MaxTurns)
+        Ok((StopReason::MaxTurns, turn_usage))
     }
 
     async fn prepare_context(
@@ -314,40 +319,30 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         };
         if let Some(persistence) = self.persistence.as_deref_mut() {
             persistence
-                .append(&[Record::ContextCheckpoint(
-                    ContextCheckpoint::from_model_context(messages)?,
-                )])
+                .append(
+                    &[LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
+                        messages,
+                    )?)],
+                )
                 .await?;
         }
         let _ = self
             .tx
-            .send(EventKind::ContextCompacted {
-                before_tokens: u64::try_from(update.before_tokens).unwrap_or(u64::MAX),
-                after_tokens: u64::try_from(update.after_tokens).unwrap_or(u64::MAX),
-                dropped_messages: u64::try_from(update.dropped_messages).unwrap_or(u64::MAX),
+            .send(EventKind::Compacted {
+                before: u64::try_from(update.before_tokens).unwrap_or(u64::MAX),
+                after: u64::try_from(update.after_tokens).unwrap_or(u64::MAX),
+                dropped: u64::try_from(update.dropped_messages).unwrap_or(u64::MAX),
                 automatic: true,
             })
             .await;
         Ok(())
     }
 
-    async fn emit_usage(&mut self, usage: FinalUsage) {
-        let _ = self
-            .tx
-            .send(EventKind::Usage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                generation_ms: usage.generation_ms,
-                estimated: usage.estimated,
-            })
-            .await;
-    }
-
     async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
         match self.persistence.as_deref_mut() {
             Some(persistence) => {
                 persistence
-                    .append(&[Record::Message(message.clone())])
+                    .append(&[LogEntry::Message(message.clone())])
                     .await
             }
             None => Ok(()),
@@ -373,7 +368,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             let records = accepted
                 .iter()
                 .map(|(input, message)| {
-                    Record::InputAccepted(AcceptedInput {
+                    LogEntry::Input(AcceptedInput {
                         turn_id: self.ids.turn_id,
                         input: input.clone(),
                         message: message.clone(),
@@ -394,11 +389,11 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         for call in calls {
             let _ = self
                 .tx
-                .send(EventKind::ToolCallStart {
+                .send(EventKind::Live(LiveEvent::ToolStarted {
                     id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                })
+                }))
                 .await;
             let result = limit_tool_result(
                 self.execute_tool(messages, &call.name, call.arguments.clone())
@@ -410,13 +405,13 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             };
             let _ = self
                 .tx
-                .send(EventKind::ToolCallEnd {
+                .send(EventKind::Live(LiveEvent::ToolFinished {
                     id: call.id.clone(),
                     name: call.name,
                     arguments: call.arguments,
                     output,
                     is_error,
-                })
+                }))
                 .await;
             let (result, attachments) = match result {
                 Ok(output) => (Ok(output.text), output.attachments),
@@ -504,16 +499,16 @@ async fn collect_response(
             }
         };
         match item {
-            ModelStreamEvent::TextDelta(delta) => {
+            ModelEvent::Text(delta) => {
                 first_output_at.get_or_insert_with(Instant::now);
                 finish_open_thought(&mut blocks, &mut thought_started_at);
                 match blocks.last_mut() {
                     Some(ContentBlock::Text(text)) => text.push_str(&delta),
                     _ => blocks.push(ContentBlock::Text(delta.clone())),
                 }
-                let _ = tx.send(EventKind::TextDelta(delta)).await;
+                let _ = tx.send(EventKind::Live(LiveEvent::TextDelta(delta))).await;
             }
-            ModelStreamEvent::ThinkingDelta(delta) => {
+            ModelEvent::Reasoning(delta) => {
                 first_output_at.get_or_insert_with(Instant::now);
                 match blocks.last_mut() {
                     Some(ContentBlock::Thought { text, .. }) => text.push_str(&delta),
@@ -525,9 +520,11 @@ async fn collect_response(
                         });
                     }
                 }
-                let _ = tx.send(EventKind::Thinking(delta)).await;
+                let _ = tx
+                    .send(EventKind::Live(LiveEvent::ReasoningDelta(delta)))
+                    .await;
             }
-            ModelStreamEvent::ToolCall {
+            ModelEvent::ToolCall {
                 id,
                 name,
                 arguments,
@@ -540,11 +537,10 @@ async fn collect_response(
                     arguments,
                 });
             }
-            ModelStreamEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => usage.record(input_tokens, output_tokens),
-            ModelStreamEvent::Stop(reason) => stop_reason = reason,
+            ModelEvent::Usage(reported) => {
+                usage.record(reported.input_tokens, reported.output_tokens)
+            }
+            ModelEvent::Stop(reason) => stop_reason = reason,
         }
     }
     finish_open_thought(&mut blocks, &mut thought_started_at);
@@ -654,8 +650,8 @@ mod tests {
     };
 
     use ash_core::{
-        Content, ModelClient, ModelId, ModelRequest, ModelStream, ModelStreamEvent, Tool,
-        ToolCallId, ToolContext, ToolError,
+        Content, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool, ToolCallId,
+        ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
@@ -686,7 +682,7 @@ mod tests {
         let records = messages
             .iter()
             .cloned()
-            .map(Record::Message)
+            .map(LogEntry::Message)
             .collect::<Vec<_>>();
         let version = store
             .create(metadata(config, thread_id), &records)
@@ -701,7 +697,7 @@ mod tests {
     }
 
     struct MockAdapter {
-        responses: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        responses: Mutex<VecDeque<Vec<ModelEvent>>>,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
@@ -777,16 +773,16 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
-                    ModelStreamEvent::ToolCall {
+                    ModelEvent::ToolCall {
                         id: ToolCallId::from_provider("call_1"),
                         name: "echo".into(),
                         arguments: serde_json::json!({"value": "hello"}),
                     },
-                    ModelStreamEvent::Stop(StopReason::EndTurn),
+                    ModelEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
-                    ModelStreamEvent::TextDelta("done".into()),
-                    ModelStreamEvent::Stop(StopReason::EndTurn),
+                    ModelEvent::Text("done".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
                 ],
             ])),
             requests: requests.clone(),
@@ -810,7 +806,7 @@ mod tests {
             persisted_thread(&config, directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(32);
 
-        let reason = run_with_adapter(
+        let (reason, _usage) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -843,12 +839,12 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
-                    ModelStreamEvent::TextDelta("condensed facts".into()),
-                    ModelStreamEvent::Stop(StopReason::EndTurn),
+                    ModelEvent::Text("condensed facts".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
-                    ModelStreamEvent::TextDelta("done".into()),
-                    ModelStreamEvent::Stop(StopReason::EndTurn),
+                    ModelEvent::Text("done".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
                 ],
             ])),
             requests: requests.clone(),
@@ -879,7 +875,7 @@ mod tests {
             persisted_thread(&config, directory.path(), &messages).await;
         let (tx, mut rx) = mpsc::channel(16);
 
-        let reason = run_with_adapter(
+        let (reason, _usage) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -918,9 +914,9 @@ mod tests {
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
                 event,
-                EventKind::ContextCompacted {
+                EventKind::Compacted {
                     automatic: true,
-                    dropped_messages: 2,
+                    dropped: 2,
                     ..
                 }
             ))
@@ -932,8 +928,8 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelStreamEvent::TextDelta("done".into()),
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                ModelEvent::Text("done".into()),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: requests.clone(),
         };
@@ -1011,16 +1007,20 @@ mod tests {
     async fn aggregates_usage_for_each_model_call() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelStreamEvent::Usage {
+                ModelEvent::Usage(Usage {
                     input_tokens: 120,
                     output_tokens: 0,
-                },
-                ModelStreamEvent::ThinkingDelta("checking".into()),
-                ModelStreamEvent::Usage {
+                    generation_ms: 0,
+                    estimated: false,
+                }),
+                ModelEvent::Reasoning("checking".into()),
+                ModelEvent::Usage(Usage {
                     input_tokens: 0,
                     output_tokens: 25,
-                },
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                    generation_ms: 0,
+                    estimated: false,
+                }),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1038,9 +1038,9 @@ mod tests {
             metadata: serde_json::Map::new(),
         };
         let mut messages = vec![Message::user("question")];
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
 
-        run_with_adapter(
+        let (reason, usage) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -1052,22 +1052,11 @@ mod tests {
         .await
         .unwrap();
 
-        let usage = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
-            if let EventKind::Usage {
-                input_tokens,
-                output_tokens,
-                generation_ms,
-                estimated,
-            } = event
-            {
-                Some((input_tokens, output_tokens, generation_ms, estimated))
-            } else {
-                None
-            }
-        });
-
-        assert!(matches!(usage, Some((120, 25, _, false))));
-        assert!(rx.try_recv().is_err());
+        assert_eq!(reason, StopReason::EndTurn);
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 25);
+        assert!(!usage.estimated);
     }
 
     #[test]
@@ -1096,9 +1085,9 @@ mod tests {
     async fn persists_reasoning_blocks_in_thread_history() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelStreamEvent::ThinkingDelta("inspect first".into()),
-                ModelStreamEvent::TextDelta("done".into()),
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                ModelEvent::Reasoning("inspect first".into()),
+                ModelEvent::Text("done".into()),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1153,7 +1142,7 @@ mod tests {
         impl ModelClient for PendingAdapter {
             fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
                 Ok(Box::pin(
-                    futures::stream::iter([Ok(ModelStreamEvent::TextDelta("partial".into()))])
+                    futures::stream::iter([Ok(ModelEvent::Text("partial".into()))])
                         .chain(futures::stream::pending()),
                 ))
             }
@@ -1191,9 +1180,11 @@ mod tests {
                 event = rx.recv() => event,
                 result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
             };
-            assert!(matches!(event, Some(EventKind::TextDelta(text)) if text == "partial"));
+            assert!(
+                matches!(event, Some(EventKind::Live(LiveEvent::TextDelta(text))) if text == "partial")
+            );
             cancel.cancel();
-            (&mut turn).await.unwrap()
+            (&mut turn).await.unwrap().0
         };
         assert_eq!(reason, StopReason::Aborted);
 
@@ -1212,8 +1203,8 @@ mod tests {
         impl ModelClient for FailingAdapter {
             fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
                 Ok(Box::pin(futures::stream::iter([
-                    Ok(ModelStreamEvent::ThinkingDelta("checking".into())),
-                    Ok(ModelStreamEvent::TextDelta("partial".into())),
+                    Ok(ModelEvent::Reasoning("checking".into())),
+                    Ok(ModelEvent::Text("partial".into())),
                     Err(ash_core::ProtocolError::InvalidResponse(
                         "stream ended badly".into(),
                     )),
@@ -1270,12 +1261,12 @@ mod tests {
     async fn cancellation_completes_an_active_tool_call() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelStreamEvent::ToolCall {
+                ModelEvent::ToolCall {
                     id: ToolCallId::from_provider("call_1"),
                     name: "blocking".into(),
                     arguments: serde_json::json!({}),
                 },
-                ModelStreamEvent::Stop(StopReason::EndTurn),
+                ModelEvent::Stop(StopReason::EndTurn),
             ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1312,12 +1303,12 @@ mod tests {
                     event = rx.recv() => event,
                     result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
                 };
-                if matches!(event, Some(EventKind::ToolCallStart { .. })) {
+                if matches!(event, Some(EventKind::Live(LiveEvent::ToolStarted { .. }))) {
                     break;
                 }
             }
             cancel.cancel();
-            (&mut turn).await.unwrap()
+            (&mut turn).await.unwrap().0
         };
 
         assert_eq!(reason, StopReason::Aborted);
@@ -1328,7 +1319,10 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(EventKind::ToolCallEnd { is_error: true, .. })
+            Some(EventKind::Live(LiveEvent::ToolFinished {
+                is_error: true,
+                ..
+            }))
         ));
     }
 

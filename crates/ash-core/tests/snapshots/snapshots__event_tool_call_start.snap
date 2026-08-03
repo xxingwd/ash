@@ -3,11 +3,13 @@ source: crates/ash-core/tests/snapshots.rs
 expression: event
 ---
 {
-  "ToolCallStart": {
-    "id": "[uuid]",
-    "name": "read",
-    "arguments": {
-      "path": "README.md"
+  "Live": {
+    "ToolStarted": {
+      "id": "[uuid]",
+      "name": "read",
+      "arguments": {
+        "path": "README.md"
+      }
     }
   }
 }

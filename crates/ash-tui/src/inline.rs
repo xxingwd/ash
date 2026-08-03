@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io,
     path::{Path, PathBuf},
     time::Instant,
@@ -7,6 +6,7 @@ use std::{
 
 use ash_core::{
     Content, ContentBlock, ForkPoint, Message, MessageContent, SubagentSnapshot, ThreadSummary,
+    ToolCallId, TurnView, Usage,
 };
 use crossterm::terminal;
 use ratatui::layout::Position;
@@ -46,27 +46,13 @@ impl SessionView {
             context_limit,
         }
     }
-
-    fn update(&mut self, protocol: &str, model: &str, working_dir: &Path) {
-        self.protocol = protocol.to_string();
-        self.model = model.to_string();
-        self.working_dir = working_dir.to_path_buf();
-    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TurnUsage {
     input_tokens: u64,
     output_tokens: u64,
     generation_ms: u64,
-}
-
-impl TurnUsage {
-    fn add(&mut self, input_tokens: u64, output_tokens: u64, generation_ms: u64) {
-        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
-        self.generation_ms = self.generation_ms.saturating_add(generation_ms);
-    }
 }
 
 #[derive(Debug, Default)]
@@ -75,28 +61,24 @@ struct UsageState {
     /// available, otherwise a local estimate (resume, fork, rollback, compact).
     context_tokens: Option<u64>,
     context_estimated: bool,
-    turn: TurnUsage,
 }
 
 impl UsageState {
-    fn begin_turn(&mut self) {
-        self.turn = TurnUsage::default();
-    }
-
-    fn record(
-        &mut self,
-        input_tokens: u64,
-        output_tokens: u64,
-        generation_ms: u64,
-        estimated: bool,
-    ) {
-        self.context_tokens = Some(input_tokens.saturating_add(output_tokens));
-        self.context_estimated = estimated;
-        self.turn.add(input_tokens, output_tokens, generation_ms);
-    }
-
-    fn finish_turn(&mut self) -> TurnUsage {
-        std::mem::take(&mut self.turn)
+    /// Record the settled turn's usage and return the values for the worked
+    /// summary block.
+    fn commit_turn_usage(&mut self, usage: Option<&Usage>) -> TurnUsage {
+        match usage {
+            Some(usage) => {
+                self.context_tokens = Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                self.context_estimated = usage.estimated;
+                TurnUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    generation_ms: usage.generation_ms,
+                }
+            }
+            None => TurnUsage::default(),
+        }
     }
 
     fn set_compacted_context(&mut self, tokens: u64) {
@@ -405,13 +387,9 @@ impl TerminalUi {
     pub fn restore_session(
         &mut self,
         messages: &[Message],
-        protocol: &str,
-        model: &str,
-        working_dir: &Path,
         context_tokens: Option<u64>,
     ) -> io::Result<()> {
         self.begin_fresh_viewport()?;
-        self.session.update(protocol, model, working_dir);
         self.enqueue_welcome();
         self.push_restored_messages(messages);
         // `begin_fresh_viewport` resets usage; restore the estimated context
@@ -469,7 +447,6 @@ impl TerminalUi {
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.current_turn_id = Some(turn_id);
         self.scroll_top = None;
-        self.usage.begin_turn();
         self.status.start("Working");
         self.commit_user_message(input)
     }
@@ -542,7 +519,7 @@ impl TerminalUi {
         self.redraw()
     }
 
-    pub fn tool_start(&mut self, _name: &str, _arguments: &Value) -> io::Result<()> {
+    pub fn tool_start(&mut self) -> io::Result<()> {
         self.finish_stream();
         self.redraw()
     }
@@ -563,18 +540,6 @@ impl TerminalUi {
         self.redraw()
     }
 
-    pub fn record_usage(
-        &mut self,
-        input_tokens: u64,
-        output_tokens: u64,
-        generation_ms: u64,
-        estimated: bool,
-    ) -> io::Result<()> {
-        self.usage
-            .record(input_tokens, output_tokens, generation_ms, estimated);
-        self.redraw()
-    }
-
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
         self.push_history_block(HistoryBlock::error(error));
@@ -585,10 +550,18 @@ impl TerminalUi {
         }
     }
 
-    pub fn finish_response(&mut self) -> io::Result<()> {
+    /// Commit a settled turn: replace the streamed preview with the canonical
+    /// projection of the turn's messages, then move it into the scrollback.
+    pub fn commit_turn(&mut self, view: &TurnView) -> io::Result<()> {
         self.finish_stream();
+        if let Some(turn_id) = self.current_turn_id {
+            self.transcript
+                .retain(|block| !block.is_streamed_for_turn(turn_id));
+        }
+        self.assistant_block_id = None;
+        self.push_turn_messages(&view.messages);
         let elapsed_seconds = self.status.elapsed_seconds();
-        let usage = self.usage.finish_turn();
+        let usage = self.usage.commit_turn_usage(view.usage.as_ref());
         self.status.stop();
         self.view.busy = false;
         self.push_history_block(HistoryBlock::worked(
@@ -932,18 +905,7 @@ impl TerminalUi {
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
-        let tool_results = messages
-            .iter()
-            .filter_map(|message| match &message.content {
-                MessageContent::ToolResult { id, result, .. } => {
-                    let output = match result {
-                        Ok(output) | Err(output) => output.as_str(),
-                    };
-                    Some((id, (result.is_err(), output)))
-                }
-                MessageContent::User(_) | MessageContent::Assistant(_) => None,
-            })
-            .collect::<HashMap<_, _>>();
+        let tool_results = tool_results_map(messages);
 
         for message in messages {
             match &message.content {
@@ -964,41 +926,65 @@ impl TerminalUi {
                     self.push_history_block(HistoryBlock::user(&text));
                 }
                 MessageContent::Assistant(blocks) => {
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text(text) if !text.is_empty() => {
-                                self.push_assistant_block(text.clone());
-                            }
-                            ContentBlock::Thought {
-                                text,
-                                elapsed_seconds,
-                            } if !text.is_empty() => {
-                                self.push_thought_block(*elapsed_seconds);
-                            }
-                            ContentBlock::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            } => {
-                                let (is_error, output) = tool_results
-                                    .get(id)
-                                    .copied()
-                                    .unwrap_or((true, "tool result unavailable"));
-                                self.push_tool_block(
-                                    name.clone(),
-                                    arguments.clone(),
-                                    output.to_string(),
-                                    is_error,
-                                );
-                            }
-                            ContentBlock::Text(_) | ContentBlock::Thought { .. } => {}
-                        }
-                    }
+                    self.push_assistant_blocks(blocks, &tool_results);
                 }
                 MessageContent::ToolResult { .. } => {}
             }
         }
         self.current_turn_id = None;
+    }
+
+    /// Project one settled turn's canonical messages into transcript blocks.
+    /// User inputs are skipped: the composer already committed them when the
+    /// turn started (or when steering was accepted).
+    fn push_turn_messages(&mut self, messages: &[Message]) {
+        let tool_results = tool_results_map(messages);
+        for message in messages {
+            match &message.content {
+                MessageContent::User(_) => {}
+                MessageContent::Assistant(blocks) => {
+                    self.push_assistant_blocks(blocks, &tool_results);
+                }
+                MessageContent::ToolResult { .. } => {}
+            }
+        }
+    }
+
+    fn push_assistant_blocks(
+        &mut self,
+        blocks: &[ContentBlock],
+        tool_results: &std::collections::HashMap<ToolCallId, (bool, &str)>,
+    ) {
+        for block in blocks {
+            match block {
+                ContentBlock::Text(text) if !text.is_empty() => {
+                    self.push_assistant_block(text.clone());
+                }
+                ContentBlock::Thought {
+                    text,
+                    elapsed_seconds,
+                } if !text.is_empty() => {
+                    self.push_thought_block(*elapsed_seconds);
+                }
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let (is_error, output) = tool_results
+                        .get(id)
+                        .copied()
+                        .unwrap_or((true, "tool result unavailable"));
+                    self.push_tool_block(
+                        name.clone(),
+                        arguments.clone(),
+                        output.to_string(),
+                        is_error,
+                    );
+                }
+                ContentBlock::Text(_) | ContentBlock::Thought { .. } => {}
+            }
+        }
     }
 
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
@@ -1079,6 +1065,20 @@ fn queued_status(queued_messages: usize) -> String {
     }
 }
 
+fn tool_results_map(messages: &[Message]) -> std::collections::HashMap<ToolCallId, (bool, &str)> {
+    let mut results = std::collections::HashMap::new();
+    for message in messages {
+        if let MessageContent::ToolResult { id, result, .. } = &message.content {
+            let (is_error, output) = match result {
+                Ok(output) => (false, output.as_str()),
+                Err(error) => (true, error.as_str()),
+            };
+            results.insert(id.clone(), (is_error, output));
+        }
+    }
+    results
+}
+
 fn latest_turn_id(
     current_turn_id: Option<u64>,
     transcript: &[LiveBlock],
@@ -1104,18 +1104,35 @@ mod tests {
     }
 
     #[test]
-    fn usage_sums_model_calls_and_keeps_the_latest_context_size() {
+    fn usage_commits_turn_usage_and_keeps_the_latest_context_size() {
         let mut usage = UsageState::default();
-        usage.begin_turn();
-        usage.record(100, 20, 400, false);
-        usage.record(150, 30, 600, true);
+        let turn = usage.commit_turn_usage(Some(&Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            generation_ms: 400,
+            estimated: false,
+        }));
+        assert_eq!(usage.context_tokens, Some(120));
+        assert!(!usage.context_estimated);
+        assert_eq!(turn.input_tokens, 100);
+        assert_eq!(turn.output_tokens, 20);
+        assert_eq!(turn.generation_ms, 400);
 
+        let turn = usage.commit_turn_usage(Some(&Usage {
+            input_tokens: 150,
+            output_tokens: 30,
+            generation_ms: 600,
+            estimated: true,
+        }));
         assert_eq!(usage.context_tokens, Some(180));
         assert!(usage.context_estimated);
-        let turn = usage.finish_turn();
-        assert_eq!(turn.input_tokens, 250);
-        assert_eq!(turn.output_tokens, 50);
-        assert_eq!(turn.generation_ms, 1_000);
+        assert_eq!(turn.input_tokens, 150);
+        assert_eq!(turn.output_tokens, 30);
+        assert_eq!(turn.generation_ms, 600);
+
+        let turn = usage.commit_turn_usage(None);
+        assert_eq!(turn, TurnUsage::default());
+        assert_eq!(usage.context_tokens, Some(180));
     }
 
     #[test]

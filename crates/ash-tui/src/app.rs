@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{EventKind, MessageId, SubagentSnapshot, ThreadId};
+use ash_core::{EventKind, LiveEvent, MessageId, SubagentSnapshot, ThreadId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -16,7 +16,7 @@ use crate::{
     menu::ComposerMenuState,
     operation::{
         AgentStart, BackgroundAction, Cancellation, EventRoute, FailureCompletion, OperationState,
-        RollbackCompletion, SubmissionPolicy, TurnCompletion,
+        RollbackCompletion, SubmissionPolicy,
     },
     session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
@@ -31,6 +31,7 @@ pub enum UiCommand {
     Submit(String),
     Cancel,
     CancelAndRollback,
+    Rollback,
     Compact,
     NewSession,
     ListSessions,
@@ -265,7 +266,7 @@ async fn handle_agent_event(
     event: EventKind,
 ) -> anyhow::Result<LoopAction> {
     match event {
-        EventKind::TurnStarted => {
+        EventKind::TurnStart => {
             let start = if state.operation.is_busy() {
                 state.operation.agent_started()
             } else if let Some(input) = state.pending_inputs.pop_front() {
@@ -282,27 +283,25 @@ async fn handle_agent_event(
                 AgentStart::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
-        EventKind::TextDelta(text) => {
+        EventKind::Live(LiveEvent::TextDelta(text)) => {
             terminal.text(&text)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Thinking(text) => {
+        EventKind::Live(LiveEvent::ReasoningDelta(text)) => {
             terminal.thinking(&text)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ToolCallStart {
-            name, arguments, ..
-        } => {
-            terminal.tool_start(&name, &arguments)?;
+        EventKind::Live(LiveEvent::ToolStarted { .. }) => {
+            terminal.tool_start()?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ToolCallEnd {
+        EventKind::Live(LiveEvent::ToolFinished {
             name,
             arguments,
             output,
             is_error,
             ..
-        } => {
+        }) => {
             terminal.tool_end(&name, &arguments, &output, is_error)?;
             Ok(LoopAction::Continue)
         }
@@ -317,21 +316,11 @@ async fn handle_agent_event(
             }
             Ok(LoopAction::Continue)
         }
-        EventKind::TurnCompleted { .. } => {
-            let Some(completion) = state.operation.complete_turn() else {
-                return Ok(LoopAction::Continue);
-            };
-            terminal.finish_response()?;
-            match completion {
-                TurnCompletion::Cancelled => {
-                    state.render(terminal)?;
-                    Ok(LoopAction::Continue)
-                }
-                TurnCompletion::Completed => {
-                    state.render(terminal)?;
-                    Ok(LoopAction::Continue)
-                }
-            }
+        EventKind::Turn(view) => {
+            state.operation.complete_turn();
+            terminal.commit_turn(&view)?;
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
         }
         EventKind::TurnRolledBack {
             prompt,
@@ -350,31 +339,28 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ContextCompacted {
-            before_tokens,
-            after_tokens,
-            dropped_messages,
+        EventKind::Compacted {
+            before,
+            after,
+            dropped,
             automatic,
         } => {
             if automatic {
-                terminal.record_automatic_compaction(after_tokens)?;
+                terminal.record_automatic_compaction(after)?;
             } else {
                 state.operation.finish();
-                terminal.finish_compaction(before_tokens, after_tokens, dropped_messages)?;
+                terminal.finish_compaction(before, after, dropped)?;
             }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ThreadRestored {
-            model,
-            protocol,
-            working_dir,
-            messages,
+        EventKind::Restored {
+            view,
             context_tokens,
         } => {
             state.menu.close_picker();
             state.operation.finish();
-            terminal.restore_session(&messages, &protocol, &model, &working_dir, context_tokens)?;
+            terminal.restore_session(&view.messages, context_tokens)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -403,30 +389,15 @@ async fn handle_agent_event(
             Ok(LoopAction::Continue)
         }
         EventKind::ThreadForked {
-            model,
-            protocol,
-            working_dir,
-            messages,
+            view,
             prompt,
             context_tokens,
         } => {
             state.menu.close_picker();
             state.operation.finish_background(BackgroundAction::Fork);
-            terminal.restore_session(&messages, &protocol, &model, &working_dir, context_tokens)?;
+            terminal.restore_session(&view.messages, context_tokens)?;
             state.input.set_text(prompt);
             state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::Usage {
-            input_tokens,
-            output_tokens,
-            generation_ms,
-            estimated,
-        } => {
-            terminal.record_usage(input_tokens, output_tokens, generation_ms, estimated)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::ChildSpawned { .. } | EventKind::ChildCompleted { .. } => {
             Ok(LoopAction::Continue)
         }
     }
@@ -892,6 +863,10 @@ async fn run_command(
             Some(UiCommand::ListSessions)
         }
         SlashCommand::Undo => {
+            state.operation.start_rollback();
+            Some(UiCommand::Rollback)
+        }
+        SlashCommand::Fork => {
             state
                 .operation
                 .start_background(BackgroundAction::ListForkPoints);
@@ -932,6 +907,7 @@ fn inserts_newline(key: &KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::TurnCompletion;
 
     #[test]
     fn derives_terminal_view_from_one_app_state() {
