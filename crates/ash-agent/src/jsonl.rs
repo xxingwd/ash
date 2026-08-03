@@ -195,6 +195,70 @@ pub(crate) struct StoredFile {
     pub(crate) log: ThreadLog,
 }
 
+/// Open append-only handle to one thread file. Unlike `ThreadStore::append`,
+/// which re-scans the directory and re-reads the whole file for every write,
+/// a writer keeps the file handle open so each append is a single write+flush.
+/// The runtime holds one writer per active thread; `ThreadStore` remains the
+/// boundary for cross-process load/resume and for the store API.
+#[derive(Debug)]
+pub struct ThreadWriter {
+    path: PathBuf,
+    metadata: FileMetadata,
+    file: Option<tokio::fs::File>,
+    revision: Version,
+}
+
+impl ThreadWriter {
+    pub(crate) fn revision(&self) -> Version {
+        self.revision
+    }
+
+    pub(crate) async fn append(
+        &mut self,
+        entries: &[LogEntry],
+    ) -> Result<Version, ash_core::AshError> {
+        if entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Rollback))
+            && self.file.is_none()
+        {
+            return Err(ash_core::AshError::Config(
+                "thread store has no persisted turn to roll back".to_string(),
+            ));
+        }
+
+        let is_new = self.file.is_none();
+        let mut data = String::new();
+        if is_new {
+            push_line(&mut data, FileRecord::ThreadMeta(self.metadata.clone()))?;
+        }
+        for entry in entries.iter().cloned() {
+            push_line(&mut data, FileRecord::from_entry(entry))?;
+        }
+
+        if is_new {
+            if let Some(parent) = self.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            self.file = Some(
+                tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
+        }
+        let file = self.file.as_mut().ok_or_else(|| {
+            ash_core::AshError::Config("thread store was not materialized".to_string())
+        })?;
+        file.write_all(data.as_bytes()).await?;
+        file.flush().await?;
+        self.revision = self.revision.advance(entries.len());
+        Ok(self.revision)
+    }
+}
+
 #[derive(Default)]
 struct Replay {
     metadata: Option<FileMetadata>,
@@ -540,6 +604,38 @@ impl ThreadStore for JsonlThreadStore {
             .ok_or_else(|| ash_core::AshError::Config(format!("thread not found: {thread_id}")))?;
         let mut thread = ThreadFile::resume(&stored).await?;
         thread.append(expected_version, entries).await
+    }
+
+    async fn open_writer(
+        &self,
+        thread_id: ThreadId,
+        metadata: ThreadMetadata,
+    ) -> Result<ThreadWriter, ash_core::AshError> {
+        let _guard = self.gate.lock().await;
+        let stored = ThreadFile::stored_threads_in(self.directory.clone(), None)
+            .await?
+            .into_iter()
+            .find(|stored| stored.metadata.thread_id == thread_id);
+        match stored {
+            Some(stored) => {
+                let file = open_thread_for_append(&stored.path).await?;
+                Ok(ThreadWriter {
+                    path: stored.path,
+                    metadata: stored.metadata,
+                    file: Some(file),
+                    revision: stored.log.revision(),
+                })
+            }
+            None => {
+                let thread_file = ThreadFile::from_metadata(metadata, &self.directory);
+                Ok(ThreadWriter {
+                    path: thread_file.path,
+                    metadata: thread_file.metadata,
+                    file: None,
+                    revision: thread_file.revision,
+                })
+            }
+        }
     }
 
     async fn list(
@@ -970,5 +1066,58 @@ mod tests {
         assert!(!listed
             .iter()
             .any(|summary| summary.thread_id == subagent_id));
+    }
+
+    #[tokio::test]
+    async fn writer_batches_entries_until_commit_point() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlThreadStore::new(directory.path());
+        let thread_id = ThreadId::new();
+        let cfg = config(directory.path().to_path_buf());
+        let metadata = |id: ThreadId| ThreadMetadata {
+            thread_id: id,
+            model_backend: "custom".to_string(),
+            model: cfg.model.clone(),
+            working_dir: cfg.working_dir.clone(),
+            system_prompt: cfg.system_prompt.clone(),
+            max_turns: cfg.max_turns,
+            max_context_tokens: cfg.max_context_tokens,
+            max_tool_duration: cfg.max_tool_duration,
+            kind: crate::ThreadKind::Root,
+        };
+        let mut writer = store
+            .open_writer(thread_id, metadata(thread_id))
+            .await
+            .unwrap();
+        assert!(writer.file.is_none(), "new thread has no file yet");
+
+        // First append materializes the file with metadata + entries.
+        let turn_id = TurnId::new();
+        let version = writer
+            .append(&[
+                LogEntry::TurnStart(turn_id),
+                LogEntry::Message(Message::user("question")),
+            ])
+            .await
+            .unwrap();
+        assert!(writer.file.is_some());
+        assert_eq!(version.value(), 2);
+
+        // Subsequent appends reuse the open handle: no re-scan, no re-read.
+        let version = writer
+            .append(&[LogEntry::Message(Message::assistant_text("answer"))])
+            .await
+            .unwrap();
+        assert_eq!(version.value(), 3);
+        writer
+            .append(&[LogEntry::TurnEnd {
+                id: turn_id,
+                result: ash_core::TurnResult::Completed(ash_core::StopReason::EndTurn),
+                usage: None,
+            }])
+            .await
+            .unwrap();
+        let stored = store.load(thread_id).await.unwrap().unwrap();
+        assert_eq!(stored.log.messages().len(), 2);
     }
 }

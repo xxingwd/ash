@@ -684,11 +684,17 @@ mod tests {
             .cloned()
             .map(LogEntry::Message)
             .collect::<Vec<_>>();
-        let version = store
+        store
             .create(metadata(config, thread_id), &records)
             .await
             .unwrap();
-        let persistence = ThreadPersistence::new(store.clone(), thread_id, version);
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            store
+                .open_writer(thread_id, metadata(config, thread_id))
+                .await
+                .unwrap(),
+        ));
+        let persistence = ThreadPersistence::new(writer).await;
         (thread_id, store, persistence)
     }
 
@@ -817,6 +823,7 @@ mod tests {
         )
         .await
         .unwrap();
+        persistence.flush().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
         assert_eq!(requests.lock().unwrap()[1].messages.len(), 3);
@@ -886,6 +893,7 @@ mod tests {
         )
         .await
         .unwrap();
+        persistence.flush().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
         let stored = load_thread(&store, thread_id).await;
@@ -1121,6 +1129,7 @@ mod tests {
         )
         .await
         .unwrap();
+        persistence.flush().await.unwrap();
 
         assert!(matches!(
             &messages[1].content,
@@ -1242,6 +1251,7 @@ mod tests {
         )
         .await
         .unwrap_err();
+        persistence.flush().await.unwrap();
 
         assert!(matches!(error, ash_core::AshError::Protocol(_)));
         assert!(matches!(

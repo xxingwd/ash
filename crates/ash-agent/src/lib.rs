@@ -25,7 +25,7 @@ pub use context_policy::{
 };
 pub use extension::{Extension, TurnContext, TurnPatch};
 pub use input::{Input, InputSource};
-pub use jsonl::JsonlThreadStore;
+pub use jsonl::{JsonlThreadStore, ThreadWriter};
 pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, ThreadLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use message_history::MessageHistoryStore;

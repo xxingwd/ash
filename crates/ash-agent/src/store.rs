@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use ash_core::{ModelId, ThreadId, ThreadSummary};
 use serde::{Deserialize, Serialize};
 
-use crate::{LogEntry, ThreadLog};
+use crate::{jsonl::ThreadWriter, LogEntry, ThreadLog};
 
 /// Whether a thread belongs to the interactive root session or to a spawned
 /// sub-agent. Sub-agent threads are hidden from the session list and cannot
@@ -85,14 +85,32 @@ pub trait ThreadStore: Send + Sync {
         &self,
         excluded_thread: Option<ThreadId>,
     ) -> Result<Vec<ThreadSummary>, ash_core::AshError>;
+
+    /// Open an append-only writer for a thread. The runtime's hot write path
+    /// holds one writer per active thread so each append is a single
+    /// write+flush instead of a directory scan plus full-file re-read.
+    /// The default implementation is unsupported; storage backends that
+    /// cannot keep an open handle may fall back to `append` per call.
+    async fn open_writer(
+        &self,
+        _thread_id: ThreadId,
+        _metadata: ThreadMetadata,
+    ) -> Result<ThreadWriter, ash_core::AshError> {
+        Err(ash_core::AshError::Config(
+            "this thread store does not support open writers".to_string(),
+        ))
+    }
 }
 
 pub type SharedThreadStore = Arc<dyn ThreadStore>;
 
 pub(crate) struct ThreadPersistence {
-    store: SharedThreadStore,
-    thread_id: ThreadId,
+    writer: Arc<tokio::sync::Mutex<ThreadWriter>>,
     version: Version,
+    /// Entries buffered in memory and not yet written to disk. Flushed at
+    /// commit points (`TurnEnd`, rollback, checkpoint) so one turn costs two
+    /// writes: the accepted inputs, then all messages plus the turn end.
+    pending: Vec<LogEntry>,
     /// Entries appended through this persistence handle. The caller replays
     /// them into its in-memory log so it stays in sync without reloading the
     /// thread from disk.
@@ -100,11 +118,12 @@ pub(crate) struct ThreadPersistence {
 }
 
 impl ThreadPersistence {
-    pub(crate) fn new(store: SharedThreadStore, thread_id: ThreadId, version: Version) -> Self {
+    pub(crate) async fn new(writer: Arc<tokio::sync::Mutex<ThreadWriter>>) -> Self {
+        let version = writer.lock().await.revision();
         Self {
-            store,
-            thread_id,
+            writer,
             version,
+            pending: Vec::new(),
             appended: Vec::new(),
         }
     }
@@ -117,12 +136,22 @@ impl ThreadPersistence {
         std::mem::take(&mut self.appended)
     }
 
+    /// Buffer entries without touching the disk. Callers see them only via
+    /// `take_appended` after `flush`; the in-memory log is the working truth
+    /// and the file catches up at the next commit point.
     pub(crate) async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
-        self.version = self
-            .store
-            .append(self.thread_id, self.version, entries)
-            .await?;
+        self.pending.extend(entries.iter().cloned());
         self.appended.extend(entries.iter().cloned());
+        Ok(())
+    }
+
+    /// Write all buffered entries in one write+flush and advance the version.
+    pub(crate) async fn flush(&mut self) -> Result<(), ash_core::AshError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.version = self.writer.lock().await.append(&pending).await?;
         Ok(())
     }
 }

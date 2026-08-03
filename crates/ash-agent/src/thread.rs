@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
+    sync::Arc,
 };
 
 use ash_core::{
@@ -13,8 +14,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
-    AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime, SharedThreadStore,
-    ThreadLog, ThreadMetadata, TurnContext, Version,
+    jsonl::ThreadWriter, AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime,
+    SharedThreadStore, ThreadLog, ThreadMetadata, TurnContext, Version,
 };
 
 #[derive(Clone)]
@@ -502,7 +503,10 @@ pub struct ThreadState {
     metadata: ThreadMetadata,
     store: SharedThreadStore,
     version: Version,
-    persisted: bool,
+    /// Open append-only handle to this thread's file. Initialized lazily so
+    /// `ThreadState::new` stays synchronous; every write goes through it
+    /// without re-scanning or re-reading the file.
+    writer: Option<Arc<tokio::sync::Mutex<ThreadWriter>>>,
 }
 
 impl ThreadState {
@@ -518,7 +522,7 @@ impl ThreadState {
             metadata,
             store,
             version: Version::initial(),
-            persisted: false,
+            writer: None,
         }
     }
 
@@ -610,7 +614,9 @@ impl ThreadState {
         self.metadata.thread_id = self.id;
         self.log = stored.log;
         self.version = stored.version;
-        self.persisted = true;
+        // The previous writer (if any) pointed at a different thread file;
+        // re-open on the next append.
+        self.writer = None;
     }
 
     async fn submit_inputs(
@@ -677,8 +683,13 @@ impl ThreadState {
         model_context.extend(patch.context);
         let mut turn_config = self.config.clone();
         turn_config.tools.extend(patch.tools);
-        let mut persistence =
-            crate::store::ThreadPersistence::new(self.store.clone(), self.id, self.version);
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer initialized by the accepted-input append")
+            .clone();
+        let mut persistence = crate::store::ThreadPersistence::new(writer).await;
+        let context_before = model_context.len();
         let execution = TurnExecution::new(self.id, turn_id, events.clone(), cancel, steering);
         let mut result = run_agent_turn_persisted(
             self.runtime.model(),
@@ -692,6 +703,43 @@ impl ThreadState {
             Ok((_, usage)) => *usage,
             Err(_) => None,
         };
+        // Messages produced by this turn's model calls and tool executions
+        // (the accepted inputs were already persisted with `TurnStart`).
+        let turn_messages = model_context[context_before..].to_vec();
+        let mut view = TurnView {
+            id: turn_id,
+            result: match &result {
+                Ok((reason, _)) => TurnResult::Completed(reason.clone()),
+                Err(error) => TurnResult::Failed(error.to_string()),
+            },
+            messages: turn_messages,
+            usage,
+        };
+        if let Err(error) = self.runtime.complete_turn(&turn_context, &view).await {
+            if result.is_ok() {
+                view.result = TurnResult::Failed(error.to_string());
+                result = Err(error);
+            }
+        }
+        // Commit point: buffer the turn's terminal entry, then write all
+        // buffered messages plus the turn end in one write+flush. On crash
+        // before this point the turn has no `TurnEnd`, so the projection
+        // marks it `Interrupted` and its partial output is never exposed.
+        let terminal = LogEntry::TurnEnd {
+            id: turn_id,
+            result: view.result.clone(),
+            usage: view.usage,
+        };
+        if let Err(error) = persistence.append(&[terminal]).await {
+            if result.is_ok() {
+                return Err(error);
+            }
+        }
+        if let Err(error) = persistence.flush().await {
+            if result.is_ok() {
+                return Err(error);
+            }
+        }
         self.version = persistence.version();
         // Replay what this turn appended into the in-memory log instead of
         // reloading the thread from disk (which scans the whole directory and
@@ -701,32 +749,8 @@ impl ThreadState {
         for entry in appended {
             self.log.push(entry);
         }
-        let mut view = TurnView {
-            id: turn_id,
-            result: match &result {
-                Ok((reason, _)) => TurnResult::Completed(reason.clone()),
-                Err(error) => TurnResult::Failed(error.to_string()),
-            },
-            messages: self.log.turn_messages(turn_id),
-            usage,
-        };
-        if let Err(error) = self.runtime.complete_turn(&turn_context, &view).await {
-            if result.is_ok() {
-                view.result = TurnResult::Failed(error.to_string());
-                result = Err(error);
-            }
-        }
-        let terminal = LogEntry::TurnEnd {
-            id: turn_id,
-            result: view.result.clone(),
-            usage: view.usage,
-        };
-        let terminal_result = self.append(&[terminal]).await;
-        if let Err(error) = terminal_result {
-            if result.is_ok() {
-                return Err(error);
-            }
-        }
+        // The canonical projection now includes the persisted user inputs.
+        view.messages = self.log.turn_messages(turn_id);
         result.map(|_| view)
     }
 
@@ -782,13 +806,15 @@ impl ThreadState {
         if entries.is_empty() {
             return Ok(());
         }
-        self.version = if self.persisted {
-            self.store.append(self.id, self.version, entries).await?
-        } else {
-            let version = self.store.create(self.metadata.clone(), entries).await?;
-            self.persisted = true;
-            version
-        };
+        if self.writer.is_none() {
+            let writer = self
+                .store
+                .open_writer(self.id, self.metadata.clone())
+                .await?;
+            self.writer = Some(Arc::new(tokio::sync::Mutex::new(writer)));
+        }
+        let writer = self.writer.as_ref().expect("writer initialized");
+        self.version = writer.lock().await.append(entries).await?;
         for entry in entries {
             self.log.push(entry.clone());
         }

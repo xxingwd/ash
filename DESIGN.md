@@ -97,6 +97,13 @@ Entry slices represent one ordered version change. Implementations reject stale 
 The default `JsonlThreadStore` serializes writes per store, appends entries in one batch, and
 can read legacy `session-*`/`session_meta` files while writing `thread-*`/`thread_meta` files.
 
+The runtime's hot write path keeps one open `ThreadWriter` per active thread, so each
+append is a single write+flush instead of a directory scan plus full-file re-read. Writes
+are batched at commit points: accepted inputs are persisted when the turn starts, and all
+turn messages plus `TurnEnd` are flushed together when the turn settles. A crash before
+that commit point leaves a turn without `TurnEnd`, which the projection reports as
+`Interrupted` and never exposes as normal history.
+
 ## Events And Projection
 
 `EventKind` distinguishes live deltas from durable facts and derived views:
