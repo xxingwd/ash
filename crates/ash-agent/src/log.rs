@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ash_core::{
     Message, MessageContent, MessageId, ThreadView, TurnId, TurnResult, TurnView, Usage,
 };
@@ -90,26 +92,48 @@ impl ThreadLog {
         self.entries.push(entry);
     }
 
-    /// Full user-visible history, excluding messages removed by rollback.
+    /// Full user-visible history, excluding messages removed by rollback and
+    /// partial messages from a turn that never settled (e.g. after a crash):
+    /// its accepted inputs stay visible, but half-streamed assistant and tool
+    /// messages are not exposed as normal history.
     pub fn messages(&self) -> Vec<Message> {
-        active_entries(&self.entries)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                LogEntry::Input(input) => Some(input.message.clone()),
-                LogEntry::Message(message) => Some(message.clone()),
-                LogEntry::TurnStart(_)
-                | LogEntry::Checkpoint(_)
-                | LogEntry::TurnEnd { .. }
-                | LogEntry::Rollback => None,
-            })
-            .collect()
+        let active = active_entries(&self.entries);
+        let open_turns = open_turn_ids(&active);
+        let mut messages = Vec::new();
+        let mut current_turn: Option<TurnId> = None;
+        for entry in active {
+            match entry {
+                LogEntry::TurnStart(id) => current_turn = Some(*id),
+                LogEntry::TurnEnd { id, .. } => {
+                    if current_turn == Some(*id) {
+                        current_turn = None;
+                    }
+                }
+                LogEntry::Input(input) => messages.push(input.message.clone()),
+                LogEntry::Message(message) => {
+                    let partial = current_turn.is_some_and(|turn_id| {
+                        open_turns.contains(&turn_id) && !is_user_message(message)
+                    });
+                    if !partial {
+                        messages.push(message.clone());
+                    }
+                }
+                LogEntry::Checkpoint(_) | LogEntry::Rollback => {}
+            }
+        }
+        messages
     }
 
-    /// The model context for the next request, honoring checkpoints.
+    /// The model context for the next request, honoring checkpoints. Messages
+    /// of a turn that never settled are excluded (except its accepted inputs)
+    /// so the model never resumes from a half-streamed fact.
     pub fn model_context(&self) -> Vec<Message> {
+        let active = active_entries(&self.entries);
+        let open_turns = open_turn_ids(&active);
         let mut messages = Vec::new();
         let mut model_context = Vec::new();
-        for entry in active_entries(&self.entries) {
+        let mut current_turn: Option<TurnId> = None;
+        for entry in active {
             match entry {
                 LogEntry::Input(input) => {
                     messages.push(input.message.clone());
@@ -117,12 +141,23 @@ impl ThreadLog {
                 }
                 LogEntry::Message(message) => {
                     messages.push(message.clone());
-                    model_context.push(message.clone());
+                    let partial = current_turn.is_some_and(|turn_id| {
+                        open_turns.contains(&turn_id) && !is_user_message(message)
+                    });
+                    if !partial {
+                        model_context.push(message.clone());
+                    }
                 }
                 LogEntry::Checkpoint(checkpoint) => {
                     model_context = apply_checkpoint(&messages, checkpoint);
                 }
-                LogEntry::TurnStart(_) | LogEntry::TurnEnd { .. } | LogEntry::Rollback => {}
+                LogEntry::TurnStart(id) => current_turn = Some(*id),
+                LogEntry::TurnEnd { id, .. } => {
+                    if current_turn == Some(*id) {
+                        current_turn = None;
+                    }
+                }
+                LogEntry::Rollback => {}
             }
         }
         model_context
@@ -229,6 +264,41 @@ fn active_entries(entries: &[LogEntry]) -> Vec<&LogEntry> {
         }
     }
     active
+}
+
+fn is_user_message(message: &Message) -> bool {
+    matches!(message.content, MessageContent::User(_))
+}
+
+/// Turn ids that started but never settled (no matching `TurnEnd`). At most
+/// one exists in practice (turns run serially), but the projection is robust
+/// to any number.
+fn open_turn_ids(entries: &[&LogEntry]) -> HashSet<TurnId> {
+    let mut open = HashSet::new();
+    let mut current: Option<TurnId> = None;
+    for entry in entries {
+        match entry {
+            LogEntry::TurnStart(id) => {
+                if let Some(previous) = current {
+                    open.insert(previous);
+                }
+                current = Some(*id);
+            }
+            LogEntry::TurnEnd { id, .. } => {
+                if current == Some(*id) {
+                    current = None;
+                }
+            }
+            LogEntry::Input(_)
+            | LogEntry::Message(_)
+            | LogEntry::Checkpoint(_)
+            | LogEntry::Rollback => {}
+        }
+    }
+    if let Some(remaining) = current {
+        open.insert(remaining);
+    }
+    open
 }
 
 fn rollback_last_turn(entries: &mut Vec<&LogEntry>) {
@@ -392,6 +462,43 @@ mod tests {
         assert!(matches!(turns[0].result, TurnResult::Interrupted(_)));
         assert_eq!(turns[0].messages.len(), 2);
         assert_eq!(log.view().turns.len(), 1);
+    }
+
+    #[test]
+    fn settled_turn_keeps_all_of_its_messages() {
+        let turn_id = TurnId::new();
+        let mut log = ThreadLog::new();
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(LogEntry::Message(Message::user("question")));
+        log.push(LogEntry::Message(Message::assistant_text("answer")));
+        log.push(LogEntry::TurnEnd {
+            id: turn_id,
+            result: TurnResult::Completed(StopReason::EndTurn),
+            usage: None,
+        });
+
+        // A settled turn's assistant messages are normal history.
+        assert_eq!(log.messages().len(), 2);
+        assert_eq!(log.model_context().len(), 2);
+    }
+
+    #[test]
+    fn open_turn_partial_messages_stay_out_of_history_and_context() {
+        let turn_id = TurnId::new();
+        let mut log = ThreadLog::new();
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(LogEntry::Message(Message::user("question")));
+        log.push(LogEntry::Message(Message::assistant_text("partial answer")));
+        log.push(LogEntry::Message(Message::assistant_text("more partial")));
+
+        // The accepted input stays visible; half-streamed assistant messages
+        // are not exposed as normal history or model context.
+        let messages = log.messages();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].content, MessageContent::User(_)));
+        assert_eq!(log.model_context().len(), 1);
+        // The turn snapshot keeps the full audit trail.
+        assert_eq!(log.turns()[0].messages.len(), 3);
     }
 
     #[test]
