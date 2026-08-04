@@ -5,8 +5,8 @@ use std::{
 };
 
 use ash_core::{
-    CancellationToken, Content, Event, EventKind, ForkPoint, Message, MessageContent, MessageId,
-    StopReason, ThreadId, ThreadView, TurnId, TurnResult, TurnView,
+    CancellationToken, Event, EventKind, ForkPoint, Message, MessageId, StopReason, ThreadId,
+    ThreadView, TurnId, TurnResult, TurnView,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -14,8 +14,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
-    jsonl::ThreadWriter, AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime,
-    SharedThreadStore, ThreadLog, ThreadMetadata, TurnContext, Version,
+    jsonl::ThreadWriter, AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedThread,
+    RunConfig, Runtime, SharedThreadStore, ThreadLog, ThreadMetadata, TurnContext,
 };
 
 #[derive(Clone)]
@@ -348,12 +348,22 @@ async fn run_turn(
                 sequence,
                 EventKind::Error(error.to_string()),
             );
-            state.log.turns().pop().unwrap_or_else(|| TurnView {
-                id,
-                result: TurnResult::Failed(error.to_string()),
-                messages: Vec::new(),
-                usage: None,
-            })
+            // Only reuse the projected view when the log actually contains
+            // this turn's settlement. `submit_inputs` can fail before writing
+            // anything (empty input, duplicate idempotency key), in which
+            // case `turns().pop()` would return a previous turn's view and
+            // the UI would re-commit stale content.
+            state
+                .log
+                .turns()
+                .pop()
+                .filter(|view| view.id == id)
+                .unwrap_or_else(|| TurnView {
+                    id,
+                    result: TurnResult::Failed(error.to_string()),
+                    messages: Vec::new(),
+                    usage: None,
+                })
         }
     };
     publish(events, thread_id, Some(id), sequence, EventKind::Turn(view));
@@ -502,7 +512,6 @@ pub struct ThreadState {
     log: ThreadLog,
     metadata: ThreadMetadata,
     store: SharedThreadStore,
-    version: Version,
     /// Open append-only handle to this thread's file. Initialized lazily so
     /// `ThreadState::new` stays synchronous; every write goes through it
     /// without re-scanning or re-reading the file.
@@ -512,7 +521,7 @@ pub struct ThreadState {
 impl ThreadState {
     pub(crate) fn new(config: RunConfig, runtime: Runtime) -> Self {
         let id = ThreadId::new();
-        let metadata = thread_metadata(&config, &runtime, id);
+        let metadata = thread_metadata(&config, id);
         let store = runtime.thread_store_handle();
         Self {
             id,
@@ -521,7 +530,6 @@ impl ThreadState {
             log: ThreadLog::new(),
             metadata,
             store,
-            version: Version::initial(),
             writer: None,
         }
     }
@@ -539,13 +547,13 @@ impl ThreadState {
     }
 
     pub(crate) async fn resume(&mut self, thread_id: ThreadId) -> Result<bool, ash_core::AshError> {
-        let Some(stored) = self.store.load(thread_id).await? else {
+        let Some(opened) = self.store.open(thread_id).await? else {
             return Ok(false);
         };
-        if stored.metadata.kind == crate::ThreadKind::Subagent {
+        if opened.thread.metadata.kind == crate::ThreadKind::Subagent {
             return Ok(false);
         }
-        self.restore(stored);
+        self.restore(opened);
         Ok(true)
     }
 
@@ -563,7 +571,7 @@ impl ThreadState {
             .iter()
             .rev()
             .filter_map(|message| {
-                user_prompt(message).map(|prompt| ForkPoint {
+                message.user_turn_text().map(|prompt| ForkPoint {
                     message_id: message.id,
                     prompt,
                 })
@@ -582,8 +590,7 @@ impl ThreadState {
                 .enumerate()
                 .find_map(|(index, message)| {
                     (message.id == message_id)
-                        .then(|| user_prompt(message).map(|prompt| (index, prompt)))
-                        .flatten()
+                        .then(|| message.user_turn_text().map(|prompt| (index, prompt)))?
                 })
         else {
             return Ok(None);
@@ -609,14 +616,11 @@ impl ThreadState {
         Ok(Some((state, details)))
     }
 
-    fn restore(&mut self, stored: crate::StoredThread) {
-        self.id = stored.metadata.thread_id;
-        self.metadata.thread_id = self.id;
-        self.log = stored.log;
-        self.version = stored.version;
-        // The previous writer (if any) pointed at a different thread file;
-        // re-open on the next append.
-        self.writer = None;
+    fn restore(&mut self, opened: OpenedThread) {
+        self.id = opened.thread.metadata.thread_id;
+        self.metadata = opened.thread.metadata;
+        self.log = opened.thread.log;
+        self.writer = Some(Arc::new(tokio::sync::Mutex::new(opened.writer)));
     }
 
     async fn submit_inputs(
@@ -683,12 +687,8 @@ impl ThreadState {
         model_context.extend(patch.context);
         let mut turn_config = self.config.clone();
         turn_config.tools.extend(patch.tools);
-        let writer = self
-            .writer
-            .as_ref()
-            .expect("writer initialized by the accepted-input append")
-            .clone();
-        let mut persistence = crate::store::ThreadPersistence::new(writer).await;
+        let writer = self.writer().await?;
+        let mut persistence = crate::store::ThreadPersistence::new(writer);
         let context_before = model_context.len();
         let execution = TurnExecution::new(self.id, turn_id, events.clone(), cancel, steering);
         let mut result = run_agent_turn_persisted(
@@ -706,13 +706,17 @@ impl ThreadState {
         // Messages produced by this turn's model calls and tool executions
         // (the accepted inputs were already persisted with `TurnStart`).
         let turn_messages = model_context[context_before..].to_vec();
+        // The view given to extensions must match what the UI and the log
+        // eventually see: accepted inputs plus this turn's output.
+        let mut view_messages = self.log.turn_messages(turn_id);
+        view_messages.extend(turn_messages.iter().cloned());
         let mut view = TurnView {
             id: turn_id,
             result: match &result {
                 Ok((reason, _)) => TurnResult::Completed(reason.clone()),
                 Err(error) => TurnResult::Failed(error.to_string()),
             },
-            messages: turn_messages,
+            messages: view_messages,
             usage,
         };
         if let Err(error) = self.runtime.complete_turn(&turn_context, &view).await {
@@ -730,21 +734,16 @@ impl ThreadState {
             result: view.result.clone(),
             usage: view.usage,
         };
-        if let Err(error) = persistence.append(&[terminal]).await {
-            if result.is_ok() {
-                return Err(error);
-            }
-        }
+        persistence.append(&[terminal]);
         if let Err(error) = persistence.flush().await {
             if result.is_ok() {
                 return Err(error);
             }
         }
-        self.version = persistence.version();
         // Replay what this turn appended into the in-memory log instead of
         // reloading the thread from disk (which scans the whole directory and
         // visibly delays the turn-completed event after the last delta).
-        let appended = persistence.take_appended();
+        let appended = persistence.take_flushed();
         drop(persistence);
         for entry in appended {
             self.log.push(entry);
@@ -806,19 +805,25 @@ impl ThreadState {
         if entries.is_empty() {
             return Ok(());
         }
-        if self.writer.is_none() {
-            let writer = self
-                .store
-                .open_writer(self.id, self.metadata.clone())
-                .await?;
-            self.writer = Some(Arc::new(tokio::sync::Mutex::new(writer)));
-        }
-        let writer = self.writer.as_ref().expect("writer initialized");
-        self.version = writer.lock().await.append(entries).await?;
+        let writer = self.writer().await?;
+        writer.lock().await.append(entries).await?;
         for entry in entries {
             self.log.push(entry.clone());
         }
         Ok(())
+    }
+
+    async fn writer(
+        &mut self,
+    ) -> Result<Arc<tokio::sync::Mutex<ThreadWriter>>, ash_core::AshError> {
+        if let Some(writer) = &self.writer {
+            return Ok(Arc::clone(writer));
+        }
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            self.store.open_writer(self.metadata).await?,
+        ));
+        self.writer = Some(Arc::clone(&writer));
+        Ok(writer)
     }
 }
 
@@ -830,16 +835,9 @@ struct ForkData {
     prompt: String,
 }
 
-fn thread_metadata(config: &RunConfig, runtime: &Runtime, thread_id: ThreadId) -> ThreadMetadata {
+fn thread_metadata(config: &RunConfig, thread_id: ThreadId) -> ThreadMetadata {
     ThreadMetadata {
         thread_id,
-        model_backend: runtime.model_backend().to_string(),
-        model: config.model.clone(),
-        working_dir: config.working_dir.clone(),
-        system_prompt: config.system_prompt.clone(),
-        max_turns: config.max_turns,
-        max_context_tokens: config.max_context_tokens,
-        max_tool_duration: config.max_tool_duration,
         kind: thread_kind(config),
     }
 }
@@ -848,16 +846,7 @@ fn thread_metadata(config: &RunConfig, runtime: &Runtime, thread_id: ThreadId) -
 /// collaboration layer stamps `"kind": "subagent"` when spawning a child so
 /// its thread stays out of the session list.
 pub(crate) fn thread_kind(config: &RunConfig) -> crate::ThreadKind {
-    if config
-        .metadata
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("subagent")
-    {
-        crate::ThreadKind::Subagent
-    } else {
-        crate::ThreadKind::Root
-    }
+    crate::ThreadKind::from_metadata(&config.metadata)
 }
 
 fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
@@ -865,23 +854,7 @@ fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, message)| user_prompt(message).map(|prompt| (index, prompt)))
-}
-
-fn user_prompt(message: &Message) -> Option<String> {
-    let MessageContent::User(contents) = &message.content else {
-        return None;
-    };
-    Some(
-        contents
-            .iter()
-            .map(|content| match content {
-                Content::Text(text) => text.clone(),
-                Content::Image { media_type, .. } => format!("[image: {media_type}]"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+        .find_map(|(index, message)| message.user_turn_text().map(|prompt| (index, prompt)))
 }
 
 #[cfg(test)]
@@ -896,8 +869,8 @@ mod tests {
     };
 
     use ash_core::{
-        ContentBlock, MessageContent, MessageId, ModelClient, ModelEvent, ModelId, ModelRequest,
-        ModelStream, Role, ToolCallId,
+        Content, ContentBlock, MessageContent, MessageId, ModelClient, ModelEvent, ModelId,
+        ModelRequest, ModelStream, Role, ToolCallId,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -934,6 +907,18 @@ mod tests {
 
     struct GoalExtension {
         completed: Arc<AtomicUsize>,
+    }
+
+    struct FailingPrepareExtension;
+
+    #[async_trait::async_trait]
+    impl crate::Extension for FailingPrepareExtension {
+        async fn prepare(
+            &self,
+            _turn: &TurnContext,
+        ) -> Result<crate::TurnPatch, ash_core::AshError> {
+            Err(ash_core::AshError::Config("prepare failed".to_string()))
+        }
     }
 
     #[async_trait::async_trait]
@@ -1155,7 +1140,7 @@ mod tests {
         runtime
             .thread_store_handle()
             .create(
-                thread_metadata(&config(directory.path().join("old")), &runtime, saved_id),
+                thread_metadata(&config(directory.path().join("old")), saved_id),
                 &[LogEntry::Message(saved_message)],
             )
             .await
@@ -1282,7 +1267,10 @@ mod tests {
         second.wait().await.unwrap();
 
         let messages = thread.messages().await.unwrap();
-        let prompts = messages.iter().filter_map(user_prompt).collect::<Vec<_>>();
+        let prompts = messages
+            .iter()
+            .filter_map(Message::user_turn_text)
+            .collect::<Vec<_>>();
         assert_eq!(prompts, ["first", "second"]);
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
@@ -1316,7 +1304,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .filter_map(user_prompt)
+            .filter_map(Message::user_turn_text)
             .collect::<Vec<_>>();
         assert_eq!(prompts, ["note", "task"]);
     }
@@ -1379,7 +1367,7 @@ mod tests {
         assert!(requests[1]
             .messages
             .iter()
-            .any(|message| user_prompt(message).as_deref() == Some("updated direction")));
+            .any(|message| message.user_turn_text().as_deref() == Some("updated direction")));
     }
 
     #[tokio::test]
@@ -1442,5 +1430,80 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.role == Role::System));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_that_wrote_nothing_emits_its_own_failed_view() {
+        let directory = TempDir::new().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            Arc::new(MockAdapter {
+                responses: Mutex::new(VecDeque::from([vec![ModelEvent::Stop(
+                    StopReason::EndTurn,
+                )]])),
+                requests: requests.clone(),
+            }),
+            "test",
+        )
+        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())))
+        .with_extension(Arc::new(FailingPrepareExtension));
+        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        let mut events = thread.events();
+
+        // `submit_inputs` persists `TurnStart` + the input, then `prepare_turn`
+        // fails. The turn settles with its own `TurnEnd(Failed)`; the emitted
+        // view must be this turn's failure, not a previous turn's stale view.
+        thread
+            .submit("work")
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap_err();
+
+        // Drain events for a bounded time; `events.next()` would block forever
+        // after the turn settles because no further events are emitted.
+        let mut saw_turn = false;
+        while let Ok(Some(Ok(event))) =
+            tokio::time::timeout(Duration::from_millis(200), events.next()).await
+        {
+            if let EventKind::Turn(view) = event.kind {
+                saw_turn = true;
+                assert!(matches!(view.result, TurnResult::Failed(_)));
+                assert!(!view.messages.is_empty());
+            }
+        }
+        assert!(saw_turn);
+    }
+
+    #[tokio::test]
+    async fn extension_observes_the_full_turn_message_set() {
+        let directory = TempDir::new().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::new(
+            Arc::new(MockAdapter {
+                responses: Mutex::new(VecDeque::from([vec![
+                    ModelEvent::Text("done".to_string()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ]])),
+                requests: requests.clone(),
+            }),
+            "test",
+        )
+        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())))
+        .with_extension(Arc::new(GoalExtension {
+            completed: completed.clone(),
+        }));
+        let mut run_config = config(directory.path().into());
+        run_config
+            .metadata
+            .insert("goal".to_string(), serde_json::json!("ship"));
+        let thread = Thread::spawn(ThreadState::new(run_config, runtime));
+
+        thread.submit("work").await.unwrap().wait().await.unwrap();
+
+        // The extension sees the accepted user input plus the assistant reply.
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 }
