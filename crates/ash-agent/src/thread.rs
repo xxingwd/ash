@@ -653,15 +653,19 @@ impl ThreadState {
             ));
         }
         let mut accepted = Vec::with_capacity(inputs.len() + 1);
+        // The accepted inputs' messages are needed for the final turn view;
+        // capture them here instead of re-projecting the whole log later.
+        let mut accepted_messages = Vec::with_capacity(inputs.len());
         accepted.push(LogEntry::TurnStart(turn_id));
-        accepted.extend(inputs.into_iter().map(|input| {
+        for input in inputs {
             let message = Message::user_content(input.content.clone());
-            LogEntry::Input(AcceptedInput {
+            accepted_messages.push(message.clone());
+            accepted.push(LogEntry::Input(AcceptedInput {
                 turn_id,
                 input,
                 message,
-            })
-        }));
+            }));
+        }
         self.append(&accepted).await?;
         let turn_context = TurnContext {
             thread_id: self.id,
@@ -707,8 +711,11 @@ impl ThreadState {
         // (the accepted inputs were already persisted with `TurnStart`).
         let turn_messages = model_context[context_before..].to_vec();
         // The view given to extensions must match what the UI and the log
-        // eventually see: accepted inputs plus this turn's output.
-        let mut view_messages = self.log.turn_messages(turn_id);
+        // eventually see: accepted inputs plus this turn's output. Steering
+        // inputs are already inside `turn_messages` (they were pushed into
+        // the model context mid-turn), so appending the accepted inputs here
+        // reproduces `log.turn_messages(turn_id)` without re-scanning the log.
+        let mut view_messages = accepted_messages.clone();
         view_messages.extend(turn_messages.iter().cloned());
         let mut view = TurnView {
             id: turn_id,
@@ -748,8 +755,8 @@ impl ThreadState {
         for entry in appended {
             self.log.push(entry);
         }
-        // The canonical projection now includes the persisted user inputs.
-        view.messages = self.log.turn_messages(turn_id);
+        // `view.messages` already holds the canonical set (accepted inputs
+        // plus this turn's output); replaying the log does not change it.
         result.map(|_| view)
     }
 

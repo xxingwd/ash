@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
 use crate::store::ThreadPersistence;
 use crate::{
-    context::{count_output_tokens, estimate_request_tokens},
+    context::count_output_tokens,
     context_policy::{ContextRequest, DefaultContextPolicy},
     log::{ContextCheckpoint, LogEntry},
     AcceptedInput, Input, RunConfig,
@@ -37,6 +37,12 @@ struct CollectedResponse {
 enum ResponseOutcome {
     Finished(StopReason),
     ToolCalls(Vec<PendingToolCall>),
+    Failed(ash_core::ProtocolError),
+}
+
+enum StreamExit {
+    Exhausted,
+    Cancelled,
     Failed(ash_core::ProtocolError),
 }
 
@@ -229,15 +235,9 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             }
             debug!(turn = turn + 1, "calling LLM");
 
-            self.prepare_context(messages).await?;
+            let estimated_input_tokens = self.prepare_context(messages).await?;
 
             let request_messages = messages.clone();
-            let estimated_input_tokens = u64::try_from(estimate_request_tokens(
-                self.config.system_prompt.as_deref(),
-                &request_messages,
-                &self.tool_defs,
-            ))
-            .unwrap_or(u64::MAX);
             let request_started = Instant::now();
             let mut stream = self.model.stream(ModelRequest {
                 model: self.config.model.clone(),
@@ -256,7 +256,10 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 .map(count_output_tokens)
                 .and_then(|tokens| u64::try_from(tokens).ok())
                 .unwrap_or(0);
-            let call_usage = usage.finalize(estimated_input_tokens, estimated_output_tokens);
+            let call_usage = usage.finalize(
+                u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
+                estimated_output_tokens,
+            );
             turn_usage = Some(match turn_usage {
                 Some(acc) => Usage {
                     input_tokens: acc.input_tokens.saturating_add(call_usage.input_tokens),
@@ -296,7 +299,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     async fn prepare_context(
         &mut self,
         messages: &mut Vec<Message>,
-    ) -> Result<(), ash_core::AshError> {
+    ) -> Result<usize, ash_core::AshError> {
         let prepared = self
             .config
             .context_policy
@@ -312,19 +315,18 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 &self.cancel,
             )
             .await?;
+        let estimated_input_tokens = prepared.estimated_input_tokens;
         let update = prepared.update;
         *messages = prepared.messages;
         let Some(update) = update else {
-            return Ok(());
+            return Ok(estimated_input_tokens);
         };
         if let Some(persistence) = self.persistence.as_deref_mut() {
-            persistence
-                .append(
-                    &[LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
-                        messages,
-                    )?)],
-                )
-                .await?;
+            persistence.append(
+                &[LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
+                    messages,
+                )?)],
+            );
         }
         let _ = self
             .tx
@@ -335,15 +337,14 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 automatic: true,
             })
             .await;
-        Ok(())
+        Ok(estimated_input_tokens)
     }
 
     async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
         match self.persistence.as_deref_mut() {
             Some(persistence) => {
-                persistence
-                    .append(&[LogEntry::Message(message.clone())])
-                    .await
+                persistence.append(&[LogEntry::Message(message.clone())]);
+                Ok(())
             }
             None => Ok(()),
         }
@@ -375,7 +376,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     })
                 })
                 .collect::<Vec<_>>();
-            persistence.append(&records).await?;
+            persistence.append(&records);
         }
         messages.extend(accepted.into_iter().map(|(_, message)| message));
         Ok(true)
@@ -475,28 +476,20 @@ async fn collect_response(
     let mut blocks = Vec::new();
     let mut thought_started_at = None;
     let mut stop_reason = StopReason::EndTurn;
-    let mut cancelled = false;
-    let mut failure = None;
     let mut usage = UsageAccumulator::default();
     let mut first_output_at = None;
 
-    loop {
+    let stream_exit = loop {
         let next = tokio::select! {
-            _ = cancel.cancelled() => {
-                cancelled = true;
-                None
-            },
+            _ = cancel.cancelled() => break StreamExit::Cancelled,
             next = stream.next() => next,
         };
         let Some(item) = next else {
-            break;
+            break StreamExit::Exhausted;
         };
         let item = match item {
             Ok(item) => item,
-            Err(stream_error) => {
-                failure = Some(stream_error);
-                break;
-            }
+            Err(error) => break StreamExit::Failed(error),
         };
         match item {
             ModelEvent::Text(delta) => {
@@ -542,7 +535,7 @@ async fn collect_response(
             }
             ModelEvent::Stop(reason) => stop_reason = reason,
         }
-    }
+    };
     finish_open_thought(&mut blocks, &mut thought_started_at);
 
     let calls: Vec<PendingToolCall> = blocks
@@ -565,16 +558,11 @@ async fn collect_response(
         role: Role::Assistant,
         content: MessageContent::Assistant(blocks),
     });
-    let outcome = if let Some(error) = failure {
-        ResponseOutcome::Failed(error)
-    } else if calls.is_empty() {
-        ResponseOutcome::Finished(if cancelled {
-            StopReason::Aborted
-        } else {
-            stop_reason
-        })
-    } else {
-        ResponseOutcome::ToolCalls(calls)
+    let outcome = match stream_exit {
+        StreamExit::Failed(error) => ResponseOutcome::Failed(error),
+        _ if !calls.is_empty() => ResponseOutcome::ToolCalls(calls),
+        StreamExit::Cancelled => ResponseOutcome::Finished(StopReason::Aborted),
+        StreamExit::Exhausted => ResponseOutcome::Finished(stop_reason),
     };
 
     CollectedResponse {
@@ -658,22 +646,14 @@ mod tests {
     use super::*;
     use crate::{JsonlThreadStore, SharedThreadStore, StoredThread, ThreadMetadata};
 
-    fn metadata(config: &RunConfig, thread_id: ThreadId) -> ThreadMetadata {
+    fn metadata(thread_id: ThreadId) -> ThreadMetadata {
         ThreadMetadata {
             thread_id,
-            model_backend: "test".to_string(),
-            model: config.model.clone(),
-            working_dir: config.working_dir.clone(),
-            system_prompt: config.system_prompt.clone(),
-            max_turns: config.max_turns,
-            max_context_tokens: config.max_context_tokens,
-            max_tool_duration: config.max_tool_duration,
             kind: crate::ThreadKind::Root,
         }
     }
 
     async fn persisted_thread(
-        config: &RunConfig,
         directory: &std::path::Path,
         messages: &[Message],
     ) -> (ThreadId, SharedThreadStore, ThreadPersistence) {
@@ -684,17 +664,10 @@ mod tests {
             .cloned()
             .map(LogEntry::Message)
             .collect::<Vec<_>>();
-        store
-            .create(metadata(config, thread_id), &records)
-            .await
-            .unwrap();
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            store
-                .open_writer(thread_id, metadata(config, thread_id))
-                .await
-                .unwrap(),
-        ));
-        let persistence = ThreadPersistence::new(writer).await;
+        store.create(metadata(thread_id), &records).await.unwrap();
+        let opened = store.open(thread_id).await.unwrap().unwrap();
+        let writer = Arc::new(tokio::sync::Mutex::new(opened.writer));
+        let persistence = ThreadPersistence::new(writer);
         (thread_id, store, persistence)
     }
 
@@ -809,7 +782,7 @@ mod tests {
         let mut messages = vec![Message::user("use a tool")];
         let directory = TempDir::new().unwrap();
         let (thread_id, store, mut persistence) =
-            persisted_thread(&config, directory.path(), &messages).await;
+            persisted_thread(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(32);
 
         let (reason, _usage) = run_with_adapter(
@@ -879,7 +852,7 @@ mod tests {
         ];
         let directory = TempDir::new().unwrap();
         let (thread_id, store, mut persistence) =
-            persisted_thread(&config, directory.path(), &messages).await;
+            persisted_thread(directory.path(), &messages).await;
         let (tx, mut rx) = mpsc::channel(16);
 
         let (reason, _usage) = run_with_adapter(
@@ -1115,7 +1088,7 @@ mod tests {
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
         let (thread_id, store, mut persistence) =
-            persisted_thread(&config, directory.path(), &messages).await;
+            persisted_thread(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(32);
 
         run_with_adapter(
@@ -1237,7 +1210,7 @@ mod tests {
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
         let (thread_id, store, mut persistence) =
-            persisted_thread(&config, directory.path(), &messages).await;
+            persisted_thread(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(8);
 
         let error = run_with_adapter(

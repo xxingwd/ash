@@ -22,6 +22,9 @@ pub struct ContextRequest {
 pub struct PreparedContext {
     pub messages: Vec<Message>,
     pub update: Option<ContextUpdate>,
+    /// Token estimate for the prepared messages (system + tools + history),
+    /// computed once by the policy so the engine does not re-tokenize.
+    pub estimated_input_tokens: usize,
 }
 
 pub struct ContextUpdate {
@@ -132,17 +135,20 @@ impl ContextPolicy for DefaultContextPolicy {
         );
         if !needs_compaction(estimated_tokens, request.max_context_tokens) {
             return Ok(PreparedContext {
+                estimated_input_tokens: estimated_tokens,
                 messages: request.messages,
                 update: None,
             });
         }
         let Some(compacted) = self.compact(request.clone(), model, cancel).await? else {
             return Ok(PreparedContext {
+                estimated_input_tokens: estimated_tokens,
                 messages: request.messages,
                 update: None,
             });
         };
         Ok(PreparedContext {
+            estimated_input_tokens: compacted.update.after_tokens,
             messages: compacted.messages,
             update: Some(compacted.update),
         })
@@ -162,6 +168,7 @@ impl ContextPolicy for PassthroughContextPolicy {
     ) -> Result<PreparedContext, ash_core::AshError> {
         Ok(PreparedContext {
             messages: request.messages,
+            estimated_input_tokens: 0,
             update: None,
         })
     }
