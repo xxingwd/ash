@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "==> building static musl release..."
-cargo build --release -p ash-cli
+cargo build --release --target x86_64-unknown-linux-musl -p ash-cli
 
 BIN="target/x86_64-unknown-linux-musl/release/ash"
 strip "$BIN" 2>/dev/null || true
