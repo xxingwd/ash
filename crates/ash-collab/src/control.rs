@@ -11,8 +11,18 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
-const COLLABORATION_TOOL_NAMES: [&str; 6] = [
+const EXPOSED_COLLABORATION_TOOL_NAMES: [&str; 4] = [
     "spawn_agent",
+    "message_agent",
+    "interrupt_agent",
+    "wait_agent",
+];
+
+const LEGACY_COLLABORATION_TOOL_NAMES: [&str; 3] = ["send_message", "followup_task", "list_agents"];
+
+const COLLABORATION_TOOL_NAMES: [&str; 7] = [
+    "spawn_agent",
+    "message_agent",
     "send_message",
     "followup_task",
     "interrupt_agent",
@@ -23,11 +33,11 @@ const COLLABORATION_TOOL_NAMES: [&str; 6] = [
 const MULTI_AGENT_INSTRUCTIONS: &str = r#"<multi_agent_mode>
 You are one agent in a team that shares the same workspace and tools. Split work where parallelism pays; keep tightly coupled work local.
 
-Delegation is proactive. You do not need separate permission to delegate work that is already inside the user's request.
+Delegation is available when it simplifies the work. You do not need separate permission to delegate work that is already inside the user's request.
 
 Decision rules:
 - Handle simple, one-path tasks yourself.
-- When there are two or more independent questions or workstreams, usually spawn them in the same round.
+- When there are two or more independent questions or workstreams, multiple sub-agents may run at the same time.
 - Use `explorer` for a focused, read-only codebase question that can be answered independently. Trust a completed exploration instead of repeating it.
 - Prefer `worker` for a bounded implementation, fix, test, or refactor with a clear write scope.
 - Use `default` for a self-contained task that does not fit the other roles.
@@ -37,9 +47,10 @@ Operating rules:
 - Give every agent a concrete task, expected output, and enough context to finish without guessing.
 - For code changes, assign explicit files or modules. Write scopes must not overlap.
 - The workspace is shared. Never ask an agent to revert unrelated edits; tell workers they are not alone in the codebase.
-- After spawning, continue useful non-overlapping work immediately. Do not redo the delegated task.
-- Use `wait_agent` only when an agent's result is required for the next step.
-- Reuse context with `followup_task`; use `send_message` for guidance that should not start a new turn.
+- After spawning, continue useful non-overlapping work immediately when available. Do not redo the delegated task.
+- Use `wait_agent` with `timeout_ms: 0` to inspect current status, or with a positive timeout when an agent's result is required for the next step.
+- Reuse context with `message_agent` and `start_turn: true`; use `message_agent` with `start_turn: false` for guidance that should not start a new turn.
+- Interrupt a sub-agent only from the parent when the current turn is stale, wrong, or blocking the plan.
 - Review returned changes before integrating them.
 </multi_agent_mode>"#;
 
@@ -365,17 +376,24 @@ impl ControlState {
             .get(&tree_id)
             .into_iter()
             .flat_map(|session| session.agents.values())
-            .filter(|record| path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix)))
+            .filter(|record| agent_path_matches(record, path_prefix))
             .map(ChildRecord::snapshot)
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         agents
     }
 
-    fn wait_snapshot(&mut self, tree_id: TreeId, waiter: &str) -> WaitSnapshot {
+    fn wait_snapshot(
+        &mut self,
+        tree_id: TreeId,
+        waiter: &str,
+        path_prefix: Option<&str>,
+    ) -> WaitSnapshot {
         self.threads
             .get_mut(&tree_id)
-            .map_or_else(WaitSnapshot::empty, |session| session.wait_snapshot(waiter))
+            .map_or_else(WaitSnapshot::empty, |session| {
+                session.wait_snapshot(waiter, path_prefix)
+            })
     }
 
     fn finish_turn(
@@ -399,21 +417,27 @@ impl ChildSession {
             .count()
     }
 
-    fn wait_snapshot(&mut self, waiter: &str) -> WaitSnapshot {
-        let cursor = self.wait_cursors.get(waiter).copied().unwrap_or(0);
+    fn wait_snapshot(&mut self, waiter: &str, path_prefix: Option<&str>) -> WaitSnapshot {
+        let waiter_key = match path_prefix {
+            Some(prefix) => format!("{waiter}\n{prefix}"),
+            None => waiter.to_string(),
+        };
+        let cursor = self.wait_cursors.get(&waiter_key).copied().unwrap_or(0);
         let completion_revision = self
             .agents
             .values()
+            .filter(|record| agent_path_matches(record, path_prefix))
             .filter(|record| !record.state.is_active())
             .filter_map(|record| record.completion_revision)
             .filter(|revision| *revision > cursor)
             .max();
         if let Some(revision) = completion_revision {
-            self.wait_cursors.insert(waiter.to_string(), revision);
+            self.wait_cursors.insert(waiter_key, revision);
         }
         let mut agents = self
             .agents
             .values()
+            .filter(|record| agent_path_matches(record, path_prefix))
             .map(ChildRecord::snapshot)
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
@@ -472,6 +496,8 @@ struct MessageAgentArgs {
     target: String,
     /// Message text to deliver.
     message: String,
+    /// Start a follow-up turn after delivery. If false or omitted, the message is queued as guidance only.
+    start_turn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -481,15 +507,11 @@ struct InterruptAgentArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ListAgentsArgs {
+struct WaitAgentArgs {
+    /// Maximum wait in milliseconds. Use 0 to return the current snapshot immediately. Defaults to 10000 and is capped at 3600000.
+    timeout_ms: Option<u64>,
     /// Optional canonical task-path prefix.
     path_prefix: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct WaitAgentArgs {
-    /// Maximum wait in milliseconds. Defaults to 10000 and is capped at 3600000.
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,7 +584,7 @@ impl AgentControl {
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
         let spawn = self.clone();
         let spawn_description = format!(
-            "Spawn a sub-agent for a concrete, bounded task that can make progress independently alongside useful local work. Spawned agents inherit the current model, environment, AGENTS.md instructions, skills, and tools.\n\nUse this proactively when parallel work improves speed or quality:\n- Use `explorer` for an independent read-only codebase question.\n- Prefer `worker` for a bounded code change with explicit file or module ownership.\n- Use `default` for another self-contained task.\n- When two or more independent tasks are available, usually spawn them in the same round.\n- Do not spawn for a trivial task or an immediate blocker that must finish before your next action.\n- Give the agent the exact output you need; do not duplicate its work locally.\n- After spawning, continue non-overlapping work and call `wait_agent` only when its result becomes a blocker.\n\n{}",
+            "Spawn a sub-agent for a concrete, bounded task that can make progress independently. Spawned agents use the same Runtime -> Thread -> Turn execution pipeline as the parent and inherit the current model, environment, AGENTS.md instructions, skills, and tools.\n\nUse this when a separate agent makes the plan simpler or can answer an independent question:\n- Use `explorer` for an independent read-only codebase question.\n- Prefer `worker` for a bounded code change with explicit file or module ownership.\n- Use `default` for another self-contained task.\n- Multiple sub-agents are supported, but do not spawn for trivial tasks or immediate blockers.\n- Give the agent the exact output you need; do not duplicate its work locally.\n- After spawning, continue non-overlapping work when available and call `wait_agent` only when its result becomes relevant.\n\n{}",
             AgentRole::available_roles_description()
         );
         let spawn_tool = define_tool(
@@ -574,31 +596,13 @@ impl AgentControl {
             },
         );
 
-        let send = self.clone();
-        let send_tool = define_tool(
-            "send_message",
-            "Send a message to an existing agent. The message is queued promptly and does not trigger a new turn.",
+        let message = self.clone();
+        let message_tool = define_tool(
+            "message_agent",
+            "Send a message to an existing agent. Set `start_turn` to true for a follow-up turn; leave it false to queue guidance without starting work.",
             move |context, args: MessageAgentArgs| {
-                let control = send.clone();
-                async move {
-                    control
-                        .send_message(&context, args, MessageDelivery::Queue)
-                        .await
-                }
-            },
-        );
-
-        let followup = self.clone();
-        let followup_tool = define_tool(
-            "followup_task",
-            "Reuse an existing agent for context-dependent work. Send a follow-up task and trigger another turn when it is idle; if it is running, queue the task for its next turn. Prefer this over spawning a replacement agent for related work.",
-            move |context, args: MessageAgentArgs| {
-                let control = followup.clone();
-                async move {
-                    control
-                        .send_message(&context, args, MessageDelivery::Followup)
-                        .await
-                }
+                let control = message.clone();
+                async move { control.message_agent(&context, args).await }
             },
         );
 
@@ -612,34 +616,17 @@ impl AgentControl {
             },
         );
 
-        let list = self.clone();
-        let list_tool = define_tool(
-            "list_agents",
-            "List agents in the current root session, optionally filtered by canonical task-path prefix.",
-            move |context, args: ListAgentsArgs| {
-                let control = list.clone();
-                async move { control.list(&context, args).await }
-            },
-        );
-
         let wait = self.clone();
         let wait_tool = define_tool(
             "wait_agent",
-            "Wait for an agent update only when its result is required for your next step. Completed updates include the final message so it can be reviewed and integrated.",
+            "Wait for an agent update, or set `timeout_ms` to 0 to return the current snapshot immediately. Completed updates include final messages for review.",
             move |context, args: WaitAgentArgs| {
                 let control = wait.clone();
                 async move { control.wait(&context, args).await }
             },
         );
 
-        vec![
-            spawn_tool,
-            send_tool,
-            followup_tool,
-            interrupt_tool,
-            list_tool,
-            wait_tool,
-        ]
+        vec![spawn_tool, message_tool, interrupt_tool, wait_tool]
     }
 
     async fn spawn(&self, context: ToolContext, args: SpawnAgentArgs) -> Result<String, ToolError> {
@@ -687,7 +674,7 @@ impl AgentControl {
                 .any(|record| record.task_name == task_name)
             {
                 return Err(ToolError::Execution(format!(
-                    "agent task name already exists: {task_name}; use followup_task to reuse it"
+                    "agent task name already exists: {task_name}; use message_agent with start_turn=true to reuse it"
                 )));
             }
             session.agents.insert(
@@ -723,15 +710,19 @@ impl AgentControl {
         }))
     }
 
-    async fn send_message(
+    async fn message_agent(
         &self,
         context: &ToolContext,
         args: MessageAgentArgs,
-        delivery: MessageDelivery,
     ) -> Result<String, ToolError> {
         if args.message.trim().is_empty() {
             return Err(ToolError::Execution("message cannot be empty".to_string()));
         }
+        let delivery = if args.start_turn.unwrap_or(false) {
+            MessageDelivery::Followup
+        } else {
+            MessageDelivery::Queue
+        };
         let (target, command_tx) = {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
@@ -806,13 +797,6 @@ impl AgentControl {
         }))
     }
 
-    async fn list(&self, context: &ToolContext, args: ListAgentsArgs) -> Result<String, ToolError> {
-        let agents = self
-            .snapshots(context.agent.tree_id, args.path_prefix.as_deref())
-            .await;
-        json_output(&serde_json::json!({ "agents": agents }))
-    }
-
     async fn wait(&self, context: &ToolContext, args: WaitAgentArgs) -> Result<String, ToolError> {
         let remaining = context
             .deadline
@@ -824,17 +808,25 @@ impl AgentControl {
             .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
             .min(max_timeout_ms);
+        if timeout_ms == 0 {
+            let agents = self
+                .snapshots(context.agent.tree_id, args.path_prefix.as_deref())
+                .await;
+            return json_output(&serde_json::json!({
+                "agents": agents,
+                "timed_out": false,
+            }));
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let notified = self.inner.updates.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let snapshot = self
-                .inner
-                .state
-                .lock()
-                .await
-                .wait_snapshot(context.agent.tree_id, &context.agent.path);
+            let snapshot = self.inner.state.lock().await.wait_snapshot(
+                context.agent.tree_id,
+                &context.agent.path,
+                args.path_prefix.as_deref(),
+            );
             if snapshot.agents.is_empty() || snapshot.has_update {
                 return json_output(&serde_json::json!({
                     "agents": snapshot.agents,
@@ -847,12 +839,11 @@ impl AgentControl {
                 _ = &mut notified => false,
             };
             if timed_out {
-                let snapshot = self
-                    .inner
-                    .state
-                    .lock()
-                    .await
-                    .wait_snapshot(context.agent.tree_id, &context.agent.path);
+                let snapshot = self.inner.state.lock().await.wait_snapshot(
+                    context.agent.tree_id,
+                    &context.agent.path,
+                    args.path_prefix.as_deref(),
+                );
                 return json_output(&serde_json::json!({
                     "agents": snapshot.agents,
                     "timed_out": !snapshot.has_update,
@@ -861,7 +852,11 @@ impl AgentControl {
         }
     }
 
-    async fn snapshots(&self, tree_id: TreeId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
+    pub async fn snapshots(
+        &self,
+        tree_id: TreeId,
+        path_prefix: Option<&str>,
+    ) -> Vec<AgentSnapshot> {
         self.inner
             .state
             .lock()
@@ -971,20 +966,20 @@ pub fn install_subagent_tools(
     runtime: Runtime,
     max_concurrent_children: Option<usize>,
 ) -> Option<Arc<AgentControl>> {
-    if COLLABORATION_TOOL_NAMES
+    let has_exposed_tools = EXPOSED_COLLABORATION_TOOL_NAMES
         .iter()
-        .all(|name| agent.tools.iter().any(|tool| tool.name() == *name))
-    {
+        .all(|name| agent.tools.iter().any(|tool| tool.name() == *name));
+    let has_legacy_tools = LEGACY_COLLABORATION_TOOL_NAMES
+        .iter()
+        .any(|name| agent.tools.iter().any(|tool| tool.name() == *name));
+    if has_exposed_tools && !has_legacy_tools {
+        ensure_multi_agent_instructions(agent.system_prompt.get_or_insert_with(String::new));
         return None;
     }
     agent
         .tools
         .retain(|tool| !COLLABORATION_TOOL_NAMES.contains(&tool.name()));
-    let system_prompt = agent.system_prompt.get_or_insert_with(String::new);
-    if !system_prompt.trim().is_empty() {
-        system_prompt.push_str("\n\n");
-    }
-    system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
+    ensure_multi_agent_instructions(agent.system_prompt.get_or_insert_with(String::new));
     let spawner = Arc::new(InheritedAgentSpawner {
         runtime,
         system_prompt: agent.system_prompt.clone(),
@@ -994,6 +989,16 @@ pub fn install_subagent_tools(
     let control = AgentControl::new(max_concurrent_children, spawner);
     agent.tools.extend(control.tools());
     Some(Arc::new(control))
+}
+
+fn ensure_multi_agent_instructions(system_prompt: &mut String) {
+    if system_prompt.contains("<multi_agent_mode>") {
+        return;
+    }
+    if !system_prompt.trim().is_empty() {
+        system_prompt.push_str("\n\n");
+    }
+    system_prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
@@ -1010,6 +1015,10 @@ fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
                 .to_string(),
         ))
     }
+}
+
+fn agent_path_matches(record: &ChildRecord, path_prefix: Option<&str>) -> bool {
+    path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix))
 }
 
 fn normalized_agent_path(agent_path: &str) -> String {
@@ -1271,22 +1280,30 @@ mod tests {
             names,
             vec![
                 "spawn_agent",
-                "send_message",
-                "followup_task",
+                "message_agent",
                 "interrupt_agent",
-                "list_agents",
                 "wait_agent",
             ]
         );
         let spawn = agent.tools[0].definition();
         assert!(spawn.description.contains("explorer"));
         assert!(spawn.description.contains("worker"));
-        assert!(spawn.description.contains("same round"));
+        assert!(spawn.description.contains("Runtime -> Thread -> Turn"));
         assert!(spawn.description.contains("continue non-overlapping work"));
         for property in ["task_name", "message", "agent_type", "fork_turns"] {
             assert!(spawn.parameters_schema["properties"]
                 .get(property)
                 .is_some());
+        }
+        let message = agent.tools[1].definition();
+        for property in ["target", "message", "start_turn"] {
+            assert!(message.parameters_schema["properties"]
+                .get(property)
+                .is_some());
+        }
+        let wait = agent.tools[3].definition();
+        for property in ["timeout_ms", "path_prefix"] {
+            assert!(wait.parameters_schema["properties"].get(property).is_some());
         }
         assert!(agent
             .system_prompt
@@ -1297,7 +1314,7 @@ mod tests {
             .system_prompt
             .as_deref()
             .unwrap()
-            .contains("Delegation is proactive"));
+            .contains("Delegation is available"));
         assert_eq!(
             agent
                 .system_prompt
@@ -1404,13 +1421,13 @@ mod tests {
             );
 
         let result = control
-            .send_message(
+            .message_agent(
                 &test_context(tree_id),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "follow up".to_string(),
+                    start_turn: Some(true),
                 },
-                MessageDelivery::Followup,
             )
             .await;
 
@@ -1418,6 +1435,58 @@ mod tests {
         let agents = control.snapshots(tree_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
         assert_eq!(agents[0].last_task_message, "original");
+    }
+
+    #[tokio::test]
+    async fn message_agent_can_queue_guidance_without_starting_a_turn() {
+        let control = state_only_control();
+        let tree_id = TreeId::new();
+        let agent_id = ThreadId::new();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        control
+            .inner
+            .state
+            .lock()
+            .await
+            .threads
+            .entry(tree_id)
+            .or_default()
+            .agents
+            .insert(
+                agent_id,
+                ChildRecord {
+                    id: agent_id,
+                    task_name: "/root/inspect".to_string(),
+                    role: AgentRole::Explorer,
+                    state: ChildState::Completed(Some("done".to_string())),
+                    pending_followups: 0,
+                    completion_revision: Some(1),
+                    last_task_message: "original".to_string(),
+                    command_tx,
+                },
+            );
+
+        let result = control
+            .message_agent(
+                &test_context(tree_id),
+                MessageAgentArgs {
+                    target: "/root/inspect".to_string(),
+                    message: "keep this in mind".to_string(),
+                    start_turn: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(!result["turn_triggered"].as_bool().unwrap());
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            ChildCommand::Queue(message) if message == "keep this in mind"
+        ));
+        let agents = control.snapshots(tree_id, None).await;
+        assert_eq!(agents[0].status, AgentStatus::Completed);
+        assert_eq!(agents[0].last_task_message, "keep this in mind");
     }
 
     #[test]
@@ -1579,6 +1648,7 @@ mod tests {
                 &context,
                 WaitAgentArgs {
                     timeout_ms: Some(100),
+                    path_prefix: None,
                 },
             )
             .await
@@ -1597,6 +1667,7 @@ mod tests {
                     &waiting_context,
                     WaitAgentArgs {
                         timeout_ms: Some(1_000),
+                        path_prefix: None,
                     },
                 )
                 .await
@@ -1623,6 +1694,61 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(&second).unwrap();
         assert!(!second["timed_out"].as_bool().unwrap());
         assert_eq!(second["agents"][1]["final_message"], "second result");
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_wait_lists_without_advancing_completion_cursor() {
+        let control = state_only_control();
+        let tree_id = TreeId::new();
+        let agent_id = ThreadId::new();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        {
+            let mut state = control.inner.state.lock().await;
+            let session = state.threads.entry(tree_id).or_default();
+            session.next_completion_revision = 1;
+            session.agents.insert(
+                agent_id,
+                ChildRecord {
+                    id: agent_id,
+                    task_name: "/root/completed".to_string(),
+                    role: AgentRole::Explorer,
+                    state: ChildState::Completed(Some("result".to_string())),
+                    pending_followups: 0,
+                    completion_revision: Some(1),
+                    last_task_message: "task".to_string(),
+                    command_tx,
+                },
+            );
+        }
+
+        let context = test_context(tree_id);
+        let snapshot = control
+            .wait(
+                &context,
+                WaitAgentArgs {
+                    timeout_ms: Some(0),
+                    path_prefix: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert!(!snapshot["timed_out"].as_bool().unwrap());
+        assert_eq!(snapshot["agents"][0]["final_message"], "result");
+
+        let completion = control
+            .wait(
+                &context,
+                WaitAgentArgs {
+                    timeout_ms: Some(100),
+                    path_prefix: None,
+                },
+            )
+            .await
+            .unwrap();
+        let completion: serde_json::Value = serde_json::from_str(&completion).unwrap();
+        assert!(!completion["timed_out"].as_bool().unwrap());
+        assert_eq!(completion["agents"][0]["final_message"], "result");
     }
 
     #[tokio::test]
@@ -1717,13 +1843,13 @@ mod tests {
         assert_eq!(completed[0].final_message.as_deref(), Some("child done"));
 
         control
-            .send_message(
+            .message_agent(
                 &followup_context,
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "Confirm the finding.".to_string(),
+                    start_turn: Some(true),
                 },
-                MessageDelivery::Followup,
             )
             .await
             .unwrap();

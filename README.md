@@ -143,14 +143,12 @@ Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消�
 
 ## 子 Agent
 
-默认交互链路提供六个 Codex 风格的协作工具：
+默认交互链路提供四个协作工具：
 
 - `spawn_agent`：启动一个有独立上下文的后台 Agent
-- `send_message`：向现有 Agent 追加消息，但不主动开启新一轮
-- `followup_task`：复用现有 Agent 的上下文并开启后续任务
+- `message_agent`：向现有 Agent 发送消息；`start_turn: false` 只追加指导，`start_turn: true` 复用上下文并开启后续任务
 - `interrupt_agent`：只中断目标 Agent 当前一轮，之后仍可继续复用
-- `list_agents`：查看当前根会话中的 Agent、状态和最终结果
-- `wait_agent`：等待状态变化；完成状态会携带最终消息
+- `wait_agent`：等待状态变化；`timeout_ms: 0` 立即返回当前 Agent、状态和最终结果
 
 内置类型与 Codex CLI `0.144.3` 对齐：
 
@@ -160,13 +158,15 @@ Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消�
 
 Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临时移除，因此 Ash
 也不对外暴露它。子 Agent 继承当前模型、协议、工作目录、工具、AGENTS.md 和 Skills
-上下文；默认最多同时运行三个子 Agent，加上根 Agent 共四个并发槽。`fork_turns`
-支持 `none`、`all` 或最近 N 轮。子 Agent 树按根 Session ID 隔离，执行 `/new` 或
+上下文，并通过与父 Agent 相同的 `Runtime -> Thread -> Turn` 流水线运行。
+`ASH_MAX_CONCURRENT_AGENTS` 可选地限制同时活跃的子 Agent 数量；不设置时不施加额外
+子 Agent 上限。`fork_turns` 支持 `none`、`all` 或最近 N 轮。子 Agent 树按根 Session ID 隔离，执行 `/new` 或
 `/clear` 后不会混入旧会话的 Agent。
 
-ASH 会主动寻找真正能并行推进的工作：多个独立问题通常在同一轮交给多个
-explorer，边界清晰的代码改动优先交给 worker。简单任务和紧耦合的即时阻塞仍由
-当前 Agent 自己完成；委派后当前 Agent 会继续处理不重叠的工作，而不是立即等待。
+ASH 支持多个子 Agent 并行，但这只是能力而不是强制流程：只有独立问题或清晰边界的
+工作流才适合拆给 explorer/worker。简单任务和紧耦合的即时阻塞仍由当前 Agent 自己
+完成；父 Agent 可以继续处理不重叠的工作，也可以用 `interrupt_agent` 主动停止
+已经过时或方向错误的子 Agent。
 
 ## 终端行为
 

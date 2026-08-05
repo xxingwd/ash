@@ -16,10 +16,8 @@ enum ToolKind {
     Bash,
     Skill,
     SpawnAgent,
-    SendMessage,
-    FollowupTask,
+    MessageAgent,
     InterruptAgent,
-    ListAgents,
     WaitAgent,
     Other,
 }
@@ -36,11 +34,9 @@ impl ToolKind {
             "bash" => Self::Bash,
             "skill" => Self::Skill,
             "spawn_agent" => Self::SpawnAgent,
-            "send_message" => Self::SendMessage,
-            "followup_task" => Self::FollowupTask,
+            "message_agent" | "send_message" | "followup_task" => Self::MessageAgent,
             "interrupt_agent" => Self::InterruptAgent,
-            "list_agents" => Self::ListAgents,
-            "wait_agent" => Self::WaitAgent,
+            "wait_agent" | "list_agents" => Self::WaitAgent,
             _ => Self::Other,
         }
     }
@@ -135,22 +131,30 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
             "spawning",
             string_argument(arguments, "task_name"),
         ),
-        ToolKind::SendMessage => phrase(
-            "Messaged",
-            "messaging",
-            string_argument(arguments, "target"),
-        ),
-        ToolKind::FollowupTask => phrase(
-            "Continued",
-            "continuing",
-            string_argument(arguments, "target"),
-        ),
+        ToolKind::MessageAgent => {
+            if arguments
+                .get("start_turn")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                phrase(
+                    "Continued",
+                    "continuing",
+                    string_argument(arguments, "target"),
+                )
+            } else {
+                phrase(
+                    "Messaged",
+                    "messaging",
+                    string_argument(arguments, "target"),
+                )
+            }
+        }
         ToolKind::InterruptAgent => phrase(
             "Interrupted",
             "interrupting",
             string_argument(arguments, "target"),
         ),
-        ToolKind::ListAgents => phrase("Listed", "listing", "agents".to_string()),
         ToolKind::WaitAgent => phrase("Waited", "waiting", "for agents".to_string()),
         ToolKind::Other => phrase(
             "Ran",
