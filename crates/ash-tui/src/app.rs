@@ -5,7 +5,6 @@ use std::time::Duration;
 use ash_core::{EventKind, LiveEvent, MessageId, SubagentSnapshot, ThreadId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 
@@ -26,7 +25,6 @@ use crate::{
 /// tracking every delta: newline deltas flush immediately and this periodic
 /// status refresh redraws anything that did not complete a line yet.
 const STATUS_INTERVAL: Duration = Duration::from_millis(350);
-const MOUSE_SCROLL_ROWS: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
@@ -421,7 +419,6 @@ async fn handle_terminal_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        CrosstermEvent::Mouse(mouse) => handle_mouse(state, terminal, mouse),
         CrosstermEvent::Key(key)
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
         {
@@ -429,70 +426,6 @@ async fn handle_terminal_event(
         }
         _ => Ok(LoopAction::Continue),
     }
-}
-
-fn handle_mouse(
-    state: &mut AppState,
-    terminal: &mut TerminalUi,
-    mouse: crossterm::event::MouseEvent,
-) -> anyhow::Result<LoopAction> {
-    if let Some(should_render) =
-        picker_mouse_action(state.menu.visible_session_picker_mut(), mouse.kind)
-    {
-        if should_render {
-            state.render(terminal)?;
-        }
-        return Ok(LoopAction::Continue);
-    }
-    if let Some(should_render) =
-        picker_mouse_action(state.menu.visible_fork_picker_mut(), mouse.kind)
-    {
-        if should_render {
-            state.render(terminal)?;
-        }
-        return Ok(LoopAction::Continue);
-    }
-    if let Some(should_render) =
-        picker_mouse_action(state.menu.visible_completion_mut(), mouse.kind)
-    {
-        if should_render {
-            state.render(terminal)?;
-        }
-        return Ok(LoopAction::Continue);
-    }
-
-    match mouse.kind {
-        MouseEventKind::ScrollUp => terminal.scroll_lines_up(MOUSE_SCROLL_ROWS)?,
-        MouseEventKind::ScrollDown => terminal.scroll_lines_down(MOUSE_SCROLL_ROWS)?,
-        MouseEventKind::Down(MouseButton::Left) => {
-            terminal.start_selection(mouse.column, mouse.row)?
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            terminal.drag_selection(mouse.column, mouse.row)?
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            terminal.finish_selection(mouse.column, mouse.row)?
-        }
-        _ => {}
-    }
-    Ok(LoopAction::Continue)
-}
-
-fn picker_mouse_action(
-    picker: Option<&mut impl PickerNavigation>,
-    kind: MouseEventKind,
-) -> Option<bool> {
-    let picker = picker?;
-    Some(scroll_picker(picker, kind))
-}
-
-fn scroll_picker(picker: &mut impl PickerNavigation, kind: MouseEventKind) -> bool {
-    match kind {
-        MouseEventKind::ScrollUp => picker.move_up(),
-        MouseEventKind::ScrollDown => picker.move_down(),
-        _ => return false,
-    }
-    true
 }
 
 async fn handle_key(

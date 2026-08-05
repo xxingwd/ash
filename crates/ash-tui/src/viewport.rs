@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use ash_core::{ForkPoint, SubagentSnapshot, ThreadSummary};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Flex, Layout, Position, Rect},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Widget},
@@ -16,7 +16,6 @@ use crate::{
     markdown::RenderedLine,
     menu::MenuView,
     scrollback::sanitize_single_line,
-    selection::SelectableText,
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left, format_token_count},
     text_width::truncate_end,
@@ -77,16 +76,12 @@ pub(crate) struct ViewportFrame {
     pub(crate) scroll_top: u16,
     pub(crate) max_scroll_top: u16,
     pub(crate) page_rows: u16,
-    transcript_area: Rect,
-    selectable_text: SelectableText,
 }
 
 impl ViewportFrame {
     #[cfg(test)]
-    pub(crate) fn for_test(buffer: Buffer, cursor: Position) -> Self {
+    pub(crate) fn for_test(buffer: Buffer, cursor: ratatui::layout::Position) -> Self {
         let area = buffer.area;
-        let mut selectable_text = SelectableText::new(area.height);
-        selectable_text.push(0, Arc::new(buffer.clone()));
         Self {
             viewport_height: area.height.max(1),
             buffer,
@@ -95,79 +90,7 @@ impl ViewportFrame {
             scroll_top: 0,
             max_scroll_top: 0,
             page_rows: area.height.max(1),
-            transcript_area: area,
-            selectable_text,
         }
-    }
-
-    pub(crate) fn selection_text(&self, anchor: Position, focus: Position) -> String {
-        self.selectable_text.text(anchor, focus)
-    }
-
-    pub(crate) fn highlight_selection(&mut self, anchor: Position, focus: Position) {
-        self.selectable_text.highlight(
-            &mut self.buffer,
-            self.transcript_area,
-            self.scroll_top,
-            anchor,
-            focus,
-        );
-    }
-
-    pub(crate) fn selection_start(&self, column: u16, row: u16) -> Option<Position> {
-        let position = Position::new(column, row);
-        if !self.transcript_area.contains(position) {
-            return None;
-        }
-        self.selectable_text.point(self.content_position(position))
-    }
-
-    pub(crate) fn selection_focus(
-        &self,
-        anchor: Position,
-        column: u16,
-        row: u16,
-    ) -> Option<Position> {
-        if self.transcript_area.is_empty() {
-            return None;
-        }
-        let position = Position::new(
-            column.clamp(
-                self.transcript_area.x,
-                self.transcript_area.right().saturating_sub(1),
-            ),
-            row.clamp(
-                self.transcript_area.y,
-                self.transcript_area.bottom().saturating_sub(1),
-            ),
-        );
-        self.selectable_text
-            .focus(anchor, self.content_position(position))
-    }
-
-    pub(crate) fn scroll_top_for_drag(&self, row: u16, anchor: Position, focus: Position) -> u16 {
-        if self.transcript_area.is_empty() {
-            return self.scroll_top;
-        }
-        let selection_reaches_below_top = anchor.y.max(focus.y) > self.scroll_top;
-        let next = if row <= self.transcript_area.y && selection_reaches_below_top {
-            self.scroll_top
-                .saturating_sub(self.transcript_area.y.saturating_sub(row).max(1))
-        } else if row >= self.transcript_area.bottom() {
-            self.scroll_top
-                .saturating_add(row.saturating_sub(self.transcript_area.bottom()) + 1)
-        } else {
-            self.scroll_top
-        };
-        next.min(self.max_scroll_top)
-    }
-
-    fn content_position(&self, position: Position) -> Position {
-        Position::new(
-            position.x.saturating_sub(self.transcript_area.x),
-            self.scroll_top
-                .saturating_add(position.y.saturating_sub(self.transcript_area.y)),
-        )
     }
 }
 
@@ -222,13 +145,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .scroll_top
         .unwrap_or(max_scroll_top)
         .min(max_scroll_top);
-    let selectable_text = selectable_transcript(
-        &regions,
-        &layout.areas,
-        &rendered_blocks,
-        active.as_ref(),
-        layout.height,
-    );
     let mut buffer = Buffer::empty(Rect::new(0, 0, terminal_width, terminal_height));
     render_transcript(
         &regions,
@@ -278,8 +194,6 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         scroll_top,
         max_scroll_top,
         page_rows: transcript_view_rows.max(1),
-        transcript_area: screen.transcript,
-        selectable_text,
     }
 }
 
@@ -534,26 +448,6 @@ fn render_transcript(
             }
         }
     }
-}
-
-fn selectable_transcript(
-    regions: &[RegionSpec],
-    areas: &[Rect],
-    blocks: &[Arc<Buffer>],
-    active: Option<&Arc<Buffer>>,
-    height: u16,
-) -> SelectableText {
-    let mut text = SelectableText::new(height);
-    for (region, area) in regions.iter().zip(areas) {
-        let buffer = match region.kind {
-            ViewportRegion::Live(index) => blocks.get(index),
-            ViewportRegion::Active => active,
-        };
-        if let Some(buffer) = buffer {
-            text.push(area.y, Arc::clone(buffer));
-        }
-    }
-    text
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1716,87 +1610,6 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, 0), "• entry 2");
         assert_eq!(row_text(&frame.buffer, 4), "• entry 4");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
-    }
-
-    #[test]
-    fn selection_extracts_and_highlights_visible_cells() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
-        buffer.set_string(0, 0, "hello", Style::default());
-        buffer.set_string(0, 1, "world", Style::default());
-        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
-        let anchor = Position::new(2, 1);
-        let focus = Position::new(1, 0);
-
-        assert_eq!(frame.selection_text(anchor, focus), "ello\nwor");
-        frame.highlight_selection(anchor, focus);
-
-        assert!(frame
-            .buffer
-            .cell((1, 0))
-            .expect("selection start")
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(frame
-            .buffer
-            .cell((2, 1))
-            .expect("selection end")
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(!frame
-            .buffer
-            .cell((0, 0))
-            .expect("outside selection")
-            .modifier
-            .contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn selection_omits_wide_character_placeholder_cells() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
-        buffer.set_string(0, 0, "你好abc", Style::default());
-        let frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
-
-        assert_eq!(
-            frame.selection_text(Position::new(0, 0), Position::new(6, 0)),
-            "你好abc"
-        );
-        assert_eq!(
-            frame.selection_text(Position::new(1, 0), Position::new(6, 0)),
-            "好abc"
-        );
-    }
-
-    #[test]
-    fn selection_starts_only_on_transcript_text() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
-        buffer.set_string(2, 0, "answer", Style::default());
-        buffer.set_string(0, 2, "input", Style::default());
-        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 2));
-        frame.transcript_area = Rect::new(0, 0, 12, 2);
-
-        assert_eq!(frame.selection_start(0, 0), Some(Position::new(2, 0)));
-        assert_eq!(frame.selection_start(0, 1), None);
-        assert_eq!(frame.selection_start(0, 2), None);
-    }
-
-    #[test]
-    fn dragging_past_transcript_edges_advances_its_scroll_position() {
-        let buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
-        let mut frame = ViewportFrame::for_test(buffer, Position::new(0, 0));
-        frame.transcript_area = Rect::new(0, 0, 12, 2);
-        frame.scroll_top = 3;
-        frame.max_scroll_top = 10;
-        let anchor = Position::new(0, 5);
-        let focus = Position::new(0, 4);
-
-        assert_eq!(frame.scroll_top_for_drag(1, anchor, focus), 3);
-        assert_eq!(frame.scroll_top_for_drag(0, anchor, focus), 2);
-        assert_eq!(frame.scroll_top_for_drag(2, anchor, focus), 4);
-        assert_eq!(frame.scroll_top_for_drag(4, anchor, focus), 6);
-        assert_eq!(
-            frame.scroll_top_for_drag(0, Position::new(0, 3), Position::new(5, 3)),
-            3
-        );
     }
 
     #[test]

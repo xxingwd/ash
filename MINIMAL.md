@@ -14,6 +14,7 @@
 
 - ✅ 2026-08-05：基线提交 `6cf0883`（当前工作区全部改动入库，fmt/test/clippy 通过）。本计划基于该基线。
 - ✅ 2026-08-05：**Step 1（A 类）已落地并提交**。A1–A5 全部删除，附带同步：engine.rs 的 `RateLimited { .. }` 匹配与测试构造、TODO.md #17 的过时 `with_spawner` 表述。`RateLimited` 变体由带字段改为 unit 变体（错误文案同步简化）。
+- ✅ 2026-08-05：**Step 2（C1）已落地并提交**。删除鼠标交互整套（从未启用 `enable_mouse_capture`，属不可达代码）：`selection.rs` 模块（267 行）、viewport.rs 的 `SelectableText` 字段/构建/5 个方法/4 个测试、inline.rs 的 `TextSelection`/`selection` 状态/`scroll_lines_up/down`/`start/drag/finish_selection`、app.rs 的 `handle_mouse`/`picker_mouse_action`/`scroll_picker`/`MOUSE_SCROLL_ROWS`、inline_surface.rs 的 `copy_to_clipboard`/`osc52_sequence` + 测试，并移除 ash-tui 的 base64 依赖（`transcript_area` 字段随之无读，一并删除）。净 −633 行。
 
 ---
 

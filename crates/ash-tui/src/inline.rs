@@ -9,7 +9,6 @@ use ash_core::{
     ToolCallId, TurnView, Usage,
 };
 use crossterm::terminal;
-use ratatui::layout::Position;
 use serde_json::Value;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
@@ -112,21 +111,6 @@ struct StatusState {
     header: String,
     started_at: Option<Instant>,
     frame: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TextSelection {
-    anchor: Position,
-    focus: Position,
-}
-
-impl TextSelection {
-    fn new(position: Position) -> Self {
-        Self {
-            anchor: position,
-            focus: position,
-        }
-    }
 }
 
 impl StatusState {
@@ -237,7 +221,6 @@ pub(crate) struct TerminalUi {
     next_block_id: u64,
     status: StatusState,
     usage: UsageState,
-    selection: Option<TextSelection>,
     stream: StreamState,
     current_turn_id: Option<u64>,
     next_turn_id: u64,
@@ -273,7 +256,6 @@ impl TerminalUi {
             next_block_id: 1,
             status: StatusState::default(),
             usage: UsageState::default(),
-            selection: None,
             stream: StreamState::default(),
             current_turn_id: None,
             next_turn_id: 1,
@@ -592,7 +574,6 @@ impl TerminalUi {
     ) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        self.selection = None;
         self.surface.resize(width, height)?;
         if self.stream.is_reasoning() {
             let width = width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1);
@@ -632,16 +613,6 @@ impl TerminalUi {
         self.redraw()
     }
 
-    pub fn scroll_lines_up(&mut self, rows: u16) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
-        self.scroll_up(rows, width, height)
-    }
-
-    pub fn scroll_lines_down(&mut self, rows: u16) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
-        self.scroll_down(rows, width, height)
-    }
-
     pub fn scroll_to_top(&mut self) -> io::Result<()> {
         self.scroll_top = Some(0);
         self.redraw()
@@ -650,59 +621,6 @@ impl TerminalUi {
     pub fn scroll_to_bottom(&mut self) -> io::Result<()> {
         self.scroll_top = None;
         self.redraw()
-    }
-
-    pub fn start_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
-        let (width, height) = terminal_size()?;
-        self.selection = self
-            .viewport_frame(width, height)
-            .selection_start(column, row)
-            .map(TextSelection::new);
-        Ok(())
-    }
-
-    pub fn drag_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
-        let Some(mut selection) = self.selection else {
-            return Ok(());
-        };
-        let (width, height) = terminal_size()?;
-        let frame = self.viewport_frame(width, height);
-        let next_scroll_top = frame.scroll_top_for_drag(row, selection.anchor, selection.focus);
-        if next_scroll_top != frame.scroll_top {
-            self.scroll_top = (next_scroll_top < frame.max_scroll_top).then_some(next_scroll_top);
-        }
-        let frame = self.viewport_frame(width, height);
-        if let Some(focus) = frame.selection_focus(selection.anchor, column, row) {
-            selection.focus = focus;
-        }
-        self.selection = Some(selection);
-        self.redraw_at(width, height)
-    }
-
-    pub fn finish_selection(&mut self, column: u16, row: u16) -> io::Result<()> {
-        let Some(mut selection) = self.selection else {
-            return Ok(());
-        };
-        let (width, height) = terminal_size()?;
-        let frame = self.viewport_frame(width, height);
-        if let Some(focus) = frame.selection_focus(selection.anchor, column, row) {
-            selection.focus = focus;
-        }
-        if selection.anchor == selection.focus {
-            self.selection = None;
-            return Ok(());
-        }
-
-        self.selection = Some(selection);
-        let text = frame.selection_text(selection.anchor, selection.focus);
-        let copy_result = if text.is_empty() {
-            Ok(())
-        } else {
-            self.surface.copy_to_clipboard(&text)
-        };
-        self.selection = None;
-        let redraw_result = self.redraw_at(width, height);
-        copy_result.and(redraw_result)
     }
 
     pub fn refresh_status(&mut self) -> io::Result<()> {
@@ -768,7 +686,6 @@ impl TerminalUi {
         self.surface.reset()?;
         self.view = ViewState::default();
         self.usage = UsageState::default();
-        self.selection = None;
         self.reset_turn_state();
         Ok(())
     }
@@ -807,7 +724,6 @@ impl TerminalUi {
         let committed = std::mem::take(&mut self.transcript);
         let result = self.synchronized(|terminal| {
             terminal.scroll_top = None;
-            terminal.selection = None;
 
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
@@ -834,7 +750,6 @@ impl TerminalUi {
         let history = std::mem::take(&mut self.history);
         let result = self.synchronized(|terminal| {
             terminal.surface.reset()?;
-            terminal.selection = None;
             terminal.render_viewport(width, height)?;
             insert_history_blocks(
                 &mut terminal.surface,
@@ -852,7 +767,6 @@ impl TerminalUi {
     }
 
     fn scroll_up(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
-        self.selection = None;
         let frame = self.viewport_frame(width, height);
         if frame.max_scroll_top == 0 {
             return Ok(());
@@ -862,7 +776,6 @@ impl TerminalUi {
     }
 
     fn scroll_down(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
-        self.selection = None;
         let frame = self.viewport_frame(width, height);
         let next = frame.scroll_top.saturating_add(rows);
         self.scroll_top = (next < frame.max_scroll_top).then_some(next);
@@ -880,11 +793,8 @@ impl TerminalUi {
     }
 
     fn render_viewport(&mut self, width: u16, height: u16) -> io::Result<()> {
-        let mut frame = self.viewport_frame(width, height);
+        let frame = self.viewport_frame(width, height);
         normalize_scroll_top(&mut self.scroll_top, frame.scroll_top);
-        if let Some(selection) = self.selection {
-            frame.highlight_selection(selection.anchor, selection.focus);
-        }
         self.surface.render_frame(&frame)
     }
 

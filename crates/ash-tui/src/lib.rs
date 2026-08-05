@@ -12,7 +12,6 @@ mod markdown;
 mod menu;
 mod operation;
 mod scrollback;
-mod selection;
 mod session_picker;
 mod slash_command;
 mod status_line;

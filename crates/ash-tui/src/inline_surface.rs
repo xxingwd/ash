@@ -1,6 +1,5 @@
 use std::io::{self, Stdout, Write};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
@@ -167,12 +166,6 @@ impl InlineScreen {
         insert_finalized_buffer(&mut self.terminal, buffer, gap_after)?;
         self.viewport_area = self.terminal.get_frame().area();
         Ok(())
-    }
-
-    pub(crate) fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
-        let writer = self.terminal.backend_mut().writer_mut();
-        writer.write_all(osc52_sequence(text).as_bytes())?;
-        writer.flush()
     }
 
     pub(crate) fn leave_screen(&mut self) -> io::Result<()> {
@@ -365,10 +358,6 @@ fn render_inline(screen: &mut Buffer, frame: &ViewportFrame) -> Position {
         screen.area.x + frame.cursor_column.min(screen.area.width.saturating_sub(1)),
         screen.area.y + frame.cursor_row.min(screen.area.height.saturating_sub(1)),
     )
-}
-
-fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
 struct TerminalGuard {
@@ -671,11 +660,6 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(writer.frame.as_deref(), Some(b"first\r\nsecond".as_slice()));
-    }
-
-    #[test]
-    fn osc52_copies_utf8_text_through_the_terminal() {
-        assert_eq!(osc52_sequence("你好"), "\x1b]52;c;5L2g5aW9\x07");
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {
