@@ -22,7 +22,9 @@ use crate::{
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
 };
 
-/// Pace complete assistant lines so streaming remains readable rather than tracking every delta.
+/// Pace complete assistant lines so streaming remains readable rather than
+/// tracking every delta: newline deltas flush immediately and this periodic
+/// status refresh redraws anything that did not complete a line yet.
 const STATUS_INTERVAL: Duration = Duration::from_millis(350);
 const MOUSE_SCROLL_ROWS: u16 = 3;
 
@@ -535,16 +537,16 @@ async fn handle_key(
             return Ok(LoopAction::Continue);
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !state.input.is_empty() =>
+        {
+            state.input.clear()
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.input.is_empty() {
-                return Ok(if state.operation.is_busy() {
-                    LoopAction::Continue
-                } else {
-                    let _ = commands.send(UiCommand::Exit).await;
-                    LoopAction::Exit
-                });
+            if !state.operation.is_busy() {
+                let _ = commands.send(UiCommand::Exit).await;
+                return Ok(LoopAction::Exit);
             }
-            state.input.clear();
         }
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL) && state.input.is_empty() =>

@@ -1,12 +1,15 @@
-use std::collections::HashMap;
-
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{model_config, sse, ProviderConfig};
+use crate::{
+    model_config,
+    pending_calls::stop_reason,
+    pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
+    project_request_messages, sse, ProviderConfig,
+};
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
@@ -33,7 +36,8 @@ impl AnthropicAdapter {
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
-        let messages: Vec<Value> = req
+        let projected = project_request_messages(req)?;
+        let messages: Vec<Value> = projected
             .messages
             .iter()
             .filter_map(|msg| match &msg.content {
@@ -128,7 +132,7 @@ impl AnthropicAdapter {
             "stream": true,
             "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
         });
-        if let Some(system) = &req.system {
+        if let Some(system) = &projected.system {
             body["system"] = json!(system);
         }
         if !tools.is_empty() {
@@ -154,14 +158,18 @@ impl ModelClient for AnthropicAdapter {
 
 #[derive(Default)]
 struct AnthropicDecoder {
-    calls: HashMap<u64, PendingCall>,
+    calls: PendingCallAccumulator<u64>,
     stop: Option<StopReason>,
 }
 
-struct PendingCall {
-    id: ToolCallId,
-    name: String,
-    arguments: String,
+impl AnthropicDecoder {
+    fn block_index(event: &Value) -> Result<u64, ProtocolError> {
+        event["index"].as_u64().ok_or_else(|| {
+            ProtocolError::InvalidResponse(
+                "Anthropic content-block event is missing index".to_string(),
+            )
+        })
+    }
 }
 
 impl sse::Decoder for AnthropicDecoder {
@@ -169,35 +177,33 @@ impl sse::Decoder for AnthropicDecoder {
         let event: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
-        let mut finished = false;
-
-        match event["type"].as_str().unwrap_or_default() {
+        let event_type = event["type"].as_str().ok_or_else(|| {
+            ProtocolError::InvalidResponse("Anthropic event is missing type".to_string())
+        })?;
+        match event_type {
             "message_start" => {
                 if let Some(usage) = event["message"].get("usage") {
-                    items.push(ModelEvent::Usage(Usage {
-                        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-                        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                        generation_ms: 0,
-                        estimated: false,
-                    }));
+                    items.push(ModelEvent::Usage(build_usage(
+                        usage["input_tokens"].as_u64().unwrap_or(0),
+                        usage["output_tokens"].as_u64().unwrap_or(0),
+                    )));
                 }
             }
             "content_block_start" => {
                 let block = &event["content_block"];
                 if block["type"].as_str() == Some("tool_use") {
-                    let index = event["index"].as_u64().unwrap_or(0);
-                    let id = block["id"]
-                        .as_str()
-                        .map(ToolCallId::from_provider)
-                        .unwrap_or_default();
-                    self.calls.insert(
-                        index,
-                        PendingCall {
-                            id,
-                            name: block["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                        },
-                    );
+                    let index = Self::block_index(&event)?;
+                    let id = block["id"].as_str().ok_or_else(|| {
+                        ProtocolError::InvalidResponse(
+                            "Anthropic tool-use block is missing id".to_string(),
+                        )
+                    })?;
+                    let name = block["name"].as_str().ok_or_else(|| {
+                        ProtocolError::InvalidResponse(
+                            "Anthropic tool-use block is missing name".to_string(),
+                        )
+                    })?;
+                    self.calls.insert(index, PendingCall::new(id, name));
                 }
             }
             "content_block_delta" => {
@@ -214,54 +220,49 @@ impl sse::Decoder for AnthropicDecoder {
                         }
                     }
                     Some("input_json_delta") => {
-                        let index = event["index"].as_u64().unwrap_or(0);
-                        if let (Some(call), Some(partial)) =
-                            (self.calls.get_mut(&index), delta["partial_json"].as_str())
-                        {
-                            call.arguments.push_str(partial);
-                        }
+                        let index = Self::block_index(&event)?;
+                        let partial = delta["partial_json"].as_str().ok_or_else(|| {
+                            ProtocolError::InvalidResponse(
+                                "Anthropic tool-input delta is missing partial_json".to_string(),
+                            )
+                        })?;
+                        let call = self.calls.get_mut(&index).ok_or_else(|| {
+                            ProtocolError::InvalidResponse(format!(
+                                "Anthropic tool-input delta references unknown block {index}"
+                            ))
+                        })?;
+                        call.arguments.push_str(partial);
                     }
                     _ => {}
                 }
             }
             "content_block_stop" => {
-                let index = event["index"].as_u64().unwrap_or(0);
+                let index = Self::block_index(&event)?;
                 if let Some(call) = self.calls.remove(&index) {
-                    let arguments = if call.arguments.trim().is_empty() {
-                        json!({})
-                    } else {
-                        serde_json::from_str(&call.arguments).map_err(|error| {
-                            ProtocolError::InvalidResponse(format!(
-                                "invalid Anthropic tool arguments: {error}"
-                            ))
-                        })?
-                    };
-                    items.push(ModelEvent::ToolCall {
-                        id: call.id,
-                        name: call.name,
-                        arguments,
-                    });
+                    items.push(call.finish("Anthropic")?);
                 }
             }
             "message_delta" => {
                 if let Some(usage) = event.get("usage") {
-                    items.push(ModelEvent::Usage(Usage {
-                        input_tokens: 0,
-                        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                        generation_ms: 0,
-                        estimated: false,
-                    }));
+                    items.push(ModelEvent::Usage(build_usage(
+                        0,
+                        usage["output_tokens"].as_u64().unwrap_or(0),
+                    )));
                 }
-                self.stop = Some(match event["delta"]["stop_reason"].as_str() {
-                    Some("max_tokens") => StopReason::MaxTokens,
-                    _ => StopReason::EndTurn,
-                });
+                self.stop = Some(stop_reason(
+                    event["delta"]["stop_reason"].as_str() == Some("max_tokens"),
+                ));
             }
             "message_stop" => {
+                if !self.calls.is_empty() {
+                    return Err(ProtocolError::InvalidResponse(
+                        "Anthropic message stopped with an unfinished tool call".to_string(),
+                    ));
+                }
                 items.push(ModelEvent::Stop(
                     self.stop.take().unwrap_or(StopReason::EndTurn),
                 ));
-                finished = true;
+                return Ok(sse::DecodeResult::finished(items));
             }
             "error" => {
                 return Err(ProtocolError::InvalidResponse(
@@ -274,11 +275,7 @@ impl sse::Decoder for AnthropicDecoder {
             _ => {}
         }
 
-        Ok(if finished {
-            sse::DecodeResult::finished(items)
-        } else {
-            sse::DecodeResult::continuing(items)
-        })
+        Ok(sse::DecodeResult::continuing(items))
     }
 }
 
@@ -286,7 +283,9 @@ impl sse::Decoder for AnthropicDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -329,6 +328,31 @@ mod tests {
         let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
         assert!(matches!(result, sse::DecodeResult::Finished(_)));
+    }
+
+    #[test]
+    fn rejects_tool_use_without_a_block_index() {
+        let mut decoder = AnthropicDecoder::default();
+
+        let result = decoder.decode(
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_123","name":"read"}}"#,
+        );
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn rejects_message_stop_with_an_unfinished_tool_call() {
+        let mut decoder = AnthropicDecoder::default();
+        decoder
+            .decode(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"read"}}"#,
+            )
+            .unwrap();
+
+        let result = decoder.decode(r#"{"type":"message_stop"}"#);
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
     }
 
     #[test]

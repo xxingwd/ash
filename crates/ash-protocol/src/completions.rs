@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
-
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
+use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{model_config, sse, ProviderConfig};
+use crate::{
+    consecutive_tool_results, model_config,
+    pending_calls::stop_reason,
+    pending_calls::{build_usage, PendingCallAccumulator},
+    project_request_messages, sse, ProviderConfig,
+};
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 pub struct CompletionsAdapter {
@@ -31,13 +34,14 @@ impl CompletionsAdapter {
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
+        let projected = project_request_messages(req)?;
         let mut messages = Vec::new();
-        if let Some(system) = &req.system {
+        if let Some(system) = &projected.system {
             messages.push(json!({"role": "system", "content": system}));
         }
         let mut index = 0;
-        while index < req.messages.len() {
-            match &req.messages[index].content {
+        while index < projected.messages.len() {
+            match &projected.messages[index].content {
                 MessageContent::User(contents) => {
                     messages.push(json!({"role": "user", "content": chat_content(contents)}));
                     index += 1;
@@ -75,31 +79,19 @@ impl CompletionsAdapter {
                     index += 1;
                 }
                 MessageContent::ToolResult { .. } => {
-                    let mut attachments = Vec::new();
-                    while index < req.messages.len() {
-                        let MessageContent::ToolResult {
-                            id,
-                            result,
-                            attachments: result_attachments,
-                        } = &req.messages[index].content
-                        else {
-                            break;
-                        };
+                    let group = consecutive_tool_results(&projected.messages, index);
+                    for result in group.results {
                         messages.push(json!({
                             "role": "tool",
-                            "tool_call_id": id.as_str(),
-                            "content": result.as_ref().map_or_else(
-                                |error| format!("Error: {error}"),
-                                Clone::clone,
-                            ),
+                            "tool_call_id": result.id.as_str(),
+                            "content": result.output,
                         }));
-                        attachments.extend(result_attachments.iter().cloned());
-                        index += 1;
                     }
-                    if !attachments.is_empty() {
+                    index = group.next_index;
+                    if !group.attachments.is_empty() {
                         messages.push(json!({
                             "role": "user",
-                            "content": chat_content(&attachments),
+                            "content": chat_content(&group.attachments),
                         }));
                     }
                 }
@@ -183,63 +175,63 @@ impl ModelClient for CompletionsAdapter {
 }
 
 #[derive(Default)]
-struct CompletionsDecoder {
-    calls: BTreeMap<usize, PendingCall>,
-}
-
-#[derive(Default)]
-struct PendingCall {
-    id: String,
-    name: String,
-    arguments: String,
+pub(crate) struct CompletionsDecoder {
+    calls: PendingCallAccumulator<usize>,
+    stop: Option<StopReason>,
 }
 
 impl CompletionsDecoder {
-    fn finish_items(&mut self, reason: StopReason) -> Result<Vec<ModelEvent>, ProtocolError> {
+    fn tool_call_index(call: &Value) -> Result<usize, ProtocolError> {
+        let index = call["index"].as_u64().ok_or_else(|| {
+            ProtocolError::InvalidResponse(
+                "Chat Completions tool-call delta is missing index".to_string(),
+            )
+        })?;
+        usize::try_from(index).map_err(|_| {
+            ProtocolError::InvalidResponse(
+                "Chat Completions tool-call index is too large".to_string(),
+            )
+        })
+    }
+
+    fn finish_calls(&mut self) -> Result<Vec<ModelEvent>, ProtocolError> {
         let mut items = Vec::new();
-        for (_, call) in std::mem::take(&mut self.calls) {
-            let arguments = if call.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&call.arguments).map_err(|error| {
-                    ProtocolError::InvalidResponse(format!(
-                        "invalid Chat Completions tool arguments: {error}"
-                    ))
-                })?
-            };
-            items.push(ModelEvent::ToolCall {
-                id: if call.id.is_empty() {
-                    ToolCallId::new()
-                } else {
-                    ToolCallId::from_provider(call.id)
-                },
-                name: call.name,
-                arguments,
-            });
+        for (_, call) in self.calls.drain() {
+            items.push(call.finish("Chat Completions")?);
         }
-        items.push(ModelEvent::Stop(reason));
         Ok(items)
+    }
+
+    fn record_stop(&mut self, reason: StopReason) -> Result<(), ProtocolError> {
+        if self.stop.replace(reason).is_some() {
+            return Err(ProtocolError::InvalidResponse(
+                "Chat Completions emitted more than one finish_reason".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl sse::Decoder for CompletionsDecoder {
     fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         if data == "[DONE]" {
-            return Ok(sse::DecodeResult::finished(
-                self.finish_items(StopReason::EndTurn)?,
-            ));
+            return Ok(if self.stop.is_some() {
+                sse::DecodeResult::finished(Vec::new())
+            } else {
+                // `[DONE]` is only a wire delimiter. Without a preceding
+                // finish_reason the response has no semantic terminal state.
+                sse::DecodeResult::wire_done(Vec::new())
+            });
         }
 
         let chunk: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
-            items.push(ModelEvent::Usage(Usage {
-                input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
-                output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-                generation_ms: 0,
-                estimated: false,
-            }));
+            items.push(ModelEvent::Usage(build_usage(
+                usage["prompt_tokens"].as_u64().unwrap_or(0),
+                usage["completion_tokens"].as_u64().unwrap_or(0),
+            )));
         }
 
         let Some(choice) = chunk["choices"]
@@ -248,6 +240,11 @@ impl sse::Decoder for CompletionsDecoder {
         else {
             return Ok(sse::DecodeResult::continuing(items));
         };
+        if self.stop.is_some() {
+            return Err(ProtocolError::InvalidResponse(
+                "Chat Completions emitted a choice after finish_reason".to_string(),
+            ));
+        }
         let delta = &choice["delta"];
         if let Some(reasoning) = ["reasoning_content", "reasoning", "thinking"]
             .into_iter()
@@ -264,10 +261,7 @@ impl sse::Decoder for CompletionsDecoder {
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
-                let entry = self
-                    .calls
-                    .entry(call["index"].as_u64().unwrap_or(0) as usize)
-                    .or_default();
+                let entry = self.calls.entry(Self::tool_call_index(call)?);
                 if let Some(id) = call["id"].as_str() {
                     entry.id = id.to_string();
                 }
@@ -281,15 +275,15 @@ impl sse::Decoder for CompletionsDecoder {
         }
 
         if let Some(reason) = choice["finish_reason"].as_str() {
-            let reason = if reason == "length" {
-                StopReason::MaxTokens
-            } else {
-                StopReason::EndTurn
-            };
-            items.extend(self.finish_items(reason)?);
-            return Ok(sse::DecodeResult::finished(items));
+            items.extend(self.finish_calls()?);
+            self.record_stop(stop_reason(reason == "length"))?;
+            return Ok(sse::DecodeResult::terminal(items));
         }
         Ok(sse::DecodeResult::continuing(items))
+    }
+
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, ProtocolError> {
+        Ok(self.stop.take().map(ModelEvent::Stop).into_iter().collect())
     }
 }
 
@@ -297,7 +291,9 @@ impl sse::Decoder for CompletionsDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -313,19 +309,20 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}"#,
             )
             .unwrap();
-        assert!(matches!(&result, sse::DecodeResult::Finished(_)));
+        assert!(matches!(&result, sse::DecodeResult::Terminal(_)));
         let items = result.into_items();
 
         assert_eq!(
             items,
-            vec![
-                ModelEvent::ToolCall {
-                    id: ToolCallId::from_provider("call_7"),
-                    name: "bash".into(),
-                    arguments: json!({"command": "pwd"}),
-                },
-                ModelEvent::Stop(StopReason::EndTurn),
-            ]
+            vec![ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_7"),
+                name: "bash".into(),
+                arguments: json!({"command": "pwd"}),
+            }]
+        );
+        assert_eq!(
+            decoder.finish().unwrap(),
+            vec![ModelEvent::Stop(StopReason::EndTurn)]
         );
     }
 
@@ -346,6 +343,28 @@ mod tests {
                 ModelEvent::Text("done".into()),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_tool_call_delta_without_index() {
+        let mut decoder = CompletionsDecoder::default();
+
+        let result = decoder.decode(
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_7","function":{"name":"bash"}}]},"finish_reason":null}]}"#,
+        );
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn rejects_completed_tool_call_without_a_name() {
+        let mut decoder = CompletionsDecoder::default();
+
+        let result = decoder.decode(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
     }
 
     #[test]

@@ -270,6 +270,7 @@ mod tests {
             result: TurnResult::Completed(reason),
             messages: Vec::new(),
             usage: None,
+            context_tokens: None,
         })
     }
 

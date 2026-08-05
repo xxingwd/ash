@@ -183,14 +183,12 @@ impl InputState {
         if self.history_index + 1 < self.history.len() {
             self.history_index += 1;
             self.buffer.clone_from(&self.history[self.history_index]);
-            self.cursor = self.buffer.len();
-            self.goal_column = None;
         } else {
             self.history_index = self.history.len();
             self.buffer = self.history_draft.take().unwrap_or_default();
-            self.cursor = self.buffer.len();
-            self.goal_column = None;
         }
+        self.cursor = self.buffer.len();
+        self.goal_column = None;
     }
 
     pub fn view(&self, width: u16) -> InputView {

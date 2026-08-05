@@ -94,23 +94,20 @@ fn parse_value(value: &str) -> Value {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
         "null" => Value::Null,
-        _ => value
-            .parse::<i64>()
-            .map(|number| Value::Number(number.into()))
-            .or_else(|_| {
-                value
-                    .parse::<u64>()
-                    .map(|number| Value::Number(number.into()))
-            })
-            .or_else(|_| {
-                value
-                    .parse::<f64>()
-                    .ok()
-                    .and_then(Number::from_f64)
-                    .map(Value::Number)
-                    .ok_or(())
-            })
-            .unwrap_or_else(|_| Value::String(value.to_string())),
+        _ => {
+            if let Ok(number) = value.parse::<i64>() {
+                return Value::Number(number.into());
+            }
+            if let Ok(number) = value.parse::<u64>() {
+                return Value::Number(number.into());
+            }
+            if let Ok(number) = value.parse::<f64>() {
+                if let Some(number) = Number::from_f64(number) {
+                    return Value::Number(number);
+                }
+            }
+            Value::String(value.to_string())
+        }
     }
 }
 

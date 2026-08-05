@@ -46,19 +46,15 @@ fn format_compact(value: u64, scale: u64, suffix: &str) -> String {
 
 pub(crate) fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
     let model_width = UnicodeWidthStr::width(model) as u16;
-    if model_width >= width || path.is_empty() {
+    let path_width = width.saturating_sub(model_width.saturating_add(3));
+    if model_width >= width || path.is_empty() || path_width == 0 {
         return (truncate_end(model, usize::from(width)), None);
     }
 
-    let path_width = width.saturating_sub(model_width.saturating_add(3));
-    if path_width == 0 {
-        (truncate_end(model, usize::from(width)), None)
-    } else {
-        (
-            model.to_string(),
-            Some(truncate_end(path, usize::from(path_width))),
-        )
-    }
+    (
+        model.to_string(),
+        Some(truncate_end(path, usize::from(path_width))),
+    )
 }
 
 #[cfg(test)]

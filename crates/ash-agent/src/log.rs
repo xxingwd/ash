@@ -1,11 +1,7 @@
-use std::collections::HashSet;
+use ash_core::{Message, MessageId, ThreadView, TurnId, TurnResult, TurnView, Usage};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use ash_core::{
-    Message, MessageContent, MessageId, ThreadView, TurnId, TurnResult, TurnView, Usage,
-};
-use serde::{Deserialize, Serialize};
-
-use crate::{Input, Version};
+use crate::Input;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
@@ -50,9 +46,72 @@ pub enum LogEntry {
     Rollback,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ThreadLog {
     entries: Vec<LogEntry>,
+    #[serde(skip)]
+    projection: Projector,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Projector {
+    all: Vec<Message>,
+    history: Vec<Message>,
+    context: Vec<Message>,
+    turns: Vec<TurnView>,
+    open: Option<OpenTurn>,
+    checkpoint: Option<AppliedCheckpoint>,
+    turn_boundaries: Vec<ProjectionSnapshot>,
+    legacy_boundaries: Vec<ProjectionSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenTurn {
+    id: TurnId,
+    messages: Vec<Message>,
+    events: Vec<OpenEvent>,
+    all_start: usize,
+    history_start: usize,
+    context_start: Vec<Message>,
+    checkpoint_start: Option<AppliedCheckpoint>,
+}
+
+#[derive(Clone, Debug)]
+enum OpenEvent {
+    Message(Message),
+    Checkpoint(ContextCheckpoint),
+}
+
+#[derive(Clone, Debug)]
+struct ProjectionSnapshot {
+    all_len: usize,
+    history_len: usize,
+    turns_len: usize,
+    open: Option<OpenTurn>,
+    checkpoint: Option<AppliedCheckpoint>,
+    open_context: Option<Vec<Message>>,
+    legacy_boundaries_len: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedCheckpoint {
+    value: ContextCheckpoint,
+    all_len: usize,
+}
+
+impl<'de> Deserialize<'de> for ThreadLog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct StoredLog {
+            entries: Vec<LogEntry>,
+        }
+
+        let stored = StoredLog::deserialize(deserializer)?;
+        Ok(Self::from_entries(stored.entries))
+    }
 }
 
 impl ThreadLog {
@@ -61,21 +120,22 @@ impl ThreadLog {
     }
 
     pub fn from_messages(messages: impl IntoIterator<Item = Message>) -> Self {
-        Self {
-            entries: messages.into_iter().map(LogEntry::Message).collect(),
-        }
+        Self::from_entries(messages.into_iter().map(LogEntry::Message).collect())
     }
 
     pub(crate) fn from_entries(entries: Vec<LogEntry>) -> Self {
-        Self { entries }
+        let mut projection = Projector::default();
+        for entry in &entries {
+            projection.apply(entry);
+        }
+        Self {
+            entries,
+            projection,
+        }
     }
 
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
-    }
-
-    pub fn revision(&self) -> Version {
-        Version::from_entry_count(self.entries.len())
     }
 
     pub fn contains_idempotency_key(&self, key: &str) -> bool {
@@ -89,6 +149,7 @@ impl ThreadLog {
     }
 
     pub fn push(&mut self, entry: LogEntry) {
+        self.projection.apply(&entry);
         self.entries.push(entry);
     }
 
@@ -97,233 +158,214 @@ impl ThreadLog {
     /// its accepted inputs stay visible, but half-streamed assistant and tool
     /// messages are not exposed as normal history.
     pub fn messages(&self) -> Vec<Message> {
-        let active = active_entries(&self.entries);
-        let open_turns = open_turn_ids(&active);
-        let mut messages = Vec::new();
-        let mut current_turn: Option<TurnId> = None;
-        for entry in active {
-            match entry {
-                LogEntry::TurnStart(id) => current_turn = Some(*id),
-                LogEntry::TurnEnd { id, .. } => {
-                    if current_turn == Some(*id) {
-                        current_turn = None;
-                    }
-                }
-                LogEntry::Input(input) => messages.push(input.message.clone()),
-                LogEntry::Message(message) => {
-                    let partial = current_turn.is_some_and(|turn_id| {
-                        open_turns.contains(&turn_id) && !is_user_message(message)
-                    });
-                    if !partial {
-                        messages.push(message.clone());
-                    }
-                }
-                LogEntry::Checkpoint(_) | LogEntry::Rollback => {}
-            }
-        }
-        messages
+        self.projection.history.clone()
     }
 
     /// The model context for the next request, honoring checkpoints. Messages
     /// of a turn that never settled are excluded (except its accepted inputs)
     /// so the model never resumes from a half-streamed fact.
     pub fn model_context(&self) -> Vec<Message> {
-        let active = active_entries(&self.entries);
-        let open_turns = open_turn_ids(&active);
-        let mut messages = Vec::new();
-        let mut model_context = Vec::new();
-        let mut current_turn: Option<TurnId> = None;
-        for entry in active {
-            match entry {
-                LogEntry::Input(input) => {
-                    messages.push(input.message.clone());
-                    model_context.push(input.message.clone());
-                }
-                LogEntry::Message(message) => {
-                    messages.push(message.clone());
-                    let partial = current_turn.is_some_and(|turn_id| {
-                        open_turns.contains(&turn_id) && !is_user_message(message)
-                    });
-                    if !partial {
-                        model_context.push(message.clone());
-                    }
-                }
-                LogEntry::Checkpoint(checkpoint) => {
-                    model_context = apply_checkpoint(&messages, checkpoint);
-                }
-                LogEntry::TurnStart(id) => current_turn = Some(*id),
-                LogEntry::TurnEnd { id, .. } => {
-                    if current_turn == Some(*id) {
-                        current_turn = None;
-                    }
-                }
-                LogEntry::Rollback => {}
-            }
-        }
-        model_context
+        self.projection.context.clone()
     }
 
     /// Completed turn snapshots in log order. A turn left open when the
     /// session ended (no `TurnEnd`, e.g. after a crash) is projected as
     /// `Interrupted` so partial turns never masquerade as normal history.
     pub fn turns(&self) -> Vec<TurnView> {
-        let mut turns = Vec::new();
-        let mut open: Option<(TurnId, Vec<Message>)> = None;
-        for entry in active_entries(&self.entries) {
-            match entry {
-                LogEntry::TurnStart(id) => {
-                    if let Some((previous_id, messages)) = open.take() {
-                        turns.push(TurnView {
-                            id: previous_id,
-                            result: TurnResult::Interrupted(
-                                "turn left open when the session ended".to_string(),
-                            ),
-                            messages,
-                            usage: None,
-                        });
-                    }
-                    open = Some((*id, Vec::new()));
-                }
-                LogEntry::Input(input) => {
-                    if let Some((_, messages)) = open.as_mut() {
-                        messages.push(input.message.clone());
-                    }
-                }
-                LogEntry::Message(message) => {
-                    if let Some((_, messages)) = open.as_mut() {
-                        messages.push(message.clone());
-                    }
-                }
-                LogEntry::TurnEnd { id, result, usage } => {
-                    if let Some((open_id, messages)) = open.take() {
-                        debug_assert_eq!(open_id, *id);
-                        turns.push(TurnView {
-                            id: open_id,
-                            result: result.clone(),
-                            messages,
-                            usage: *usage,
-                        });
-                    }
-                }
-                LogEntry::Checkpoint(_) | LogEntry::Rollback => {}
-            }
-        }
-        if let Some((id, messages)) = open {
-            turns.push(TurnView {
-                id,
-                result: TurnResult::Interrupted(
-                    "turn left open when the session ended".to_string(),
-                ),
-                messages,
-                usage: None,
-            });
-        }
-        turns
+        self.projection.turns()
     }
 
     /// Messages belonging to one turn: accepted inputs plus model and tool
     /// messages recorded under that turn id.
     pub fn turn_messages(&self, turn_id: TurnId) -> Vec<Message> {
-        let mut collecting = false;
-        let mut messages = Vec::new();
-        for entry in active_entries(&self.entries) {
-            match entry {
-                LogEntry::TurnStart(id) if *id == turn_id => collecting = true,
-                LogEntry::TurnStart(_) | LogEntry::TurnEnd { .. } => collecting = false,
-                LogEntry::Input(input) if collecting => messages.push(input.message.clone()),
-                LogEntry::Message(message) if collecting => messages.push(message.clone()),
-                LogEntry::Input(_)
-                | LogEntry::Message(_)
-                | LogEntry::Checkpoint(_)
-                | LogEntry::Rollback => {}
-            }
-        }
-        messages
+        self.turn_view(turn_id)
+            .map(|turn| turn.messages)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn turn_view(&self, turn_id: TurnId) -> Option<TurnView> {
+        self.projection.turn_view(turn_id)
     }
 
     /// Full projected state: history, model context, and turn views.
     pub fn view(&self) -> ThreadView {
         ThreadView {
-            messages: self.messages(),
-            context: self.model_context(),
-            turns: self.turns(),
+            messages: self.projection.history.clone(),
+            context: self.projection.context.clone(),
+            turns: self.projection.turns(),
+            context_tokens: None,
         }
     }
 }
 
-fn active_entries(entries: &[LogEntry]) -> Vec<&LogEntry> {
-    let mut active = Vec::new();
-    for entry in entries {
-        match entry {
-            LogEntry::Rollback => rollback_last_turn(&mut active),
-            LogEntry::Input(_)
-            | LogEntry::Message(_)
-            | LogEntry::Checkpoint(_)
-            | LogEntry::TurnStart(_)
-            | LogEntry::TurnEnd { .. } => active.push(entry),
-        }
-    }
-    active
-}
-
-fn is_user_message(message: &Message) -> bool {
-    matches!(message.content, MessageContent::User(_))
-}
-
-/// Turn ids that started but never settled (no matching `TurnEnd`). At most
-/// one exists in practice (turns run serially), but the projection is robust
-/// to any number.
-fn open_turn_ids(entries: &[&LogEntry]) -> HashSet<TurnId> {
-    let mut open = HashSet::new();
-    let mut current: Option<TurnId> = None;
-    for entry in entries {
+impl Projector {
+    fn apply(&mut self, entry: &LogEntry) {
         match entry {
             LogEntry::TurnStart(id) => {
-                if let Some(previous) = current {
-                    open.insert(previous);
+                let boundary = self.snapshot();
+                self.turn_boundaries.push(boundary);
+                if let Some(previous) = self.open.take() {
+                    self.turns
+                        .push(interrupted_turn(previous.id, previous.messages));
                 }
-                current = Some(*id);
+                self.open = Some(OpenTurn {
+                    id: *id,
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    all_start: self.all.len(),
+                    history_start: self.history.len(),
+                    context_start: self.context.clone(),
+                    checkpoint_start: self.checkpoint.clone(),
+                });
             }
-            LogEntry::TurnEnd { id, .. } => {
-                if current == Some(*id) {
-                    current = None;
+            LogEntry::Input(input) => {
+                self.push_message(input.message.clone(), true);
+            }
+            LogEntry::Message(message) => {
+                self.push_message(message.clone(), message.is_user_turn());
+            }
+            LogEntry::Checkpoint(checkpoint) => {
+                self.context = apply_checkpoint(&self.all, checkpoint);
+                self.checkpoint = Some(AppliedCheckpoint {
+                    value: checkpoint.clone(),
+                    all_len: self.all.len(),
+                });
+                if let Some(open) = self.open.as_mut() {
+                    open.events.push(OpenEvent::Checkpoint(checkpoint.clone()));
                 }
             }
-            LogEntry::Input(_)
-            | LogEntry::Message(_)
-            | LogEntry::Checkpoint(_)
-            | LogEntry::Rollback => {}
+            LogEntry::TurnEnd { id, result, usage } => {
+                if let Some(open) = self.open.take() {
+                    debug_assert_eq!(open.id, *id);
+                    self.settle(&open);
+                    self.turns.push(TurnView {
+                        id: open.id,
+                        result: result.clone(),
+                        messages: open.messages,
+                        usage: *usage,
+                        context_tokens: None,
+                    });
+                }
+            }
+            LogEntry::Rollback => self.rollback(),
         }
     }
-    if let Some(remaining) = current {
-        open.insert(remaining);
+
+    fn push_message(&mut self, message: Message, visible_while_open: bool) {
+        if self.open.is_none() && message.is_user_turn() {
+            let boundary = self.snapshot();
+            self.legacy_boundaries.push(boundary);
+        }
+
+        self.all.push(message.clone());
+        if self.open.is_none() || visible_while_open {
+            self.history.push(message.clone());
+            self.context.push(message.clone());
+        }
+        if let Some(open) = self.open.as_mut() {
+            open.messages.push(message.clone());
+            open.events.push(OpenEvent::Message(message));
+        }
     }
-    open
+
+    fn settle(&mut self, open: &OpenTurn) {
+        self.history.truncate(open.history_start);
+        self.history.extend(open.messages.iter().cloned());
+
+        let mut all = self.all[..open.all_start].to_vec();
+        let mut context = open.context_start.clone();
+        let mut latest_checkpoint = open.checkpoint_start.clone();
+        for event in &open.events {
+            match event {
+                OpenEvent::Message(message) => {
+                    all.push(message.clone());
+                    context.push(message.clone());
+                }
+                OpenEvent::Checkpoint(checkpoint) => {
+                    context = apply_checkpoint(&all, checkpoint);
+                    latest_checkpoint = Some(AppliedCheckpoint {
+                        value: checkpoint.clone(),
+                        all_len: all.len(),
+                    });
+                }
+            }
+        }
+        self.context = context;
+        self.checkpoint = latest_checkpoint;
+    }
+
+    fn rollback(&mut self) {
+        if let Some(boundary) = self.turn_boundaries.pop() {
+            self.restore(boundary);
+        } else if let Some(boundary) = self.legacy_boundaries.pop() {
+            self.restore(boundary);
+        }
+    }
+
+    fn snapshot(&self) -> ProjectionSnapshot {
+        ProjectionSnapshot {
+            all_len: self.all.len(),
+            history_len: self.history.len(),
+            turns_len: self.turns.len(),
+            open: self.open.clone(),
+            checkpoint: self.checkpoint.clone(),
+            open_context: self.open.as_ref().map(|_| self.context.clone()),
+            legacy_boundaries_len: self.legacy_boundaries.len(),
+        }
+    }
+
+    fn restore(&mut self, boundary: ProjectionSnapshot) {
+        self.all.truncate(boundary.all_len);
+        self.history.truncate(boundary.history_len);
+        self.turns.truncate(boundary.turns_len);
+        self.open = boundary.open;
+        self.checkpoint = boundary.checkpoint;
+        self.context = boundary
+            .open_context
+            .unwrap_or_else(|| rebuild_context(&self.all, self.checkpoint.as_ref()));
+        self.legacy_boundaries
+            .truncate(boundary.legacy_boundaries_len);
+    }
+
+    fn turns(&self) -> Vec<TurnView> {
+        let mut turns = self.turns.clone();
+        if let Some(open) = &self.open {
+            turns.push(interrupted_turn(open.id, open.messages.clone()));
+        }
+        turns
+    }
+
+    fn turn_view(&self, turn_id: TurnId) -> Option<TurnView> {
+        if let Some(open) = &self.open {
+            if open.id == turn_id {
+                return Some(interrupted_turn(open.id, open.messages.clone()));
+            }
+        }
+        self.turns
+            .iter()
+            .rev()
+            .find(|turn| turn.id == turn_id)
+            .cloned()
+    }
 }
 
-fn rollback_last_turn(entries: &mut Vec<&LogEntry>) {
-    let Some(turn_start) = entries.iter().rposition(|entry| {
-        matches!(
-            entry,
-            LogEntry::Input(AcceptedInput {
-                message: Message {
-                    content: MessageContent::User(_),
-                    ..
-                },
-                ..
-            }) | LogEntry::Message(Message {
-                content: MessageContent::User(_),
-                ..
-            })
-        )
-    }) else {
-        return;
+fn rebuild_context(all: &[Message], checkpoint: Option<&AppliedCheckpoint>) -> Vec<Message> {
+    let Some(checkpoint) = checkpoint else {
+        return all.to_vec();
     };
-    entries.truncate(turn_start);
-    // A rolled-back turn leaves its `TurnStart` marker behind; drop it so the
-    // projection does not see a dangling open turn.
-    while matches!(entries.last(), Some(LogEntry::TurnStart(_))) {
-        entries.pop();
+    let applied_at = checkpoint.all_len.min(all.len());
+    let mut context = apply_checkpoint(&all[..applied_at], &checkpoint.value);
+    context.extend_from_slice(&all[applied_at..]);
+    context
+}
+
+fn interrupted_turn(id: TurnId, messages: Vec<Message>) -> TurnView {
+    TurnView {
+        id,
+        result: TurnResult::Interrupted("turn left open when the session ended".to_string()),
+        messages,
+        usage: None,
+        context_tokens: None,
     }
 }
 
@@ -344,8 +386,128 @@ fn apply_checkpoint(messages: &[Message], checkpoint: &ContextCheckpoint) -> Vec
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
-    use ash_core::StopReason;
+    use ash_core::{MessageContent, StopReason};
+
+    fn legacy_projection(entries: &[LogEntry]) -> ThreadView {
+        let mut active = Vec::new();
+        for entry in entries {
+            if matches!(entry, LogEntry::Rollback) {
+                legacy_rollback(&mut active);
+            } else {
+                active.push(entry);
+            }
+        }
+
+        let mut open_ids = HashSet::new();
+        let mut current = None;
+        for entry in &active {
+            match entry {
+                LogEntry::TurnStart(id) => {
+                    if let Some(previous) = current.replace(*id) {
+                        open_ids.insert(previous);
+                    }
+                }
+                LogEntry::TurnEnd { id, .. } if current == Some(*id) => current = None,
+                _ => {}
+            }
+        }
+        if let Some(id) = current {
+            open_ids.insert(id);
+        }
+
+        let mut all = Vec::new();
+        let mut messages = Vec::new();
+        let mut context = Vec::new();
+        let mut turns = Vec::new();
+        let mut current = None;
+        let mut open: Option<(TurnId, Vec<Message>)> = None;
+        for entry in active {
+            match entry {
+                LogEntry::TurnStart(id) => {
+                    if let Some((id, messages)) = open.take() {
+                        turns.push(interrupted_turn(id, messages));
+                    }
+                    current = Some(*id);
+                    open = Some((*id, Vec::new()));
+                }
+                LogEntry::Input(input) => {
+                    all.push(input.message.clone());
+                    messages.push(input.message.clone());
+                    context.push(input.message.clone());
+                    if let Some((_, turn_messages)) = open.as_mut() {
+                        turn_messages.push(input.message.clone());
+                    }
+                }
+                LogEntry::Message(message) => {
+                    all.push(message.clone());
+                    let partial =
+                        current.is_some_and(|id| open_ids.contains(&id) && !message.is_user_turn());
+                    if !partial {
+                        messages.push(message.clone());
+                        context.push(message.clone());
+                    }
+                    if let Some((_, turn_messages)) = open.as_mut() {
+                        turn_messages.push(message.clone());
+                    }
+                }
+                LogEntry::Checkpoint(checkpoint) => {
+                    context = apply_checkpoint(&all, checkpoint);
+                }
+                LogEntry::TurnEnd { id, result, usage } => {
+                    if current == Some(*id) {
+                        current = None;
+                    }
+                    if let Some((open_id, messages)) = open.take() {
+                        turns.push(TurnView {
+                            id: open_id,
+                            result: result.clone(),
+                            messages,
+                            usage: *usage,
+                            context_tokens: None,
+                        });
+                    }
+                }
+                LogEntry::Rollback => unreachable!(),
+            }
+        }
+        if let Some((id, messages)) = open {
+            turns.push(interrupted_turn(id, messages));
+        }
+        ThreadView {
+            messages,
+            context,
+            turns,
+            context_tokens: None,
+        }
+    }
+
+    fn legacy_rollback(entries: &mut Vec<&LogEntry>) {
+        if let Some(start) = entries
+            .iter()
+            .rposition(|entry| matches!(entry, LogEntry::TurnStart(_)))
+        {
+            entries.truncate(start);
+            return;
+        }
+        if let Some(start) = entries.iter().rposition(|entry| match entry {
+            LogEntry::Input(input) => input.message.is_user_turn(),
+            LogEntry::Message(message) => message.is_user_turn(),
+            _ => false,
+        }) {
+            entries.truncate(start);
+        }
+    }
+
+    fn accepted(turn_id: TurnId, text: &str) -> LogEntry {
+        LogEntry::Input(AcceptedInput {
+            turn_id,
+            input: Input::user(text),
+            message: Message::user(text),
+        })
+    }
 
     #[test]
     fn projects_full_history_and_compacted_model_context_from_one_log() {
@@ -512,5 +674,146 @@ mod tests {
 
         assert!(log.turns().is_empty());
         assert!(log.messages().is_empty());
+    }
+
+    #[test]
+    fn rollback_drops_every_input_in_the_latest_turn() {
+        let turn_id = TurnId::new();
+        let first_input = Message::user("note");
+        let second_input = Message::user("task");
+        let mut log = ThreadLog::new();
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(LogEntry::Input(AcceptedInput {
+            turn_id,
+            input: Input::user("note"),
+            message: first_input,
+        }));
+        log.push(LogEntry::Input(AcceptedInput {
+            turn_id,
+            input: Input::user("task"),
+            message: second_input,
+        }));
+        log.push(LogEntry::Message(Message::assistant_text("done")));
+        log.push(LogEntry::TurnEnd {
+            id: turn_id,
+            result: TurnResult::Completed(StopReason::EndTurn),
+            usage: None,
+        });
+        log.push(LogEntry::Rollback);
+
+        assert!(log.turns().is_empty());
+        assert!(log.messages().is_empty());
+        assert!(log.model_context().is_empty());
+    }
+
+    #[test]
+    fn incremental_projection_matches_the_previous_projection_rules() {
+        let first = TurnId::new();
+        let second = TurnId::new();
+        let first_input = accepted(first, "first");
+        let tail_id = match &first_input {
+            LogEntry::Input(input) => input.message.id,
+            _ => unreachable!(),
+        };
+        let entries = vec![
+            LogEntry::TurnStart(first),
+            first_input,
+            LogEntry::Message(Message::assistant_text("partial")),
+            LogEntry::Checkpoint(ContextCheckpoint {
+                summary: Message::system("summary"),
+                tail_start_id: Some(tail_id),
+            }),
+            LogEntry::Message(Message::assistant_text("settled")),
+            LogEntry::TurnEnd {
+                id: first,
+                result: TurnResult::Completed(StopReason::EndTurn),
+                usage: None,
+            },
+            LogEntry::TurnStart(second),
+            accepted(second, "second"),
+            LogEntry::Message(Message::assistant_text("unfinished")),
+            LogEntry::Rollback,
+            LogEntry::TurnStart(second),
+            accepted(second, "replacement"),
+            LogEntry::Message(Message::assistant_text("replacement answer")),
+            LogEntry::TurnEnd {
+                id: second,
+                result: TurnResult::Completed(StopReason::MaxTokens),
+                usage: None,
+            },
+        ];
+
+        let mut incremental = ThreadLog::new();
+        for (index, entry) in entries.iter().cloned().enumerate() {
+            incremental.push(entry);
+            assert_eq!(
+                incremental.view(),
+                legacy_projection(&entries[..=index]),
+                "projection diverged after entry {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_after_mid_turn_checkpoint_restores_previous_context() {
+        let original = Message::user("original");
+        let turn_id = TurnId::new();
+        let mut log = ThreadLog::from_messages([original.clone()]);
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(accepted(turn_id, "new task"));
+        log.push(LogEntry::Checkpoint(ContextCheckpoint {
+            summary: Message::system("temporary summary"),
+            tail_start_id: None,
+        }));
+        log.push(LogEntry::Rollback);
+
+        assert_eq!(log.model_context(), vec![original]);
+        assert!(log.turns().is_empty());
+    }
+
+    #[test]
+    fn consecutive_rollbacks_restore_each_turn_boundary() {
+        let first = TurnId::new();
+        let second = TurnId::new();
+        let mut log = ThreadLog::new();
+        for (turn_id, prompt, answer) in [
+            (first, "first", "first answer"),
+            (second, "second", "second answer"),
+        ] {
+            log.push(LogEntry::TurnStart(turn_id));
+            log.push(accepted(turn_id, prompt));
+            log.push(LogEntry::Message(Message::assistant_text(answer)));
+            log.push(LogEntry::TurnEnd {
+                id: turn_id,
+                result: TurnResult::Completed(StopReason::EndTurn),
+                usage: None,
+            });
+        }
+
+        log.push(LogEntry::Rollback);
+        assert_eq!(log.turns().len(), 1);
+        assert_eq!(log.turns()[0].id, first);
+
+        log.push(LogEntry::Rollback);
+        assert!(log.turns().is_empty());
+        assert!(log.messages().is_empty());
+    }
+
+    #[test]
+    fn deserialization_rebuilds_the_incremental_projection() {
+        let turn_id = TurnId::new();
+        let mut log = ThreadLog::new();
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(accepted(turn_id, "question"));
+        log.push(LogEntry::Message(Message::assistant_text("answer")));
+        log.push(LogEntry::TurnEnd {
+            id: turn_id,
+            result: TurnResult::Completed(StopReason::EndTurn),
+            usage: None,
+        });
+
+        let restored: ThreadLog =
+            serde_json::from_value(serde_json::to_value(&log).unwrap()).unwrap();
+        assert_eq!(restored.view(), log.view());
     }
 }

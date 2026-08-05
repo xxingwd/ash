@@ -64,7 +64,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
     pub(crate) context_tokens: Option<u64>,
-    pub(crate) context_estimated: bool,
     pub(crate) context_limit: Option<u64>,
     pub(crate) tools_expanded: bool,
     pub(crate) subagents: &'a [SubagentSnapshot],
@@ -323,6 +322,22 @@ enum ScreenPart {
     Footer,
 }
 
+// Order defines which sections yield space first as the terminal shrinks.
+const SHRINK_ORDER: [ScreenPart; 5] = [
+    ScreenPart::Transcript,
+    ScreenPart::Footer,
+    ScreenPart::Menu,
+    ScreenPart::Composer,
+    ScreenPart::Subagents,
+];
+const REMOVE_ORDER: [ScreenPart; 5] = [
+    ScreenPart::Status,
+    ScreenPart::Subagents,
+    ScreenPart::Transcript,
+    ScreenPart::Footer,
+    ScreenPart::Menu,
+];
+
 impl ScreenRows {
     fn rows_mut(&mut self, part: ScreenPart) -> &mut u16 {
         match part {
@@ -349,22 +364,10 @@ impl ScreenRows {
 }
 
 fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> ScreenRows {
-    for part in [
-        ScreenPart::Transcript,
-        ScreenPart::Footer,
-        ScreenPart::Menu,
-        ScreenPart::Composer,
-        ScreenPart::Subagents,
-    ] {
+    for part in SHRINK_ORDER {
         rows.shrink_to_fit(part, 1, height);
     }
-    for part in [
-        ScreenPart::Status,
-        ScreenPart::Subagents,
-        ScreenPart::Transcript,
-        ScreenPart::Footer,
-        ScreenPart::Menu,
-    ] {
+    for part in REMOVE_ORDER {
         rows.remove_if_needed(part, height);
     }
     rows
@@ -750,13 +753,11 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     let detailed_context = context_display(
         input.context_tokens,
         input.context_limit,
-        input.context_estimated,
         ContextDisplayMode::Detailed,
     );
     let compact_context = context_display(
         input.context_tokens,
         input.context_limit,
-        input.context_estimated,
         ContextDisplayMode::Compact,
     );
     let candidates = [
@@ -833,14 +834,12 @@ enum ContextDisplayMode {
 fn context_display(
     context_tokens: Option<u64>,
     context_limit: Option<u64>,
-    estimated: bool,
     mode: ContextDisplayMode,
 ) -> Option<ContextDisplay> {
     let tokens = context_tokens?;
-    let estimate = if estimated { "~" } else { "" };
     let Some(limit) = context_limit.filter(|limit| *limit > 0) else {
         return Some(ContextDisplay {
-            text: format!("ctx {estimate}{}", format_token_count(tokens)),
+            text: format!("ctx {}", format_token_count(tokens)),
             color: Color::Green,
         });
     };
@@ -866,12 +865,12 @@ fn context_display(
             .unwrap_or(CONTEXT_BAR_COLUMNS)
             .min(CONTEXT_BAR_COLUMNS);
             format!(
-                "ctx {}{} {estimate}{percent_text}",
+                "ctx {}{} {percent_text}",
                 "█".repeat(filled),
                 "░".repeat(CONTEXT_BAR_COLUMNS - filled),
             )
         }
-        ContextDisplayMode::Compact => format!("ctx {estimate}{percent_text}"),
+        ContextDisplayMode::Compact => format!("ctx {percent_text}"),
     };
     Some(ContextDisplay { text, color })
 }
@@ -1161,7 +1160,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1220,7 +1218,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1266,7 +1263,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1309,7 +1305,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1375,7 +1370,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1441,7 +1435,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1474,7 +1467,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1509,7 +1501,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1549,7 +1540,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1589,7 +1579,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1630,7 +1619,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1673,7 +1661,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1719,7 +1706,6 @@ mod tests {
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
             context_tokens: None,
-            context_estimated: false,
 
             context_limit: None,
             tools_expanded: false,
@@ -1815,18 +1801,18 @@ mod tests {
 
     #[test]
     fn context_display_uses_a_fixed_bar_and_compact_fallback() {
-        let detailed = context_display(Some(50), Some(100), false, ContextDisplayMode::Detailed)
+        let detailed = context_display(Some(50), Some(100), ContextDisplayMode::Detailed)
             .expect("detailed meter");
         assert_eq!(detailed.text, "ctx ████░░░░ 50%");
         assert_eq!(detailed.color, Color::Green);
 
-        let compact = context_display(Some(85), Some(100), true, ContextDisplayMode::Compact)
+        let compact = context_display(Some(85), Some(100), ContextDisplayMode::Compact)
             .expect("compact meter");
-        assert_eq!(compact.text, "ctx ~85%");
+        assert_eq!(compact.text, "ctx 85%");
         assert_eq!(compact.color, Color::Red);
 
-        let unknown = context_display(Some(12_345), None, true, ContextDisplayMode::Detailed)
+        let unknown = context_display(Some(12_345), None, ContextDisplayMode::Detailed)
             .expect("token display");
-        assert_eq!(unknown.text, "ctx ~12.3k");
+        assert_eq!(unknown.text, "ctx 12.3k");
     }
 }

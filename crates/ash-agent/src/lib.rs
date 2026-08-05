@@ -33,7 +33,8 @@ pub use prompt::build_system_prompt;
 pub use runtime::Runtime;
 pub use skill::{tool as skill_tool, Skill};
 pub use store::{
-    SharedThreadStore, StoredThread, ThreadKind, ThreadMetadata, ThreadStore, Version,
+    OpenedThread, SharedThreadStore, StoredThread, ThreadAppender, ThreadKind, ThreadMetadata,
+    ThreadStore,
 };
 pub(crate) use thread::ThreadState;
 pub use thread::{ContextCompaction, Fork, Thread, Turn};

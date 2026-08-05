@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ash_core::{ModelId, Tool, TreeId};
 
-use crate::ContextPolicy;
+use crate::{ContextPolicy, ThreadKind};
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
@@ -25,6 +25,7 @@ pub struct ThreadOptions {
     pub tool_timeout: Duration,
     pub path: String,
     pub tree_id: Option<TreeId>,
+    pub kind: ThreadKind,
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -35,7 +36,25 @@ impl Default for ThreadOptions {
             tool_timeout: Duration::from_secs(120),
             path: "/root".to_string(),
             tree_id: None,
+            kind: ThreadKind::Root,
             metadata: serde_json::Map::new(),
+        }
+    }
+}
+
+/// Exponential retry backoff for safe model-call retries.
+/// First retry waits `base`, then doubles each attempt, capped at `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBackoff {
+    pub base: std::time::Duration,
+    pub max: std::time::Duration,
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self {
+            base: std::time::Duration::from_secs(1),
+            max: std::time::Duration::from_secs(10),
         }
     }
 }
@@ -53,7 +72,16 @@ pub(crate) struct RunConfig {
     pub max_tool_duration: Duration,
     pub agent_path: String,
     pub tree_id: Option<TreeId>,
+    pub kind: ThreadKind,
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// How many times a single model call may be retried after a safe,
+    /// retryable failure (network error, upstream 5xx, rate limit, or a
+    /// truncated stream). Retries only happen before any tool call has been
+    /// executed, so they never repeat side effects. Between attempts the
+    /// runner waits an exponential backoff (`RetryBackoff`), cancellable.
+    pub max_retries: u32,
+    /// Backoff schedule for the retries above.
+    pub retry_backoff: RetryBackoff,
 }
 
 impl RunConfig {
@@ -69,7 +97,10 @@ impl RunConfig {
             max_tool_duration: options.tool_timeout,
             agent_path: options.path.clone(),
             tree_id: options.tree_id,
+            kind: options.kind,
             metadata: options.metadata.clone(),
+            max_retries: 5,
+            retry_backoff: RetryBackoff::default(),
         }
     }
 }

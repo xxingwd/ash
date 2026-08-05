@@ -13,7 +13,10 @@ use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::{sanitize_terminal_text, wrap_text},
-    tool_display::{read_group_detail, read_group_summary, tool_call_summary},
+    tool_display::{
+        read_group_detail, read_group_summary, tool_call_summary, tool_renderer,
+        ChangePreviewSource, ToolRenderer,
+    },
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
@@ -47,6 +50,7 @@ enum LiveBlockKind {
         streaming: bool,
     },
     Thought {
+        source: String,
         elapsed_seconds: u64,
     },
     ReadGroup(Vec<String>),
@@ -77,8 +81,14 @@ impl LiveBlock {
         )
     }
 
-    pub(crate) fn thought(id: u64, elapsed_seconds: u64) -> Self {
-        Self::new(id, LiveBlockKind::Thought { elapsed_seconds })
+    pub(crate) fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
+        Self::new(
+            id,
+            LiveBlockKind::Thought {
+                source,
+                elapsed_seconds,
+            },
+        )
     }
 
     pub(crate) fn tool(
@@ -260,7 +270,10 @@ impl LiveBlock {
             LiveBlockKind::Assistant { source, .. } => {
                 render_markdown_block(source, Style::default(), width)
             }
-            LiveBlockKind::Thought { elapsed_seconds } => render_thought(*elapsed_seconds, width),
+            LiveBlockKind::Thought {
+                source,
+                elapsed_seconds,
+            } => render_thought(source, *elapsed_seconds, width, expanded),
             LiveBlockKind::ReadGroup(details) => render_read_group(details, width),
             LiveBlockKind::Tool {
                 name,
@@ -283,21 +296,53 @@ impl LiveBlock {
     }
 }
 
-fn render_thought(elapsed_seconds: u64, width: u16) -> Buffer {
+fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool) -> Buffer {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), 1));
+    // Compact mode keeps the summary line; expanded mode reveals the full
+    // reasoning text below it, mirroring the tool output toggle (`Ctrl+o`).
+    if !expanded {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), 1));
+        buffer.set_line(
+            0,
+            0,
+            &Line::styled(
+                format!(
+                    "• Thought for {}",
+                    crate::stream_state::format_elapsed(elapsed_seconds)
+                ),
+                style,
+            ),
+            width,
+        );
+        return buffer;
+    }
+    let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
+    let mut lines = render_markdown(source, content_width);
+    while lines.last().is_some_and(RenderedLine::is_blank) {
+        lines.pop();
+    }
+    for line in &mut lines {
+        line.patch_style(style);
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(u16::MAX).max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
     buffer.set_line(
         0,
         0,
         &Line::styled(
             format!(
-                "• Thought for {}",
+                "• Thought for {} — expanded",
                 crate::stream_state::format_elapsed(elapsed_seconds)
             ),
             style,
         ),
         width,
     );
+    for (offset, line) in lines.into_iter().enumerate() {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(line.ratatui_line().spans);
+        buffer.set_line(0, offset as u16 + 1, &Line::from(spans), width);
+    }
     buffer
 }
 
@@ -483,22 +528,18 @@ fn render_tool(
     width: u16,
     expanded: bool,
 ) -> Buffer {
-    if !is_error {
-        let preview = match name {
-            "edit" if !output.is_empty() => Some(output.to_string()),
-            "write" => arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .map(write_preview),
-            _ => None,
-        };
-        if let Some(preview) = preview {
-            return render_change_preview(name, arguments, &preview, width);
+    let show_output = match tool_renderer(name, is_error) {
+        ToolRenderer::Bash => {
+            return render_bash_tool(name, arguments, output, is_error, width, expanded);
         }
-    }
-    if name == "bash" {
-        return render_bash_tool(name, arguments, output, is_error, width, expanded);
-    }
+        ToolRenderer::ChangePreview(source) => {
+            if let Some(preview) = change_preview(source, arguments, output) {
+                return render_change_preview(name, arguments, &preview, width);
+            }
+            false
+        }
+        ToolRenderer::Generic { show_output } => show_output,
+    };
     let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
     let (action, detail) = tool_call_summary(name, arguments, is_error, detail_width);
     let title = render_tool_title(action, detail, is_error, width);
@@ -506,12 +547,20 @@ fn render_tool(
         return title;
     }
     let mut rows = vec![title];
-    // read/edit/write have dedicated previews (ReadGroup / change preview);
-    // every other tool shows its output (errors included, like bash).
-    if name != "read" && name != "edit" && name != "write" {
+    if show_output {
         rows.push(render_tool_output(output, width, expanded));
     }
     stack_rows(&rows, width)
+}
+
+fn change_preview(source: ChangePreviewSource, arguments: &Value, output: &str) -> Option<String> {
+    match source {
+        ChangePreviewSource::EditOutput => (!output.is_empty()).then(|| output.to_string()),
+        ChangePreviewSource::WriteContent => arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .map(write_preview),
+    }
 }
 
 /// Render a bash tool call: the highlighted command (the "input") inline on
@@ -923,11 +972,22 @@ mod tests {
 
     #[test]
     fn completed_thoughts_render_as_a_single_summary_line() {
-        let block = LiveBlock::thought(1, 3);
+        let block = LiveBlock::thought(1, "detail".to_string(), 3);
         let rendered = block.render(40, false);
 
         assert_eq!(rendered.area.height, 1);
         assert_eq!(row_text(&rendered, 0), "• Thought for 3s");
+    }
+
+    #[test]
+    fn expanded_thoughts_reveal_the_full_reasoning_text() {
+        let block = LiveBlock::thought(1, "first\nsecond".to_string(), 3);
+        let rendered = block.render(40, true);
+
+        assert_eq!(rendered.area.height, 3);
+        assert_eq!(row_text(&rendered, 0), "• Thought for 3s — expanded");
+        assert_eq!(row_text(&rendered, 1), "  first");
+        assert_eq!(row_text(&rendered, 2), "  second");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, estimate_request_tokens, skill_tool, Agent, MessageHistoryStore, Runtime,
-    Skill, Thread, ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
+    build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
+    ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_core::{
     CancellationToken, EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId,
@@ -14,6 +14,9 @@ use secrecy::SecretString;
 
 use crate::Cli;
 
+const DEFAULT_MAX_TURNS: u32 = 100;
+const DEFAULT_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct InteractiveController {
     thread: Thread,
     agent: Agent,
@@ -22,6 +25,56 @@ struct InteractiveController {
     event_tx: tokio::sync::mpsc::Sender<EventKind>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
     history_store: MessageHistoryStore,
+}
+
+#[derive(Default)]
+struct TurnState {
+    cancellations: std::collections::HashMap<TurnId, CancellationToken>,
+    active: Option<TurnId>,
+    rollback_after_cancel: Option<TurnId>,
+}
+
+impl TurnState {
+    fn track(&mut self, id: TurnId, cancellation: CancellationToken) {
+        self.cancellations.insert(id, cancellation);
+    }
+
+    fn start(&mut self, id: Option<TurnId>) {
+        self.active = id;
+    }
+
+    fn finish(&mut self, id: Option<TurnId>) -> bool {
+        let Some(id) = id else {
+            return false;
+        };
+        self.cancellations.remove(&id);
+        if self.active == Some(id) {
+            self.active = None;
+        }
+        if self.rollback_after_cancel == Some(id) {
+            self.rollback_after_cancel = None;
+            return true;
+        }
+        false
+    }
+
+    fn cancel_active(&mut self, rollback: bool) -> bool {
+        let Some(id) = self.active else {
+            return false;
+        };
+        let Some(cancellation) = self.cancellations.get(&id) else {
+            return false;
+        };
+        if rollback {
+            self.rollback_after_cancel = Some(id);
+        }
+        cancellation.cancel();
+        true
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 struct AgentSetup {
@@ -51,10 +104,10 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     let model = cli.model.clone().or_else(|| env_value("ASH_MODEL"));
     let model = match model {
         Some(model) => model,
-        None if matches!(&protocol, Protocol::AnthropicMessages) => {
-            "claude-sonnet-4-20250514".into()
-        }
-        None => anyhow::bail!("set ASH_MODEL in the process environment or pass --model"),
+        None => match protocol.default_model() {
+            Some(default) => default.into(),
+            None => anyhow::bail!("set ASH_MODEL in the process environment or pass --model"),
+        },
     };
     let base_url = cli.base_url.clone().or_else(|| env_value("ASH_BASE_URL"));
     let configured_max_context_tokens = match cli.max_context_tokens {
@@ -93,13 +146,13 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         system_prompt: Some(system_prompt),
         model: ModelId::new(model),
         tools,
-        max_turns: 100,
+        max_turns: DEFAULT_MAX_TURNS,
         max_context_tokens,
         context_policy: std::sync::Arc::new(ash_agent::DefaultContextPolicy),
     };
     let options = ThreadOptions {
         working_dir,
-        tool_timeout: std::time::Duration::from_secs(120),
+        tool_timeout: DEFAULT_TOOL_TIMEOUT,
         ..ThreadOptions::default()
     };
     if let Some(skill) = active_skill {
@@ -252,29 +305,20 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
 impl InteractiveController {
     async fn run(mut self) {
         let mut events = self.thread.events();
-        let mut turns = std::collections::HashMap::<TurnId, CancellationToken>::new();
-        let mut active = None;
-        let mut rollback_after_cancel = false;
+        let mut turns = TurnState::default();
         loop {
             tokio::select! {
                 biased;
                 event = events.next() => match event {
                     Some(Ok(event)) => {
                         if matches!(event.kind, EventKind::TurnStart) {
-                            active = event.turn_id;
+                            turns.start(event.turn_id);
                         }
                         let completed = matches!(event.kind, EventKind::Turn(_));
                         let completed_turn = event.turn_id;
                         let _ = self.event_tx.send(event.kind).await;
-                        if completed {
-                            if let Some(turn_id) = completed_turn {
-                                turns.remove(&turn_id);
-                            }
-                            active = None;
-                            if rollback_after_cancel {
-                                rollback_after_cancel = false;
-                                self.rollback_last_turn().await;
-                            }
+                        if completed && turns.finish(completed_turn) {
+                            self.rollback_last_turn().await;
                         }
                     }
                     Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
@@ -289,7 +333,7 @@ impl InteractiveController {
                             }
                             match self.thread.submit(input).await {
                                 Ok(turn) => {
-                                    turns.insert(turn.id(), turn.cancellation_token());
+                                    turns.track(turn.id(), turn.cancellation_token());
                                 }
                                 Err(error) => {
                                     let _ = self.event_tx.send(EventKind::Error(error.to_string())).await;
@@ -297,15 +341,10 @@ impl InteractiveController {
                             }
                         }
                         UiCommand::Cancel => {
-                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
-                                cancel.cancel();
-                            }
+                            turns.cancel_active(false);
                         }
                         UiCommand::CancelAndRollback => {
-                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
-                                rollback_after_cancel = true;
-                                cancel.cancel();
-                            } else {
+                            if !turns.cancel_active(true) {
                                 self.rollback_last_turn().await;
                             }
                         }
@@ -314,27 +353,22 @@ impl InteractiveController {
                         UiCommand::NewSession => {
                             self.thread = self.runtime.start(self.agent.clone(), self.options.clone());
                             events = self.thread.events();
-                            turns.clear();
-                            active = None;
+                            turns.reset();
                         }
                         UiCommand::ListSessions => self.list_threads().await,
                         UiCommand::ListForkPoints => self.list_fork_points().await,
                         UiCommand::ResumeSession(thread_id) => {
                             self.resume_thread(thread_id).await;
                             events = self.thread.events();
-                            turns.clear();
-                            active = None;
+                            turns.reset();
                         }
                         UiCommand::ForkSession(message_id) => {
                             self.fork_thread(message_id).await;
                             events = self.thread.events();
-                            turns.clear();
-                            active = None;
+                            turns.reset();
                         }
                         UiCommand::Exit => {
-                            if let Some(cancel) = active.and_then(|id| turns.get(&id)) {
-                                cancel.cancel();
-                            }
+                            turns.cancel_active(false);
                             break;
                         }
                     }
@@ -351,10 +385,10 @@ impl InteractiveController {
                 }
                 let context_tokens = self
                     .thread
-                    .messages()
+                    .view()
                     .await
                     .ok()
-                    .and_then(|messages| self.estimated_context_tokens(&messages));
+                    .and_then(|view| view.context_tokens);
                 EventKind::TurnRolledBack {
                     prompt,
                     context_tokens,
@@ -397,17 +431,6 @@ impl InteractiveController {
 
     /// Estimate the model-context size for a given message history, using the
     /// same estimator the runtime uses when the API does not report usage.
-    fn estimated_context_tokens(&self, messages: &[ash_core::Message]) -> Option<u64> {
-        let tools = self
-            .agent
-            .tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect::<Vec<_>>();
-        let tokens = estimate_request_tokens(self.agent.system_prompt.as_deref(), messages, &tools);
-        u64::try_from(tokens).ok()
-    }
-
     async fn resume_thread(&mut self, thread_id: ThreadId) {
         let event = match self
             .runtime
@@ -418,7 +441,7 @@ impl InteractiveController {
                 self.thread = thread;
                 match self.thread.view().await {
                     Ok(view) => EventKind::Restored {
-                        context_tokens: self.estimated_context_tokens(&view.messages),
+                        context_tokens: view.context_tokens,
                         view,
                     },
                     Err(error) => EventKind::Error(format!("Failed to restore chat: {error}")),
@@ -436,7 +459,7 @@ impl InteractiveController {
                 self.thread = forked.thread;
                 match self.thread.view().await {
                     Ok(view) => EventKind::ThreadForked {
-                        context_tokens: self.estimated_context_tokens(&view.messages),
+                        context_tokens: view.context_tokens,
                         view,
                         prompt: forked.prompt,
                     },
@@ -478,5 +501,33 @@ mod tests {
             assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);
         }
         assert!(parse_protocol("responses").is_err());
+    }
+
+    #[test]
+    fn rollback_is_bound_to_the_cancelled_turn() {
+        let turn_id = TurnId::new();
+        let mut turns = TurnState::default();
+        turns.track(turn_id, CancellationToken::new());
+        turns.start(Some(turn_id));
+
+        assert!(turns.cancel_active(true));
+        assert!(turns.finish(Some(turn_id)));
+        assert!(!turns.finish(Some(turn_id)));
+    }
+
+    #[test]
+    fn switching_sessions_clears_pending_rollback() {
+        let old_turn = TurnId::new();
+        let mut turns = TurnState::default();
+        turns.track(old_turn, CancellationToken::new());
+        turns.start(Some(old_turn));
+        assert!(turns.cancel_active(true));
+
+        turns.reset();
+        let new_turn = TurnId::new();
+        turns.track(new_turn, CancellationToken::new());
+        turns.start(Some(new_turn));
+
+        assert!(!turns.finish(Some(new_turn)));
     }
 }

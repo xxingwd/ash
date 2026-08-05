@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason, ToolCallId, Usage};
+use ash_core::{ContentBlock, MessageContent, ProtocolError};
 use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
-use crate::{model_config, sse, ProviderConfig};
+use crate::{
+    consecutive_tool_results, model_config,
+    pending_calls::stop_reason,
+    pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
+    project_request_messages, sse, ProviderConfig,
+};
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 pub struct ResponsesAdapter {
@@ -31,10 +36,11 @@ impl ResponsesAdapter {
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
+        let projected = project_request_messages(req)?;
         let mut input = Vec::new();
         let mut index = 0;
-        while index < req.messages.len() {
-            match &req.messages[index].content {
+        while index < projected.messages.len() {
+            match &projected.messages[index].content {
                 MessageContent::User(contents) => {
                     input.push(json!({"role": "user", "content": responses_content(contents)}));
                     index += 1;
@@ -66,31 +72,19 @@ impl ResponsesAdapter {
                     index += 1;
                 }
                 MessageContent::ToolResult { .. } => {
-                    let mut attachments = Vec::new();
-                    while index < req.messages.len() {
-                        let MessageContent::ToolResult {
-                            id,
-                            result,
-                            attachments: result_attachments,
-                        } = &req.messages[index].content
-                        else {
-                            break;
-                        };
+                    let group = consecutive_tool_results(&projected.messages, index);
+                    for result in group.results {
                         input.push(json!({
                             "type": "function_call_output",
-                            "call_id": id.as_str(),
-                            "output": result.as_ref().map_or_else(
-                                |error| format!("Error: {error}"),
-                                Clone::clone,
-                            ),
+                            "call_id": result.id.as_str(),
+                            "output": result.output,
                         }));
-                        attachments.extend(result_attachments.iter().cloned());
-                        index += 1;
                     }
-                    if !attachments.is_empty() {
+                    index = group.next_index;
+                    if !group.attachments.is_empty() {
                         input.push(json!({
                             "role": "user",
-                            "content": responses_content(&attachments),
+                            "content": responses_content(&group.attachments),
                         }));
                     }
                 }
@@ -114,7 +108,7 @@ impl ResponsesAdapter {
             "input": input,
             "stream": true,
         });
-        if let Some(system) = &req.system {
+        if let Some(system) = &projected.system {
             body["instructions"] = json!(system);
         }
         if !tools.is_empty() {
@@ -171,51 +165,126 @@ impl ModelClient for ResponsesAdapter {
 }
 
 #[derive(Default)]
-struct ResponsesDecoder {
-    calls: BTreeMap<String, PendingCall>,
-    emitted_calls: BTreeSet<String>,
+pub(crate) struct ResponsesDecoder {
+    calls: PendingCallAccumulator<ResponseItemKey>,
+    emitted_calls: BTreeSet<ResponseItemKey>,
+    output_keys: BTreeMap<u64, ResponseItemKey>,
     streamed_reasoning_summaries: BTreeSet<u64>,
 }
 
-#[derive(Default)]
-struct PendingCall {
-    call_id: String,
-    name: String,
-    arguments: String,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ResponseItemKey {
+    Id(String),
+    OutputIndex(u64),
+}
+
+impl PendingCall {
+    /// Merge a call re-keyed from an output index into this item-keyed call.
+    fn merge(&mut self, other: Self) {
+        if self.id.is_empty() {
+            self.id = other.id;
+        }
+        if self.name.is_empty() {
+            self.name = other.name;
+        }
+        if self.arguments.is_empty() {
+            self.arguments = other.arguments;
+        } else if !other.arguments.is_empty() {
+            self.arguments.push_str(&other.arguments);
+        }
+    }
+
+    /// Apply a `function_call` item payload; `replace_arguments` is true for
+    /// atomic `output_item.done` payloads and false for `output_item.added`
+    /// placeholders.
+    fn apply_item(&mut self, item: &Value, replace_arguments: bool) {
+        if let Some(call_id) = item["call_id"]
+            .as_str()
+            .filter(|call_id| !call_id.is_empty())
+        {
+            self.id = call_id.to_string();
+        }
+        if let Some(name) = item["name"].as_str().filter(|name| !name.is_empty()) {
+            self.name = name.to_string();
+        }
+        if let Some(arguments) = item["arguments"].as_str() {
+            if replace_arguments || self.arguments.is_empty() || !arguments.is_empty() {
+                self.arguments = arguments.to_string();
+            }
+        }
+    }
 }
 
 impl ResponsesDecoder {
-    fn key(event: &Value) -> String {
-        event["item_id"]
-            .as_str()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("output: {}", event["output_index"].as_u64().unwrap_or(0)))
+    fn raw_key(event: &Value) -> Result<ResponseItemKey, ProtocolError> {
+        if let Some(id) = event["item_id"].as_str() {
+            return Ok(ResponseItemKey::Id(id.to_string()));
+        }
+        event["output_index"]
+            .as_u64()
+            .map(ResponseItemKey::OutputIndex)
+            .ok_or_else(|| {
+                ProtocolError::InvalidResponse(
+                    "Responses function-call event is missing item_id and output_index".to_string(),
+                )
+            })
     }
 
-    fn emit_call(&mut self, key: &str) -> Result<Option<ModelEvent>, ProtocolError> {
+    fn key(&self, event: &Value) -> Result<ResponseItemKey, ProtocolError> {
+        match Self::raw_key(event)? {
+            ResponseItemKey::OutputIndex(index) => Ok(self
+                .output_keys
+                .get(&index)
+                .cloned()
+                .unwrap_or(ResponseItemKey::OutputIndex(index))),
+            key => Ok(key),
+        }
+    }
+
+    fn item_key(&mut self, event: &Value) -> Result<ResponseItemKey, ProtocolError> {
+        let key = if let Some(id) = event["item"]["id"].as_str() {
+            ResponseItemKey::Id(id.to_string())
+        } else {
+            Self::raw_key(event)?
+        };
+        if let Some(index) = event["output_index"].as_u64() {
+            self.bind_output_index(index, key.clone());
+        }
+        Ok(key)
+    }
+
+    fn bind_output_index(&mut self, index: u64, key: ResponseItemKey) {
+        let old_key = ResponseItemKey::OutputIndex(index);
+        self.output_keys.insert(index, key.clone());
+        if old_key == key {
+            return;
+        }
+        if let Some(call) = self.calls.remove(&old_key) {
+            self.calls.entry(key.clone()).merge(call);
+        }
+        if self.emitted_calls.remove(&old_key) {
+            self.emitted_calls.insert(key);
+        }
+    }
+
+    fn summary_index(event: &Value) -> Result<u64, ProtocolError> {
+        event["summary_index"].as_u64().ok_or_else(|| {
+            ProtocolError::InvalidResponse(
+                "Responses reasoning event is missing summary_index".to_string(),
+            )
+        })
+    }
+
+    fn emit_call(&mut self, key: &ResponseItemKey) -> Result<Option<ModelEvent>, ProtocolError> {
         if self.emitted_calls.contains(key) {
+            self.calls.remove(key);
             return Ok(None);
         }
         let Some(call) = self.calls.remove(key) else {
             return Ok(None);
         };
-        let arguments = if call.arguments.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&call.arguments).map_err(|error| {
-                ProtocolError::InvalidResponse(format!("invalid Responses tool arguments: {error}"))
-            })?
-        };
-        let item = ModelEvent::ToolCall {
-            id: if call.call_id.is_empty() {
-                ToolCallId::new()
-            } else {
-                ToolCallId::from_provider(call.call_id)
-            },
-            name: call.name,
-            arguments,
-        };
-        self.emitted_calls.insert(key.to_string());
+        let item = call.finish("Responses")?;
+        self.emitted_calls.insert(key.clone());
         Ok(Some(item))
     }
 }
@@ -223,14 +292,15 @@ impl ResponsesDecoder {
 impl sse::Decoder for ResponsesDecoder {
     fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         if data == "[DONE]" {
-            return Ok(sse::DecodeResult::finished(Vec::new()));
+            return Ok(sse::DecodeResult::wire_done(Vec::new()));
         }
         let event: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
-        let mut finished = false;
-
-        match event["type"].as_str().unwrap_or_default() {
+        let event_type = event["type"].as_str().ok_or_else(|| {
+            ProtocolError::InvalidResponse("Responses event is missing type".to_string())
+        })?;
+        match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     items.push(ModelEvent::Text(delta.to_string()));
@@ -239,12 +309,12 @@ impl sse::Decoder for ResponsesDecoder {
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     self.streamed_reasoning_summaries
-                        .insert(event["summary_index"].as_u64().unwrap_or(0));
+                        .insert(Self::summary_index(&event)?);
                     items.push(ModelEvent::Reasoning(delta.to_string()));
                 }
             }
             "response.reasoning_summary_text.done" => {
-                let summary_index = event["summary_index"].as_u64().unwrap_or(0);
+                let summary_index = Self::summary_index(&event)?;
                 if !self.streamed_reasoning_summaries.contains(&summary_index) {
                     if let Some(text) = event["text"].as_str() {
                         items.push(ModelEvent::Reasoning(text.to_string()));
@@ -256,29 +326,20 @@ impl sse::Decoder for ResponsesDecoder {
                 if item["type"].as_str() == Some("reasoning") {
                     self.streamed_reasoning_summaries.clear();
                 } else if item["type"].as_str() == Some("function_call") {
-                    self.calls.insert(
-                        item["id"]
-                            .as_str()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_else(|| Self::key(&event)),
-                        PendingCall {
-                            call_id: item["call_id"].as_str().unwrap_or_default().to_string(),
-                            name: item["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: item["arguments"].as_str().unwrap_or_default().to_string(),
-                        },
-                    );
+                    let key = self.item_key(&event)?;
+                    self.calls.entry(key).apply_item(item, false);
                 }
             }
             "response.function_call_arguments.delta" => {
-                let key = Self::key(&event);
-                let call = self.calls.entry(key).or_default();
+                let key = self.key(&event)?;
+                let call = self.calls.entry(key);
                 if let Some(delta) = event["delta"].as_str() {
                     call.arguments.push_str(delta);
                 }
             }
             "response.function_call_arguments.done" => {
-                let key = Self::key(&event);
-                let call = self.calls.entry(key.clone()).or_default();
+                let key = self.key(&event)?;
+                let call = self.calls.entry(key.clone());
                 if let Some(arguments) = event["arguments"].as_str() {
                     call.arguments = arguments.to_string();
                 }
@@ -286,7 +347,7 @@ impl sse::Decoder for ResponsesDecoder {
                     call.name = name.to_string();
                 }
                 if let Some(call_id) = event["call_id"].as_str() {
-                    call.call_id = call_id.to_string();
+                    call.id = call_id.to_string();
                 }
                 if let Some(item) = self.emit_call(&key)? {
                     items.push(item);
@@ -295,42 +356,31 @@ impl sse::Decoder for ResponsesDecoder {
             "response.output_item.done" => {
                 let item = &event["item"];
                 if item["type"].as_str() == Some("function_call") {
-                    let key = item["id"]
-                        .as_str()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| Self::key(&event));
-                    self.calls
-                        .entry(key.clone())
-                        .or_insert_with(|| PendingCall {
-                            call_id: item["call_id"].as_str().unwrap_or_default().to_string(),
-                            name: item["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: item["arguments"].as_str().unwrap_or_default().to_string(),
-                        });
+                    let key = self.item_key(&event)?;
+                    self.calls.entry(key.clone()).apply_item(item, true);
                     if let Some(call) = self.emit_call(&key)? {
                         items.push(call);
                     }
                 }
             }
             "response.completed" => {
+                if !self.calls.is_empty() {
+                    return Err(ProtocolError::InvalidResponse(
+                        "Responses API completed with an unfinished tool call".to_string(),
+                    ));
+                }
                 let response = &event["response"];
                 let usage = response.get("usage").unwrap_or(&event["usage"]);
                 if !usage.is_null() {
-                    items.push(ModelEvent::Usage(Usage {
-                        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-                        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                        generation_ms: 0,
-                        estimated: false,
-                    }));
+                    items.push(ModelEvent::Usage(build_usage(
+                        usage["input_tokens"].as_u64().unwrap_or(0),
+                        usage["output_tokens"].as_u64().unwrap_or(0),
+                    )));
                 }
-                let reason = if response["incomplete_details"]["reason"].as_str()
-                    == Some("max_output_tokens")
-                {
-                    StopReason::MaxTokens
-                } else {
-                    StopReason::EndTurn
-                };
-                items.push(ModelEvent::Stop(reason));
-                finished = true;
+                items.push(ModelEvent::Stop(stop_reason(
+                    response["incomplete_details"]["reason"].as_str() == Some("max_output_tokens"),
+                )));
+                return Ok(sse::DecodeResult::finished(items));
             }
             "response.failed" => {
                 return Err(ProtocolError::InvalidResponse(
@@ -342,11 +392,7 @@ impl sse::Decoder for ResponsesDecoder {
             }
             _ => {}
         }
-        Ok(if finished {
-            sse::DecodeResult::finished(items)
-        } else {
-            sse::DecodeResult::continuing(items)
-        })
+        Ok(sse::DecodeResult::continuing(items))
     }
 }
 
@@ -354,7 +400,9 @@ impl sse::Decoder for ResponsesDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role};
+    use ash_core::{
+        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -401,6 +449,36 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_function_call_output_index_to_item_id() {
+        let mut decoder = ResponsesDecoder::default();
+        decoder
+            .decode(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}"#,
+            )
+            .unwrap();
+        decoder
+            .decode(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"Cargo.toml\"}"}"#,
+            )
+            .unwrap();
+        let items = decoder
+            .decode(
+                r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"Cargo.toml\"}"}"#,
+            )
+            .unwrap()
+            .into_items();
+
+        assert_eq!(
+            items,
+            vec![ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_1"),
+                name: "read".into(),
+                arguments: json!({"path": "Cargo.toml"}),
+            }]
+        );
+    }
+
+    #[test]
     fn emits_reasoning_summary_deltas_without_repeating_done_text() {
         let mut decoder = ResponsesDecoder::default();
         let delta = decoder
@@ -442,6 +520,41 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, sse::DecodeResult::Finished(_)));
+    }
+
+    #[test]
+    fn rejects_completed_response_with_an_unfinished_tool_call() {
+        let mut decoder = ResponsesDecoder::default();
+        decoder
+            .decode(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}"#,
+            )
+            .unwrap();
+
+        let result = decoder.decode(r#"{"type":"response.completed","response":{}}"#);
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn rejects_function_call_event_without_a_key() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result =
+            decoder.decode(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#);
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn rejects_completed_function_call_without_a_name() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result = decoder.decode(
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{}"}"#,
+        );
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use syntect::util::LinesWithEndings;
 
 /// Default display budget for a bash/tool output block.
 pub(crate) const TOOL_OUTPUT_MAX_LINES: usize = 5;
-/// Display budget when a tool block is expanded (`Ctrl+t`).
+/// Display budget when a tool block is expanded (`Ctrl+o`).
 pub(crate) const TOOL_OUTPUT_EXPANDED_MAX_LINES: usize = 50;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -84,18 +84,12 @@ pub(crate) fn highlight_bash_command(command: &str) -> Vec<Line<'static>> {
 ///   bold is kept.
 fn syntect_style(style: syntect::highlighting::Style) -> Style {
     const ANSI_ALPHA_DEFAULT: u8 = 0x01;
-    const OPAQUE_ALPHA: u8 = 0xFF;
 
     let mut ratatui_style = Style::default();
     let fg = style.foreground;
     if fg.a != ANSI_ALPHA_DEFAULT {
-        let color = if fg.a == OPAQUE_ALPHA {
-            Color::Rgb(fg.r, fg.g, fg.b)
-        } else {
-            // Non-ANSI alpha values in some bundled themes; treat as RGB.
-            Color::Rgb(fg.r, fg.g, fg.b)
-        };
-        ratatui_style = ratatui_style.fg(color);
+        // Non-ANSI alpha values in some bundled themes; treat as RGB.
+        ratatui_style = ratatui_style.fg(Color::Rgb(fg.r, fg.g, fg.b));
     }
     if style
         .font_style

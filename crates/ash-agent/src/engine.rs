@@ -8,6 +8,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::agent::RetryBackoff;
 #[cfg(test)]
 use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
 use crate::store::ThreadPersistence;
@@ -22,10 +23,17 @@ const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
 const AGENT_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the agent ...\n";
 
+#[derive(Clone)]
 struct PendingToolCall {
     id: ToolCallId,
     name: String,
     arguments: serde_json::Value,
+}
+
+/// What the turn loop should do after one model/tool step.
+enum Step {
+    More,
+    Done(StopReason),
 }
 
 struct CollectedResponse {
@@ -37,6 +45,7 @@ struct CollectedResponse {
 enum ResponseOutcome {
     Finished(StopReason),
     ToolCalls(Vec<PendingToolCall>),
+    Cancelled,
     Failed(ash_core::ProtocolError),
 }
 
@@ -68,6 +77,7 @@ struct AgentTurnRunner<'config, 'store> {
     model: &'config dyn ModelClient,
     persistence: Option<&'store mut ThreadPersistence>,
     steering: mpsc::UnboundedReceiver<Input>,
+    ephemeral_context: Vec<Message>,
     tool_defs: Vec<ToolDefinition>,
 }
 
@@ -82,6 +92,7 @@ pub(crate) struct TurnExecution {
     tx: mpsc::Sender<EventKind>,
     cancel: CancellationToken,
     steering: mpsc::UnboundedReceiver<Input>,
+    ephemeral_context: Vec<Message>,
 }
 
 impl ExecutionIds {
@@ -97,12 +108,14 @@ impl TurnExecution {
         tx: mpsc::Sender<EventKind>,
         cancel: CancellationToken,
         steering: mpsc::UnboundedReceiver<Input>,
+        ephemeral_context: Vec<Message>,
     ) -> Self {
         Self {
             ids: ExecutionIds::new(thread_id, turn_id),
             tx,
             cancel,
             steering,
+            ephemeral_context,
         }
     }
 }
@@ -152,6 +165,7 @@ pub(crate) async fn compact_with_adapter(
                 model: config.model.clone(),
                 system_prompt: config.system_prompt.clone(),
                 messages: messages.to_vec(),
+                ephemeral_context: Vec::new(),
                 tools,
                 max_context_tokens: config.max_context_tokens,
             },
@@ -200,7 +214,7 @@ async fn run_with_adapter(
     persistence: Option<&mut ThreadPersistence>,
 ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     let (_, steering) = mpsc::unbounded_channel();
-    let execution = TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering);
+    let execution = TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering, Vec::new());
     run_agent_turn_inner(model, config, messages, execution, persistence).await
 }
 
@@ -220,6 +234,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             model,
             persistence,
             steering: execution.steering,
+            ephemeral_context: execution.ephemeral_context,
             tool_defs,
         }
     }
@@ -234,10 +249,37 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 return Ok((StopReason::Aborted, turn_usage));
             }
             debug!(turn = turn + 1, "calling LLM");
+            if let Step::Done(reason) = self.step(messages, &mut turn_usage).await? {
+                return Ok((reason, turn_usage));
+            }
+        }
 
+        Ok((StopReason::MaxTurns, turn_usage))
+    }
+
+    /// Run one model call plus its follow-up work (tool execution, steering).
+    /// Returns `Step::More` to continue the turn or `Step::Done` to stop it.
+    ///
+    /// Safe failures (network errors, upstream 5xx, rate limits, truncated
+    /// streams) are retried up to `config.max_retries` times. A retry is only
+    /// taken before any tool call was executed: the partial output is
+    /// discarded (both from memory and from the staged log) and the identical
+    /// request is re-issued, so retries never repeat side effects.
+    async fn step(
+        &mut self,
+        messages: &mut Vec<Message>,
+        turn_usage: &mut Option<Usage>,
+    ) -> Result<Step, ash_core::AshError> {
+        let mut retries = 0u32;
+        loop {
+            let pending_base = self.persistence.as_ref().map(|p| p.pending_len());
             let estimated_input_tokens = self.prepare_context(messages).await?;
+            // Snapshot after context preparation (compaction may have
+            // reshaped `messages`); truncating to this length on retry
+            // removes only the partial assistant message pushed below.
+            let rollback_messages_len = messages.len();
 
-            let request_messages = messages.clone();
+            let request_messages = self.request_messages(messages);
             let request_started = Instant::now();
             let mut stream = self.model.stream(ModelRequest {
                 model: self.config.model.clone(),
@@ -251,6 +293,40 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 usage,
                 outcome,
             } = collect_response(&mut stream, &self.tx, &self.cancel, request_started).await;
+
+            // Retry only safe, retryable failures before any side effect.
+            // A truncated stream produced no terminal marker from the
+            // provider; without tool calls the request is idempotent, so
+            // re-issuing it is safe. Other failures retry only when the
+            // transport itself is the likely culprit.
+            let retry = match &outcome {
+                ResponseOutcome::Failed(error) => retryable(error),
+                ResponseOutcome::Finished(StopReason::Truncated) => true,
+                _ => false,
+            };
+            if retry && retries < self.config.max_retries {
+                let backoff = self.config.retry_backoff;
+                let delay = retry_delay(retries, backoff);
+                debug!(
+                    retries,
+                    ?delay,
+                    "retrying model call after retryable failure"
+                );
+                tokio::select! {
+                    // A cancellation during the backoff aborts the turn.
+                    _ = self.cancel.cancelled() => return Ok(Step::Done(StopReason::Aborted)),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                retries += 1;
+                if let Some(base) = pending_base {
+                    if let Some(persistence) = self.persistence.as_deref_mut() {
+                        persistence.rollback_to(base);
+                    }
+                }
+                messages.truncate(rollback_messages_len);
+                continue;
+            }
+
             let estimated_output_tokens = message
                 .as_ref()
                 .map(count_output_tokens)
@@ -260,9 +336,14 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
                 estimated_output_tokens,
             );
-            turn_usage = Some(match turn_usage {
+            *turn_usage = Some(match *turn_usage {
                 Some(acc) => Usage {
-                    input_tokens: acc.input_tokens.saturating_add(call_usage.input_tokens),
+                    // The API reports the full model input (system prompt,
+                    // tools, and history) per request, so later calls in a
+                    // turn already include earlier ones. Take the latest
+                    // snapshot instead of summing deltas; output tokens are
+                    // per-call increments and do accumulate across the turn.
+                    input_tokens: acc.input_tokens.max(call_usage.input_tokens),
                     output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
                     generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
                     estimated: acc.estimated || call_usage.estimated,
@@ -274,26 +355,29 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 messages.push(message);
             }
 
-            let mut stop_reason = None;
-            match outcome {
-                ResponseOutcome::Finished(reason) => stop_reason = Some(reason),
-                ResponseOutcome::Failed(error) => return Err(error.into()),
+            return match outcome {
+                ResponseOutcome::Failed(error) => Err(error.into()),
+                ResponseOutcome::Cancelled => {
+                    // Drain steering so queued input is not lost, then abort.
+                    let _ = self.apply_steering(messages).await?;
+                    Ok(Step::Done(StopReason::Aborted))
+                }
                 ResponseOutcome::ToolCalls(calls) => {
                     self.execute_tool_calls(messages, calls).await?;
                     if self.cancel.is_cancelled() {
-                        return Ok((StopReason::Aborted, turn_usage));
+                        return Ok(Step::Done(StopReason::Aborted));
                     }
+                    let _ = self.apply_steering(messages).await?;
+                    Ok(Step::More)
                 }
-            }
-            let has_steering = self.apply_steering(messages).await?;
-            if let Some(reason) = stop_reason {
-                if !has_steering {
-                    return Ok((reason, turn_usage));
+                ResponseOutcome::Finished(reason) => {
+                    if self.apply_steering(messages).await? {
+                        return Ok(Step::More);
+                    }
+                    Ok(Step::Done(reason))
                 }
-            }
+            };
         }
-
-        Ok((StopReason::MaxTurns, turn_usage))
     }
 
     async fn prepare_context(
@@ -308,6 +392,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     model: self.config.model.clone(),
                     system_prompt: self.config.system_prompt.clone(),
                     messages: std::mem::take(messages),
+                    ephemeral_context: std::mem::take(&mut self.ephemeral_context),
                     tools: self.tool_defs.clone(),
                     max_context_tokens: self.config.max_context_tokens,
                 },
@@ -318,11 +403,12 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         let estimated_input_tokens = prepared.estimated_input_tokens;
         let update = prepared.update;
         *messages = prepared.messages;
+        self.ephemeral_context = prepared.ephemeral_context;
         let Some(update) = update else {
             return Ok(estimated_input_tokens);
         };
         if let Some(persistence) = self.persistence.as_deref_mut() {
-            persistence.append(
+            persistence.stage(
                 &[LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
                     messages,
                 )?)],
@@ -343,7 +429,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
         match self.persistence.as_deref_mut() {
             Some(persistence) => {
-                persistence.append(&[LogEntry::Message(message.clone())]);
+                persistence.stage(&[LogEntry::Message(message.clone())]);
                 Ok(())
             }
             None => Ok(()),
@@ -376,7 +462,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     })
                 })
                 .collect::<Vec<_>>();
-            persistence.append(&records);
+            persistence.stage(&records);
         }
         messages.extend(accepted.into_iter().map(|(_, message)| message));
         Ok(true)
@@ -400,9 +486,15 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 self.execute_tool(messages, &call.name, call.arguments.clone())
                     .await,
             );
-            let (output, is_error) = match &result {
-                Ok(output) => (output.text.clone(), false),
-                Err(error) => (error.to_string(), true),
+            let (output, is_error, result, attachments) = match result {
+                Ok(output) => {
+                    let text = output.text;
+                    (text.clone(), false, Ok(text), output.attachments)
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    (text.clone(), true, Err(text), Vec::new())
+                }
             };
             let _ = self
                 .tx
@@ -414,10 +506,6 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     is_error,
                 }))
                 .await;
-            let (result, attachments) = match result {
-                Ok(output) => (Ok(output.text), output.attachments),
-                Err(error) => (Err(error.to_string()), Vec::new()),
-            };
             let message = Message {
                 id: ash_core::MessageId::new(),
                 role: Role::User,
@@ -453,7 +541,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     .tree_id
                     .unwrap_or_else(|| self.ids.thread_id.into()),
                 path: self.config.agent_path.clone(),
-                messages: messages.to_vec(),
+                messages: self.request_messages(messages),
             },
         };
 
@@ -464,6 +552,13 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 tool.execute(context, arguments),
             ) => result.unwrap_or(Err(ToolError::Timeout(self.config.max_tool_duration)))
         }
+    }
+
+    fn request_messages(&self, messages: &[Message]) -> Vec<Message> {
+        let mut request = Vec::with_capacity(messages.len() + self.ephemeral_context.len());
+        request.extend_from_slice(messages);
+        request.extend_from_slice(&self.ephemeral_context);
+        request
     }
 }
 
@@ -476,6 +571,7 @@ async fn collect_response(
     let mut blocks = Vec::new();
     let mut thought_started_at = None;
     let mut stop_reason = StopReason::EndTurn;
+    let mut saw_stop = false;
     let mut usage = UsageAccumulator::default();
     let mut first_output_at = None;
 
@@ -533,10 +629,21 @@ async fn collect_response(
             ModelEvent::Usage(reported) => {
                 usage.record(reported.input_tokens, reported.output_tokens)
             }
-            ModelEvent::Stop(reason) => stop_reason = reason,
+            ModelEvent::Stop(reason) => {
+                saw_stop = true;
+                stop_reason = reason;
+            }
         }
     };
     finish_open_thought(&mut blocks, &mut thought_started_at);
+
+    // Defense in depth for truncated streams: the protocol adapters emit
+    // `Stop(Truncated)` when a stream ends without a terminal marker, but any
+    // stream that simply runs out without ever signalling a stop is treated
+    // as truncated here rather than as a clean `EndTurn`.
+    if matches!(stream_exit, StreamExit::Exhausted) && !saw_stop {
+        stop_reason = StopReason::Truncated;
+    }
 
     let calls: Vec<PendingToolCall> = blocks
         .iter()
@@ -558,12 +665,7 @@ async fn collect_response(
         role: Role::Assistant,
         content: MessageContent::Assistant(blocks),
     });
-    let outcome = match stream_exit {
-        StreamExit::Failed(error) => ResponseOutcome::Failed(error),
-        _ if !calls.is_empty() => ResponseOutcome::ToolCalls(calls),
-        StreamExit::Cancelled => ResponseOutcome::Finished(StopReason::Aborted),
-        StreamExit::Exhausted => ResponseOutcome::Finished(stop_reason),
-    };
+    let outcome = response_action(stream_exit, calls, stop_reason);
 
     CollectedResponse {
         message,
@@ -579,6 +681,47 @@ async fn collect_response(
         },
         outcome,
     }
+}
+
+/// Map a stream exit plus any accumulated tool calls to the turn outcome.
+/// Priority is explicit: stream failure > pending tool calls > cancellation >
+/// normal stop. A cancellation that raced with tool calls still executes the
+/// calls (the model already asked for them); the call results are what the
+/// next step runs on.
+fn response_action(
+    stream_exit: StreamExit,
+    calls: Vec<PendingToolCall>,
+    stop_reason: StopReason,
+) -> ResponseOutcome {
+    match (stream_exit, calls.is_empty()) {
+        (StreamExit::Failed(error), _) => ResponseOutcome::Failed(error),
+        (_, false) => ResponseOutcome::ToolCalls(calls),
+        (StreamExit::Cancelled, true) => ResponseOutcome::Cancelled,
+        (StreamExit::Exhausted, true) => ResponseOutcome::Finished(stop_reason),
+    }
+}
+
+/// Error classification for the retry path. Only transport-level failures are
+/// retried: request/network errors, upstream 5xx, and rate limits. Auth,
+/// request-shaping, and response-shaping errors are never retried because
+/// re-issuing them cannot succeed.
+fn retryable(error: &ash_core::ProtocolError) -> bool {
+    matches!(
+        error,
+        ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited { .. }
+    ) || matches!(
+        error,
+        ash_core::ProtocolError::Upstream { status, .. } if *status >= 500
+    )
+}
+
+/// Exponential backoff for the `attempt`-th retry (0-based): `base * 2^attempt`,
+/// capped at `max`.
+fn retry_delay(attempt: u32, backoff: RetryBackoff) -> std::time::Duration {
+    let base_ms = u64::try_from(backoff.base.as_millis()).unwrap_or(u64::MAX);
+    let max_ms = u64::try_from(backoff.max.as_millis()).unwrap_or(u64::MAX);
+    let millis = base_ms.saturating_mul(1u64 << attempt.min(20)).min(max_ms);
+    std::time::Duration::from_millis(millis)
 }
 
 fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
@@ -688,6 +831,16 @@ mod tests {
         }
     }
 
+    /// A client whose stream fails immediately with a fixed protocol error.
+    struct FailingAdapter(ash_core::ProtocolError);
+
+    impl ModelClient for FailingAdapter {
+        fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+            let error = self.0.clone();
+            Ok(Box::pin(futures::stream::iter(vec![Err(error)])))
+        }
+    }
+
     struct EchoTool;
 
     #[async_trait::async_trait]
@@ -777,7 +930,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("use a tool")];
         let directory = TempDir::new().unwrap();
@@ -796,7 +952,7 @@ mod tests {
         )
         .await
         .unwrap();
-        persistence.flush().await.unwrap();
+        persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
         assert_eq!(requests.lock().unwrap()[1].messages.len(), 3);
@@ -840,7 +996,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![
             Message::user(&format!("old request {}", "x".repeat(10_000))),
@@ -866,7 +1025,7 @@ mod tests {
         )
         .await
         .unwrap();
-        persistence.flush().await.unwrap();
+        persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
         let stored = load_thread(&store, thread_id).await;
@@ -905,6 +1064,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_compaction_never_persists_ephemeral_context() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([
+                vec![
+                    ModelEvent::Text("condensed facts".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+                vec![
+                    ModelEvent::Text("done".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+            ])),
+            requests: requests.clone(),
+        };
+        let config = RunConfig {
+            system_prompt: Some("system".to_string()),
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 1_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        };
+        let mut messages = vec![
+            Message::user(&format!("old request {}", "x".repeat(10_000))),
+            Message::assistant_text("old answer"),
+            Message::user("recent one"),
+            Message::assistant_text("answer one"),
+            Message::user("recent two"),
+            Message::assistant_text("answer two"),
+        ];
+        let ephemeral = Message::system("turn-only extension context");
+        let ephemeral_id = ephemeral.id;
+        let directory = TempDir::new().unwrap();
+        let (thread_id, store, mut persistence) =
+            persisted_thread(directory.path(), &messages).await;
+        let (tx, _rx) = mpsc::channel(16);
+        let (_, steering) = mpsc::unbounded_channel();
+        let execution = TurnExecution::new(
+            thread_id,
+            TurnId::new(),
+            tx,
+            CancellationToken::new(),
+            steering,
+            vec![ephemeral],
+        );
+
+        let (reason, _) = run_agent_turn_inner(
+            &adapter,
+            &config,
+            &mut messages,
+            execution,
+            Some(&mut persistence),
+        )
+        .await
+        .unwrap();
+        persistence.commit().await.unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[0]
+                .messages
+                .iter()
+                .any(|message| message.id == ephemeral_id));
+            assert!(requests[1]
+                .messages
+                .iter()
+                .any(|message| message.id == ephemeral_id));
+        }
+        let stored = load_thread(&store, thread_id).await;
+        assert!(!stored
+            .log
+            .model_context()
+            .iter()
+            .any(|message| message.id == ephemeral_id));
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_rejects_a_stream_without_a_clean_stop() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![ModelEvent::Text(
+                "partial summary".into(),
+            )]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 1_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        };
+        let mut messages = vec![
+            Message::user(&format!("old request {}", "x".repeat(10_000))),
+            Message::assistant_text("old answer"),
+            Message::user("recent"),
+        ];
+        let (tx, _rx) = mpsc::channel(4);
+
+        let error = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("without a terminal marker"));
+    }
+
+    #[tokio::test]
     async fn prunes_large_old_tool_outputs_before_full_compaction() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
@@ -925,7 +1218,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = Vec::new();
         for turn in 0..7 {
@@ -1016,7 +1312,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let (tx, _rx) = mpsc::channel(8);
@@ -1037,6 +1336,79 @@ mod tests {
         let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 25);
+        assert!(!usage.estimated);
+    }
+
+    #[tokio::test]
+    async fn multi_call_turn_keeps_the_latest_input_snapshot_and_sums_output() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([
+                vec![
+                    ModelEvent::Usage(Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        generation_ms: 0,
+                        estimated: false,
+                    }),
+                    ModelEvent::ToolCall {
+                        id: ToolCallId::from_provider("call_1"),
+                        name: "echo".into(),
+                        arguments: serde_json::json!({"value": "hello"}),
+                    },
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+                vec![
+                    ModelEvent::Usage(Usage {
+                        input_tokens: 130,
+                        output_tokens: 5,
+                        generation_ms: 0,
+                        estimated: false,
+                    }),
+                    ModelEvent::Text("done".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: vec![Arc::new(EchoTool)],
+            model: ModelId::new("test-model"),
+            max_turns: 4,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        };
+        let mut messages = vec![Message::user("use a tool")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, usage) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        let usage = usage.unwrap();
+        // The API reports the full input per request: the second call (130)
+        // already includes the first call's context, so the turn keeps the
+        // latest snapshot instead of summing to 230. Output is incremental
+        // and sums to 15.
+        assert_eq!(usage.input_tokens, 130);
+        assert_eq!(usage.output_tokens, 15);
         assert!(!usage.estimated);
     }
 
@@ -1083,7 +1455,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
@@ -1102,7 +1477,7 @@ mod tests {
         )
         .await
         .unwrap();
-        persistence.flush().await.unwrap();
+        persistence.commit().await.unwrap();
 
         assert!(matches!(
             &messages[1].content,
@@ -1141,7 +1516,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let (tx, mut rx) = mpsc::channel(8);
@@ -1205,7 +1583,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
@@ -1224,7 +1605,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        persistence.flush().await.unwrap();
+        persistence.commit().await.unwrap();
 
         assert!(matches!(error, ash_core::AshError::Protocol(_)));
         assert!(matches!(
@@ -1238,6 +1619,213 @@ mod tests {
         let persisted = serde_json::to_string(&load_thread(&store, thread_id).await.log).unwrap();
         assert!(persisted.contains("checking"));
         assert!(persisted.contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_retried_and_partial_output_discarded() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let adapter = MockAdapter {
+            // First call: the provider cuts the stream mid-response (text
+            // without any `Stop`). Second call: clean finish.
+            responses: Mutex::new(VecDeque::from([
+                vec![ModelEvent::Text("partial thought".into())],
+                vec![
+                    ModelEvent::Text("complete".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+            ])),
+            requests: requests.clone(),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 1,
+            retry_backoff: RetryBackoff {
+                base: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+            },
+        };
+        let mut messages = vec![Message::user("question")];
+        let directory = TempDir::new().unwrap();
+        let (thread_id, store, mut persistence) =
+            persisted_thread(directory.path(), &messages).await;
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, _usage) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            thread_id,
+            &adapter,
+            Some(&mut persistence),
+        )
+        .await
+        .unwrap();
+        persistence.commit().await.unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        // The partial output must not survive the retry, neither in memory
+        // nor in the staged/committed log.
+        assert!(messages.iter().all(|message| {
+            !matches!(
+                &message.content,
+                MessageContent::Assistant(blocks)
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.contains("partial")))
+            )
+        }));
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "complete")
+        ));
+        let persisted = serde_json::to_string(&load_thread(&store, thread_id).await.log).unwrap();
+        assert!(!persisted.contains("partial thought"));
+        assert!(persisted.contains("complete"));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_exhausts_retries_and_reports_truncated() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([
+                vec![ModelEvent::Text("still cut".into())],
+                vec![ModelEvent::Text("cut again".into())],
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 1,
+            retry_backoff: RetryBackoff {
+                base: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+            },
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, _usage) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::Truncated);
+        // The final (also truncated) attempt is kept so the user sees what
+        // the provider returned before the retry budget ran out.
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Assistant(blocks)
+                if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "cut again")
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_retried_but_shaping_errors_are_not() {
+        // Rate limit: retried, then succeeds.
+        struct RateLimitThenOk {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+        impl ModelClient for RateLimitThenOk {
+            fn stream(&self, req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+                self.requests.lock().unwrap().push(req);
+                let calls = self.requests.lock().unwrap().len();
+                let items: Vec<Result<ModelEvent, ash_core::ProtocolError>> = if calls == 1 {
+                    vec![Err(ash_core::ProtocolError::RateLimited {
+                        retry_after: None,
+                    })]
+                } else {
+                    vec![
+                        Ok(ModelEvent::Text("ok".into())),
+                        Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(items)))
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let adapter = RateLimitThenOk {
+            requests: requests.clone(),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 1,
+            retry_backoff: RetryBackoff {
+                base: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+            },
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, _rx) = mpsc::channel(8);
+        let (reason, _) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        // Invalid response (a shaping error): never retried.
+        let adapter = FailingAdapter(ash_core::ProtocolError::InvalidResponse("bad json".into()));
+        let (tx, _rx) = mpsc::channel(8);
+        let error = run_with_adapter(
+            &config,
+            &mut vec![Message::user("question")],
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ash_core::AshError::Protocol(_)));
     }
 
     #[tokio::test]
@@ -1264,7 +1852,10 @@ mod tests {
             max_tool_duration: Duration::from_secs(30),
             agent_path: "/root".to_string(),
             tree_id: None,
+            kind: crate::ThreadKind::Root,
             metadata: serde_json::Map::new(),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("use a tool")];
         let (tx, mut rx) = mpsc::channel(8);
@@ -1310,6 +1901,40 @@ mod tests {
     }
 
     #[test]
+    fn response_action_prioritizes_failure_then_tool_calls_then_cancellation() {
+        let call = PendingToolCall {
+            id: ToolCallId::from_provider("call_1"),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let failed = || StreamExit::Failed(ash_core::ProtocolError::InvalidResponse("boom".into()));
+        let stop = StopReason::EndTurn;
+
+        assert!(matches!(
+            response_action(StreamExit::Exhausted, Vec::new(), stop.clone()),
+            ResponseOutcome::Finished(StopReason::EndTurn)
+        ));
+        assert!(matches!(
+            response_action(StreamExit::Cancelled, Vec::new(), stop.clone()),
+            ResponseOutcome::Cancelled
+        ));
+        // Tool calls beat cancellation: the model already asked for them.
+        assert!(matches!(
+            response_action(StreamExit::Cancelled, vec![call.clone()], stop.clone()),
+            ResponseOutcome::ToolCalls(_)
+        ));
+        // Stream failure beats everything, even pending tool calls.
+        assert!(matches!(
+            response_action(failed(), vec![call.clone()], stop.clone()),
+            ResponseOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            response_action(failed(), Vec::new(), stop),
+            ResponseOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
     fn truncates_large_tool_output_without_splitting_utf8() {
         let output = "你".repeat(MAX_AGENT_OUTPUT_BYTES);
         let truncated = limit_tool_output(output);
@@ -1317,5 +1942,91 @@ mod tests {
         assert!(truncated.len() <= MAX_AGENT_OUTPUT_BYTES);
         assert!(truncated.contains("tool output truncated"));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_and_caps_at_max() {
+        let backoff = RetryBackoff {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(10),
+        };
+        assert_eq!(retry_delay(0, backoff), Duration::from_secs(1));
+        assert_eq!(retry_delay(1, backoff), Duration::from_secs(2));
+        assert_eq!(retry_delay(2, backoff), Duration::from_secs(4));
+        assert_eq!(retry_delay(3, backoff), Duration::from_secs(8));
+        // 16s would exceed the cap; clamped to 10s.
+        assert_eq!(retry_delay(4, backoff), Duration::from_secs(10));
+        assert_eq!(retry_delay(9, backoff), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_backoff_aborts_the_turn() {
+        // Every call truncates; with a long backoff the cancellation lands
+        // while the runner is waiting between attempts.
+        struct AlwaysTruncated(Arc<Mutex<Vec<ModelRequest>>>);
+        impl ModelClient for AlwaysTruncated {
+            fn stream(&self, req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+                self.0.lock().unwrap().push(req);
+                Ok(Box::pin(futures::stream::iter(vec![Ok(ModelEvent::Text(
+                    "cut".into(),
+                ))])))
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let adapter = AlwaysTruncated(requests.clone());
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            metadata: serde_json::Map::new(),
+            max_retries: 5,
+            retry_backoff: RetryBackoff {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let turn = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            cancel.clone(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        );
+        tokio::pin!(turn);
+
+        // Let the first truncated call settle and enter the 1s backoff, then
+        // cancel. The wait must abort instead of retrying. Poll the turn
+        // concurrently so the model call can actually run.
+        let wait_for_first_call = async {
+            loop {
+                if !requests.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            _ = wait_for_first_call => {}
+            result = &mut turn => panic!("turn ended before the first call: {result:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let (reason, _) = (&mut turn).await.unwrap();
+
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }

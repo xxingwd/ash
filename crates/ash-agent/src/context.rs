@@ -64,6 +64,12 @@ pub(crate) struct CompactionPlan {
     pub(crate) compacted_messages: usize,
 }
 
+#[derive(Default)]
+struct CompactionHistory {
+    previous_summary: Option<String>,
+    messages: Vec<Message>,
+}
+
 pub fn estimate_tokens(input: &str) -> usize {
     estimate_character_count(character_units(input))
 }
@@ -133,7 +139,7 @@ pub(crate) fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
         if extract_summary(message).is_some() {
             break;
         }
-        if message.role == Role::User && matches!(&message.content, MessageContent::User(_)) {
+        if message.is_user_turn() {
             turns = turns.saturating_add(1);
         }
         if turns < DEFAULT_TAIL_TURNS {
@@ -194,33 +200,11 @@ pub(crate) fn plan_compaction(
     messages: &[Message],
     max_context_tokens: usize,
 ) -> Option<CompactionPlan> {
-    let mut previous_summary = None;
-    let history = messages
-        .iter()
-        .filter_map(|message| {
-            if let Some(summary) = extract_summary(message) {
-                previous_summary = Some(summary.to_string());
-                None
-            } else {
-                Some(message.clone())
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let turns = user_turns(&history);
-    let recent_budget = preserve_recent_budget(max_context_tokens);
-    let mut used = 0usize;
-    let mut tail_start = None;
-    for (position, (start, end)) in turns.iter().rev().take(DEFAULT_TAIL_TURNS).enumerate() {
-        let turn_tokens = count_tokens(&history[*start..*end]);
-        if position > 0 && used.saturating_add(turn_tokens) > recent_budget {
-            break;
-        }
-        used = used.saturating_add(turn_tokens);
-        tail_start = Some(*start);
-    }
-
-    let split = tail_start.unwrap_or(history.len());
+    let CompactionHistory {
+        previous_summary,
+        messages: history,
+    } = compaction_history(messages);
+    let split = recent_tail_start(&history, max_context_tokens);
     let head = &history[..split];
     if head.is_empty() {
         return None;
@@ -237,6 +221,38 @@ pub(crate) fn plan_compaction(
         tail: history[split..].to_vec(),
         compacted_messages: head.len(),
     })
+}
+
+fn compaction_history(messages: &[Message]) -> CompactionHistory {
+    messages
+        .iter()
+        .fold(CompactionHistory::default(), |mut history, message| {
+            if let Some(summary) = extract_summary(message) {
+                history.previous_summary = Some(summary.to_string());
+            } else {
+                history.messages.push(message.clone());
+            }
+            history
+        })
+}
+
+fn recent_tail_start(messages: &[Message], max_context_tokens: usize) -> usize {
+    let recent_budget = preserve_recent_budget(max_context_tokens);
+    let mut recent_turns = user_turns(messages).into_iter().rev();
+    let Some((latest_start, latest_end)) = recent_turns.next() else {
+        return messages.len();
+    };
+    let mut used = count_tokens(&messages[latest_start..latest_end]);
+    let mut tail_start = latest_start;
+    for (start, end) in recent_turns.take(DEFAULT_TAIL_TURNS.saturating_sub(1)) {
+        let turn_tokens = count_tokens(&messages[start..end]);
+        if used.saturating_add(turn_tokens) > recent_budget {
+            break;
+        }
+        used = used.saturating_add(turn_tokens);
+        tail_start = start;
+    }
+    tail_start
 }
 
 pub(crate) fn apply_summary(summary: &str, tail: Vec<Message>) -> Vec<Message> {
@@ -269,10 +285,7 @@ fn user_turns(messages: &[Message]) -> Vec<(usize, usize)> {
     let mut turns = messages
         .iter()
         .enumerate()
-        .filter_map(|(index, message)| {
-            (message.role == Role::User && matches!(&message.content, MessageContent::User(_)))
-                .then_some((index, messages.len()))
-        })
+        .filter_map(|(index, message)| message.is_user_turn().then_some((index, messages.len())))
         .collect::<Vec<_>>();
     for index in 0..turns.len().saturating_sub(1) {
         turns[index].1 = turns[index + 1].0;

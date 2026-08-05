@@ -55,15 +55,7 @@ fn parse_url(input: &str) -> Result<Url, ToolError> {
 
 fn parse_timeout(seconds: Option<f64>, framework_limit: Duration) -> Result<Duration, ToolError> {
     let requested = match seconds {
-        Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
-            Duration::try_from_secs_f64(seconds)
-                .map_err(|_| ToolError::Execution("timeout is too large".into()))?
-        }
-        Some(_) => {
-            return Err(ToolError::Execution(
-                "timeout must be a positive finite number of seconds".into(),
-            ));
-        }
+        Some(seconds) => crate::timeout::parse_positive_seconds(seconds)?,
         None => DEFAULT_TIMEOUT,
     };
     if requested > MAX_TIMEOUT {

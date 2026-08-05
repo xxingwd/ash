@@ -1,6 +1,6 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use ash_agent::{Agent, Input, InputSource, Runtime, Thread, ThreadOptions};
+use ash_agent::{Agent, Input, InputSource, Runtime, Thread, ThreadKind, ThreadOptions};
 use ash_core::{
     define_tool, CancellationToken, ContentBlock, Message, MessageContent, StopReason,
     SubagentSnapshot, SubagentState, ThreadId, Tool, ToolContext, ToolError, TreeId,
@@ -110,7 +110,8 @@ impl AgentSpawner for InheritedAgentSpawner {
             tool_timeout: self.scope.tool_timeout,
             path: request.task_name,
             tree_id: Some(request.tree_id),
-            metadata: subagent_metadata(&self.scope.metadata),
+            kind: ThreadKind::Subagent,
+            metadata: self.scope.metadata.clone(),
         };
         Ok(ChildAgent {
             runtime: self.runtime.clone(),
@@ -119,16 +120,6 @@ impl AgentSpawner for InheritedAgentSpawner {
             history: request.messages,
         })
     }
-}
-
-/// Stamp the child thread with the `kind=subagent` marker so its persisted
-/// record stays hidden from the session list and cannot be resumed.
-fn subagent_metadata(
-    base: &serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut metadata = base.clone();
-    metadata.insert("kind".to_string(), serde_json::json!("subagent"));
-    metadata
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -186,7 +177,7 @@ struct ControlInner {
     state: Mutex<ControlState>,
     updates: Notify,
     max_concurrent_children: Option<usize>,
-    spawner: Option<Arc<dyn AgentSpawner>>,
+    spawner: Arc<dyn AgentSpawner>,
     subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
 }
 
@@ -233,6 +224,9 @@ struct ChildRecord {
     task_name: String,
     role: AgentRole,
     state: ChildState,
+    /// Follow-up turns accepted by the controller but not yet settled. This
+    /// includes the currently running follow-up, if any.
+    pending_followups: usize,
     completion_revision: Option<u64>,
     last_task_message: String,
     command_tx: mpsc::Sender<ChildCommand>,
@@ -241,7 +235,6 @@ struct ChildRecord {
 enum ChildState {
     Pending,
     Running(CancellationToken),
-    RunningThenPending(CancellationToken),
     Completed(Option<String>),
     Interrupted(Option<String>),
     Errored {
@@ -254,7 +247,7 @@ impl ChildState {
     fn status(&self) -> AgentStatus {
         match self {
             Self::Pending => AgentStatus::Pending,
-            Self::Running(_) | Self::RunningThenPending(_) => AgentStatus::Running,
+            Self::Running(_) => AgentStatus::Running,
             Self::Completed(_) => AgentStatus::Completed,
             Self::Interrupted(_) => AgentStatus::Interrupted,
             Self::Errored { .. } => AgentStatus::Errored,
@@ -262,17 +255,14 @@ impl ChildState {
     }
 
     fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending | Self::Running(_) | Self::RunningThenPending(_)
-        )
+        matches!(self, Self::Pending | Self::Running(_))
     }
 
     fn final_message(&self) -> Option<&str> {
         match self {
             Self::Completed(message) | Self::Interrupted(message) => message.as_deref(),
             Self::Errored { final_message, .. } => final_message.as_deref(),
-            Self::Pending | Self::Running(_) | Self::RunningThenPending(_) => None,
+            Self::Pending | Self::Running(_) => None,
         }
     }
 
@@ -285,31 +275,8 @@ impl ChildState {
 
     fn cancel(&self) -> Option<CancellationToken> {
         match self {
-            Self::Running(cancel) | Self::RunningThenPending(cancel) => Some(cancel.clone()),
+            Self::Running(cancel) => Some(cancel.clone()),
             _ => None,
-        }
-    }
-
-    fn queue_followup(&mut self) {
-        let current = std::mem::replace(self, Self::Pending);
-        *self = match current {
-            Self::Running(cancel) | Self::RunningThenPending(cancel) => {
-                Self::RunningThenPending(cancel)
-            }
-            Self::Pending | Self::Completed(_) | Self::Interrupted(_) | Self::Errored { .. } => {
-                Self::Pending
-            }
-        };
-    }
-
-    fn finish_turn(self, completed: Self) -> Self {
-        match self {
-            Self::RunningThenPending(_) => Self::Pending,
-            Self::Running(_)
-            | Self::Pending
-            | Self::Completed(_)
-            | Self::Interrupted(_)
-            | Self::Errored { .. } => completed,
         }
     }
 }
@@ -331,8 +298,28 @@ impl ChildRecord {
         self.last_task_message.clear();
         self.last_task_message.push_str(message);
         if delivery == MessageDelivery::Followup {
-            self.state.queue_followup();
+            self.pending_followups = self.pending_followups.saturating_add(1);
+            if !matches!(self.state, ChildState::Running(_)) {
+                self.state = ChildState::Pending;
+            }
             self.completion_revision = None;
+        }
+    }
+
+    /// Settle one turn and report whether the agent is now terminal. A queued
+    /// follow-up keeps the record pending until every accepted follow-up has
+    /// finished, so waiters never observe an intermediate completion.
+    fn finish_turn(&mut self, completed: ChildState, was_followup: bool) -> bool {
+        if was_followup {
+            debug_assert!(self.pending_followups > 0);
+            self.pending_followups = self.pending_followups.saturating_sub(1);
+        }
+        if self.pending_followups == 0 {
+            self.state = completed;
+            true
+        } else {
+            self.state = ChildState::Pending;
+            false
         }
     }
 }
@@ -391,10 +378,16 @@ impl ControlState {
             .map_or_else(WaitSnapshot::empty, |session| session.wait_snapshot(waiter))
     }
 
-    fn finish_turn(&mut self, tree_id: TreeId, agent_id: ThreadId, completed: ChildState) -> bool {
+    fn finish_turn(
+        &mut self,
+        tree_id: TreeId,
+        agent_id: ThreadId,
+        completed: ChildState,
+        was_followup: bool,
+    ) -> bool {
         self.threads
             .get_mut(&tree_id)
-            .is_some_and(|session| session.finish_turn(agent_id, completed))
+            .is_some_and(|session| session.finish_turn(agent_id, completed, was_followup))
     }
 }
 
@@ -430,13 +423,16 @@ impl ChildSession {
         }
     }
 
-    fn finish_turn(&mut self, agent_id: ThreadId, completed: ChildState) -> bool {
+    fn finish_turn(
+        &mut self,
+        agent_id: ThreadId,
+        completed: ChildState,
+        was_followup: bool,
+    ) -> bool {
         let Some(record) = self.agents.get_mut(&agent_id) else {
             return false;
         };
-        let current = std::mem::replace(&mut record.state, ChildState::Pending);
-        record.state = current.finish_turn(completed);
-        if !record.state.is_active() {
+        if record.finish_turn(completed, was_followup) {
             self.next_completion_revision = self.next_completion_revision.saturating_add(1);
             record.completion_revision = Some(self.next_completion_revision);
         }
@@ -528,28 +524,8 @@ impl ForkMode {
     }
 }
 
-impl Default for AgentControl {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
 impl AgentControl {
-    pub fn new(max_concurrent_children: Option<usize>) -> Self {
-        Self::new_with_spawner(max_concurrent_children, None)
-    }
-
-    pub fn with_spawner(
-        max_concurrent_children: Option<usize>,
-        spawner: Arc<dyn AgentSpawner>,
-    ) -> Self {
-        Self::new_with_spawner(max_concurrent_children, Some(spawner))
-    }
-
-    fn new_with_spawner(
-        max_concurrent_children: Option<usize>,
-        spawner: Option<Arc<dyn AgentSpawner>>,
-    ) -> Self {
+    pub fn new(max_concurrent_children: Option<usize>, spawner: Arc<dyn AgentSpawner>) -> Self {
         let (subagent_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(ControlInner {
@@ -560,6 +536,13 @@ impl AgentControl {
                 subagent_tx,
             }),
         }
+    }
+
+    pub fn with_spawner(
+        max_concurrent_children: Option<usize>,
+        spawner: Arc<dyn AgentSpawner>,
+    ) -> Self {
+        Self::new(max_concurrent_children, spawner)
     }
 
     /// Subscribe to display-oriented snapshots of every sub-agent managed by
@@ -680,10 +663,7 @@ impl AgentControl {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         let messages = fork_messages(&context.agent.messages, fork_mode);
-        let spawner = self.inner.spawner.as_ref().ok_or_else(|| {
-            ToolError::Execution("sub-agent spawner is not configured".to_string())
-        })?;
-        let mut child = spawner.spawn(SpawnRequest {
+        let mut child = self.inner.spawner.spawn(SpawnRequest {
             role,
             parent_path,
             task_name: task_name.clone(),
@@ -724,6 +704,7 @@ impl AgentControl {
                     task_name: task_name.clone(),
                     role,
                     state: ChildState::Pending,
+                    pending_followups: 0,
                     completion_revision: None,
                     last_task_message: args.message.clone(),
                     command_tx,
@@ -903,7 +884,7 @@ impl AgentControl {
         initial_input: String,
         mut command_rx: mpsc::Receiver<ChildCommand>,
     ) {
-        self.run_child_turn(tree_id, agent_id, &thread, initial_input)
+        self.run_child_turn(tree_id, agent_id, &thread, initial_input, false)
             .await;
 
         while let Some(command) = command_rx.recv().await {
@@ -914,7 +895,7 @@ impl AgentControl {
                         .await;
                 }
                 ChildCommand::Followup(message) => {
-                    self.run_child_turn(tree_id, agent_id, &thread, message)
+                    self.run_child_turn(tree_id, agent_id, &thread, message, true)
                         .await;
                 }
             }
@@ -927,6 +908,7 @@ impl AgentControl {
         agent_id: ThreadId,
         thread: &Thread,
         input: String,
+        is_followup: bool,
     ) {
         let turn = match thread
             .submit(Input::from_text(InputSource::Agent, input))
@@ -942,6 +924,7 @@ impl AgentControl {
                         final_message: None,
                         error: error.to_string(),
                     },
+                    is_followup,
                 );
                 drop(state);
                 self.inner.updates.notify_waiters();
@@ -980,7 +963,7 @@ impl AgentControl {
             },
         };
         let mut state = self.inner.state.lock().await;
-        if !state.finish_turn(tree_id, agent_id, completed) {
+        if !state.finish_turn(tree_id, agent_id, completed, is_followup) {
             return;
         }
         drop(state);
@@ -1015,7 +998,7 @@ pub fn install_subagent_tools(
         definition: agent.clone(),
         scope: options,
     });
-    let control = AgentControl::with_spawner(max_concurrent_children, spawner);
+    let control = AgentControl::new(max_concurrent_children, spawner);
     agent.tools.extend(control.tools());
     Some(Arc::new(control))
 }
@@ -1194,6 +1177,20 @@ mod tests {
 
     use super::*;
 
+    struct RejectingSpawner;
+
+    impl AgentSpawner for RejectingSpawner {
+        fn spawn(&self, _request: SpawnRequest) -> Result<ChildAgent, ToolError> {
+            Err(ToolError::Execution(
+                "spawn is not used by this test".to_string(),
+            ))
+        }
+    }
+
+    fn state_only_control() -> AgentControl {
+        AgentControl::new(None, Arc::new(RejectingSpawner))
+    }
+
     fn test_agent() -> Agent {
         Agent {
             system_prompt: Some("base prompt".to_string()),
@@ -1254,7 +1251,7 @@ mod tests {
             definition: agent,
             scope: options,
         });
-        (AgentControl::with_spawner(None, spawner), directory)
+        (AgentControl::new(None, spawner), directory)
     }
 
     #[test]
@@ -1329,19 +1326,63 @@ mod tests {
     }
 
     #[test]
-    fn queued_followup_keeps_the_current_turn_active_until_the_next_turn() {
-        let mut state = ChildState::Running(CancellationToken::new());
+    fn multiple_queued_followups_publish_completion_only_after_the_last_turn() {
+        let agent_id = ThreadId::new();
+        let (command_tx, _command_rx) = mpsc::channel(2);
+        let mut record = ChildRecord {
+            id: agent_id,
+            task_name: "/root/inspect".to_string(),
+            role: AgentRole::Explorer,
+            state: ChildState::Running(CancellationToken::new()),
+            pending_followups: 0,
+            completion_revision: None,
+            last_task_message: "initial".to_string(),
+            command_tx,
+        };
+        record.prepare_delivery(MessageDelivery::Followup, "first follow-up");
+        record.prepare_delivery(MessageDelivery::Followup, "second follow-up");
+        let mut session = ChildSession::default();
+        session.agents.insert(agent_id, record);
 
-        state.queue_followup();
-        assert_eq!(state.status(), AgentStatus::Running);
+        assert!(session.finish_turn(
+            agent_id,
+            ChildState::Completed(Some("initial result".to_string())),
+            false,
+        ));
+        let record = session.agents.get_mut(&agent_id).unwrap();
+        assert_eq!(record.pending_followups, 2);
+        assert!(matches!(record.state, ChildState::Pending));
+        assert_eq!(record.completion_revision, None);
 
-        let state = state.finish_turn(ChildState::Completed(Some("first turn".to_string())));
-        assert!(matches!(state, ChildState::Pending));
+        record.state = ChildState::Running(CancellationToken::new());
+        assert!(session.finish_turn(
+            agent_id,
+            ChildState::Completed(Some("first result".to_string())),
+            true,
+        ));
+        let record = session.agents.get_mut(&agent_id).unwrap();
+        assert_eq!(record.pending_followups, 1);
+        assert!(matches!(record.state, ChildState::Pending));
+        assert_eq!(record.completion_revision, None);
+
+        record.state = ChildState::Running(CancellationToken::new());
+        assert!(session.finish_turn(
+            agent_id,
+            ChildState::Completed(Some("final result".to_string())),
+            true,
+        ));
+        let record = session.agents.get(&agent_id).unwrap();
+        assert_eq!(record.pending_followups, 0);
+        assert!(matches!(
+            &record.state,
+            ChildState::Completed(Some(message)) if message == "final result"
+        ));
+        assert_eq!(record.completion_revision, Some(1));
     }
 
     #[tokio::test]
     async fn failed_delivery_does_not_change_the_agent_lifecycle() {
-        let control = AgentControl::default();
+        let control = state_only_control();
         let tree_id = TreeId::new();
         let agent_id = ThreadId::new();
         let (command_tx, command_rx) = mpsc::channel(1);
@@ -1362,6 +1403,7 @@ mod tests {
                     task_name: "/root/inspect".to_string(),
                     role: AgentRole::Explorer,
                     state: ChildState::Completed(Some("done".to_string())),
+                    pending_followups: 0,
                     completion_revision: None,
                     last_task_message: "original".to_string(),
                     command_tx,
@@ -1466,7 +1508,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_agent_trees_by_root_session() {
-        let control = AgentControl::default();
+        let control = state_only_control();
         let root = TreeId::new();
         let other_root = TreeId::new();
         let agent_id = ThreadId::new();
@@ -1487,6 +1529,7 @@ mod tests {
                     task_name: "/root/inspect".to_string(),
                     role: AgentRole::Explorer,
                     state: ChildState::Completed(Some("done".to_string())),
+                    pending_followups: 0,
                     completion_revision: None,
                     last_task_message: "inspect".to_string(),
                     command_tx,
@@ -1499,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_returns_each_completion_only_once() {
-        let control = AgentControl::default();
+        let control = state_only_control();
         let tree_id = TreeId::new();
         let completed_id = ThreadId::new();
         let running_id = ThreadId::new();
@@ -1516,6 +1559,7 @@ mod tests {
                     task_name: "/root/completed".to_string(),
                     role: AgentRole::Explorer,
                     state: ChildState::Completed(Some("first result".to_string())),
+                    pending_followups: 0,
                     completion_revision: Some(1),
                     last_task_message: "first task".to_string(),
                     command_tx: completed_tx,
@@ -1528,6 +1572,7 @@ mod tests {
                     task_name: "/root/running".to_string(),
                     role: AgentRole::Worker,
                     state: ChildState::Running(CancellationToken::new()),
+                    pending_followups: 0,
                     completion_revision: None,
                     last_task_message: "second task".to_string(),
                     command_tx: running_tx,
@@ -1572,6 +1617,7 @@ mod tests {
                 tree_id,
                 running_id,
                 ChildState::Completed(Some("second result".to_string())),
+                false,
             ));
         }
         control.inner.updates.notify_waiters();

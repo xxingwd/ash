@@ -8,6 +8,9 @@ use crate::{
 };
 
 const MAX_VISIBLE_REASONING_LINES: usize = 5;
+/// Display budget for the live reasoning preview when tool blocks are
+/// expanded (`Ctrl+o`): keep the last 50 rendered rows instead of 5.
+const MAX_EXPANDED_REASONING_LINES: usize = 50;
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamState {
@@ -27,7 +30,10 @@ enum StreamMode {
 }
 
 pub(crate) enum FinishedStream {
-    Thought { elapsed_seconds: u64 },
+    Thought {
+        source: String,
+        elapsed_seconds: u64,
+    },
 }
 
 impl StreamState {
@@ -52,7 +58,7 @@ impl StreamState {
         source.push_str(&sanitize_terminal_text(delta));
     }
 
-    pub(crate) fn refresh_reasoning(&mut self, width: u16) {
+    pub(crate) fn refresh_reasoning(&mut self, width: u16, expanded: bool) {
         let StreamMode::Reasoning {
             source,
             started_at,
@@ -66,6 +72,7 @@ impl StreamState {
             source,
             started_at.elapsed().as_secs(),
             width,
+            expanded,
             markdown_cache,
         );
     }
@@ -94,6 +101,7 @@ impl StreamState {
             StreamMode::Reasoning {
                 source, started_at, ..
             } if !source.trim().is_empty() => Some(FinishedStream::Thought {
+                source,
                 elapsed_seconds: started_at.elapsed().as_secs(),
             }),
             StreamMode::Reasoning { .. } => None,
@@ -124,6 +132,7 @@ fn render_reasoning_view(
     source: &str,
     elapsed_seconds: u64,
     width: u16,
+    expanded: bool,
     markdown_cache: &mut StreamingMarkdownCache,
 ) -> Vec<RenderedLine> {
     let mut header = render_markdown(
@@ -134,7 +143,12 @@ fn render_reasoning_view(
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
     let tail = markdown_cache.update(source, width);
-    let mut body = markdown_cache.latest_lines(&tail, MAX_VISIBLE_REASONING_LINES);
+    let limit = if expanded {
+        MAX_EXPANDED_REASONING_LINES
+    } else {
+        MAX_VISIBLE_REASONING_LINES
+    };
+    let mut body = markdown_cache.latest_lines(&tail, limit);
     while body.last().is_some_and(RenderedLine::is_blank) {
         body.pop();
     }
@@ -162,6 +176,7 @@ mod tests {
             "one\ntwo\nthree\nfour\nfive\nsix",
             3,
             80,
+            false,
             &mut StreamingMarkdownCache::default(),
         );
         let text = lines
@@ -175,11 +190,35 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_view_expanded_keeps_many_more_lines() {
+        let source = (1..=40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines =
+            render_reasoning_view(&source, 3, 80, true, &mut StreamingMarkdownCache::default());
+        let text = lines
+            .iter()
+            .map(RenderedLine::plain_text)
+            .collect::<Vec<_>>();
+
+        // Header plus every one of the 40 source lines: no tail truncation
+        // within the expanded 50-row budget.
+        assert_eq!(lines.len(), 41);
+        assert_eq!(text[0], "Thinking (3s)");
+        assert_eq!(
+            &text[1..],
+            (1..=40).map(|i| format!("line {i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn reasoning_view_counts_wrapped_rows_toward_the_five_line_window() {
         let lines = render_reasoning_view(
             "12345\n67890\nabc\ndef",
             3,
             3,
+            false,
             &mut StreamingMarkdownCache::default(),
         );
         let text = lines
@@ -192,7 +231,13 @@ mod tests {
 
     #[test]
     fn reasoning_view_uses_the_completed_thought_style() {
-        let lines = render_reasoning_view("detail", 3, 80, &mut StreamingMarkdownCache::default());
+        let lines = render_reasoning_view(
+            "detail",
+            3,
+            80,
+            false,
+            &mut StreamingMarkdownCache::default(),
+        );
         for line in &lines {
             for span in line.ratatui_line().spans {
                 assert!(span.style.add_modifier.contains(Modifier::DIM));

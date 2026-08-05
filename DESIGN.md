@@ -24,7 +24,8 @@ The stable execution vocabulary is deliberately small:
 
 - `Agent` is immutable behavior: model, prompt, tools, limits, and context policy.
 - `Runtime` owns injected capabilities: model client, thread store, and extensions.
-- `ThreadOptions` is per-thread scope: working directory, timeout, agent path, tree ID, and metadata.
+- `ThreadOptions` is per-thread scope: working directory, timeout, agent path, tree ID,
+  typed `ThreadKind`, and product metadata.
 - `Thread` is the durable concurrent conversation boundary and the sole input-queue owner.
 - `Turn` is one submitted unit of execution. It can be awaited, interrupted, or steered.
 - `Input` carries content, source, metadata, and an optional idempotency key.
@@ -87,21 +88,31 @@ is written.
 `ThreadStore` is the only public persistence boundary:
 
 ```text
-create(metadata, entries) -> version
+create(metadata, entries)
 load(thread_id) -> stored thread
-append(thread_id, expected_version, entries) -> version
+open(thread_id) -> stored thread + locked writer
+open_writer(metadata) -> locked writer for a new thread
 list(excluded_thread) -> summaries
 ```
 
-Entry slices represent one ordered version change. Implementations reject stale versions.
-The default `JsonlThreadStore` serializes writes per store, appends entries in one batch, and
-can read legacy `session-*`/`session_meta` files while writing `thread-*`/`thread_meta` files.
+Locked writers are exposed through the storage-neutral `ThreadAppender` capability. A backend may
+hold a file lock, database transaction, or remote lease in that handle; runtime code never depends
+on the JSONL writer type.
 
-The runtime's hot write path keeps one open `ThreadWriter` per active thread, so each
-append is a single write+flush instead of a directory scan plus full-file re-read. Writes
-are batched at commit points: accepted inputs are persisted when the turn starts, and all
-turn messages plus `TurnEnd` are flushed together when the turn settles. A crash before
-that commit point leaves a turn without `TurnEnd`, which the projection reports as
+The default `JsonlThreadStore` stores new threads as `{thread_id}.jsonl`. Its compact first record
+contains only list metadata, so listing does not replay thread logs. Loading addresses new files
+directly by id and only replays the selected thread; legacy timestamped `thread-*`/`session-*`
+files and their metadata records remain readable.
+
+`ThreadMetadata` carries the typed `ThreadKind` (`Root` or `Subagent`) used by persistence and
+session listing. Runtime code derives that value from `ThreadOptions.kind`; `ThreadOptions.metadata`
+remains product-specific state and is not inspected for a reserved `"kind"` key.
+
+The runtime's hot write path keeps one exclusively locked `ThreadAppender` per active thread. Resume
+replays the selected file through that same handle, so later appends are a single write+flush with
+no second read. Writes are batched at commit points: accepted inputs are persisted when the turn
+starts, and all turn messages plus `TurnEnd` are flushed together when the turn settles. A crash
+before that commit point leaves a turn without `TurnEnd`, which the projection reports as
 `Interrupted` and never exposes as normal history.
 
 ## Events And Projection
@@ -116,13 +127,20 @@ that commit point leaves a turn without `TurnEnd`, which the projection reports 
 
 All memory state is derived from the log through one reducer direction:
 `LogEntry -> ThreadView -> messages / context / turns -> transcript blocks`. The TUI draws
-live deltas as a preview and replaces them with the canonical projection on `Turn`.
+live deltas as a preview and replaces them with the canonical projection on `Turn`. `ThreadLog`
+maintains that projection incrementally as entries arrive, and thread events obtain settled turn
+views from the same reducer rather than assembling a parallel view in the execution path.
 
 ## Context And Memory
 
 `ContextPolicy` prepares model context and performs automatic compaction without deleting full
 history. A checkpoint changes only the model-context projection. Manual and automatic
 compaction therefore share the same durable mechanism.
+
+Durable messages and extension-provided ephemeral context remain separate throughout preparation.
+Both count toward the request budget and are sent to the model, but compaction summarizes and
+checkpoints only durable messages. A compaction stream must end with a clean `EndTurn`; a missing or
+truncated terminal marker rejects the summary instead of persisting partial context.
 
 Long-term or cross-thread memory is an extension, not part of the thread log. A memory extension
 can retrieve relevant facts in `prepare`, inject ephemeral context, and update its own store in
@@ -136,6 +154,11 @@ receives a `TurnContext` containing IDs, accepted inputs, current messages, and 
 `Extension::prepare` returns a `TurnPatch` with ephemeral context and turn-scoped tools.
 `Extension::complete` observes a `TurnOutcome` containing the final status and the complete
 durable message projection for that Turn.
+
+Before provider-specific serialization, `ash-protocol` validates every message's role/content pair
+and projects system-role text into the provider's privileged system or instructions field. This
+keeps extension-provided system context at system priority without changing the durable message
+schema; invalid role/content combinations and system images fail locally as invalid requests.
 
 This is the intended integration boundary for:
 
@@ -160,6 +183,52 @@ Extensions compose at `Runtime`; they do not add branches to the model/tool loop
 Every child gets its own `Thread` and executes through the same runtime path as a root agent.
 Tree identity and canonical agent path live in `ThreadOptions` and `ToolContext`; collaboration
 state does not leak into `ash-core` or terminal state.
+
+The controller counts every accepted follow-up until it settles. A child with queued follow-ups
+stays active and receives no completion revision until the final queued turn finishes, so waiters
+cannot observe an intermediate result as the agent's terminal state.
+
+## Stream Integrity And Error Handling
+
+A model stream is only "clean" when the provider signals a terminal state:
+`finish_reason` (Chat Completions), `message_stop` (Anthropic), or
+`response.completed` (Responses). A stream that reaches EOF without one of
+those markers is truncated, not finished.
+
+Semantic termination is distinct from wire termination. Chat Completions continues draining after
+`finish_reason` so a trailing usage chunk is preserved, then emits exactly one `Stop` as the final
+model event. `[DONE]` and EOF only close the wire; neither can replace a missing semantic terminal
+marker. Provider completion is also rejected while a tool call is still incomplete.
+
+Detection is layered so no client can silently treat a cut stream as a clean
+stop:
+
+1. `ash-protocol` adapters emit `ModelEvent::Stop(StopReason::Truncated)` when
+   the SSE stream ends without a terminal marker (`sse::stream` tracks whether
+   the decoder ever reported `Finished`).
+2. `ash-agent`'s `collect_response` applies the same rule as a fallback: a
+   stream that runs out without any `Stop` event is `Truncated`, never
+   `EndTurn`.
+
+Retries follow a strict safety policy. A single model call may be re-issued up
+ to `RunConfig::max_retries` times (default 5), and only when:
+
+- the failure is transport-level and retryable: `Request` (network/EOF),
+  upstream 5xx, or `RateLimited`; or the stream was `Truncated`; and
+- no tool call has been executed yet in this call, so re-issuing the request
+  cannot repeat side effects.
+
+Between attempts the runner waits an exponential backoff (`RetryBackoff`,
+base 1s doubling to a 10s cap, i.e. 1s, 2s, 4s, 8s, 10s), and a cancellation
+during the wait aborts the turn instead of retrying.
+
+Non-retryable failures (`Auth`, `InvalidRequest`, `ContextTooLong`,
+`InvalidResponse`, upstream 4xx) fail the turn immediately and surface as
+`TurnResult::Failed`. On retry, the partial assistant message is discarded both
+from memory and from the staged log (`ThreadPersistence::rollback_to`), so a
+successful retry leaves no trace of the failed attempt; when the retry budget
+is exhausted the final partial output is kept and the turn ends with
+`StopReason::Truncated`, visible to the user as an incomplete response.
 
 ## Product Boundary
 

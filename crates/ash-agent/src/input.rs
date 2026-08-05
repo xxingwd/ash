@@ -42,7 +42,7 @@ impl Input {
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
             || self.content.iter().all(|content| match content {
-                ash_core::Content::Text(text) => text.is_empty(),
+                ash_core::Content::Text(text) => text.trim().is_empty(),
                 ash_core::Content::Image { data, .. } => data.is_empty(),
             })
     }
@@ -57,5 +57,16 @@ impl From<String> for Input {
 impl From<&str> for Input {
     fn from(value: &str) -> Self {
         Self::user(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_only_text_is_empty() {
+        assert!(Input::user(" \n\t").is_empty());
+        assert!(!Input::user("  task  ").is_empty());
     }
 }

@@ -5,8 +5,75 @@ use crate::text_width::truncate_end;
 
 const GROUP_DETAIL_LIMIT: usize = 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolKind {
+    Read,
+    Write,
+    Edit,
+    Glob,
+    Grep,
+    WebFetch,
+    Bash,
+    Skill,
+    SpawnAgent,
+    SendMessage,
+    FollowupTask,
+    InterruptAgent,
+    ListAgents,
+    WaitAgent,
+    Other,
+}
+
+impl ToolKind {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "read" => Self::Read,
+            "write" => Self::Write,
+            "edit" => Self::Edit,
+            "glob" => Self::Glob,
+            "grep" => Self::Grep,
+            "webfetch" => Self::WebFetch,
+            "bash" => Self::Bash,
+            "skill" => Self::Skill,
+            "spawn_agent" => Self::SpawnAgent,
+            "send_message" => Self::SendMessage,
+            "followup_task" => Self::FollowupTask,
+            "interrupt_agent" => Self::InterruptAgent,
+            "list_agents" => Self::ListAgents,
+            "wait_agent" => Self::WaitAgent,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangePreviewSource {
+    EditOutput,
+    WriteContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolRenderer {
+    Bash,
+    ChangePreview(ChangePreviewSource),
+    Generic { show_output: bool },
+}
+
+pub(crate) fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
+    let kind = ToolKind::from_name(name);
+    match (kind, is_error) {
+        (ToolKind::Bash, _) => ToolRenderer::Bash,
+        (ToolKind::Edit, false) => ToolRenderer::ChangePreview(ChangePreviewSource::EditOutput),
+        (ToolKind::Write, false) => ToolRenderer::ChangePreview(ChangePreviewSource::WriteContent),
+        (ToolKind::Read | ToolKind::Edit | ToolKind::Write, _) => {
+            ToolRenderer::Generic { show_output: false }
+        }
+        _ => ToolRenderer::Generic { show_output: true },
+    }
+}
+
 pub(crate) fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
-    (name == "read").then(|| path_argument(arguments))
+    (ToolKind::from_name(name) == ToolKind::Read).then(|| path_argument(arguments))
 }
 
 pub(crate) fn tool_call_summary(
@@ -50,42 +117,42 @@ struct ToolPhrase {
 }
 
 fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
-    match name {
-        "read" => phrase("Read", "reading", path_argument(arguments)),
-        "write" => phrase("Wrote", "writing", path_argument(arguments)),
-        "edit" => phrase("Edited", "editing", path_argument(arguments)),
-        "glob" => phrase("Found", "finding", string_argument(arguments, "pattern")),
-        "grep" => phrase(
+    match ToolKind::from_name(name) {
+        ToolKind::Read => phrase("Read", "reading", path_argument(arguments)),
+        ToolKind::Write => phrase("Wrote", "writing", path_argument(arguments)),
+        ToolKind::Edit => phrase("Edited", "editing", path_argument(arguments)),
+        ToolKind::Glob => phrase("Found", "finding", string_argument(arguments, "pattern")),
+        ToolKind::Grep => phrase(
             "Searched",
             "searching",
             string_argument(arguments, "pattern"),
         ),
-        "webfetch" => phrase("Fetched", "fetching", url_argument(arguments)),
-        "bash" => phrase("Ran", "running", string_argument(arguments, "command")),
-        "skill" => phrase("Loaded", "loading", string_argument(arguments, "name")),
-        "spawn_agent" => phrase(
+        ToolKind::WebFetch => phrase("Fetched", "fetching", url_argument(arguments)),
+        ToolKind::Bash => phrase("Ran", "running", string_argument(arguments, "command")),
+        ToolKind::Skill => phrase("Loaded", "loading", string_argument(arguments, "name")),
+        ToolKind::SpawnAgent => phrase(
             "Spawned",
             "spawning",
             string_argument(arguments, "task_name"),
         ),
-        "send_message" => phrase(
+        ToolKind::SendMessage => phrase(
             "Messaged",
             "messaging",
             string_argument(arguments, "target"),
         ),
-        "followup_task" => phrase(
+        ToolKind::FollowupTask => phrase(
             "Continued",
             "continuing",
             string_argument(arguments, "target"),
         ),
-        "interrupt_agent" => phrase(
+        ToolKind::InterruptAgent => phrase(
             "Interrupted",
             "interrupting",
             string_argument(arguments, "target"),
         ),
-        "list_agents" => phrase("Listed", "listing", "agents".to_string()),
-        "wait_agent" => phrase("Waited", "waiting", "for agents".to_string()),
-        _ => phrase(
+        ToolKind::ListAgents => phrase("Listed", "listing", "agents".to_string()),
+        ToolKind::WaitAgent => phrase("Waited", "waiting", "for agents".to_string()),
+        ToolKind::Other => phrase(
             "Ran",
             "running",
             sanitize_single_line(name).replace('_', " "),
@@ -289,5 +356,22 @@ mod tests {
 
         assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
         assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn renderer_policy_is_centralized_by_tool_kind() {
+        assert_eq!(tool_renderer("bash", false), ToolRenderer::Bash);
+        assert_eq!(
+            tool_renderer("edit", false),
+            ToolRenderer::ChangePreview(ChangePreviewSource::EditOutput)
+        );
+        assert_eq!(
+            tool_renderer("read", true),
+            ToolRenderer::Generic { show_output: false }
+        );
+        assert_eq!(
+            tool_renderer("custom_tool", false),
+            ToolRenderer::Generic { show_output: true }
+        );
     }
 }

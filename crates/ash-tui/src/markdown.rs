@@ -549,26 +549,34 @@ impl MarkdownWriter {
         }
         self.finish_line();
 
-        let mut rendered = self
+        let rendered = self
             .lines
             .into_iter()
             .flat_map(|line| wrap_line(line, self.width))
             .collect::<Vec<_>>();
-        while rendered.first().is_some_and(RenderedLine::is_blank) {
-            rendered.remove(0);
-        }
-        while rendered.last().is_some_and(RenderedLine::is_blank) {
-            rendered.pop();
-        }
-        let mut collapsed = Vec::with_capacity(rendered.len());
-        for line in rendered {
-            if line.is_blank() && collapsed.last().is_some_and(RenderedLine::is_blank) {
+        trim_and_collapse_blank_lines(rendered)
+    }
+}
+
+fn trim_and_collapse_blank_lines(lines: Vec<RenderedLine>) -> Vec<RenderedLine> {
+    let mut collapsed = Vec::with_capacity(lines.len());
+    let mut seen_content = false;
+    for line in lines {
+        if !seen_content {
+            if line.is_blank() {
                 continue;
             }
-            collapsed.push(line);
+            seen_content = true;
         }
-        collapsed
+        if line.is_blank() && collapsed.last().is_some_and(RenderedLine::is_blank) {
+            continue;
+        }
+        collapsed.push(line);
     }
+    while collapsed.last().is_some_and(RenderedLine::is_blank) {
+        collapsed.pop();
+    }
+    collapsed
 }
 
 fn heading_style(level: HeadingLevel) -> Style {

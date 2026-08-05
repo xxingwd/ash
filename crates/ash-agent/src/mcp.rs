@@ -112,9 +112,7 @@ impl McpManager {
         cmd.args(&config.args);
 
         if let Some(env) = &config.env {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+            cmd.envs(env);
         }
 
         let transport = TokioChildProcess::new(cmd)
@@ -130,7 +128,7 @@ impl McpManager {
     }
 
     pub async fn discover_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let mut tools = Vec::new();
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
         for (config, peer) in &self.peers {
             let remote_tools = match peer.list_all_tools().await {
@@ -155,7 +153,7 @@ impl McpManager {
                     schema,
                     peer.clone(),
                     tool_info.name.to_string(),
-                )) as Arc<dyn Tool>);
+                )));
             }
         }
 

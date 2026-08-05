@@ -4,12 +4,13 @@ mod glob;
 mod grep;
 mod path;
 mod read;
+mod timeout;
 mod truncate;
 mod webfetch;
 mod write;
 
 use ash_core::{Tool, ToolError};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 pub fn tools(
     working_dir: impl Into<PathBuf>,
@@ -19,9 +20,11 @@ pub fn tools(
     let Some(names) = enabled else {
         return Ok(tools);
     };
+    let known = tools.iter().map(|tool| tool.name()).collect::<HashSet<_>>();
     let unknown = names
         .iter()
-        .filter(|name| !tools.iter().any(|tool| tool.name() == name.as_str()))
+        .map(String::as_str)
+        .filter(|name| !known.contains(name))
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
         let available = tools
@@ -31,16 +34,13 @@ pub fn tools(
             .join(", ");
         return Err(ToolError::Execution(format!(
             "unknown tool(s): {}; available tools: {available}",
-            unknown
-                .into_iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
+            unknown.join(", ")
         )));
     }
+    let enabled = names.iter().map(String::as_str).collect::<HashSet<_>>();
     Ok(tools
         .into_iter()
-        .filter(|tool| names.iter().any(|name| name == tool.name()))
+        .filter(|tool| enabled.contains(tool.name()))
         .collect())
 }
 

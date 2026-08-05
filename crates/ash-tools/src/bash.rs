@@ -65,7 +65,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
                     .map_err(|_| {
                         ToolError::Execution(format!(
                             "command timed out after {} seconds",
-                            args.timeout.unwrap_or_default()
+                            timeout.as_secs_f64()
                         ))
                     })?,
                 None => command.status().await,
@@ -89,16 +89,28 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
 }
 
 fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
-    let resolved = crate::path::WorkspacePath::new(root, requested)?
+    let candidate = crate::path::WorkspacePath::new(root, requested)?
         .full_path()
         .to_path_buf();
-    let metadata = std::fs::metadata(&resolved).map_err(|error| {
+    let workspace = std::fs::canonicalize(root).map_err(|error| {
         ToolError::Execution(format!(
-            "cannot access working directory {}: {error}",
-            resolved.display()
+            "cannot resolve working directory {}: {error}",
+            root.display()
         ))
     })?;
-    if !metadata.is_dir() {
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        ToolError::Execution(format!(
+            "cannot access working directory {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !resolved.starts_with(&workspace) {
+        return Err(ToolError::Execution(format!(
+            "working directory is outside the session working directory: {}",
+            resolved.display()
+        )));
+    }
+    if !resolved.is_dir() {
         return Err(ToolError::Execution(format!(
             "working directory is not a directory: {}",
             resolved.display()
@@ -108,13 +120,7 @@ fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
 }
 
 fn parse_timeout(seconds: f64) -> Result<Duration, ToolError> {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(ToolError::Execution(
-            "timeout must be a positive finite number of seconds".into(),
-        ));
-    }
-    Duration::try_from_secs_f64(seconds)
-        .map_err(|_| ToolError::Execution("timeout is too large".into()))
+    crate::timeout::parse_positive_seconds(seconds)
 }
 
 fn render_files(
@@ -352,6 +358,35 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_cwd_symlink_that_resolves_outside_working_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
+
+        let error = run_in(root.path(), "pwd", Some("outside"))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("outside the session working directory"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allows_cwd_symlink_that_resolves_inside_working_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::os::unix::fs::symlink("src", root.path().join("source")).unwrap();
+        let expected = std::fs::canonicalize(root.path().join("src")).unwrap();
+
+        let output = run_in(root.path(), "pwd", Some("source")).await.unwrap();
+
+        assert_eq!(output.trim(), expected.to_str().unwrap());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use ash_core::ToolError;
 use cap_std::{ambient_authority, fs::Dir};
 
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 
 pub(crate) struct WorkspacePath {
     dir: Dir,
@@ -132,7 +133,7 @@ impl WorkspacePath {
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).create_new(true);
 
-        for _ in 0..100 {
+        for _ in 0..MAX_TEMP_FILE_ATTEMPTS {
             let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let temp = parent.join(format!(".{file_name}.ash-edit-{}-{id}", std::process::id()));
             let mut file = match self.dir.open_with(&temp, &options) {
@@ -155,7 +156,9 @@ impl WorkspacePath {
 
         Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "could not allocate a temporary edit file",
+            format!(
+                "could not allocate a temporary edit file after {MAX_TEMP_FILE_ATTEMPTS} attempts"
+            ),
         ))
     }
 }

@@ -1,0 +1,216 @@
+use std::collections::BTreeMap;
+
+use ash_core::{ModelEvent, ProtocolError, StopReason, ToolCallId, Usage};
+use serde_json::json;
+
+/// Shared construction of provider-neutral usage records. Stream decoders
+/// report token counts under provider-specific field names; once those are
+/// read, every protocol builds the same `Usage` shape.
+pub(crate) fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens,
+        generation_ms: 0,
+        estimated: false,
+    }
+}
+
+/// Shared mapping from a provider's "ran out of tokens" signal to the
+/// provider-neutral `StopReason`.
+pub(crate) fn stop_reason(max_token_reason: bool) -> StopReason {
+    if max_token_reason {
+        StopReason::MaxTokens
+    } else {
+        StopReason::EndTurn
+    }
+}
+
+/// A tool call being accumulated from incremental stream deltas.
+///
+/// Providers deliver the call in fragments: an opening event may or may not
+/// carry the id and name, and the arguments arrive as concatenated JSON
+/// fragments. This type stores the raw fragments and `finish` closes the
+/// call into a provider-neutral `ModelEvent` (empty arguments fall back to
+/// `{}`, a missing id falls back to a fresh `ToolCallId`, invalid JSON is a
+/// protocol error named after the provider).
+#[derive(Default)]
+pub(crate) struct PendingCall {
+    /// Provider tool-call id; empty means the provider never sent one.
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
+impl PendingCall {
+    pub(crate) fn new(id: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: String::new(),
+        }
+    }
+
+    /// Close the accumulated call into a provider-neutral event.
+    pub(crate) fn finish(self, protocol: &str) -> Result<ModelEvent, ProtocolError> {
+        if self.name.trim().is_empty() {
+            return Err(ProtocolError::InvalidResponse(format!(
+                "{protocol} tool call is missing a name"
+            )));
+        }
+        let arguments = if self.arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&self.arguments).map_err(|error| {
+                ProtocolError::InvalidResponse(format!(
+                    "invalid {protocol} tool arguments: {error}"
+                ))
+            })?
+        };
+        let id = if self.id.is_empty() {
+            ToolCallId::new()
+        } else {
+            ToolCallId::from_provider(self.id)
+        };
+        Ok(ModelEvent::ToolCall {
+            id,
+            name: self.name,
+            arguments,
+        })
+    }
+}
+
+/// Tool calls keyed by the provider's own call identifier (a block index, a
+/// delta index, or an item key).
+pub(crate) struct PendingCallAccumulator<K: Ord> {
+    calls: BTreeMap<K, PendingCall>,
+}
+
+impl<K: Ord> Default for PendingCallAccumulator<K> {
+    fn default() -> Self {
+        Self {
+            calls: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord> PendingCallAccumulator<K> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    pub(crate) fn entry(&mut self, key: K) -> &mut PendingCall {
+        self.calls.entry(key).or_default()
+    }
+
+    pub(crate) fn insert(&mut self, key: K, call: PendingCall) -> Option<PendingCall> {
+        self.calls.insert(key, call)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut PendingCall> {
+        self.calls.get_mut(key)
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<PendingCall> {
+        self.calls.remove(key)
+    }
+
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (K, PendingCall)> + '_ {
+        std::mem::take(&mut self.calls).into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn finish_falls_back_to_empty_object_and_fresh_id() {
+        let event = PendingCall::new("", "read").finish("Anthropic").unwrap();
+
+        match event {
+            ModelEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(name, "read");
+                assert_eq!(arguments, json!({}));
+                assert!(!id.as_str().is_empty());
+            }
+            _ => panic!("expected a tool call event"),
+        }
+    }
+
+    #[test]
+    fn finish_preserves_provider_id_and_parses_arguments() {
+        let mut call = PendingCall::new("toolu_123", "bash");
+        call.arguments.push_str("{\"command\":");
+        call.arguments.push_str("\"pwd\"}");
+
+        let event = call.finish("Anthropic").unwrap();
+
+        match event {
+            ModelEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, ToolCallId::from_provider("toolu_123"));
+                assert_eq!(name, "bash");
+                assert_eq!(arguments, json!({"command": "pwd"}));
+            }
+            _ => panic!("expected a tool call event"),
+        }
+    }
+
+    #[test]
+    fn finish_names_the_protocol_in_errors() {
+        let mut invalid = PendingCall::new("id", "bash");
+        invalid.arguments.push_str("{\"command\":");
+        let invalid = invalid.finish("Anthropic");
+
+        match invalid {
+            Err(ProtocolError::InvalidResponse(message)) => {
+                assert!(message.contains("Anthropic"));
+                assert!(message.contains("invalid Anthropic tool arguments"));
+            }
+            _ => panic!("expected an invalid response error"),
+        }
+
+        let unnamed = PendingCall::new("id", "").finish("Chat Completions");
+
+        match unnamed {
+            Err(ProtocolError::InvalidResponse(message)) => {
+                assert!(message.contains("Chat Completions"));
+            }
+            _ => panic!("expected an invalid response error"),
+        }
+    }
+
+    #[test]
+    fn accumulator_drains_calls_in_key_order() {
+        let mut accumulator = PendingCallAccumulator::default();
+        accumulator.entry(1).name = "second".to_string();
+        accumulator.entry(0).name = "first".to_string();
+
+        let names = accumulator
+            .drain()
+            .map(|(_, call)| call.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn usage_and_stop_reason_helpers_are_provider_neutral() {
+        let usage = build_usage(120, 25);
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.generation_ms, 0);
+        assert!(!usage.estimated);
+
+        assert_eq!(stop_reason(true), StopReason::MaxTokens);
+        assert_eq!(stop_reason(false), StopReason::EndTurn);
+    }
+}

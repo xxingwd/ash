@@ -222,4 +222,60 @@ impl Message {
             content: MessageContent::User(vec![Content::Text(text.to_string())]),
         }
     }
+
+    pub fn is_user_turn(&self) -> bool {
+        self.role == Role::User && matches!(self.content, MessageContent::User(_))
+    }
+
+    pub fn user_turn_text(&self) -> Option<String> {
+        self.is_user_turn().then(|| self.content_text()).flatten()
+    }
+
+    pub fn content_text(&self) -> Option<String> {
+        let MessageContent::User(contents) = &self.content else {
+            return None;
+        };
+        Some(
+            contents
+                .iter()
+                .map(Content::display_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+}
+
+impl Content {
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Image { media_type, .. } => format!("[image: {media_type}]"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_turn_helpers_exclude_system_messages() {
+        let user = Message::user_content(vec![
+            Content::Text("inspect".to_string()),
+            Content::Image {
+                media_type: "image/png".to_string(),
+                data: vec![1],
+            },
+        ]);
+        let system = Message::system("rules");
+
+        assert!(user.is_user_turn());
+        assert_eq!(
+            user.user_turn_text().as_deref(),
+            Some("inspect\n[image: image/png]")
+        );
+        assert!(!system.is_user_turn());
+        assert_eq!(system.user_turn_text(), None);
+        assert_eq!(system.content_text().as_deref(), Some("rules"));
+    }
 }

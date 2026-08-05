@@ -1,0 +1,12 @@
+# 默认以 musl 静态链接构建，产物不依赖目标系统的 glibc 版本，
+# 可在任何 x86_64 Linux 上直接运行。
+#
+# 需要本机已安装 musl 工具链：
+#   rustup target add x86_64-unknown-linux-musl
+#   Arch:      sudo pacman -S musl
+#   Debian/Ubuntu: sudo apt install musl-tools
+#
+# 临时切回动态 glibc 构建：
+#   cargo build --target x86_64-unknown-linux-gnu
+[build]
+target = "x86_64-unknown-linux-musl"

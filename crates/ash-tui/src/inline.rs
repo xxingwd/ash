@@ -57,41 +57,31 @@ struct TurnUsage {
 
 #[derive(Debug, Default)]
 struct UsageState {
-    /// Latest known model-context size: an API-reported usage value when
-    /// available, otherwise a local estimate (resume, fork, rollback, compact).
+    /// Current model-context size, always a local estimate from the agent
+    /// (same estimator the runtime uses for compaction). The API usage is
+    /// not used here: it is billed per request/turn and would drift from the
+    /// context that actually drives compaction.
     context_tokens: Option<u64>,
-    context_estimated: bool,
 }
 
 impl UsageState {
-    /// Record the settled turn's usage and return the values for the worked
-    /// summary block.
+    /// Record the settled turn's usage for the worked summary block. The
+    /// context size is updated separately from `view.context_tokens`.
     fn commit_turn_usage(&mut self, usage: Option<&Usage>) -> TurnUsage {
         match usage {
-            Some(usage) => {
-                self.context_tokens = Some(usage.input_tokens.saturating_add(usage.output_tokens));
-                self.context_estimated = usage.estimated;
-                TurnUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    generation_ms: usage.generation_ms,
-                }
-            }
+            Some(usage) => TurnUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                generation_ms: usage.generation_ms,
+            },
             None => TurnUsage::default(),
         }
     }
 
-    fn set_compacted_context(&mut self, tokens: u64) {
+    /// Record the current model-context size (turn end, compaction, restore,
+    /// fork, rollback). Always an estimate; never mixed with API usage.
+    fn set_context_tokens(&mut self, tokens: u64) {
         self.context_tokens = Some(tokens);
-        self.context_estimated = true;
-    }
-
-    /// Record a locally estimated context size (restore, fork, rollback) so
-    /// the status line reflects current occupancy before any API usage is
-    /// reported for the new history.
-    fn set_estimated_context(&mut self, tokens: u64) {
-        self.context_tokens = Some(tokens);
-        self.context_estimated = true;
     }
 }
 
@@ -256,6 +246,13 @@ pub(crate) struct TerminalUi {
     assistant_block_id: Option<u64>,
 }
 
+/// True when a streamed delta contains a newline, meaning a complete line is
+/// available to display. Newline-complete deltas flush immediately; partial
+/// runs are picked up by the periodic status refresh.
+fn delta_completes_line(delta: &str) -> bool {
+    delta.contains('\n')
+}
+
 impl TerminalUi {
     pub fn enter(
         protocol: &str,
@@ -332,7 +329,7 @@ impl TerminalUi {
         dropped_messages: u64,
     ) -> io::Result<()> {
         self.status.stop();
-        self.usage.set_compacted_context(after_tokens);
+        self.usage.set_context_tokens(after_tokens);
         let message = if dropped_messages == 0 {
             "Model context is already compact; no new summary was created.".to_string()
         } else {
@@ -344,14 +341,14 @@ impl TerminalUi {
     }
 
     pub fn record_automatic_compaction(&mut self, after_tokens: u64) -> io::Result<()> {
-        self.usage.set_compacted_context(after_tokens);
+        self.usage.set_context_tokens(after_tokens);
         self.redraw()
     }
 
     /// Update the status-line context occupancy after a rollback, without
     /// clearing the transcript (unlike `restore_session`).
     pub fn record_rollback_context(&mut self, tokens: u64) -> io::Result<()> {
-        self.usage.set_estimated_context(tokens);
+        self.usage.set_context_tokens(tokens);
         self.redraw()
     }
 
@@ -396,7 +393,7 @@ impl TerminalUi {
         // size so the status line reflects current occupancy before any API
         // usage is reported for the new history.
         if let Some(tokens) = context_tokens {
-            self.usage.set_estimated_context(tokens);
+            self.usage.set_context_tokens(tokens);
         }
         self.commit_transcript_to_scrollback()
     }
@@ -476,11 +473,6 @@ impl TerminalUi {
         Ok(())
     }
 
-    pub fn text(&mut self, text: &str) -> io::Result<()> {
-        self.append_assistant(text.to_string());
-        self.redraw()
-    }
-
     /// Append one text delta to the turn's streaming assistant block,
     /// creating it on first use. Deltas go straight into the block's
     /// incremental markdown renderer; nothing is queued for a later frame.
@@ -504,19 +496,34 @@ impl TerminalUi {
         }
     }
 
+    /// Append one text delta and redraw immediately when it completes a line,
+    /// so output reads line by line instead of character by character.
+    /// Partial runs are picked up by the periodic status refresh.
+    pub fn text(&mut self, text: &str) -> io::Result<()> {
+        self.append_assistant(text.to_string());
+        if delta_completes_line(text) {
+            self.refresh_stream_view()?;
+        }
+        Ok(())
+    }
+
+    /// Append one reasoning delta to the scrolling preview. Newline-complete
+    /// deltas redraw immediately (like text), so the preview reads line by
+    /// line; partial runs are picked up by the periodic status refresh.
+    /// Reasoning belongs before the assistant text; if text output has
+    /// already started (normally impossible), ignore late reasoning deltas
+    /// rather than resurrecting a live reasoning area below the text.
     pub fn thinking(&mut self, text: &str) -> io::Result<()> {
-        // Reasoning belongs before the assistant text. If text output has
-        // already started (normally impossible), ignore late reasoning deltas
-        // rather than resurrecting a live reasoning area below the text.
         if self.assistant_block_id.is_some() {
             return Ok(());
         }
         let finished = self.stream.start_reasoning();
         self.commit_finished_stream(finished);
         self.stream.push_reasoning(text);
-        let width = self.markdown_width()?;
-        self.stream.refresh_reasoning(width);
-        self.redraw()
+        if delta_completes_line(text) {
+            self.refresh_stream_view()?;
+        }
+        Ok(())
     }
 
     pub fn tool_start(&mut self) -> io::Result<()> {
@@ -561,6 +568,9 @@ impl TerminalUi {
         self.assistant_block_id = None;
         self.push_turn_messages(&view.messages);
         let elapsed_seconds = self.status.elapsed_seconds();
+        if let Some(tokens) = view.context_tokens {
+            self.usage.set_context_tokens(tokens);
+        }
         let usage = self.usage.commit_turn_usage(view.usage.as_ref());
         self.status.stop();
         self.view.busy = false;
@@ -585,8 +595,8 @@ impl TerminalUi {
         self.selection = None;
         self.surface.resize(width, height)?;
         if self.stream.is_reasoning() {
-            self.stream
-                .refresh_reasoning(width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1));
+            let width = width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1);
+            self.stream.refresh_reasoning(width, self.tools_expanded);
         }
         self.apply_view(view, width);
         self.rebuild_scrollback_at(width, height)
@@ -614,6 +624,10 @@ impl TerminalUi {
         if !self.history.is_empty() {
             let (width, height) = terminal_size()?;
             self.rebuild_scrollback_at(width, height)?;
+        }
+        if self.stream.is_reasoning() {
+            let width = self.markdown_width()?;
+            self.stream.refresh_reasoning(width, self.tools_expanded);
         }
         self.redraw()
     }
@@ -696,12 +710,18 @@ impl TerminalUi {
             return Ok(());
         }
         self.status.frame = self.status.frame.wrapping_add(1);
+        // The periodic working refresh is the fallback flush point: it
+        // redraws current state, so partial lines that never completed a
+        // newline still appear here.
+        self.refresh_stream_view()
+    }
+
+    /// Single render path for live streamed content: refresh the reasoning
+    /// view (elapsed header + latest lines) and redraw the viewport.
+    fn refresh_stream_view(&mut self) -> io::Result<()> {
         if self.stream.is_reasoning() {
-            let width = terminal::size()?
-                .0
-                .saturating_sub(CONTENT_PREFIX_COLUMNS)
-                .max(1);
-            self.stream.refresh_reasoning(width);
+            let width = self.markdown_width()?;
+            self.stream.refresh_reasoning(width, self.tools_expanded);
         }
         self.redraw()
     }
@@ -736,9 +756,10 @@ impl TerminalUi {
 
     fn commit_finished_stream(&mut self, finished: Option<FinishedStream>) {
         match finished {
-            Some(FinishedStream::Thought { elapsed_seconds }) => {
-                self.push_thought_block(elapsed_seconds)
-            }
+            Some(FinishedStream::Thought {
+                source,
+                elapsed_seconds,
+            }) => self.push_thought_block(source, elapsed_seconds),
             None => {}
         }
     }
@@ -887,9 +908,9 @@ impl TerminalUi {
         self.push_block(LiveBlock::assistant(id, source));
     }
 
-    fn push_thought_block(&mut self, elapsed_seconds: u64) {
+    fn push_thought_block(&mut self, source: String, elapsed_seconds: u64) {
         let id = self.allocate_block_id();
-        self.push_block(LiveBlock::thought(id, elapsed_seconds));
+        self.push_block(LiveBlock::thought(id, source, elapsed_seconds));
     }
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
@@ -964,7 +985,7 @@ impl TerminalUi {
                     text,
                     elapsed_seconds,
                 } if !text.is_empty() => {
-                    self.push_thought_block(*elapsed_seconds);
+                    self.push_thought_block(text.clone(), *elapsed_seconds);
                 }
                 ContentBlock::ToolCall {
                     id,
@@ -1012,7 +1033,6 @@ impl TerminalUi {
             protocol: &protocol,
             working_dir: &self.session.working_dir,
             context_tokens: self.usage.context_tokens,
-            context_estimated: self.usage.context_estimated,
             context_limit: self.session.context_limit,
             tools_expanded: self.tools_expanded,
             subagents: &self.subagents,
@@ -1094,6 +1114,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delta_completes_line_flags_newline_deltas() {
+        assert!(!delta_completes_line("partial"));
+        assert!(!delta_completes_line(""));
+        assert!(delta_completes_line("line one\n"));
+        assert!(delta_completes_line("line one\nline two"));
+        assert!(delta_completes_line("\n"));
+    }
+
+    #[test]
     fn animates_status_with_a_fixed_width_dot_pulse() {
         assert_eq!(status_dots(0), ".  ");
         assert_eq!(status_dots(1), ".. ");
@@ -1104,16 +1133,18 @@ mod tests {
     }
 
     #[test]
-    fn usage_commits_turn_usage_and_keeps_the_latest_context_size() {
+    fn usage_commits_turn_usage_for_the_worked_summary_without_touching_context() {
         let mut usage = UsageState::default();
+        usage.set_context_tokens(500);
         let turn = usage.commit_turn_usage(Some(&Usage {
             input_tokens: 100,
             output_tokens: 20,
             generation_ms: 400,
             estimated: false,
         }));
-        assert_eq!(usage.context_tokens, Some(120));
-        assert!(!usage.context_estimated);
+        // The context size is updated separately from `set_context_tokens`;
+        // committing turn usage only feeds the worked summary block.
+        assert_eq!(usage.context_tokens, Some(500));
         assert_eq!(turn.input_tokens, 100);
         assert_eq!(turn.output_tokens, 20);
         assert_eq!(turn.generation_ms, 400);
@@ -1124,23 +1155,21 @@ mod tests {
             generation_ms: 600,
             estimated: true,
         }));
-        assert_eq!(usage.context_tokens, Some(180));
-        assert!(usage.context_estimated);
+        assert_eq!(usage.context_tokens, Some(500));
         assert_eq!(turn.input_tokens, 150);
         assert_eq!(turn.output_tokens, 30);
         assert_eq!(turn.generation_ms, 600);
 
         let turn = usage.commit_turn_usage(None);
         assert_eq!(turn, TurnUsage::default());
-        assert_eq!(usage.context_tokens, Some(180));
+        assert_eq!(usage.context_tokens, Some(500));
     }
 
     #[test]
-    fn estimated_context_sets_tokens() {
+    fn context_tokens_are_always_estimates_recorded_explicitly() {
         let mut usage = UsageState::default();
-        usage.set_estimated_context(42_000);
+        usage.set_context_tokens(42_000);
         assert_eq!(usage.context_tokens, Some(42_000));
-        assert!(usage.context_estimated);
     }
 
     #[test]

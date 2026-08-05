@@ -44,6 +44,11 @@ pub struct TurnView {
     pub result: TurnResult,
     pub messages: Vec<Message>,
     pub usage: Option<Usage>,
+    /// Locally estimated token count of the model context after this turn
+    /// (system prompt + tools + model context). Same estimator the runtime
+    /// uses for compaction; the UI shows this as the current context size.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 /// Full projected state of a thread, derived from its durable log. Never
@@ -53,6 +58,11 @@ pub struct ThreadView {
     pub messages: Vec<Message>,
     pub context: Vec<Message>,
     pub turns: Vec<TurnView>,
+    /// Locally estimated token count of the current model context (system
+    /// prompt + tools + `context`). Same estimator the runtime uses for
+    /// compaction; the UI shows this as the current context size.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 /// Ephemeral streaming deltas for the current turn. Never persisted and never
@@ -135,6 +145,11 @@ pub enum StopReason {
     MaxTokens,
     MaxTurns,
     Aborted,
+    /// The model stream ended before the provider signalled a normal terminal
+    /// state (no `finish_reason`, `message_stop`, `response.completed`, or
+    /// `[DONE]`). Partial output may have been produced; the turn is not a
+    /// clean stop and is eligible for a safe retry by the engine.
+    Truncated,
 }
 
 #[cfg(test)]

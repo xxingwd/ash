@@ -14,7 +14,7 @@ pub enum AshError {
     Cancelled,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProtocolError {
     #[error("auth failed")]
     Auth,
