@@ -681,14 +681,10 @@ fn render_bash_command_line(
 /// full command is shown. The first command line already lives on the title
 /// row, so this applies to the remaining lines only.
 fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usize {
-    use ratatui::style::Modifier as RtModifier;
-
-    const COMMAND_MAX_LINES: usize = 5;
-    const COMMAND_EXPANDED_MAX_LINES: usize = 50;
     let limit = if expanded {
-        COMMAND_EXPANDED_MAX_LINES
+        crate::ansi::EXPANDED_MAX_LINES
     } else {
-        COMMAND_MAX_LINES
+        crate::ansi::COLLAPSED_MAX_LINES
     };
     let total = lines.len();
     if total <= limit {
@@ -698,17 +694,11 @@ fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usi
     let remaining = limit - 1;
     let half = remaining / 2;
     let omitted = total - remaining;
-    let mut selected: Vec<Line<'static>> = lines.drain(..half).collect();
     let mut ellipsis = Line::from(format!("… +{omitted} lines (truncated for display)"));
     for span in &mut ellipsis.spans {
-        span.style = span.style.add_modifier(RtModifier::DIM);
+        span.style = span.style.add_modifier(Modifier::DIM);
     }
-    selected.push(ellipsis);
-    // Drain the tail after the head was removed; the remaining vector now
-    // holds the middle plus tail, so take the last `half` of it.
-    let remaining_after_head = lines.len();
-    selected.extend(lines.drain(remaining_after_head - half..));
-    *lines = selected;
+    *lines = crate::ansi::split_with_ellipsis(std::mem::take(lines), half, half, ellipsis);
     limit
 }
 
@@ -722,9 +712,9 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     const FIRST_PREFIX: &str = "  └ ";
     const SUBSEQUENT_PREFIX: &str = "    ";
     let limit = if expanded {
-        crate::ansi::TOOL_OUTPUT_EXPANDED_MAX_LINES
+        crate::ansi::EXPANDED_MAX_LINES
     } else {
-        crate::ansi::TOOL_OUTPUT_MAX_LINES
+        crate::ansi::COLLAPSED_MAX_LINES
     };
     let half = limit / 2;
     let lines = split_output(output, half, half, FIRST_PREFIX, SUBSEQUENT_PREFIX, true);

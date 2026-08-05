@@ -18,10 +18,11 @@ use syntect::highlighting::Theme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
-/// Default display budget for a bash/tool output block.
-pub(crate) const TOOL_OUTPUT_MAX_LINES: usize = 5;
-/// Display budget when a tool block is expanded (`Ctrl+o`).
-pub(crate) const TOOL_OUTPUT_EXPANDED_MAX_LINES: usize = 50;
+/// Display budget for a collapsed block: tool output, bash command
+/// continuations, and live reasoning all preview at this many lines.
+pub(crate) const COLLAPSED_MAX_LINES: usize = 5;
+/// Display budget when tool blocks are expanded (`Ctrl+o`).
+pub(crate) const EXPANDED_MAX_LINES: usize = 50;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Theme> = OnceLock::new();
@@ -191,36 +192,24 @@ pub(crate) fn split_output(
     dim: bool,
 ) -> Vec<Line<'static>> {
     let lines: Vec<&str> = output.lines().collect();
-    let total = lines.len();
+    let rendered = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut rendered = parse_ansi_line(line);
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                subsequent_prefix
+            };
+            prefix_line(&mut rendered, prefix, dim);
+            rendered
+        })
+        .collect::<Vec<_>>();
+    let total = rendered.len();
     if total <= head + tail {
-        return lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                let mut rendered = parse_ansi_line(line);
-                let prefix = if index == 0 {
-                    first_prefix
-                } else {
-                    subsequent_prefix
-                };
-                prefix_line(&mut rendered, prefix, dim);
-                rendered
-            })
-            .collect();
+        return rendered;
     }
-
-    let mut rendered_lines = Vec::with_capacity(head + tail + 1);
-    for (index, line) in lines.iter().take(head).enumerate() {
-        let mut rendered = parse_ansi_line(line);
-        let prefix = if index == 0 {
-            first_prefix
-        } else {
-            subsequent_prefix
-        };
-        prefix_line(&mut rendered, prefix, dim);
-        rendered_lines.push(rendered);
-    }
-
     let omitted = total - head - tail;
     let mut ellipsis = Line::from(format!(
         "{subsequent_prefix}… +{omitted} lines (truncated for display)"
@@ -228,14 +217,26 @@ pub(crate) fn split_output(
     for span in &mut ellipsis.spans {
         span.style = span.style.add_modifier(Modifier::DIM);
     }
-    rendered_lines.push(ellipsis);
+    split_with_ellipsis(rendered, head, tail, ellipsis)
+}
 
-    for line in lines.iter().skip(total - tail) {
-        let mut rendered = parse_ansi_line(line);
-        prefix_line(&mut rendered, subsequent_prefix, dim);
-        rendered_lines.push(rendered);
+/// Keep the first `head` and last `tail` items of `items`, inserting
+/// `ellipsis` between them when anything was omitted. Shared by tool output
+/// and multi-line bash command truncation.
+pub(crate) fn split_with_ellipsis<T>(
+    mut items: Vec<T>,
+    head: usize,
+    tail: usize,
+    ellipsis: T,
+) -> Vec<T> {
+    let total = items.len();
+    if total <= head + tail {
+        return items;
     }
-    rendered_lines
+    let mut selected: Vec<T> = items.drain(..head).collect();
+    selected.push(ellipsis);
+    selected.extend(items.drain(total - head - tail..));
+    selected
 }
 
 fn prefix_line(line: &mut Line<'static>, prefix: &str, dim: bool) {

@@ -182,7 +182,7 @@ Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由�
 则从对应 Session 消息重新渲染历史。
 
 模型提供思考摘要时，`Thinking (Xs)` 和完整思考正文会随 transcript 持续向下滚动。
-正文、工具调用或本轮结束后，思考区折叠为不可展开的一行 `• Thought for Xs`。OpenAI Chat
+正文、工具调用或本轮结束后，思考区折叠为一行 `• Thought for Xs`。OpenAI Chat
 Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinking` 字段，
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
@@ -191,6 +191,10 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 显示实际命令，不猜测 Shell 意图。文件内容、编辑前后文本、默认参数、工作目录和绝对
 路径不会进入终端历史。聚合只影响展示，底层工具调用、结果和会话记录仍保持独立。
 
+工具输出、bash 命令续行和思考区默认只显示少量行（折叠模式，5 行预算，超长时保留
+头尾加省略号）。按 `Ctrl-O` 可全局展开到 50 行预算，再次按恢复折叠；展开状态跨会话
+保持。
+
 - `Enter`：提交
 - 输入 `/`：显示斜杠命令补全；继续输入会按命令名或别名过滤
 - 补全菜单中 `↑` / `↓`（或 `Ctrl-P` / `Ctrl-N`）：切换选择
@@ -198,6 +202,7 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `↑` / `↓`：输入历史
 - `PageUp` / `PageDown`：按页浏览当前 live turn
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
+- `Ctrl-O`：在所有工具输出与思考区之间切换折叠（5 行预览）与展开（50 行）
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
 - 任务运行时按一次 `Esc`：取消并撤销当前一轮，将原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态

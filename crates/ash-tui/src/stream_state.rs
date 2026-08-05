@@ -7,11 +7,6 @@ use crate::{
     scrollback::sanitize_terminal_text,
 };
 
-const MAX_VISIBLE_REASONING_LINES: usize = 5;
-/// Display budget for the live reasoning preview when tool blocks are
-/// expanded (`Ctrl+o`): keep the last 50 rendered rows instead of 5.
-const MAX_EXPANDED_REASONING_LINES: usize = 50;
-
 #[derive(Debug, Default)]
 pub(crate) struct StreamState {
     mode: StreamMode,
@@ -143,10 +138,12 @@ fn render_reasoning_view(
         line.patch_style(Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC));
     }
     let tail = markdown_cache.update(source, width);
+    // Reasoning previews show only the latest lines; the budget matches the
+    // collapsed/expanded tool display (`Ctrl+o`).
     let limit = if expanded {
-        MAX_EXPANDED_REASONING_LINES
+        crate::ansi::EXPANDED_MAX_LINES
     } else {
-        MAX_VISIBLE_REASONING_LINES
+        crate::ansi::COLLAPSED_MAX_LINES
     };
     let mut body = markdown_cache.latest_lines(&tail, limit);
     while body.last().is_some_and(RenderedLine::is_blank) {

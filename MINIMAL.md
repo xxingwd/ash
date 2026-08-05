@@ -15,6 +15,7 @@
 - ✅ 2026-08-05：基线提交 `6cf0883`（当前工作区全部改动入库，fmt/test/clippy 通过）。本计划基于该基线。
 - ✅ 2026-08-05：**Step 1（A 类）已落地并提交**。A1–A5 全部删除，附带同步：engine.rs 的 `RateLimited { .. }` 匹配与测试构造、TODO.md #17 的过时 `with_spawner` 表述。`RateLimited` 变体由带字段改为 unit 变体（错误文案同步简化）。
 - ✅ 2026-08-05：**Step 2（C1）已落地并提交**。删除鼠标交互整套（从未启用 `enable_mouse_capture`，属不可达代码）：`selection.rs` 模块（267 行）、viewport.rs 的 `SelectableText` 字段/构建/5 个方法/4 个测试、inline.rs 的 `TextSelection`/`selection` 状态/`scroll_lines_up/down`/`start/drag/finish_selection`、app.rs 的 `handle_mouse`/`picker_mouse_action`/`scroll_picker`/`MOUSE_SCROLL_ROWS`、inline_surface.rs 的 `copy_to_clipboard`/`osc52_sequence` + 测试，并移除 ash-tui 的 base64 依赖（`transcript_area` 字段随之无读，一并删除）。净 −633 行。
+- ✅ 2026-08-05：**Step 3（C2 复核）已落地并提交**。确认 Ctrl+O 展开是设计意图（README「思考区不可展开」为文档错误，AGENTS.md 无此描述）。保留 50 行逻辑，合并复杂度：统一 3 组 5/50 常量为 `ansi.rs` 的 `COLLAPSED_MAX_LINES`/`EXPANDED_MAX_LINES`；提取泛型 `split_with_ellipsis`（head+ellipsis+tail），`truncate_command_lines` 复用（删 30 行手写 drain 逻辑），`render_tool_output` 与 reasoning 预览引用共享常量。TUI 行为不变（142 测试全绿）。README 修正「不可展开」并补充 Ctrl-O 文档。
 
 ---
 
@@ -43,7 +44,7 @@
 | # | 项 | 规模 | 位置 | 说明 |
 |---|---|---|---|---|
 | C1 | 鼠标拖拽选择 + OSC52 复制整套 | ~500 行（含测试） | selection.rs + viewport.rs/inline.rs/app.rs/inline_surface.rs 相关 | **不可达代码**：从未调用 `enable_mouse_capture`，crossterm 不会投递鼠标事件。删除后与 README「不捕获鼠标、复制交给终端」自洽 |
-| C2 | Ctrl+O 全局展开/折叠（工具输出 5↔50 行、思考全文、命令，跨会话持久） | 贯穿 5 个模块 | app.rs / inline.rs / live_block.rs / stream_state.rs / ansi.rs | README 未提，且与「思考区折叠为不可展开的一行」直接矛盾；砍掉可简化渲染签名与缓存键 |
+| C2 | ~~Ctrl+O 全局展开/折叠~~（✅ 已复核：**保留功能**，合并重复实现） | 贯穿 5 个模块 | app.rs / inline.rs / live_block.rs / stream_state.rs / ansi.rs | 决策变更：功能是设计意图，README「思考区不可展开」为文档错误（已修正）。真正的复杂度是 3 处重复的 head/ellipsis/tail 截断（工具输出 / bash 命令 / reasoning 预览）+ 3 组 5/50 常量，已合并 |
 | C3 | bash 命令语法高亮（syntect + two_face 完整语法集常驻内存） | ansi.rs 高亮部分 | crates/ash-tui/src/ansi.rs | README 未提；只为标题行配色引入两个重依赖。降级为纯文本/ANSI 解析可删依赖 |
 | C4 | `/status` 命令 | slash_command.rs + inline.rs | 输出 model/protocol/directory，与底栏信息完全重复 | |
 | C5 | welcome card ASCII logo（三级回退） | welcome_card.rs | 纯装饰，可简化成单行标题 | |
@@ -89,7 +90,7 @@
 
 - **Step 1**：删除 A 类死代码（A1–A5）。纯删除，风险最低。
 - **Step 2**：删除 C1 鼠标选择+OSC52 不可达代码（~500 行）。
-- **Step 3**：删除 C2 Ctrl+O 展开模式（简化 5 个模块的渲染签名与缓存键）。
+- ~~**Step 3**：删除 C2 Ctrl+O 展开模式~~ ✅ 2026-08-05 已改向：**保留功能**，合并 3 处重复的截断实现与 3 组 5/50 常量，修正 README 描述。
 - **Step 4**：删除 C3 bash 语法高亮，去掉 syntect/two_face 依赖。
 - **Step 5**：删除 C4 `/status`、C5 welcome logo（降级单行）、C6 diff 预览（守隐私）。
 - **Step 6**：合并 D 类重复实现（D2/D3/D4，D5/D7 视收益）。
