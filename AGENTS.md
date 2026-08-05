@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Ash is a Rust 2021 workspace under `crates/`. `ash-core` defines shared types; `ash-protocol` implements streaming adapters; `ash-tools` contains file and shell tools; `ash-agent` owns sessions, prompts, skills, and MCP; `ash-orchestrator` provides experimental coordination; `ash-tui` implements the inline UI; and `ash-cli` builds the binary. Unit tests generally sit beside modules. Integration and Insta snapshot tests are in `crates/ash-core/tests/`. Architecture constraints are documented in `DESIGN.md`; keep `target/` untracked.
+Ash is a Rust 2021 workspace under `crates/`. `ash-core` defines shared types; `ash-protocol` implements streaming adapters; `ash-tools` contains file and shell tools; `ash-agent` owns sessions, prompts, skills, and MCP; `ash-collab` implements sub-agent coordination; `ash-tui` implements the inline UI; and `ash-cli` builds the binary. Unit tests generally sit beside modules. Integration and Insta snapshot tests are in `crates/ash-core/tests/`. Architecture constraints are documented in `DESIGN.md`; keep `target/` untracked.
 
 ## Build, Test, and Development Commands
 

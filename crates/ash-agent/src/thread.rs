@@ -15,7 +15,7 @@ use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
     AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedThread, RunConfig, Runtime,
-    SharedThreadStore, ThreadAppender, ThreadLog, ThreadMetadata, TurnContext,
+    SharedThreadStore, ThreadAppender, ThreadLog, ThreadMetadata,
 };
 
 const EMPTY_INPUT_ERROR: &str = "thread input cannot be empty";
@@ -651,7 +651,6 @@ impl ThreadState {
         if inputs.is_empty() {
             return Err(ash_core::AshError::Config(EMPTY_INPUT_ERROR.to_string()));
         }
-        let turn_inputs = inputs.clone();
         let mut keys = HashSet::new();
         for input in &inputs {
             ensure_nonempty(input)?;
@@ -674,29 +673,8 @@ impl ThreadState {
             }));
         }
         self.append(&accepted).await?;
-        let turn_context = TurnContext {
-            thread_id: self.id,
-            turn_id,
-            inputs: turn_inputs,
-            messages: self.log.messages(),
-            metadata: self.config.metadata.clone(),
-        };
-        let patch = match self.runtime.prepare_turn(&turn_context).await {
-            Ok(patch) => patch,
-            Err(error) => {
-                let _ = self
-                    .append(&[LogEntry::TurnEnd {
-                        id: turn_id,
-                        result: TurnResult::Failed(error.to_string()),
-                        usage: None,
-                    }])
-                    .await;
-                return Err(error);
-            }
-        };
         let mut model_context = self.log.model_context();
-        let mut turn_config = self.config.clone();
-        turn_config.tools.extend(patch.tools);
+        let turn_config = self.config.clone();
         let writer = self.writer().await?;
         let mut persistence = crate::store::ThreadPersistence::new(writer);
         let execution = TurnExecution::new(
@@ -705,7 +683,7 @@ impl ThreadState {
             events.clone(),
             cancel,
             steering,
-            patch.context,
+            Vec::new(),
         );
         let engine_result = run_agent_turn_persisted(
             self.runtime.model(),
@@ -731,9 +709,9 @@ impl ThreadState {
             &tools,
         ))
         .ok();
-        // Project the turn's terminal entry to compute the view the extension
-        // observes, without mutating the committed log.
-        let mut view = {
+        // Project the turn's terminal entry to compute the committed view,
+        // without mutating the log before the commit point.
+        let view = {
             let mut projected = self.log.clone();
             for entry in persistence.pending() {
                 projected.push(entry.clone());
@@ -749,12 +727,6 @@ impl ThreadState {
             view.context_tokens = context_tokens;
             view
         };
-        let extension_error = self.runtime.complete_turn(&turn_context, &view).await.err();
-        // An extension failure only replaces a successful engine result; it
-        // must not mask an engine error.
-        if let (true, Some(error)) = (engine_result.is_ok(), &extension_error) {
-            view.result = TurnResult::Failed(error.to_string());
-        }
         // Commit point: buffer the turn's terminal entry, then write all
         // buffered messages plus the turn end in one write+flush. On crash
         // before this point the turn has no `TurnEnd`, so the projection
@@ -767,7 +739,7 @@ impl ThreadState {
         let appended = match persistence.commit().await {
             Ok(appended) => appended,
             // A commit failure is only fatal when nothing else already failed.
-            Err(error) if engine_result.is_ok() && extension_error.is_none() => {
+            Err(error) if engine_result.is_ok() => {
                 return Err(error);
             }
             Err(_) => Vec::new(),
@@ -779,9 +751,7 @@ impl ThreadState {
         for entry in appended {
             self.log.push(entry);
         }
-        if let Some(error) = engine_result.err().or(extension_error) {
-            return Err(error);
-        }
+        engine_result?;
         let mut committed = self
             .log
             .turn_view(turn_id)
@@ -935,53 +905,6 @@ mod tests {
         }
     }
 
-    struct GoalExtension {
-        completed: Arc<AtomicUsize>,
-    }
-
-    struct FailingPrepareExtension;
-
-    #[async_trait::async_trait]
-    impl crate::Extension for FailingPrepareExtension {
-        async fn prepare(
-            &self,
-            _turn: &TurnContext,
-        ) -> Result<crate::TurnPatch, ash_core::AshError> {
-            Err(ash_core::AshError::Config("prepare failed".to_string()))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::Extension for GoalExtension {
-        async fn prepare(
-            &self,
-            turn: &TurnContext,
-        ) -> Result<crate::TurnPatch, ash_core::AshError> {
-            assert_eq!(turn.metadata.get("goal"), Some(&serde_json::json!("ship")));
-            Ok(crate::TurnPatch {
-                context: vec![Message::system("active goal: ship")],
-                tools: Vec::new(),
-            })
-        }
-
-        async fn complete(
-            &self,
-            _turn: &TurnContext,
-            view: &ash_core::TurnView,
-        ) -> Result<(), ash_core::AshError> {
-            assert!(matches!(
-                &view.result,
-                ash_core::TurnResult::Completed(StopReason::EndTurn)
-            ));
-            assert!(view
-                .messages
-                .iter()
-                .any(|message| matches!(message.content, MessageContent::Assistant(_))));
-            self.completed.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     impl ModelClient for MockAdapter {
         fn stream(&self, request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
             self.requests.lock().unwrap().push(request);
@@ -1003,7 +926,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         }
@@ -1490,114 +1412,5 @@ mod tests {
         assert!(error.to_string().contains("duplicate agent input"));
         assert!(state.log.entries().is_empty());
         assert!(state.store.load(state.id()).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn runtime_extensions_add_turn_context_and_observe_completion() {
-        let directory = TempDir::new().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let completed = Arc::new(AtomicUsize::new(0));
-        let runtime = Runtime::new(
-            Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![
-                    ModelEvent::Text("done".to_string()),
-                    ModelEvent::Stop(StopReason::EndTurn),
-                ]])),
-                requests: requests.clone(),
-            }),
-            "test",
-        )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())))
-        .with_extension(Arc::new(GoalExtension {
-            completed: completed.clone(),
-        }));
-        let mut run_config = config(directory.path().into());
-        run_config
-            .metadata
-            .insert("goal".to_string(), serde_json::json!("ship"));
-        let thread = Thread::spawn(ThreadState::new(run_config, runtime));
-
-        thread.submit("work").await.unwrap().wait().await.unwrap();
-
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
-        assert!(requests.lock().unwrap()[0]
-            .messages
-            .iter()
-            .any(|message| message.role == Role::System));
-    }
-
-    #[tokio::test]
-    async fn failed_turn_that_wrote_nothing_emits_its_own_failed_view() {
-        let directory = TempDir::new().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let runtime = Runtime::new(
-            Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![ModelEvent::Stop(
-                    StopReason::EndTurn,
-                )]])),
-                requests: requests.clone(),
-            }),
-            "test",
-        )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())))
-        .with_extension(Arc::new(FailingPrepareExtension));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let mut events = thread.events();
-
-        // `submit_inputs` persists `TurnStart` + the input, then `prepare_turn`
-        // fails. The turn settles with its own `TurnEnd(Failed)`; the emitted
-        // view must be this turn's failure, not a previous turn's stale view.
-        thread
-            .submit("work")
-            .await
-            .unwrap()
-            .wait()
-            .await
-            .unwrap_err();
-
-        // Drain events for a bounded time; `events.next()` would block forever
-        // after the turn settles because no further events are emitted.
-        let mut saw_turn = false;
-        while let Ok(Some(Ok(event))) =
-            tokio::time::timeout(Duration::from_millis(200), events.next()).await
-        {
-            if let EventKind::Turn(view) = event.kind {
-                saw_turn = true;
-                assert!(matches!(view.result, TurnResult::Failed(_)));
-                assert!(!view.messages.is_empty());
-            }
-        }
-        assert!(saw_turn);
-    }
-
-    #[tokio::test]
-    async fn extension_observes_the_full_turn_message_set() {
-        let directory = TempDir::new().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let completed = Arc::new(AtomicUsize::new(0));
-        let runtime = Runtime::new(
-            Arc::new(MockAdapter {
-                responses: Mutex::new(VecDeque::from([vec![
-                    ModelEvent::Text("done".to_string()),
-                    ModelEvent::Stop(StopReason::EndTurn),
-                ]])),
-                requests: requests.clone(),
-            }),
-            "test",
-        )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())))
-        .with_extension(Arc::new(GoalExtension {
-            completed: completed.clone(),
-        }));
-        let mut run_config = config(directory.path().into());
-        run_config
-            .metadata
-            .insert("goal".to_string(), serde_json::json!("ship"));
-        let thread = Thread::spawn(ThreadState::new(run_config, runtime));
-
-        thread.submit("work").await.unwrap().wait().await.unwrap();
-
-        // The extension sees the accepted user input plus the assistant reply.
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 }

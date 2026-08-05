@@ -18,7 +18,7 @@ pub struct Agent {
     pub context_policy: Arc<dyn ContextPolicy>,
 }
 
-/// Per-thread execution scope. Product-specific state belongs in `metadata`.
+/// Per-thread execution scope.
 #[derive(Clone)]
 pub struct ThreadOptions {
     pub working_dir: PathBuf,
@@ -26,7 +26,6 @@ pub struct ThreadOptions {
     pub path: String,
     pub tree_id: Option<TreeId>,
     pub kind: ThreadKind,
-    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for ThreadOptions {
@@ -37,7 +36,6 @@ impl Default for ThreadOptions {
             path: "/root".to_string(),
             tree_id: None,
             kind: ThreadKind::Root,
-            metadata: serde_json::Map::new(),
         }
     }
 }
@@ -73,7 +71,6 @@ pub(crate) struct RunConfig {
     pub agent_path: String,
     pub tree_id: Option<TreeId>,
     pub kind: ThreadKind,
-    pub metadata: serde_json::Map<String, serde_json::Value>,
     /// How many times a single model call may be retried after a safe,
     /// retryable failure (network error, upstream 5xx, rate limit, or a
     /// truncated stream). Retries only happen before any tool call has been
@@ -98,7 +95,6 @@ impl RunConfig {
             agent_path: options.path.clone(),
             tree_id: options.tree_id,
             kind: options.kind,
-            metadata: options.metadata.clone(),
             max_retries: 5,
             retry_backoff: RetryBackoff::default(),
         }

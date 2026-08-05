@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use ash_core::{Message, ModelClient, ThreadId, ThreadSummary, TurnView};
+use ash_core::{Message, ModelClient, ThreadId, ThreadSummary};
 
 use crate::{
-    agent::RunConfig, Agent, Extension, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
-    ThreadState, ThreadStore, TurnContext, TurnPatch,
+    agent::RunConfig, Agent, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
+    ThreadState, ThreadStore,
 };
 
 /// Provider-neutral dependencies and the only entry point for creating threads.
@@ -13,7 +13,6 @@ pub struct Runtime {
     model: Arc<dyn ModelClient>,
     model_backend: Arc<str>,
     threads: SharedThreadStore,
-    extensions: Arc<Vec<Arc<dyn Extension>>>,
 }
 
 impl Runtime {
@@ -22,17 +21,11 @@ impl Runtime {
             model,
             model_backend: Arc::from(model_backend.into()),
             threads: Arc::new(JsonlThreadStore::default()),
-            extensions: Arc::new(Vec::new()),
         }
     }
 
     pub fn with_thread_store(mut self, threads: Arc<dyn ThreadStore>) -> Self {
         self.threads = threads;
-        self
-    }
-
-    pub fn with_extension(mut self, extension: Arc<dyn Extension>) -> Self {
-        Arc::make_mut(&mut self.extensions).push(extension);
         self
     }
 
@@ -88,35 +81,5 @@ impl Runtime {
 
     pub(crate) fn thread_store_handle(&self) -> SharedThreadStore {
         Arc::clone(&self.threads)
-    }
-
-    pub(crate) async fn prepare_turn(
-        &self,
-        turn: &TurnContext,
-    ) -> Result<TurnPatch, ash_core::AshError> {
-        let mut combined = TurnPatch::default();
-        for extension in self.extensions.iter() {
-            let patch = extension.prepare(turn).await?;
-            combined.context.extend(patch.context);
-            combined.tools.extend(patch.tools);
-        }
-        Ok(combined)
-    }
-
-    pub(crate) async fn complete_turn(
-        &self,
-        turn: &TurnContext,
-        view: &TurnView,
-    ) -> Result<(), ash_core::AshError> {
-        let mut first_error = None;
-        for extension in self.extensions.iter() {
-            if let Err(error) = extension.complete(turn, view).await {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
     }
 }

@@ -2,7 +2,6 @@ pub mod agent;
 pub mod context;
 pub mod context_policy;
 mod engine;
-pub mod extension;
 pub mod input;
 mod jsonl;
 pub mod log;
@@ -22,7 +21,6 @@ pub use context::{count_tokens, estimate_request_tokens, estimate_tokens};
 pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
 };
-pub use extension::{Extension, TurnContext, TurnPatch};
 pub use input::{Input, InputSource};
 pub use jsonl::{JsonlThreadStore, ThreadWriter};
 pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, ThreadLog};

@@ -34,7 +34,7 @@
 
 | # | 项 | 位置 | 说明 | 决策 |
 |---|---|---|---|---|
-| B1 | Extension 机制全套（`Extension::prepare/complete`、`Runtime::with_extension`、`TurnPatch`、thread.rs 中 ~60 行失败/投影/合并支撑） | ash-agent/src/extension.rs、runtime.rs、thread.rs | 仅测试消费（GoalExtension/FailingPrepareExtension）；DESIGN.md 列为预期集成边界 | ⬜ |
+| ~~B1~~ Extension 机制全套 | 已删（70320fc 之后提交） | 产品零注册，仅测试消费；`extension.rs` 删除，runtime/thread 的支撑代码清理，DESIGN.md Extensions 章节移除 | ✅ |
 | B2 | `Thread::enqueue` + `InputSource::Schedule/Heartbeat/Custom` | ash-agent/src/thread.rs | 仅测试；为「调度器/心跳」预留，产品无此场景 | ⬜ |
 | B3 | `Turn::steer` + steering 通道 + engine `apply_steering` | ash-agent/src/thread.rs、engine.rs | 仅测试；chat gateway 场景。删除需动 run_turn select 循环与 engine 调用点（非纯删除） | ⬜ |
 | B4 | idempotency_key 校验链 | ash-agent/src/thread.rs、log.rs | 仅测试；为「外部触发」设计 | ⬜ |
@@ -79,7 +79,7 @@
 |---|---|---|
 | F1 | MCP 近期要接吗？ | B5 去留；AGENTS.md/DESIGN.md 相关表述同步 |
 | F2 | chat gateway / 调度器 / 心跳场景还要吗？ | B2/B3/B4 去留（enqueue/steer/idempotency） |
-| F3 | Extension 机制有真实需求吗（goals/记忆/审批/审计）？ | B1 去留；DESIGN.md 的 Extensions 章节同步 |
+| ~~F3~~ Extension 机制有真实需求吗？ | ✅ 2026-08-05 决策：**删除**（无产品注册） |
 | F4 | `/new` 与 `/clear` 合并吗？ | D1 |
 | F5 | 图片读取要保留吗？ | E3 |
 | F6 | `ASH_MODEL_CONFIG` DSL 保留还是换配置文件？ | E4 |
@@ -95,7 +95,7 @@
 - ~~**Step 4**：删除 C3 bash 语法高亮，去掉 syntect/two_face 依赖~~ ✅ 2026-08-05 已改向：**手写词法器替换**（b4adb9b、9c58caf、d43a7a0），保留命令着色，删除 syntect/two-face（−1.36 MiB）。
 - **Step 5**：删除 C4 `/status`、C5 welcome logo（降级单行）、C6 diff 预览（守隐私）。
 - **Step 6**：合并 D 类重复实现（D2/D3/D4，D5/D7 视收益）。
-- **Step 7**：按 F 决策结果处理 B 类（B1–B5）。
+- **Step 7**：按 F 决策结果处理 B 类（B1–B5）。B1（Extension）✅ 已删；B5（mcp）✅ 保留；B2/B3/B4（调度）待统一。
 - **Step 8**：E 类降档（E1 重试次数、E2 双层超时）。
 - **Step 9**：文档同步——README 与代码行为对齐（隐藏功能删除后自然一致），DESIGN.md 删除不再成立的章节（Extensions/Collaboration 按决策调整），AGENTS.md 修正（ash-orchestrator 不存在、MCP 归属按 F1 调整）。
 

@@ -931,7 +931,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -997,7 +996,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1091,7 +1089,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1171,7 +1168,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1219,7 +1215,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1313,7 +1308,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1382,7 +1376,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1456,7 +1449,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1517,7 +1509,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1584,7 +1575,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1648,7 +1638,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1716,7 +1705,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1786,7 +1774,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1851,7 +1838,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1984,7 +1970,6 @@ mod tests {
             agent_path: "/root".to_string(),
             tree_id: None,
             kind: crate::ThreadKind::Root,
-            metadata: serde_json::Map::new(),
             max_retries: 5,
             retry_backoff: RetryBackoff {
                 base: Duration::from_secs(1),

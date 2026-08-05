@@ -10,7 +10,7 @@ scheduler, or service own transport and presentation; Ash owns agent execution s
 | `ash-core` | Provider-neutral messages, model, tool, event, ID, error, and cancellation types |
 | `ash-protocol` | Model-provider protocol adapters and streaming translation |
 | `ash-tools` | Sandboxed file, process, search, and web tools |
-| `ash-agent` | Agent definition, runtime, threads, turns, input, context, extensions, and persistence |
+| `ash-agent` | Agent definition, runtime, threads, turns, input, context, and persistence |
 | `ash-collab` | Optional child-agent spawning, messaging, lifecycle, and collaboration tools |
 | `ash-tui` | Terminal rendering and interaction only |
 | `ash-cli` | Binary composition and product command routing |
@@ -23,7 +23,7 @@ terminal state, or collaboration. `ash-agent` does not depend on the CLI or TUI.
 The stable execution vocabulary is deliberately small:
 
 - `Agent` is immutable behavior: model, prompt, tools, limits, and context policy.
-- `Runtime` owns injected capabilities: model client, thread store, and extensions.
+- `Runtime` owns injected capabilities: model client and thread store.
 - `ThreadOptions` is per-thread scope: working directory, timeout, agent path, tree ID,
   typed `ThreadKind`, and product metadata.
 - `Thread` is the durable concurrent conversation boundary and the sole input-queue owner.
@@ -137,39 +137,15 @@ views from the same reducer rather than assembling a parallel view in the execut
 history. A checkpoint changes only the model-context projection. Manual and automatic
 compaction therefore share the same durable mechanism.
 
-Durable messages and extension-provided ephemeral context remain separate throughout preparation.
+Durable messages and ephemeral context remain separate throughout preparation.
 Both count toward the request budget and are sent to the model, but compaction summarizes and
 checkpoints only durable messages. A compaction stream must end with a clean `EndTurn`; a missing or
 truncated terminal marker rejects the summary instead of persisting partial context.
 
-Long-term or cross-thread memory is an extension, not part of the thread log. A memory extension
-can retrieve relevant facts in `prepare`, inject ephemeral context, and update its own store in
-`complete`. This keeps durable conversation history separate from derived memory indexes.
-
-## Extensions
-
-`Runtime::with_extension` composes any number of `Extension` implementations. Each extension
-receives a `TurnContext` containing IDs, accepted inputs, current messages, and thread metadata.
-
-`Extension::prepare` returns a `TurnPatch` with ephemeral context and turn-scoped tools.
-`Extension::complete` observes a `TurnOutcome` containing the final status and the complete
-durable message projection for that Turn.
-
 Before provider-specific serialization, `ash-protocol` validates every message's role/content pair
 and projects system-role text into the provider's privileged system or instructions field. This
-keeps extension-provided system context at system priority without changing the durable message
-schema; invalid role/content combinations and system images fail locally as invalid requests.
-
-This is the intended integration boundary for:
-
-- Codex-style goals and plans;
-- Claude Code-style workflows and modes;
-- dynamic memory retrieval;
-- product policy and approvals;
-- per-turn tool exposure;
-- tracing and audit integrations.
-
-Extensions compose at `Runtime`; they do not add branches to the model/tool loop.
+keeps system context at system priority without changing the durable message schema; invalid
+role/content combinations and system images fail locally as invalid requests.
 
 ## Collaboration
 
@@ -253,4 +229,4 @@ chat message / timer / webhook
 
 Transport reconnection, authentication, delivery retries, timer persistence, and platform rate
 limits belong to the product adapter. Conversation ordering, idempotency, cancellation,
-steering, compaction, extensions, and durable agent history belong to `ash-agent`.
+steering, compaction, and durable agent history belong to `ash-agent`.
