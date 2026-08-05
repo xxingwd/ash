@@ -8,15 +8,9 @@
 //! Truncation (head + ellipsis + tail) happens here, at the display layer,
 //! so the agent still receives the full tool output for reasoning.
 
-use std::sync::OnceLock;
-
 use ansi_to_tui::IntoText;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::Theme;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
 
 /// Display budget for a collapsed block: tool output, bash command
 /// continuations, and live reasoning all preview at this many lines.
@@ -24,81 +18,161 @@ pub(crate) const COLLAPSED_MAX_LINES: usize = 5;
 /// Display budget when tool blocks are expanded (`Ctrl+o`).
 pub(crate) const EXPANDED_MAX_LINES: usize = 50;
 
-static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// Catppuccin Mocha palette (subset), matching the theme syntect used to
+/// load. Kept inline so bash highlighting needs no syntax library.
+mod mocha {
+    use ratatui::style::Color;
 
-fn syntax_set() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    pub(super) const KEYWORD: Color = Color::Rgb(0xF3, 0x8B, 0xA8); // pink
+    pub(super) const STRING: Color = Color::Rgb(0xA6, 0xE3, 0xA1); // green
+    pub(super) const VARIABLE: Color = Color::Rgb(0x94, 0xE2, 0xD5); // teal
+    pub(super) const COMMENT: Color = Color::Rgb(0x6C, 0x70, 0x86); // overlay1
+    pub(super) const FLAG: Color = Color::Rgb(0x89, 0xB4, 0xFA); // blue
 }
 
-fn theme() -> &'static Theme {
-    THEME.get_or_init(|| {
-        // Same default theme as codex: Catppuccin Mocha (the dark variant).
-        // An adaptive light/dark probe is possible but adds startup
-        // complexity; keep the fixed dark theme for now.
-        let themes = two_face::theme::extra();
-        themes
-            .get(two_face::theme::EmbeddedThemeName::CatppuccinMocha)
-            .clone()
-    })
-}
-
-fn bash_syntax() -> Option<&'static SyntaxReference> {
-    syntax_set()
-        .find_syntax_by_name("Shell Script (bash)")
-        .or_else(|| syntax_set().find_syntax_by_extension("sh"))
-        .or_else(|| syntax_set().find_syntax_by_name("Shell-Unix-Generic"))
-}
+/// Words that are structural in bash; given keyword color. Covers the
+/// control flow plus common builtins. A miss just renders the word in the
+/// default foreground, so the list stays small.
+const BASH_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "in", "function", "return", "exit", "cd", "export", "local", "read", "echo", "printf", "set",
+    "unset", "shift", "source", "alias", "trap", "exec", "eval", "let", "select", "time", "coproc",
+    "break", "continue",
+];
 
 /// Highlight a bash command string with syntax colors, one `Line` per source
-/// line. Falls back to plain text when the bash grammar is unavailable.
+/// line. A lightweight hand-rolled lexer replaces the syntect engine: it
+/// scans for quoted strings, `$var`, `# comments`, and known keywords, and
+/// colors everything else with the default foreground. This covers the
+/// simple commands agents actually run; exotic constructs just fall back to
+/// plain text.
 pub(crate) fn highlight_bash_command(command: &str) -> Vec<Line<'static>> {
-    let Some(syntax) = bash_syntax() else {
-        return command
-            .lines()
-            .map(|line| Line::from(line.to_string()))
-            .collect();
-    };
-    let mut highlighter = HighlightLines::new(syntax, theme());
-    let mut lines = Vec::new();
-    for source in LinesWithEndings::from(command) {
-        match highlighter.highlight_line(source, syntax_set()) {
-            Ok(ranges) => {
-                let spans: Vec<Span<'static>> = ranges
-                    .into_iter()
-                    .map(|(style, text)| Span::styled(text.to_string(), syntect_style(style)))
-                    .collect();
-                lines.push(Line::from(spans));
-            }
-            Err(_) => lines.push(Line::from(source.to_string())),
-        }
-    }
-    lines
+    command.lines().map(highlight_bash_line).collect()
 }
 
-/// Convert a syntect style to a ratatui style, following codex:
-/// - alpha 0x01 ("terminal default foreground") → omit the foreground so the
-///   terminal's own default color shows through (plain text reads as plain
-///   text, not as a hardcoded gray).
-/// - alpha 0xFF → plain RGB.
-/// - italic/underline are skipped because many terminals render them poorly;
-///   bold is kept.
-fn syntect_style(style: syntect::highlighting::Style) -> Style {
-    const ANSI_ALPHA_DEFAULT: u8 = 0x01;
+fn highlight_bash_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let mut chars = line.char_indices().peekable();
 
-    let mut ratatui_style = Style::default();
-    let fg = style.foreground;
-    if fg.a != ANSI_ALPHA_DEFAULT {
-        // Non-ANSI alpha values in some bundled themes; treat as RGB.
-        ratatui_style = ratatui_style.fg(Color::Rgb(fg.r, fg.g, fg.b));
+    macro_rules! flush_plain {
+        () => {
+            if !plain.is_empty() {
+                spans.push(Span::raw(std::mem::take(&mut plain)));
+            }
+        };
     }
-    if style
-        .font_style
-        .contains(syntect::highlighting::FontStyle::BOLD)
-    {
-        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            // Single-quoted string: literal until the closing quote.
+            '\'' => {
+                flush_plain!();
+                let mut content = String::from("'");
+                let mut closed = false;
+                for (_, c) in chars.by_ref() {
+                    content.push(c);
+                    if c == '\'' {
+                        closed = true;
+                        break;
+                    }
+                }
+                spans.push(Span::styled(content, Style::default().fg(mocha::STRING)));
+                let _ = closed;
+            }
+            // Double-quoted string: honor backslash escapes.
+            '"' => {
+                flush_plain!();
+                let mut content = String::from("\"");
+                let mut closed = false;
+                let mut escaped = false;
+                for (_, c) in chars.by_ref() {
+                    content.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                spans.push(Span::styled(content, Style::default().fg(mocha::STRING)));
+                let _ = closed;
+            }
+            // Variable: `$name`, `${name}`, `$1`.
+            '$' => {
+                flush_plain!();
+                let mut content = String::from("$");
+                if let Some((_, '{')) = chars.peek() {
+                    chars.next();
+                    content.push('{');
+                    for (_, c) in chars.by_ref() {
+                        content.push(c);
+                        if c == '}' {
+                            break;
+                        }
+                    }
+                } else {
+                    for (_, c) in chars.by_ref() {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            content.push(c);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                spans.push(Span::styled(content, Style::default().fg(mocha::VARIABLE)));
+            }
+            // Comment: to end of line.
+            '#' if index == 0 || line.as_bytes()[index - 1] == b' ' => {
+                flush_plain!();
+                let content: String = chars.by_ref().map(|(_, c)| c).collect::<String>();
+                spans.push(Span::styled(
+                    format!("#{content}"),
+                    Style::default().fg(mocha::COMMENT),
+                ));
+                break;
+            }
+            // Alphanumeric run: keyword or flag.
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                flush_plain!();
+                let mut word = String::from(c);
+                while let Some((_, c)) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || *c == '_' {
+                        word.push(*c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let style = if BASH_KEYWORDS.contains(&word.as_str()) {
+                    Style::default().fg(mocha::KEYWORD)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(word, style));
+            }
+            '-' => {
+                flush_plain!();
+                let mut word = String::from("-");
+                while let Some((_, c)) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || *c == '-' || *c == '_' {
+                        word.push(*c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                spans.push(Span::styled(word, Style::default().fg(mocha::FLAG)));
+            }
+            _ => {
+                plain.push(ch);
+            }
+        }
     }
-    ratatui_style
+    flush_plain!();
+    Line::from(spans)
 }
 
 /// Parse one line of text that may contain ANSI escape sequences into a
@@ -329,48 +403,43 @@ mod highlight_tests {
         let lines = highlight_bash_command("echo one\necho two");
         assert_eq!(lines.len(), 2);
     }
-}
-
-#[cfg(test)]
-mod current_theme_tests {
-    use super::*;
 
     #[test]
-    fn print_current_theme_colors() {
-        let lines = highlight_bash_command("cd /tmp && ls -la");
-        for span in &lines[0].spans {
-            println!(
-                "span: fg={:?} 内容={:?}",
-                span.style.fg,
-                span.content.to_string()
-            );
-        }
+    fn strings_variables_and_comments_get_their_own_colors() {
+        let line = highlight_bash_line("echo \"hi $NAME\" $HOME # note");
+        let fg_of = |needle: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains(needle))
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(fg_of("hi $NAME"), Some(mocha::STRING), "string color");
+        assert_eq!(fg_of("$HOME"), Some(mocha::VARIABLE), "variable color");
+        assert_eq!(fg_of("note"), Some(mocha::COMMENT), "comment color");
     }
-}
-
-#[cfg(test)]
-mod alpha_check_tests {
-    use super::*;
 
     #[test]
-    fn print_alpha_values() {
-        let ss = two_face::syntax::extra_newlines();
-        let syntax = ss
-            .find_syntax_by_name("Shell Script (bash)")
-            .unwrap_or_else(|| ss.find_syntax_by_name("Shell-Unix-Generic").unwrap());
-        let theme = theme();
-        let mut h = syntect::easy::HighlightLines::new(syntax, theme);
-        let ranges = h.highlight_line("cd /tmp && ls -la\n", &ss).unwrap();
-        for (style, text) in ranges {
-            println!(
-                "alpha={} fg=({},{},{}) 内容={:?}",
-                style.foreground.a,
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-                text
-            );
-        }
+    fn keywords_and_flags_get_distinct_colors() {
+        let line = highlight_bash_line("cd /tmp && ls -la");
+        let fg_of = |needle: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == needle)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(fg_of("cd"), Some(mocha::KEYWORD), "keyword color");
+        assert_eq!(fg_of("-la"), Some(mocha::FLAG), "flag color");
+    }
+
+    #[test]
+    fn unclosed_quote_falls_back_to_string_color_without_panicking() {
+        let line = highlight_bash_line("echo \"oops");
+        let content: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert_eq!(content, "echo \"oops");
     }
 }
 

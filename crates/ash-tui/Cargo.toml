@@ -15,5 +15,3 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 ansi-to-tui = "8.0.1"
-syntect = "5.3.0"
-two-face = "0.5.1"
