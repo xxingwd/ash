@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 pub enum InputSource {
     #[default]
     User,
+    /// Scheduled external trigger (timer/cron).
     Schedule,
+    /// Periodic heartbeat from a supervisor.
     Heartbeat,
+    /// Input from a collaborating agent.
     Agent,
+    /// System-level input.
     System,
-    Custom(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

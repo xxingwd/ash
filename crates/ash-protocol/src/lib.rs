@@ -43,7 +43,7 @@ impl std::fmt::Display for Protocol {
 }
 
 /// Default model for protocols that have a sensible built-in.
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 
 impl Protocol {
     /// Stable configuration name used by the CLI and `ASH_PROTOCOL`.
