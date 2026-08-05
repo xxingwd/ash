@@ -28,17 +28,24 @@ mod mocha {
     pub(super) const VARIABLE: Color = Color::Rgb(0x94, 0xE2, 0xD5); // teal
     pub(super) const COMMENT: Color = Color::Rgb(0x6C, 0x70, 0x86); // overlay1
     pub(super) const FLAG: Color = Color::Rgb(0x89, 0xB4, 0xFA); // blue
+    pub(super) const COMMAND: Color = Color::Rgb(0xCB, 0xA6, 0xF7); // mauve
 }
 
-/// Words that are structural in bash; given keyword color. Covers the
-/// control flow plus common builtins. A miss just renders the word in the
-/// default foreground, so the list stays small.
+/// Control-flow words that keep the keyword color wherever they appear.
+/// Builtins like `cd`/`echo` are deliberately absent: they are commands and
+/// get the command color when they start a command.
 const BASH_KEYWORDS: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
-    "in", "function", "return", "exit", "cd", "export", "local", "read", "echo", "printf", "set",
-    "unset", "shift", "source", "alias", "trap", "exec", "eval", "let", "select", "time", "coproc",
-    "break", "continue",
+    "in", "function", "select", "time", "coproc", "break", "continue",
 ];
+
+/// The first word after a command boundary (start of line, `&&`, `||`, `;`,
+/// or `|`) is the command and gets the command color. A keyword in that
+/// position keeps the keyword color and does not consume the boundary, so
+/// `if cd /tmp` still colors `cd` as a command.
+fn is_command_boundary(ch: char) -> bool {
+    matches!(ch, '&' | '|' | ';')
+}
 
 /// Highlight a bash command string with syntax colors, one `Line` per source
 /// line. A lightweight hand-rolled lexer replaces the syntect engine: it
@@ -54,6 +61,9 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
     let mut chars = line.char_indices().peekable();
+    // True when the next word starts a command (start of line or right after
+    // `&&`, `||`, `;`, `|`).
+    let mut at_command_pos = true;
 
     macro_rules! flush_plain {
         () => {
@@ -134,7 +144,7 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                 ));
                 break;
             }
-            // Alphanumeric run: keyword or flag.
+            // Alphanumeric run: command, keyword, or plain word.
             c if c.is_ascii_alphanumeric() || c == '_' => {
                 flush_plain!();
                 let mut word = String::from(c);
@@ -146,11 +156,19 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                         break;
                     }
                 }
-                let style = if BASH_KEYWORDS.contains(&word.as_str()) {
+                let is_keyword = BASH_KEYWORDS.contains(&word.as_str());
+                let style = if is_keyword {
                     Style::default().fg(mocha::KEYWORD)
+                } else if at_command_pos {
+                    Style::default().fg(mocha::COMMAND)
                 } else {
                     Style::default()
                 };
+                // A control-flow keyword does not consume the command
+                // position: `if cd /tmp` still colors `cd` as a command.
+                if !is_keyword {
+                    at_command_pos = false;
+                }
                 spans.push(Span::styled(word, style));
             }
             '-' => {
@@ -165,6 +183,11 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                     }
                 }
                 spans.push(Span::styled(word, Style::default().fg(mocha::FLAG)));
+            }
+            // Command separator: the next word is a command.
+            c if is_command_boundary(c) => {
+                plain.push(ch);
+                at_command_pos = true;
             }
             _ => {
                 plain.push(ch);
@@ -427,8 +450,25 @@ mod highlight_tests {
                 .find(|span| span.content == needle)
                 .and_then(|span| span.style.fg)
         };
-        assert_eq!(fg_of("cd"), Some(mocha::KEYWORD), "keyword color");
+        assert_eq!(fg_of("cd"), Some(mocha::COMMAND), "builtin as command");
+        assert_eq!(fg_of("ls"), Some(mocha::COMMAND), "command after &&");
         assert_eq!(fg_of("-la"), Some(mocha::FLAG), "flag color");
+    }
+
+    #[test]
+    fn control_flow_keywords_keep_keyword_color() {
+        let line = highlight_bash_line("if cd /tmp; then ls; fi");
+        let fg_of = |needle: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == needle)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(fg_of("if"), Some(mocha::KEYWORD), "if keyword");
+        assert_eq!(fg_of("then"), Some(mocha::KEYWORD), "then keyword");
+        assert_eq!(fg_of("fi"), Some(mocha::KEYWORD), "fi keyword");
+        assert_eq!(fg_of("cd"), Some(mocha::COMMAND), "command after if");
+        assert_eq!(fg_of("ls"), Some(mocha::COMMAND), "command after then");
     }
 
     #[test]
