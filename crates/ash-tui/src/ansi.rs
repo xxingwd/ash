@@ -18,17 +18,24 @@ pub(crate) const COLLAPSED_MAX_LINES: usize = 5;
 /// Display budget when tool blocks are expanded (`Ctrl+o`).
 pub(crate) const EXPANDED_MAX_LINES: usize = 50;
 
-/// Catppuccin Mocha palette (subset), matching the theme syntect used to
-/// load. Kept inline so bash highlighting needs no syntax library.
-mod mocha {
+/// Bash highlighting palette. Uses the same base ratatui colors as the
+/// markdown renderer (Green for quotes, Cyan for code, Blue for markers) so
+/// the TUI stays visually consistent.
+mod bash_palette {
     use ratatui::style::Color;
 
-    pub(super) const KEYWORD: Color = Color::Rgb(0xF3, 0x8B, 0xA8); // pink
-    pub(super) const STRING: Color = Color::Rgb(0xA6, 0xE3, 0xA1); // green
-    pub(super) const VARIABLE: Color = Color::Rgb(0x94, 0xE2, 0xD5); // teal
-    pub(super) const COMMENT: Color = Color::Rgb(0x6C, 0x70, 0x86); // overlay1
-    pub(super) const FLAG: Color = Color::Rgb(0x89, 0xB4, 0xFA); // blue
-    pub(super) const COMMAND: Color = Color::Rgb(0xCB, 0xA6, 0xF7); // mauve
+    /// Control-flow keywords (`if`, `then`, `fi`…).
+    pub(super) const KEYWORD: Color = Color::Magenta;
+    /// Quoted strings and here-strings.
+    pub(super) const STRING: Color = Color::Green;
+    /// `$variable` expansions.
+    pub(super) const VARIABLE: Color = Color::Cyan;
+    /// `# comments`.
+    pub(super) const COMMENT: Color = Color::DarkGray;
+    /// `-flag` options.
+    pub(super) const FLAG: Color = Color::Blue;
+    /// The command word at the start of a command.
+    pub(super) const COMMAND: Color = Color::Cyan;
 }
 
 /// Control-flow words that keep the keyword color wherever they appear.
@@ -87,7 +94,10 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                         break;
                     }
                 }
-                spans.push(Span::styled(content, Style::default().fg(mocha::STRING)));
+                spans.push(Span::styled(
+                    content,
+                    Style::default().fg(bash_palette::STRING),
+                ));
                 let _ = closed;
             }
             // Double-quoted string: honor backslash escapes.
@@ -107,7 +117,10 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                         break;
                     }
                 }
-                spans.push(Span::styled(content, Style::default().fg(mocha::STRING)));
+                spans.push(Span::styled(
+                    content,
+                    Style::default().fg(bash_palette::STRING),
+                ));
                 let _ = closed;
             }
             // Variable: `$name`, `${name}`, `$1`.
@@ -132,7 +145,10 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                         }
                     }
                 }
-                spans.push(Span::styled(content, Style::default().fg(mocha::VARIABLE)));
+                spans.push(Span::styled(
+                    content,
+                    Style::default().fg(bash_palette::VARIABLE),
+                ));
             }
             // Comment: to end of line.
             '#' if index == 0 || line.as_bytes()[index - 1] == b' ' => {
@@ -140,7 +156,7 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                 let content: String = chars.by_ref().map(|(_, c)| c).collect::<String>();
                 spans.push(Span::styled(
                     format!("#{content}"),
-                    Style::default().fg(mocha::COMMENT),
+                    Style::default().fg(bash_palette::COMMENT),
                 ));
                 break;
             }
@@ -158,9 +174,9 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                 }
                 let is_keyword = BASH_KEYWORDS.contains(&word.as_str());
                 let style = if is_keyword {
-                    Style::default().fg(mocha::KEYWORD)
+                    Style::default().fg(bash_palette::KEYWORD)
                 } else if at_command_pos {
-                    Style::default().fg(mocha::COMMAND)
+                    Style::default().fg(bash_palette::COMMAND)
                 } else {
                     Style::default()
                 };
@@ -182,7 +198,7 @@ fn highlight_bash_line(line: &str) -> Line<'static> {
                         break;
                     }
                 }
-                spans.push(Span::styled(word, Style::default().fg(mocha::FLAG)));
+                spans.push(Span::styled(word, Style::default().fg(bash_palette::FLAG)));
             }
             // Command separator: the next word is a command.
             c if is_command_boundary(c) => {
@@ -436,9 +452,17 @@ mod highlight_tests {
                 .find(|span| span.content.contains(needle))
                 .and_then(|span| span.style.fg)
         };
-        assert_eq!(fg_of("hi $NAME"), Some(mocha::STRING), "string color");
-        assert_eq!(fg_of("$HOME"), Some(mocha::VARIABLE), "variable color");
-        assert_eq!(fg_of("note"), Some(mocha::COMMENT), "comment color");
+        assert_eq!(
+            fg_of("hi $NAME"),
+            Some(bash_palette::STRING),
+            "string color"
+        );
+        assert_eq!(
+            fg_of("$HOME"),
+            Some(bash_palette::VARIABLE),
+            "variable color"
+        );
+        assert_eq!(fg_of("note"), Some(bash_palette::COMMENT), "comment color");
     }
 
     #[test]
@@ -450,9 +474,13 @@ mod highlight_tests {
                 .find(|span| span.content == needle)
                 .and_then(|span| span.style.fg)
         };
-        assert_eq!(fg_of("cd"), Some(mocha::COMMAND), "builtin as command");
-        assert_eq!(fg_of("ls"), Some(mocha::COMMAND), "command after &&");
-        assert_eq!(fg_of("-la"), Some(mocha::FLAG), "flag color");
+        assert_eq!(
+            fg_of("cd"),
+            Some(bash_palette::COMMAND),
+            "builtin as command"
+        );
+        assert_eq!(fg_of("ls"), Some(bash_palette::COMMAND), "command after &&");
+        assert_eq!(fg_of("-la"), Some(bash_palette::FLAG), "flag color");
     }
 
     #[test]
@@ -464,11 +492,15 @@ mod highlight_tests {
                 .find(|span| span.content == needle)
                 .and_then(|span| span.style.fg)
         };
-        assert_eq!(fg_of("if"), Some(mocha::KEYWORD), "if keyword");
-        assert_eq!(fg_of("then"), Some(mocha::KEYWORD), "then keyword");
-        assert_eq!(fg_of("fi"), Some(mocha::KEYWORD), "fi keyword");
-        assert_eq!(fg_of("cd"), Some(mocha::COMMAND), "command after if");
-        assert_eq!(fg_of("ls"), Some(mocha::COMMAND), "command after then");
+        assert_eq!(fg_of("if"), Some(bash_palette::KEYWORD), "if keyword");
+        assert_eq!(fg_of("then"), Some(bash_palette::KEYWORD), "then keyword");
+        assert_eq!(fg_of("fi"), Some(bash_palette::KEYWORD), "fi keyword");
+        assert_eq!(fg_of("cd"), Some(bash_palette::COMMAND), "command after if");
+        assert_eq!(
+            fg_of("ls"),
+            Some(bash_palette::COMMAND),
+            "command after then"
+        );
     }
 
     #[test]
