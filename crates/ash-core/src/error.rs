@@ -18,8 +18,8 @@ pub enum AshError {
 pub enum ProtocolError {
     #[error("auth failed")]
     Auth,
-    #[error("rate limited, retry after {retry_after:?}")]
-    RateLimited { retry_after: Option<Duration> },
+    #[error("rate limited")]
+    RateLimited,
     #[error("context too long: {tokens}/{limit}")]
     ContextTooLong { tokens: u64, limit: u64 },
     #[error("upstream {status}: {message}")]

@@ -13,6 +13,7 @@
 ## 复核记录
 
 - ✅ 2026-08-05：基线提交 `6cf0883`（当前工作区全部改动入库，fmt/test/clippy 通过）。本计划基于该基线。
+- ✅ 2026-08-05：**Step 1（A 类）已落地并提交**。A1–A5 全部删除，附带同步：engine.rs 的 `RateLimited { .. }` 匹配与测试构造、TODO.md #17 的过时 `with_spawner` 表述。`RateLimited` 变体由带字段改为 unit 变体（错误文案同步简化）。
 
 ---
 

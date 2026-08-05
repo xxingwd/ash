@@ -20,8 +20,7 @@ pub use agent::{Agent, ThreadOptions, COMPACTION_TRIGGER_PERCENT, DEFAULT_MAX_CO
 pub use ash_core::Event;
 pub use context::{count_tokens, estimate_request_tokens, estimate_tokens};
 pub use context_policy::{
-    ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PassthroughContextPolicy,
-    PreparedContext,
+    ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
 };
 pub use extension::{Extension, TurnContext, TurnPatch};
 pub use input::{Input, InputSource};

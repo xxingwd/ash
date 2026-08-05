@@ -182,26 +182,6 @@ impl ContextPolicy for DefaultContextPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PassthroughContextPolicy;
-
-#[async_trait::async_trait]
-impl ContextPolicy for PassthroughContextPolicy {
-    async fn prepare(
-        &self,
-        request: ContextRequest,
-        _model: &dyn ModelClient,
-        _cancel: &CancellationToken,
-    ) -> Result<PreparedContext, ash_core::AshError> {
-        Ok(PreparedContext {
-            messages: request.messages,
-            ephemeral_context: request.ephemeral_context,
-            estimated_input_tokens: 0,
-            update: None,
-        })
-    }
-}
-
 fn estimate_context_request(request: &ContextRequest) -> usize {
     estimate_request_tokens_with_ephemeral(
         request.system_prompt.as_deref(),

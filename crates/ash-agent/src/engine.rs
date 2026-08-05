@@ -708,7 +708,7 @@ fn response_action(
 fn retryable(error: &ash_core::ProtocolError) -> bool {
     matches!(
         error,
-        ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited { .. }
+        ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited
     ) || matches!(
         error,
         ash_core::ProtocolError::Upstream { status, .. } if *status >= 500
@@ -1760,9 +1760,7 @@ mod tests {
                 self.requests.lock().unwrap().push(req);
                 let calls = self.requests.lock().unwrap().len();
                 let items: Vec<Result<ModelEvent, ash_core::ProtocolError>> = if calls == 1 {
-                    vec![Err(ash_core::ProtocolError::RateLimited {
-                        retry_after: None,
-                    })]
+                    vec![Err(ash_core::ProtocolError::RateLimited)]
                 } else {
                     vec![
                         Ok(ModelEvent::Text("ok".into())),

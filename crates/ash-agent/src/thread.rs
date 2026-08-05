@@ -226,10 +226,6 @@ impl Turn {
         self.id
     }
 
-    pub fn interrupt(&self) {
-        self.cancellation.cancel();
-    }
-
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }

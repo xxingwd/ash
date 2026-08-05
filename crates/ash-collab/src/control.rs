@@ -538,13 +538,6 @@ impl AgentControl {
         }
     }
 
-    pub fn with_spawner(
-        max_concurrent_children: Option<usize>,
-        spawner: Arc<dyn AgentSpawner>,
-    ) -> Self {
-        Self::new(max_concurrent_children, spawner)
-    }
-
     /// Subscribe to display-oriented snapshots of every sub-agent managed by
     /// this control. The receiver is updated whenever a sub-agent is spawned,
     /// transitions state, or receives a follow-up message.

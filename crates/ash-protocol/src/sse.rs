@@ -134,7 +134,7 @@ where
 fn map_status(status: reqwest::StatusCode) -> ProtocolError {
     match status {
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => ProtocolError::Auth,
-        reqwest::StatusCode::TOO_MANY_REQUESTS => ProtocolError::RateLimited { retry_after: None },
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ProtocolError::RateLimited,
         _ => ProtocolError::Upstream {
             status: status.as_u16(),
             message: "request rejected before the event stream opened".into(),
