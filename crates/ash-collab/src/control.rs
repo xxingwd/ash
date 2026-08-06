@@ -56,7 +56,7 @@ Operating rules:
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum AgentRole {
+pub(crate) enum AgentRole {
     Default,
     Explorer,
     Worker,
@@ -122,7 +122,6 @@ impl AgentSpawner for InheritedAgentSpawner {
             path: request.task_name,
             tree_id: Some(request.tree_id),
             kind: ThreadKind::Subagent,
-            metadata: self.scope.metadata.clone(),
         };
         Ok(ChildAgent {
             runtime: self.runtime.clone(),
@@ -135,7 +134,7 @@ impl AgentSpawner for InheritedAgentSpawner {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
+pub(crate) enum AgentStatus {
     Pending,
     Running,
     Completed,
@@ -144,7 +143,7 @@ pub enum AgentStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AgentSnapshot {
+pub(crate) struct AgentSnapshot {
     pub agent_id: ThreadId,
     pub task_name: String,
     pub agent_type: AgentRole,
@@ -192,7 +191,7 @@ struct ControlInner {
     subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
 }
 
-pub struct SpawnRequest {
+pub(crate) struct SpawnRequest {
     pub role: AgentRole,
     pub parent_path: String,
     pub task_name: String,
@@ -200,14 +199,14 @@ pub struct SpawnRequest {
     pub tree_id: TreeId,
 }
 
-pub struct ChildAgent {
+pub(crate) struct ChildAgent {
     pub runtime: Runtime,
     pub agent: Agent,
     pub options: ThreadOptions,
     pub history: Vec<Message>,
 }
 
-pub trait AgentSpawner: Send + Sync {
+pub(crate) trait AgentSpawner: Send + Sync {
     fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError>;
 }
 
@@ -547,7 +546,10 @@ impl ForkMode {
 }
 
 impl AgentControl {
-    pub fn new(max_concurrent_children: Option<usize>, spawner: Arc<dyn AgentSpawner>) -> Self {
+    pub(crate) fn new(
+        max_concurrent_children: Option<usize>,
+        spawner: Arc<dyn AgentSpawner>,
+    ) -> Self {
         let (subagent_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(ControlInner {
@@ -852,7 +854,7 @@ impl AgentControl {
         }
     }
 
-    pub async fn snapshots(
+    pub(crate) async fn snapshots(
         &self,
         tree_id: TreeId,
         path_prefix: Option<&str>,

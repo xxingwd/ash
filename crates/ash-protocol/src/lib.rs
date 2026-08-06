@@ -1,8 +1,8 @@
-pub mod anthropic;
-pub mod completions;
+mod anthropic;
+mod completions;
 mod model_config;
-pub mod pending_calls;
-pub mod responses;
+mod pending_calls;
+mod responses;
 mod sse;
 
 use std::{borrow::Cow, sync::Arc};

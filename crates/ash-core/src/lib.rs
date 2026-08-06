@@ -1,9 +1,9 @@
-pub mod error;
-pub mod event;
-pub mod message;
-pub mod model;
-pub mod subagent;
-pub mod tool;
+mod error;
+mod event;
+mod message;
+mod model;
+mod subagent;
+mod tool;
 
 pub use error::*;
 pub use event::*;

@@ -70,7 +70,7 @@ struct CompactionHistory {
     messages: Vec<Message>,
 }
 
-pub fn estimate_tokens(input: &str) -> usize {
+pub(crate) fn estimate_tokens(input: &str) -> usize {
     estimate_character_count(character_units(input))
 }
 
@@ -82,7 +82,7 @@ fn character_units(input: &str) -> usize {
     input.encode_utf16().count()
 }
 
-pub fn count_tokens(messages: &[Message]) -> usize {
+pub(crate) fn count_tokens(messages: &[Message]) -> usize {
     let content = messages
         .iter()
         .map(|message| message_characters(message, ThoughtAccounting::Exclude))
@@ -101,7 +101,7 @@ pub fn count_output_tokens(message: &Message) -> usize {
 /// This is the single estimation entry point used both at runtime (when the
 /// API does not report usage) and when recomputing the current context size
 /// after restore, rollback, or fork.
-pub fn estimate_request_tokens(
+pub(crate) fn estimate_request_tokens(
     system_prompt: Option<&str>,
     messages: &[Message],
     tools: &[ToolDefinition],
