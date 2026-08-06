@@ -118,10 +118,10 @@ Review the relevant code and report concrete findings.
 ## 会话历史
 
 交互会话按“一会话一文件”保存为 JSONL。Linux 默认目录为
-`~/.local/share/ash/threads/`，文件名直接包含本地日期和时间：
+`~/.local/share/ash/threads/`，文件名就是 Session ID：
 
 ```text
-thread-2026-07-14T16-30-25.123-<thread-id>.jsonl
+<thread-id>.jsonl
 ```
 
 普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
@@ -131,7 +131,8 @@ thread-2026-07-14T16-30-25.123-<thread-id>.jsonl
 checkpoint 构造压缩上下文。API Key、访问令牌和自定义接口地址内容不会写入文件。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
-Session。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
+Session。`/status` 显示当前会话的模型、协议和工作目录。`/exit`（别名 `/quit`）退出
+Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
 `/undo` 会把最近一轮（上一条用户输入及其回答）从模型会话历史和终端 viewport 中移除，
 并把该输入恢复到输入框，便于修改后重新提交。`/fork` 会列出当前会话的历史用户输入；
 选中后创建一个新的 fork Session，继承该输入之前的消息，并把所选输入恢复到输入框。

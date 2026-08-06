@@ -1,5 +1,5 @@
 mod ansi;
-pub mod app;
+mod app;
 mod block_layout;
 mod buffer;
 mod fork_picker;

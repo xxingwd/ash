@@ -25,7 +25,7 @@ The stable execution vocabulary is deliberately small:
 - `Agent` is immutable behavior: model, prompt, tools, limits, and context policy.
 - `Runtime` owns injected capabilities: model client and thread store.
 - `ThreadOptions` is per-thread scope: working directory, timeout, agent path, tree ID,
-  typed `ThreadKind`, and product metadata.
+  and typed `ThreadKind`.
 - `Thread` is the durable concurrent conversation boundary and the sole input-queue owner.
 - `Turn` is one submitted unit of execution. It can be awaited, interrupted, or steered.
 - `Input` carries content, source, metadata, and an optional idempotency key.
@@ -100,13 +100,11 @@ hold a file lock, database transaction, or remote lease in that handle; runtime 
 on the JSONL writer type.
 
 The default `JsonlThreadStore` stores new threads as `{thread_id}.jsonl`. Its compact first record
-contains only list metadata, so listing does not replay thread logs. Loading addresses new files
-directly by id and only replays the selected thread; legacy timestamped `thread-*`/`session-*`
-files and their metadata records remain readable.
+contains only list metadata, so listing does not replay thread logs. Loading addresses files
+directly by id and only replays the selected thread.
 
 `ThreadMetadata` carries the typed `ThreadKind` (`Root` or `Subagent`) used by persistence and
-session listing. Runtime code derives that value from `ThreadOptions.kind`; `ThreadOptions.metadata`
-remains product-specific state and is not inspected for a reserved `"kind"` key.
+session listing. Runtime code derives that value from `ThreadOptions.kind`.
 
 The runtime's hot write path keeps one exclusively locked `ThreadAppender` per active thread. Resume
 replays the selected file through that same handle, so later appends are a single write+flush with
