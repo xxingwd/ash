@@ -62,7 +62,6 @@ struct Projector {
     open: Option<OpenTurn>,
     checkpoint: Option<AppliedCheckpoint>,
     turn_boundaries: Vec<ProjectionSnapshot>,
-    legacy_boundaries: Vec<ProjectionSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,7 +89,6 @@ struct ProjectionSnapshot {
     open: Option<OpenTurn>,
     checkpoint: Option<AppliedCheckpoint>,
     open_context: Option<Vec<Message>>,
-    legacy_boundaries_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -252,11 +250,6 @@ impl Projector {
     }
 
     fn push_message(&mut self, message: Message, visible_while_open: bool) {
-        if self.open.is_none() && message.is_user_turn() {
-            let boundary = self.snapshot();
-            self.legacy_boundaries.push(boundary);
-        }
-
         self.all.push(message.clone());
         if self.open.is_none() || visible_while_open {
             self.history.push(message.clone());
@@ -297,8 +290,6 @@ impl Projector {
     fn rollback(&mut self) {
         if let Some(boundary) = self.turn_boundaries.pop() {
             self.restore(boundary);
-        } else if let Some(boundary) = self.legacy_boundaries.pop() {
-            self.restore(boundary);
         }
     }
 
@@ -310,7 +301,6 @@ impl Projector {
             open: self.open.clone(),
             checkpoint: self.checkpoint.clone(),
             open_context: self.open.as_ref().map(|_| self.context.clone()),
-            legacy_boundaries_len: self.legacy_boundaries.len(),
         }
     }
 
@@ -323,8 +313,6 @@ impl Projector {
         self.context = boundary
             .open_context
             .unwrap_or_else(|| rebuild_context(&self.all, self.checkpoint.as_ref()));
-        self.legacy_boundaries
-            .truncate(boundary.legacy_boundaries_len);
     }
 
     fn turns(&self) -> Vec<TurnView> {
@@ -391,11 +379,11 @@ mod tests {
     use super::*;
     use ash_core::{MessageContent, StopReason};
 
-    fn legacy_projection(entries: &[LogEntry]) -> ThreadView {
+    fn reference_projection(entries: &[LogEntry]) -> ThreadView {
         let mut active = Vec::new();
         for entry in entries {
             if matches!(entry, LogEntry::Rollback) {
-                legacy_rollback(&mut active);
+                reference_rollback(&mut active);
             } else {
                 active.push(entry);
             }
@@ -484,19 +472,11 @@ mod tests {
         }
     }
 
-    fn legacy_rollback(entries: &mut Vec<&LogEntry>) {
+    fn reference_rollback(entries: &mut Vec<&LogEntry>) {
         if let Some(start) = entries
             .iter()
             .rposition(|entry| matches!(entry, LogEntry::TurnStart(_)))
         {
-            entries.truncate(start);
-            return;
-        }
-        if let Some(start) = entries.iter().rposition(|entry| match entry {
-            LogEntry::Input(input) => input.message.is_user_turn(),
-            LogEntry::Message(message) => message.is_user_turn(),
-            _ => false,
-        }) {
             entries.truncate(start);
         }
     }
@@ -542,23 +522,26 @@ mod tests {
         let first = Message::user("first");
         let answer = Message::assistant_text("answer");
         let second = Message::user("second");
-        let mut log = ThreadLog::from_messages([
-            first.clone(),
-            answer.clone(),
-            second,
-            Message::assistant_text("second answer"),
-        ]);
+        let mut log = ThreadLog::new();
+        log.push(LogEntry::TurnStart(TurnId::new()));
+        log.push(LogEntry::Message(first.clone()));
+        log.push(LogEntry::Message(answer.clone()));
+        log.push(LogEntry::TurnStart(TurnId::new()));
+        log.push(LogEntry::Message(second));
+        log.push(LogEntry::Message(Message::assistant_text("second answer")));
         log.push(LogEntry::Rollback);
 
-        assert_eq!(log.entries().len(), 5);
+        assert_eq!(log.entries().len(), 7);
+        // history keeps only user messages; the assistant reply lives in the
+        // settled turn, which rollback truncates away with the second turn.
         assert_eq!(
             log.messages()
                 .iter()
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
-            [first.id, answer.id]
+            [first.id]
         );
-        assert_eq!(log.model_context().len(), 2);
+        assert_eq!(log.model_context().len(), 1);
     }
 
     #[test]
@@ -748,7 +731,7 @@ mod tests {
             incremental.push(entry);
             assert_eq!(
                 incremental.view(),
-                legacy_projection(&entries[..=index]),
+                reference_projection(&entries[..=index]),
                 "projection diverged after entry {index}"
             );
         }

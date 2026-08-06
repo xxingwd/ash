@@ -25,16 +25,6 @@ struct ThreadHeader {
     kind: ThreadKind,
 }
 
-/// The first record used by older thread files. Extra configuration fields are
-/// intentionally ignored: resume always uses the current runtime configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct LegacyMetadata {
-    thread_id: ThreadId,
-    created_at: String,
-    #[serde(default)]
-    kind: ThreadKind,
-}
-
 #[derive(Clone, Debug)]
 struct StoredHeader {
     thread_id: ThreadId,
@@ -55,8 +45,6 @@ struct ContextCompactedRecord {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum FileRecord {
     ThreadHeader(ThreadHeader),
-    #[serde(rename = "thread_meta", alias = "session_meta")]
-    LegacyThreadMeta(LegacyMetadata),
     TurnStart {
         turn_id: TurnId,
     },
@@ -121,7 +109,7 @@ impl FileRecord {
                 usage,
             }),
             Self::Rollback => Some(LogEntry::Rollback),
-            Self::ThreadHeader(_) | Self::LegacyThreadMeta(_) => None,
+            Self::ThreadHeader(_) => None,
         }
     }
 
@@ -324,7 +312,7 @@ impl JsonlThreadStore {
         };
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if legacy_filename_matches(&path, thread_id) {
+            if canonical_thread_id(&path) == Some(thread_id) {
                 return Ok(Some(path));
             }
         }
@@ -440,10 +428,6 @@ fn thread_filename(thread_id: ThreadId) -> String {
 
 fn is_thread_file(path: &Path) -> bool {
     canonical_thread_id(path).is_some()
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_legacy_thread_name)
 }
 
 fn canonical_thread_id(path: &Path) -> Option<ThreadId> {
@@ -451,18 +435,6 @@ fn canonical_thread_id(path: &Path) -> Option<ThreadId> {
         return None;
     }
     path.file_stem()?.to_str()?.parse().ok()
-}
-
-fn legacy_filename_matches(path: &Path, thread_id: ThreadId) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            is_legacy_thread_name(name) && name.ends_with(&format!("-{thread_id}.jsonl"))
-        })
-}
-
-fn is_legacy_thread_name(name: &str) -> bool {
-    (name.starts_with("thread-") || name.starts_with("session-")) && name.ends_with(".jsonl")
 }
 
 async fn create_locked_thread(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
@@ -556,12 +528,6 @@ fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
             created_at: timestamp.to_string(),
             title: header.title.clone(),
             kind: header.kind,
-        }),
-        FileRecord::LegacyThreadMeta(metadata) => Some(StoredHeader {
-            thread_id: metadata.thread_id,
-            created_at: metadata.created_at.clone(),
-            title: None,
-            kind: metadata.kind,
         }),
         _ => None,
     }
@@ -831,14 +797,19 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let thread_id = ThreadId::new();
         let store = JsonlThreadStore::new(directory.path());
+        let first = Message::user("first");
+        let first_answer = Message::assistant_text("first answer");
+        let second = Message::user("second");
         create_thread(
             &store,
             thread_id,
             ThreadKind::Root,
             &[
-                LogEntry::Message(Message::user("first")),
-                LogEntry::Message(Message::assistant_text("first answer")),
-                LogEntry::Message(Message::user("second")),
+                LogEntry::TurnStart(TurnId::new()),
+                LogEntry::Message(first),
+                LogEntry::Message(first_answer),
+                LogEntry::TurnStart(TurnId::new()),
+                LogEntry::Message(second),
                 LogEntry::Message(Message::assistant_text("second answer")),
             ],
         )
@@ -849,9 +820,9 @@ mod tests {
 
         let loaded = store.load(thread_id).await.unwrap().unwrap();
         let messages = loaded.log.messages();
-        assert_eq!(messages.len(), 2);
+        // history keeps only user messages; the second turn is rolled back.
+        assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0].content, MessageContent::User(_)));
-        assert!(matches!(&messages[1].content, MessageContent::Assistant(_)));
     }
 
     #[tokio::test]
@@ -916,47 +887,6 @@ mod tests {
         assert_eq!(listed[0].thread_id, thread_id);
         assert_eq!(listed[0].title, "thread title");
         assert_eq!(listed[0].created_at.len(), 16);
-    }
-
-    #[tokio::test]
-    async fn reads_legacy_filenames_and_metadata() {
-        let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let path = directory
-            .path()
-            .join(format!("thread-2026-07-14T16-30-25.000-{thread_id}.jsonl"));
-        let mut contents = String::new();
-        push_line(
-            &mut contents,
-            FileRecord::LegacyThreadMeta(LegacyMetadata {
-                thread_id,
-                created_at: "2026-07-14T08:30:25.000Z".to_string(),
-                kind: ThreadKind::Root,
-            }),
-        )
-        .unwrap();
-        push_line(
-            &mut contents,
-            FileRecord::UserMessage(Message::user("legacy title")),
-        )
-        .unwrap();
-        tokio::fs::write(&path, contents).await.unwrap();
-        let store = JsonlThreadStore::new(directory.path());
-
-        assert_eq!(
-            store
-                .load(thread_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .log
-                .messages()
-                .len(),
-            1
-        );
-        let listed = store.list(None).await.unwrap();
-        assert_eq!(listed[0].thread_id, thread_id);
-        assert_eq!(listed[0].title, "legacy title");
     }
 
     #[tokio::test]
