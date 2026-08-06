@@ -218,7 +218,10 @@ fn short_display_path(path: &str) -> String {
 }
 
 fn sanitize_single_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::scrollback::sanitize_terminal_text(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn join_parts(action: &str, detail: &str) -> String {

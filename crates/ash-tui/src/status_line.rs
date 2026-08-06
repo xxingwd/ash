@@ -6,10 +6,11 @@ use crate::text_width::truncate_end;
 
 pub(crate) fn compact_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if let Some(relative) = home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
+    compact_path_with_home(path, home.as_deref())
+}
+
+fn compact_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(relative) = home.and_then(|home| path.strip_prefix(home).ok()) {
         if relative.as_os_str().is_empty() {
             "~".into()
         } else {
@@ -77,6 +78,25 @@ mod tests {
         assert_eq!(
             fit_status_left("gpt-5", "~/workspace/ash", 12),
             ("gpt-5".to_string(), Some("~/w…".to_string()))
+        );
+    }
+
+    #[test]
+    fn abbreviates_home_prefix_with_tilde() {
+        assert_eq!(
+            compact_path_with_home(
+                Path::new("/home/example/workspace/ash"),
+                Some(Path::new("/home/example"))
+            ),
+            "~/workspace/ash"
+        );
+        assert_eq!(
+            compact_path_with_home(Path::new("/home/example"), Some(Path::new("/home/example"))),
+            "~"
+        );
+        assert_eq!(
+            compact_path_with_home(Path::new("/elsewhere"), Some(Path::new("/home/example"))),
+            "/elsewhere"
         );
     }
 

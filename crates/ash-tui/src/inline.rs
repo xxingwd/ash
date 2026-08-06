@@ -492,15 +492,11 @@ impl TerminalUi {
     /// Append one reasoning delta to the scrolling preview. Newline-complete
     /// deltas redraw immediately (like text), so the preview reads line by
     /// line; partial runs are picked up by the periodic status refresh.
-    /// Reasoning belongs before the assistant text; if text output has
-    /// already started (normally impossible), ignore late reasoning deltas
-    /// rather than resurrecting a live reasoning area below the text.
+    /// Reasoning always precedes the assistant text: the protocol emits
+    /// thinking blocks before text output, so no late-reasoning handling is
+    /// needed here.
     pub fn thinking(&mut self, text: &str) -> io::Result<()> {
-        if self.assistant_block_id.is_some() {
-            return Ok(());
-        }
-        let finished = self.stream.start_reasoning();
-        self.commit_finished_stream(finished);
+        self.stream.start_reasoning();
         self.stream.push_reasoning(text);
         if delta_completes_line(text) {
             self.refresh_stream_view()?;

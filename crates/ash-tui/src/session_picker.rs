@@ -1,50 +1,42 @@
 use ash_core::{ThreadId, ThreadSummary};
 
+use crate::picker::PickerState;
+
 #[derive(Debug, Default)]
 pub(crate) struct SessionPickerState {
-    threads: Vec<ThreadSummary>,
-    selected: usize,
+    inner: PickerState<ThreadSummary>,
 }
 
 impl SessionPickerState {
     pub(crate) fn open(&mut self, threads: Vec<ThreadSummary>) {
-        self.threads = threads;
-        self.selected = 0;
+        self.inner.open(threads);
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        !self.threads.is_empty()
+        self.inner.is_visible()
     }
 
     pub(crate) fn threads(&self) -> &[ThreadSummary] {
-        &self.threads
+        self.inner.items()
     }
 
     pub(crate) fn selected_index(&self) -> usize {
-        self.selected
+        self.inner.selected_index()
     }
 
     pub(crate) fn selected_thread_id(&self) -> Option<ThreadId> {
-        self.threads
-            .get(self.selected)
+        self.inner
+            .items()
+            .get(self.inner.selected_index())
             .map(|session| session.thread_id)
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.threads.is_empty() {
-            return;
-        }
-        self.selected = if self.selected == 0 {
-            self.threads.len() - 1
-        } else {
-            self.selected - 1
-        };
+        self.inner.move_up();
     }
 
     pub(crate) fn move_down(&mut self) {
-        if !self.threads.is_empty() {
-            self.selected = (self.selected + 1) % self.threads.len();
-        }
+        self.inner.move_down();
     }
 }
 

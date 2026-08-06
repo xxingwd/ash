@@ -1,48 +1,42 @@
 use ash_core::{ForkPoint, MessageId};
 
+use crate::picker::PickerState;
+
 #[derive(Debug, Default)]
 pub(crate) struct ForkPickerState {
-    points: Vec<ForkPoint>,
-    selected: usize,
+    inner: PickerState<ForkPoint>,
 }
 
 impl ForkPickerState {
     pub(crate) fn open(&mut self, points: Vec<ForkPoint>) {
-        self.points = points;
-        self.selected = 0;
+        self.inner.open(points);
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        !self.points.is_empty()
+        self.inner.is_visible()
     }
 
     pub(crate) fn points(&self) -> &[ForkPoint] {
-        &self.points
+        self.inner.items()
     }
 
     pub(crate) fn selected_index(&self) -> usize {
-        self.selected
+        self.inner.selected_index()
     }
 
     pub(crate) fn selected_message_id(&self) -> Option<MessageId> {
-        self.points.get(self.selected).map(|point| point.message_id)
+        self.inner
+            .items()
+            .get(self.inner.selected_index())
+            .map(|point| point.message_id)
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.points.is_empty() {
-            return;
-        }
-        self.selected = if self.selected == 0 {
-            self.points.len() - 1
-        } else {
-            self.selected - 1
-        };
+        self.inner.move_up();
     }
 
     pub(crate) fn move_down(&mut self) {
-        if !self.points.is_empty() {
-            self.selected = (self.selected + 1) % self.points.len();
-        }
+        self.inner.move_down();
     }
 }
 

@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::{scrollback::sanitize_single_line, text_width::truncate_start};
+use crate::{status_line::compact_path, text_width::truncate_start};
 
 const FULL_WORDMARK_MIN_WIDTH: u16 = 34;
 const COMPACT_WORDMARK_MIN_WIDTH: u16 = 14;
@@ -125,24 +125,7 @@ fn centered(terminal_width: u16, content: &str, style: WelcomeStyle) -> WelcomeL
 }
 
 fn workspace_label(working_dir: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    workspace_label_with_home(working_dir, home.as_deref())
-}
-
-fn workspace_label_with_home(working_dir: &Path, home: Option<&Path>) -> String {
-    let display = home
-        .and_then(|home| working_dir.strip_prefix(home).ok())
-        .map_or_else(
-            || working_dir.display().to_string(),
-            |relative| {
-                if relative.as_os_str().is_empty() {
-                    "~".to_string()
-                } else {
-                    format!("~/{}", relative.display())
-                }
-            },
-        );
-    sanitize_single_line(&display)
+    compact_path(working_dir)
 }
 
 #[cfg(test)]
@@ -188,17 +171,6 @@ mod tests {
     fn falls_back_to_plain_text_in_tiny_terminals() {
         let lines = welcome_card(8, Path::new("/project"));
         assert_eq!(lines, vec![centered(8, "ASH", WelcomeStyle::Title)]);
-    }
-
-    #[test]
-    fn abbreviates_the_home_directory_in_the_workspace_line() {
-        assert_eq!(
-            workspace_label_with_home(
-                Path::new("/home/example/workspace/ash"),
-                Some(Path::new("/home/example")),
-            ),
-            "~/workspace/ash"
-        );
     }
 
     #[test]

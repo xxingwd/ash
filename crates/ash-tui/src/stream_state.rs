@@ -32,18 +32,16 @@ pub(crate) enum FinishedStream {
 }
 
 impl StreamState {
-    pub(crate) fn start_reasoning(&mut self) -> Option<FinishedStream> {
+    pub(crate) fn start_reasoning(&mut self) {
         if matches!(self.mode, StreamMode::Reasoning { .. }) {
-            return None;
+            return;
         }
-        let finished = self.finish();
         self.mode = StreamMode::Reasoning {
             source: String::new(),
             started_at: Instant::now(),
             lines: Vec::new(),
             markdown_cache: StreamingMarkdownCache::default(),
         };
-        finished
     }
 
     pub(crate) fn push_reasoning(&mut self, delta: &str) {

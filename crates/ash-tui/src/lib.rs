@@ -11,6 +11,7 @@ mod live_block;
 mod markdown;
 mod menu;
 mod operation;
+mod picker;
 mod scrollback;
 mod session_picker;
 mod slash_command;
