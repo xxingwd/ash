@@ -35,10 +35,10 @@
 | # | 项 | 位置 | 说明 | 决策 |
 |---|---|---|---|---|
 | ~~B1~~ Extension 机制全套 | 已删（70320fc 之后提交） | 产品零注册，仅测试消费；`extension.rs` 删除，runtime/thread 的支撑代码清理，DESIGN.md Extensions 章节移除 | ✅ |
-| B2 | `Thread::enqueue` + `InputSource::Schedule/Heartbeat/Custom` | ash-agent/src/thread.rs | 仅测试；为「调度器/心跳」预留，产品无此场景 | ⬜ |
-| B3 | `Turn::steer` + steering 通道 + engine `apply_steering` | ash-agent/src/thread.rs、engine.rs | 仅测试；chat gateway 场景。删除需动 run_turn select 循环与 engine 调用点（非纯删除） | ⬜ |
-| B4 | idempotency_key 校验链 | ash-agent/src/thread.rs、log.rs | 仅测试；为「外部触发」设计 | ⬜ |
-| B5 | `mcp.rs` 全模块（`McpManager`/`McpToolAdapter`/`load_mcp_tools`） | ash-agent/src/mcp.rs | 无产品入口：CLI 没有任何配置 MCP 的途径，等于不可用的库能力 | ⬜ |
+| ~~B2~~ `Thread::enqueue` + `InputSource::Schedule/Heartbeat`（Custom 已删） | 暂保留 | 用户决策：外部调度/定时器可能要留，待统一 | ⏸️ |
+| ~~B3~~ `Turn::steer` + steering 通道 + engine `apply_steering` | 暂保留 | 与 B2 同属外部调度，用户决策待统一 | ⏸️ |
+| ~~B4~~ idempotency_key 校验链 | 暂保留 | 与 B2/B3 同属外部触发设计，用户决策待统一 | ⏸️ |
+| ~~B5~~ `mcp.rs` 全模块（`McpManager`/`McpToolAdapter`/`load_mcp_tools`） | ✅ 保留 | 用户决策：MCP 保留（未来接 CLI 入口），模块 174 行无产品入口 |
 
 ## C. 隐藏功能 — README 未描述甚至矛盾，建议删
 
