@@ -149,18 +149,16 @@ fn apply_edits(content: &str, edits: &[Replacement]) -> Result<String, ToolError
             .match_indices(&edit.old_text)
             .map(|(start, _)| start)
             .collect::<Vec<_>>();
-        if occurrences.is_empty() {
-            return Err(ToolError::Execution(format!(
-                "edits[{index}].oldText was not found"
-            )));
-        }
         if occurrences.len() > 1 {
             return Err(ToolError::Execution(format!(
                 "edits[{index}].oldText matches {} locations; include more context",
                 occurrences.len()
             )));
         }
-        let start = occurrences[0];
+        let start = occurrences
+            .first()
+            .copied()
+            .ok_or_else(|| ToolError::Execution(format!("edits[{index}].oldText was not found")))?;
         matches.push((start, start + edit.old_text.len(), index));
     }
 

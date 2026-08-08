@@ -456,13 +456,15 @@ fn message_characters(message: &Message, thoughts: ThoughtAccounting) -> usize {
             result,
             attachments,
             ..
-        } => result
-            .as_ref()
-            .map_or_else(
-                |error| character_units(error),
-                |output| character_units(output),
-            )
-            .saturating_add(content_characters(attachments)),
+        } => {
+            // Both outcomes are character-counted the same way; take the
+            // payload first so the conversion is written once.
+            let payload = match result.as_ref() {
+                Ok(output) => output,
+                Err(error) => error,
+            };
+            character_units(payload).saturating_add(content_characters(attachments))
+        }
     }
 }
 

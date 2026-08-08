@@ -24,11 +24,12 @@ enum StreamMode {
     },
 }
 
-pub(crate) enum FinishedStream {
-    Thought {
-        source: String,
-        elapsed_seconds: u64,
-    },
+/// Summary of a reasoning phase that just finished, produced by
+/// `StreamState::finish` when there was any thought content.
+#[derive(Debug)]
+pub(crate) struct FinishedThought {
+    pub(crate) source: String,
+    pub(crate) elapsed_seconds: u64,
 }
 
 impl StreamState {
@@ -81,12 +82,12 @@ impl StreamState {
         matches!(self.mode, StreamMode::Reasoning { .. })
     }
 
-    pub(crate) fn finish(&mut self) -> Option<FinishedStream> {
+    pub(crate) fn finish(&mut self) -> Option<FinishedThought> {
         match std::mem::take(&mut self.mode) {
             StreamMode::Idle => None,
             StreamMode::Reasoning {
                 source, started_at, ..
-            } if !source.trim().is_empty() => Some(FinishedStream::Thought {
+            } if !source.trim().is_empty() => Some(FinishedThought {
                 source,
                 elapsed_seconds: started_at.elapsed().as_secs(),
             }),
@@ -241,10 +242,7 @@ mod tests {
         stream.start_reasoning();
         stream.push_reasoning("first\nsecond");
 
-        assert!(matches!(
-            stream.finish(),
-            Some(FinishedStream::Thought { .. })
-        ));
+        assert!(matches!(stream.finish(), Some(FinishedThought { .. })));
     }
 
     #[test]
@@ -259,7 +257,7 @@ mod tests {
 
         // Mimic the `finish` inside `append_assistant`: solidify the thought.
         let finished = stream.finish();
-        assert!(matches!(finished, Some(FinishedStream::Thought { .. })));
+        assert!(matches!(finished, Some(FinishedThought { .. })));
         assert!(!stream.is_reasoning());
         assert!(stream.active_lines().is_empty());
     }

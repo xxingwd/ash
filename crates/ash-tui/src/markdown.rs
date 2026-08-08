@@ -82,28 +82,46 @@ impl StreamingMarkdownCache {
     }
 
     pub(crate) fn latest_lines(&self, tail: &[RenderedLine], maximum: usize) -> Vec<RenderedLine> {
-        let has_gap = !self.stable_lines.is_empty() && !tail.is_empty();
-        let total = self
-            .stable_lines
-            .len()
-            .saturating_add(usize::from(has_gap))
-            .saturating_add(tail.len());
+        let total = combined_line_count(&self.stable_lines, tail);
         let start = total.saturating_sub(maximum);
         (start..total)
-            .filter_map(|index| {
-                if index < self.stable_lines.len() {
-                    return self.stable_lines.get(index).cloned();
-                }
-                if has_gap && index == self.stable_lines.len() {
-                    return Some(RenderedLine::default());
-                }
-                let tail_index = index
-                    .saturating_sub(self.stable_lines.len())
-                    .saturating_sub(usize::from(has_gap));
-                tail.get(tail_index).cloned()
+            .map(|index| {
+                combined_line(&self.stable_lines, tail, index)
+                    .cloned()
+                    .unwrap_or_default()
             })
             .collect()
     }
+}
+
+/// Total combined row count: stable lines, an optional blank gap row between
+/// the stable and streaming tail, then the tail lines.
+pub(crate) fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
+    stable
+        .len()
+        .saturating_add(usize::from(!stable.is_empty() && !tail.is_empty()))
+        .saturating_add(tail.len())
+}
+
+/// Maps a combined row index (stable lines, then the optional blank gap row,
+/// then the streaming tail lines) to the underlying line. Returns `None` for
+/// the gap row and for out-of-range indices.
+pub(crate) fn combined_line<'a>(
+    stable: &'a [RenderedLine],
+    tail: &'a [RenderedLine],
+    index: usize,
+) -> Option<&'a RenderedLine> {
+    if index < stable.len() {
+        return stable.get(index);
+    }
+    let has_gap = !stable.is_empty() && !tail.is_empty();
+    if has_gap && index == stable.len() {
+        return None;
+    }
+    let tail_index = index
+        .saturating_sub(stable.len())
+        .saturating_sub(usize::from(has_gap));
+    tail.get(tail_index)
 }
 
 #[derive(Clone, Debug, Default)]

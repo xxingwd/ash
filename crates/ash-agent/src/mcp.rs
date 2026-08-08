@@ -21,7 +21,6 @@ struct McpToolAdapter {
     description: String,
     schema: serde_json::Value,
     connection: Arc<McpConnection>,
-    tool_name: String,
 }
 
 impl McpToolAdapter {
@@ -30,14 +29,12 @@ impl McpToolAdapter {
         description: String,
         schema: serde_json::Value,
         connection: Arc<McpConnection>,
-        tool_name: String,
     ) -> Self {
         Self {
             name,
             description,
             schema,
             connection,
-            tool_name,
         }
     }
 }
@@ -64,7 +61,7 @@ impl Tool for McpToolAdapter {
         let arguments: Option<JsonObject> = serde_json::from_value(args)
             .map_err(|e| ToolError::Execution(format!("invalid args: {e}")))?;
 
-        let mut request = CallToolRequestParams::new(self.tool_name.clone());
+        let mut request = CallToolRequestParams::new(self.name.clone());
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
@@ -169,7 +166,6 @@ impl McpManager {
                     tool_info.description.unwrap_or_default().to_string(),
                     schema,
                     Arc::clone(connection),
-                    tool_info.name.to_string(),
                 )));
             }
         }

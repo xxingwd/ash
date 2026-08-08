@@ -34,6 +34,14 @@ enum Step {
     Done(StopReason),
 }
 
+/// How a step responds to a retryable model failure.
+enum RetryAction {
+    /// Rolled back and ready to re-issue the request.
+    Retry,
+    /// Cancelled during the backoff; the turn must abort.
+    Abort,
+}
+
 struct CollectedResponse {
     message: Option<Message>,
     usage: UsageAccumulator,
@@ -158,11 +166,7 @@ pub(crate) async fn compact_with_adapter(
     model: &dyn ModelClient,
     cancel: &CancellationToken,
 ) -> Result<Option<CompactedHistory>, ash_core::AshError> {
-    let tools = config
-        .tools
-        .iter()
-        .map(|tool| tool.definition())
-        .collect::<Vec<_>>();
+    let tools = config.tool_definitions();
     let update = DefaultContextPolicy
         .compact(
             ContextRequest {
@@ -214,7 +218,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         persistence: Option<&'store mut ThreadPersistence>,
         execution: TurnExecution,
     ) -> Self {
-        let tool_defs = config.tools.iter().map(|tool| tool.definition()).collect();
+        let tool_defs = config.tool_definitions();
         Self {
             config,
             tx: execution.tx,
@@ -295,27 +299,19 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 ResponseOutcome::Finished(StopReason::Truncated) => true,
                 _ => false,
             };
-            if retry && retries < self.config.max_retries {
-                let backoff = self.config.retry_backoff;
-                let delay = retry_delay(retries, backoff);
-                debug!(
-                    retries,
-                    ?delay,
-                    "retrying model call after retryable failure"
-                );
-                tokio::select! {
-                    // A cancellation during the backoff aborts the turn.
-                    _ = self.cancel.cancelled() => return Ok(Step::Done(StopReason::Aborted)),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                retries += 1;
-                if let Some(base) = pending_base {
-                    if let Some(persistence) = self.persistence.as_deref_mut() {
-                        persistence.rollback_to(base);
-                    }
-                }
-                messages.truncate(rollback_messages_len);
-                continue;
+            match self
+                .maybe_retry(
+                    messages,
+                    pending_base,
+                    rollback_messages_len,
+                    &mut retries,
+                    retry,
+                )
+                .await
+            {
+                Some(RetryAction::Abort) => return Ok(Step::Done(StopReason::Aborted)),
+                Some(RetryAction::Retry) => continue,
+                None => {}
             }
 
             let estimated_output_tokens = message
@@ -327,47 +323,76 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
                 estimated_output_tokens,
             );
-            *turn_usage = Some(match *turn_usage {
-                Some(acc) => Usage {
-                    // The API reports the full model input (system prompt,
-                    // tools, and history) per request, so later calls in a
-                    // turn already include earlier ones. Take the latest
-                    // snapshot instead of summing deltas; output tokens are
-                    // per-call increments and do accumulate across the turn.
-                    input_tokens: acc.input_tokens.max(call_usage.input_tokens),
-                    output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
-                    generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
-                    estimated: acc.estimated || call_usage.estimated,
-                },
-                None => call_usage,
-            });
+            merge_turn_usage(turn_usage, call_usage);
             if let Some(message) = message {
                 self.persist_message(&message).await?;
                 messages.push(message);
             }
 
-            return match outcome {
-                ResponseOutcome::Failed(error) => Err(error.into()),
-                ResponseOutcome::Cancelled => {
-                    // Drain steering so queued input is not lost, then abort.
-                    let _ = self.apply_steering(messages).await?;
-                    Ok(Step::Done(StopReason::Aborted))
+            return self.finish_outcome(messages, outcome).await;
+        }
+    }
+
+    /// Retry a safe, retryable model failure before any tool side effect. On
+    /// retry the partial output is discarded from both memory and the staged
+    /// log, and the identical request is re-issued. Cancellation during the
+    /// backoff aborts the turn.
+    async fn maybe_retry(
+        &mut self,
+        messages: &mut Vec<Message>,
+        pending_base: Option<usize>,
+        rollback_messages_len: usize,
+        retries: &mut u32,
+        retry: bool,
+    ) -> Option<RetryAction> {
+        if !retry || *retries >= self.config.max_retries {
+            return None;
+        }
+        let delay = retry_delay(*retries, self.config.retry_backoff);
+        debug!(
+            retries = *retries,
+            ?delay,
+            "retrying model call after retryable failure"
+        );
+        tokio::select! {
+            _ = self.cancel.cancelled() => return Some(RetryAction::Abort),
+            _ = tokio::time::sleep(delay) => {}
+        }
+        *retries += 1;
+        if let (Some(base), Some(persistence)) = (pending_base, self.persistence.as_deref_mut()) {
+            persistence.rollback_to(base);
+        }
+        messages.truncate(rollback_messages_len);
+        Some(RetryAction::Retry)
+    }
+
+    /// Consume the response outcome into the next step or a terminal error.
+    async fn finish_outcome(
+        &mut self,
+        messages: &mut Vec<Message>,
+        outcome: ResponseOutcome,
+    ) -> Result<Step, ash_core::AshError> {
+        match outcome {
+            ResponseOutcome::Failed(error) => Err(error.into()),
+            ResponseOutcome::Cancelled => {
+                // Drain steering so queued input is not lost, then abort.
+                let _ = self.apply_steering(messages).await?;
+                Ok(Step::Done(StopReason::Aborted))
+            }
+            ResponseOutcome::ToolCalls(calls) => {
+                self.execute_tool_calls(messages, calls).await?;
+                if self.cancel.is_cancelled() {
+                    return Ok(Step::Done(StopReason::Aborted));
                 }
-                ResponseOutcome::ToolCalls(calls) => {
-                    self.execute_tool_calls(messages, calls).await?;
-                    if self.cancel.is_cancelled() {
-                        return Ok(Step::Done(StopReason::Aborted));
-                    }
-                    let _ = self.apply_steering(messages).await?;
-                    Ok(Step::More)
+                let _ = self.apply_steering(messages).await?;
+                Ok(Step::More)
+            }
+            ResponseOutcome::Finished(reason) => {
+                if self.apply_steering(messages).await? {
+                    return Ok(Step::More);
                 }
-                ResponseOutcome::Finished(reason) => {
-                    if self.apply_steering(messages).await? {
-                        return Ok(Step::More);
-                    }
-                    Ok(Step::Done(reason))
-                }
-            };
+                Ok(Step::Done(reason))
+            }
         }
     }
 
@@ -571,14 +596,7 @@ async fn collect_response(
     cancel: &CancellationToken,
     request_started: Instant,
 ) -> CollectedResponse {
-    let mut blocks = Vec::new();
-    let mut thought_started_at = None;
-    let mut stop_reason = StopReason::EndTurn;
-    let mut saw_stop = false;
-    let mut usage = UsageAccumulator::default();
-    let mut first_output_at = None;
-    let mut open_block = None;
-
+    let mut accumulator = ResponseAccumulator::new();
     let stream_exit = loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => break StreamExit::Cancelled,
@@ -591,30 +609,61 @@ async fn collect_response(
             Ok(item) => item,
             Err(error) => break StreamExit::Failed(error),
         };
+        accumulator.apply(tx, item).await;
+    };
+    accumulator.finish(stream_exit, request_started)
+}
+
+/// Incremental state accumulated while reading one model stream.
+struct ResponseAccumulator {
+    blocks: Vec<ContentBlock>,
+    thought_started_at: Option<Instant>,
+    first_output_at: Option<Instant>,
+    stop_reason: StopReason,
+    saw_stop: bool,
+    usage: UsageAccumulator,
+    open_block: Option<OpenResponseBlock>,
+}
+
+impl ResponseAccumulator {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            thought_started_at: None,
+            first_output_at: None,
+            stop_reason: StopReason::EndTurn,
+            saw_stop: false,
+            usage: UsageAccumulator::default(),
+            open_block: None,
+        }
+    }
+
+    /// Fold one stream item into the accumulator, forwarding live deltas.
+    async fn apply(&mut self, tx: &mpsc::Sender<EventKind>, item: ModelEvent) {
         match item {
             ModelEvent::Text(delta) => {
-                first_output_at.get_or_insert_with(Instant::now);
-                finish_open_thought(&mut blocks, &mut thought_started_at);
-                match blocks.last_mut() {
+                self.first_output_at.get_or_insert_with(Instant::now);
+                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
+                match self.blocks.last_mut() {
                     Some(ContentBlock::Text(text)) => text.push_str(&delta),
-                    _ => blocks.push(ContentBlock::Text(delta.clone())),
+                    _ => self.blocks.push(ContentBlock::Text(delta.clone())),
                 }
-                open_block = Some(OpenResponseBlock::Text);
+                self.open_block = Some(OpenResponseBlock::Text);
                 send_live(tx, EventKind::Live(LiveEvent::TextDelta(delta))).await;
             }
             ModelEvent::Reasoning(delta) => {
-                first_output_at.get_or_insert_with(Instant::now);
-                match blocks.last_mut() {
+                self.first_output_at.get_or_insert_with(Instant::now);
+                match self.blocks.last_mut() {
                     Some(ContentBlock::Thought { text, .. }) => text.push_str(&delta),
                     _ => {
-                        thought_started_at = Some(Instant::now());
-                        blocks.push(ContentBlock::Thought {
+                        self.thought_started_at = Some(Instant::now());
+                        self.blocks.push(ContentBlock::Thought {
                             text: delta.clone(),
                             elapsed_seconds: 0,
                         });
                     }
                 }
-                open_block = Some(OpenResponseBlock::Thought);
+                self.open_block = Some(OpenResponseBlock::Thought);
                 send_live(tx, EventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
             }
             ModelEvent::ToolCall {
@@ -622,41 +671,74 @@ async fn collect_response(
                 name,
                 arguments,
             } => {
-                first_output_at.get_or_insert_with(Instant::now);
-                finish_open_thought(&mut blocks, &mut thought_started_at);
-                open_block = None;
-                blocks.push(ContentBlock::ToolCall {
+                self.first_output_at.get_or_insert_with(Instant::now);
+                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
+                self.open_block = None;
+                self.blocks.push(ContentBlock::ToolCall {
                     id,
                     name,
                     arguments,
                 });
             }
-            ModelEvent::Usage(reported) => {
-                usage.record(reported.input_tokens, reported.output_tokens)
-            }
+            ModelEvent::Usage(reported) => self
+                .usage
+                .record(reported.input_tokens, reported.output_tokens),
             ModelEvent::Stop(reason) => {
-                finish_open_thought(&mut blocks, &mut thought_started_at);
-                open_block = None;
-                saw_stop = true;
-                stop_reason = reason;
+                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
+                self.open_block = None;
+                self.saw_stop = true;
+                self.stop_reason = reason;
             }
         }
-    };
-    if matches!(stream_exit, StreamExit::Cancelled) {
-        discard_open_block(&mut blocks, open_block, &mut thought_started_at);
-    } else {
-        finish_open_thought(&mut blocks, &mut thought_started_at);
     }
 
-    // Defense in depth for truncated streams: the protocol adapters emit
-    // `Stop(Truncated)` when a stream ends without a terminal marker, but any
-    // stream that simply runs out without ever signalling a stop is treated
-    // as truncated here rather than as a clean `EndTurn`.
-    if matches!(stream_exit, StreamExit::Exhausted) && !saw_stop {
-        stop_reason = StopReason::Truncated;
-    }
+    /// Finalize the accumulated blocks into a response, applying truncation
+    /// and cancellation rules and extracting pending tool calls.
+    fn finish(self, stream_exit: StreamExit, request_started: Instant) -> CollectedResponse {
+        let Self {
+            mut blocks,
+            mut thought_started_at,
+            first_output_at,
+            mut stop_reason,
+            saw_stop,
+            usage,
+            open_block,
+        } = self;
+        if matches!(stream_exit, StreamExit::Cancelled) {
+            discard_open_block(&mut blocks, open_block, &mut thought_started_at);
+        } else {
+            finish_open_thought(&mut blocks, &mut thought_started_at);
+        }
 
-    let calls: Vec<PendingToolCall> = blocks
+        // Defense in depth for truncated streams: the protocol adapters emit
+        // `Stop(Truncated)` when a stream ends without a terminal marker, but any
+        // stream that simply runs out without ever signalling a stop is treated
+        // as truncated here rather than as a clean `EndTurn`.
+        if matches!(stream_exit, StreamExit::Exhausted) && !saw_stop {
+            stop_reason = StopReason::Truncated;
+        }
+
+        let calls = pending_tool_calls(&blocks);
+        let message = (!blocks.is_empty()).then(|| Message {
+            id: ash_core::MessageId::new(),
+            role: Role::Assistant,
+            content: MessageContent::Assistant(blocks),
+        });
+        let outcome = response_action(stream_exit, calls, stop_reason);
+
+        CollectedResponse {
+            message,
+            usage: UsageAccumulator {
+                generation_ms: elapsed_generation_ms(first_output_at, request_started),
+                ..usage
+            },
+            outcome,
+        }
+    }
+}
+
+fn pending_tool_calls(blocks: &[ContentBlock]) -> Vec<PendingToolCall> {
+    blocks
         .iter()
         .filter_map(|block| match block {
             ContentBlock::ToolCall {
@@ -670,28 +752,17 @@ async fn collect_response(
             }),
             ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
         })
-        .collect();
-    let message = (!blocks.is_empty()).then(|| Message {
-        id: ash_core::MessageId::new(),
-        role: Role::Assistant,
-        content: MessageContent::Assistant(blocks),
-    });
-    let outcome = response_action(stream_exit, calls, stop_reason);
+        .collect()
+}
 
-    CollectedResponse {
-        message,
-        usage: UsageAccumulator {
-            generation_ms: u64::try_from(
-                first_output_at
-                    .unwrap_or(request_started)
-                    .elapsed()
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX),
-            ..usage
-        },
-        outcome,
-    }
+fn elapsed_generation_ms(first_output_at: Option<Instant>, request_started: Instant) -> u64 {
+    u64::try_from(
+        first_output_at
+            .unwrap_or(request_started)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Map a stream exit plus any accumulated tool calls to the turn outcome.
@@ -733,6 +804,23 @@ fn retry_delay(attempt: u32, backoff: RetryBackoff) -> std::time::Duration {
     let max_ms = u64::try_from(backoff.max.as_millis()).unwrap_or(u64::MAX);
     let millis = base_ms.saturating_mul(1u64 << attempt.min(20)).min(max_ms);
     std::time::Duration::from_millis(millis)
+}
+
+/// Merge a single model call's usage into the running turn total. The API
+/// reports the full model input (system prompt, tools, and history) per
+/// request, so later calls in a turn already include earlier ones: take the
+/// latest snapshot instead of summing deltas. Output tokens are per-call
+/// increments and do accumulate across the turn.
+fn merge_turn_usage(turn_usage: &mut Option<Usage>, call_usage: Usage) {
+    *turn_usage = Some(match *turn_usage {
+        Some(acc) => Usage {
+            input_tokens: acc.input_tokens.max(call_usage.input_tokens),
+            output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
+            generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
+            estimated: acc.estimated || call_usage.estimated,
+        },
+        None => call_usage,
+    });
 }
 
 fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {

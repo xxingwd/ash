@@ -234,11 +234,11 @@ fn insert_finalized_buffer<B: Backend>(
     while remaining_height + viewport_height > screen_height_i32 {
         let lines_to_draw = remaining_height.min(screen_height_i32);
         let scroll_up = 0.max(drawn_height + lines_to_draw - screen_height_i32);
-        append_native_scrollback(terminal, screen_height, scroll_up as u16)?;
+        append_native_scrollback(terminal, screen_height, to_u16(scroll_up))?;
         cells = draw_lines(
             terminal,
-            (drawn_height - scroll_up) as u16,
-            lines_to_draw as u16,
+            to_u16(drawn_height - scroll_up),
+            to_u16(lines_to_draw),
             current.width,
             cells,
         )?;
@@ -247,20 +247,26 @@ fn insert_finalized_buffer<B: Backend>(
     }
 
     let scroll_up = 0.max(drawn_height + remaining_height + viewport_height - screen_height_i32);
-    append_native_scrollback(terminal, screen_height, scroll_up as u16)?;
+    append_native_scrollback(terminal, screen_height, to_u16(scroll_up))?;
     draw_lines(
         terminal,
-        (drawn_height - scroll_up) as u16,
-        remaining_height as u16,
+        to_u16(drawn_height - scroll_up),
+        to_u16(remaining_height),
         current.width,
         cells,
     )?;
     drawn_height += remaining_height - scroll_up;
 
     terminal.resize(Rect {
-        y: drawn_height as u16,
+        y: to_u16(drawn_height),
         ..current
     })
+}
+
+/// `i32` row positions are non-negative by construction in
+/// `insert_finalized_buffer`; clamp to `u16` like the rest of the codebase.
+fn to_u16(value: i32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 fn append_native_scrollback<B: Backend>(
@@ -283,13 +289,16 @@ fn draw_lines<'a, B: Backend>(
     cells: &'a [ratatui::buffer::Cell],
 ) -> Result<&'a [ratatui::buffer::Cell], B::Error> {
     let cell_count = usize::from(width) * usize::from(lines_to_draw);
-    let (to_draw, remainder) = cells.split_at(cell_count);
+    // Never split past the buffer: the caller's loop arithmetic guarantees a
+    // full buffer in practice, but a short one must degrade to drawing what is
+    // available instead of panicking on an out-of-bounds `split_at`.
+    let (to_draw, remainder) = cells.split_at(cell_count.min(cells.len()));
     if lines_to_draw > 0 {
         let width = usize::from(width);
         let updates = to_draw.iter().enumerate().map(|(index, cell)| {
             (
-                (index % width) as u16,
-                y_offset + (index / width) as u16,
+                u16::try_from(index % width).unwrap_or(u16::MAX),
+                y_offset.saturating_add(u16::try_from(index / width).unwrap_or(u16::MAX)),
                 cell,
             )
         });
@@ -428,7 +437,12 @@ mod tests {
     fn inline_render_clips_rows_below_the_screen() {
         let mut source = Buffer::empty(Rect::new(0, 0, 6, 4));
         for (row, text) in ["one", "two", "three", "four"].into_iter().enumerate() {
-            source.set_string(0, row as u16, text, Style::default());
+            source.set_string(
+                0,
+                u16::try_from(row).unwrap_or(u16::MAX),
+                text,
+                Style::default(),
+            );
         }
         let frame = ViewportFrame::for_test(source, Position::new(1, 3));
         let mut screen = Buffer::empty(Rect::new(0, 0, 6, 2));

@@ -1,3 +1,7 @@
+use ratatui::{
+    style::{Modifier, Style},
+    text::Span,
+};
 use unicode_width::UnicodeWidthChar;
 
 pub(crate) fn sanitize_terminal_text(text: &str) -> String {
@@ -37,6 +41,20 @@ pub(crate) fn sanitize_terminal_text(text: &str) -> String {
 
 pub(crate) fn sanitize_single_line(text: &str) -> String {
     sanitize_terminal_text(text).replace(['\r', '\n'], " ")
+}
+
+/// Content-row prefix spans: a bullet marker on the first row and an
+/// indentation gap on continuation rows. Shared by the markdown renderers so
+/// the `• /  ` prefix stays identical across blocks.
+pub(crate) fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
+    if first {
+        vec![Span::styled(
+            "• ",
+            Style::default().add_modifier(Modifier::DIM),
+        )]
+    } else {
+        vec![Span::raw("  ")]
+    }
 }
 
 pub(crate) fn wrap_text(text: &str, width: u16) -> Vec<String> {

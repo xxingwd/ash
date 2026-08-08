@@ -13,6 +13,17 @@ use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
+fn anthropic_image_block(media_type: &str, data: &[u8]) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64_image(data),
+        }
+    })
+}
+
 pub struct AnthropicAdapter {
     config: ProviderConfig,
     client: Client,
@@ -43,14 +54,9 @@ impl AnthropicAdapter {
                             ash_core::Content::Text(text) => {
                                 json!({"type": "text", "text": text})
                             }
-                            ash_core::Content::Image { media_type, data } => json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": base64_image(data),
-                                }
-                            }),
+                            ash_core::Content::Image { media_type, data } => {
+                                anthropic_image_block(media_type, data)
+                            }
                         })
                         .collect();
                     Some(json!({"role": "user", "content": content}))
@@ -90,14 +96,9 @@ impl AnthropicAdapter {
                     let mut content = vec![json!({"type": "text", "text": text})];
                     content.extend(attachments.iter().map(|attachment| match attachment {
                         ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
-                        ash_core::Content::Image { media_type, data } => json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64_image(data),
-                            }
-                        }),
+                        ash_core::Content::Image { media_type, data } => {
+                            anthropic_image_block(media_type, data)
+                        }
                     }));
                     Some(json!({
                         "role": "user",
@@ -229,7 +230,7 @@ impl sse::Decoder for AnthropicDecoder {
                                 "Anthropic tool-input delta references unknown block {index}"
                             ))
                         })?;
-                        call.arguments.push_str(partial);
+                        call.append_arguments(partial);
                     }
                     _ => {}
                 }
@@ -248,7 +249,7 @@ impl sse::Decoder for AnthropicDecoder {
                     )));
                 }
                 self.stop = Some(stop_reason(
-                    event["delta"]["stop_reason"].as_str() == Some("max_tokens"),
+                    event["delta"]["stop_reason"].as_str().unwrap_or(""),
                 ));
             }
             "message_stop" => {

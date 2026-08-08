@@ -18,9 +18,8 @@ impl<T> Default for PickerState<T> {
 }
 
 impl<T> PickerState<T> {
-    pub(crate) fn open(&mut self, items: Vec<T>) {
-        self.items = items;
-        self.selected = 0;
+    pub(crate) fn with_items(items: Vec<T>) -> Self {
+        Self { items, selected: 0 }
     }
 
     pub(crate) fn is_visible(&self) -> bool {

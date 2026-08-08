@@ -68,7 +68,7 @@ pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<Welc
     }
     lines.push(framed_row(
         inner_width,
-        &truncate_start(&workspace_label(working_dir), usize::from(inner_width)),
+        &truncate_start(&compact_path(working_dir), usize::from(inner_width)),
         WelcomeStyle::Subtitle,
     ));
     lines.push(framed_row(inner_width, "", WelcomeStyle::Frame));
@@ -122,10 +122,6 @@ fn centered(terminal_width: u16, content: &str, style: WelcomeStyle) -> WelcomeL
         text: format!("{}{content}", " ".repeat(left)),
         style,
     }
-}
-
-fn workspace_label(working_dir: &Path) -> String {
-    compact_path(working_dir)
 }
 
 #[cfg(test)]

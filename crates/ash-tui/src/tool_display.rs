@@ -159,7 +159,7 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
         ToolKind::Other => phrase(
             "Ran",
             "running",
-            sanitize_single_line(name).replace('_', " "),
+            collapse_whitespace(name).replace('_', " "),
         ),
     }
 }
@@ -184,17 +184,16 @@ fn string_argument(arguments: &Value, key: &str) -> String {
     arguments
         .get(key)
         .and_then(Value::as_str)
-        .map(sanitize_single_line)
+        .map(collapse_whitespace)
         .unwrap_or_default()
 }
 
 fn url_argument(arguments: &Value) -> String {
     let url = string_argument(arguments, "url");
-    let without_fragment = url.split('#').next().unwrap_or(&url);
+    let without_fragment = url.split_once('#').map_or(url.as_str(), |(head, _)| head);
     let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
+        .split_once('?')
+        .map_or(without_fragment, |(head, _)| head);
     let Some((scheme, rest)) = without_query.split_once("://") else {
         return without_query.to_string();
     };
@@ -217,7 +216,9 @@ fn short_display_path(path: &str) -> String {
         .to_string()
 }
 
-fn sanitize_single_line(value: &str) -> String {
+/// Collapse runs of whitespace to single spaces (unlike
+/// `scrollback::sanitize_single_line`, which only replaces newlines).
+fn collapse_whitespace(value: &str) -> String {
     crate::scrollback::sanitize_terminal_text(value)
         .split_whitespace()
         .collect::<Vec<_>>()

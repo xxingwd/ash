@@ -1,19 +1,24 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
     ThreadOptions, Turn, DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId};
+use ash_core::{
+    EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, ThreadView, TurnId,
+};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::{UiCommand, UiError};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
+use tokio::io::AsyncBufReadExt;
 
 use crate::{Cli, Command};
 
 const DEFAULT_MAX_TURNS: u32 = 100;
-const DEFAULT_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct InteractiveController {
     thread: Thread,
@@ -41,12 +46,10 @@ impl TurnState {
         }
     }
 
-    fn cancel_active(&self) -> bool {
-        let Some(turn) = &self.active else {
-            return false;
-        };
-        turn.cancellation_token().cancel();
-        true
+    fn cancel_active(&self) {
+        if let Some(turn) = &self.active {
+            turn.cancellation_token().cancel();
+        }
     }
 
     async fn steer_active(&self, input: String) -> Result<(), UiError> {
@@ -84,40 +87,17 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 fn build_config(cli: &Cli) -> Result<AgentSetup> {
-    let protocol_name = cli
-        .protocol
-        .clone()
-        .or_else(|| env_value("ASH_PROTOCOL"))
-        .unwrap_or_else(|| "anthropic".into());
-    let protocol = parse_protocol(&protocol_name)?;
+    let protocol = resolve_protocol(cli)?;
     let api_key = env_value("ASH_API_KEY").context("set ASH_API_KEY in the process environment")?;
-    let model = cli.model.clone().or_else(|| env_value("ASH_MODEL"));
-    let model = match model {
-        Some(model) => model,
-        None => match protocol.default_model() {
-            Some(default) => default.into(),
-            None => anyhow::bail!("set ASH_MODEL in the process environment or pass --model"),
-        },
-    };
+    let model = resolve_model(cli, &protocol)?;
     let base_url = cli.base_url.clone().or_else(|| env_value("ASH_BASE_URL"));
-    let configured_max_context_tokens = match cli.max_context_tokens {
-        Some(value) => Some(value),
-        None => env_usize("ASH_MAX_CONTEXT_TOKENS")?,
-    };
-    let max_context_tokens = resolve_max_context_tokens(configured_max_context_tokens)?;
+    let max_context_tokens = resolve_max_context_tokens(
+        cli.max_context_tokens
+            .or(env_usize("ASH_MAX_CONTEXT_TOKENS")?),
+    )?;
     let working_dir = std::env::current_dir()?;
     let skills = Skill::discover(&working_dir)?;
-    let active_skill = cli
-        .skill
-        .as_ref()
-        .map(|skill_name| {
-            skills
-                .iter()
-                .find(|skill| skill.name == *skill_name)
-                .cloned()
-                .with_context(|| format!("skill not found: {skill_name}"))
-        })
-        .transpose()?;
+    let active_skill = resolve_active_skill(cli, &skills)?;
     let system_prompt = build_system_prompt(&working_dir, &skills, active_skill.as_ref())?;
     let mut tools = ash_tools::tools(
         working_dir.clone(),
@@ -166,6 +146,38 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     })
 }
 
+fn resolve_protocol(cli: &Cli) -> Result<Protocol> {
+    let name = cli
+        .protocol
+        .clone()
+        .or_else(|| env_value("ASH_PROTOCOL"))
+        .unwrap_or_else(|| "anthropic".into());
+    parse_protocol(&name)
+}
+
+/// Resolve the model name with `--model` > `ASH_MODEL` > the protocol's
+/// default model.
+fn resolve_model(cli: &Cli, protocol: &Protocol) -> Result<String> {
+    cli.model
+        .clone()
+        .or_else(|| env_value("ASH_MODEL"))
+        .or_else(|| protocol.default_model().map(String::from))
+        .context("set ASH_MODEL in the process environment or pass --model")
+}
+
+fn resolve_active_skill(cli: &Cli, skills: &[Skill]) -> Result<Option<Skill>> {
+    cli.skill
+        .as_ref()
+        .map(|skill_name| {
+            skills
+                .iter()
+                .find(|skill| skill.name == *skill_name)
+                .cloned()
+                .with_context(|| format!("skill not found: {skill_name}"))
+        })
+        .transpose()
+}
+
 fn parse_protocol(name: &str) -> Result<Protocol> {
     name.parse()
         .map_err(|_| anyhow::anyhow!("unknown protocol: {name}"))
@@ -204,7 +216,8 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         Some(prompt) => prompt,
         None => {
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            stdin.read_line(&mut input).await?;
             input
         }
     };
@@ -451,13 +464,11 @@ impl InteractiveController {
         {
             Ok(Some(thread)) => {
                 self.thread = thread;
-                match self.thread.view().await {
-                    Ok(view) => EventKind::Restored {
-                        context_tokens: view.context_tokens,
-                        view,
-                    },
-                    Err(error) => EventKind::Error(format!("Failed to restore chat: {error}")),
-                }
+                self.with_current_view("restore chat", |view| EventKind::Restored {
+                    context_tokens: view.context_tokens,
+                    view,
+                })
+                .await
             }
             Ok(None) => EventKind::Error("That saved chat is no longer available.".to_string()),
             Err(error) => EventKind::Error(format!("Failed to resume saved chat: {error}")),
@@ -468,17 +479,14 @@ impl InteractiveController {
     async fn fork_thread(&mut self, message_id: MessageId) {
         let event = match self.thread.fork_at(message_id).await {
             Ok(Some(forked)) => {
+                let prompt = forked.prompt;
                 self.thread = forked.thread;
-                match self.thread.view().await {
-                    Ok(view) => EventKind::ThreadForked {
-                        context_tokens: view.context_tokens,
-                        view,
-                        prompt: forked.prompt,
-                    },
-                    Err(error) => {
-                        EventKind::Error(format!("Failed to fork the current chat: {error}"))
-                    }
-                }
+                self.with_current_view("fork the current chat", |view| EventKind::ThreadForked {
+                    context_tokens: view.context_tokens,
+                    view,
+                    prompt,
+                })
+                .await
             }
             Ok(None) => {
                 EventKind::Error("That prompt is no longer available to fork from.".to_string())
@@ -486,6 +494,19 @@ impl InteractiveController {
             Err(error) => EventKind::Error(format!("Failed to fork the current chat: {error}")),
         };
         let _ = self.event_tx.send(event).await;
+    }
+
+    /// Read the thread's current view and map it to an event. Centralizes the
+    /// error event produced when the view cannot be read.
+    async fn with_current_view(
+        &mut self,
+        view_error_context: &str,
+        on_view: impl FnOnce(ThreadView) -> EventKind,
+    ) -> EventKind {
+        match self.thread.view().await {
+            Ok(view) => on_view(view),
+            Err(error) => EventKind::Error(format!("Failed to {view_error_context}: {error}")),
+        }
     }
 }
 

@@ -59,7 +59,10 @@ impl From<String> for ToolOutput {
 
 impl From<&str> for ToolOutput {
     fn from(text: &str) -> Self {
-        text.to_string().into()
+        Self {
+            text: text.to_string(),
+            attachments: Vec::new(),
+        }
     }
 }
 

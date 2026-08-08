@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ash_core::{ContentBlock, MessageContent, ProtocolError};
+use ash_core::{ContentBlock, ProtocolError};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    consecutive_tool_results, image_data_url, join_text_contents, model_config,
+    content_value, image_data_url, model_config,
     pending_calls::stop_reason,
-    pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
-    project_request_messages, sse, ProviderConfig,
+    pending_calls::{build_usage, PendingCallAccumulator},
+    project_request_messages, sse, MessageGroup, MessageGroupIter, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -33,14 +33,12 @@ impl ResponsesAdapter {
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let mut input = Vec::new();
-        let mut index = 0;
-        while index < projected.messages.len() {
-            match &projected.messages[index].content {
-                MessageContent::User(contents) => {
+        for group in MessageGroupIter::new(&projected.messages) {
+            match group {
+                MessageGroup::User(contents) => {
                     input.push(json!({"role": "user", "content": responses_content(contents)}));
-                    index += 1;
                 }
-                MessageContent::Assistant(blocks) => {
+                MessageGroup::Assistant(blocks) => {
                     let text = blocks
                         .iter()
                         .filter_map(|block| match block {
@@ -71,10 +69,8 @@ impl ResponsesAdapter {
                         })),
                         ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
                     }));
-                    index += 1;
                 }
-                MessageContent::ToolResult { .. } => {
-                    let group = consecutive_tool_results(&projected.messages, index);
+                MessageGroup::ToolResults(group) => {
                     for result in group.results {
                         input.push(json!({
                             "type": "function_call_output",
@@ -82,7 +78,6 @@ impl ResponsesAdapter {
                             "output": result.output,
                         }));
                     }
-                    index = group.next_index;
                     if !group.attachments.is_empty() {
                         input.push(json!({
                             "role": "user",
@@ -125,23 +120,12 @@ impl ResponsesAdapter {
 }
 
 fn responses_content(contents: &[ash_core::Content]) -> Value {
-    if !contents
-        .iter()
-        .any(|content| matches!(content, ash_core::Content::Image { .. }))
-    {
-        return json!(join_text_contents(contents));
-    }
-
-    json!(contents
-        .iter()
-        .map(|content| match content {
-            ash_core::Content::Text(text) => json!({"type": "input_text", "text": text}),
-            ash_core::Content::Image { media_type, data } => json!({
-                "type": "input_image",
-                "image_url": image_data_url(media_type, data),
-            }),
+    content_value(contents, "input_text", |media_type, data| {
+        json!({
+            "type": "input_image",
+            "image_url": image_data_url(media_type, data),
         })
-        .collect::<Vec<_>>())
+    })
 }
 
 impl ModelClient for ResponsesAdapter {
@@ -168,43 +152,6 @@ pub(crate) struct ResponsesDecoder {
 enum ResponseItemKey {
     Id(String),
     OutputIndex(u64),
-}
-
-impl PendingCall {
-    /// Merge a call re-keyed from an output index into this item-keyed call.
-    fn merge(&mut self, other: Self) {
-        if self.id.is_empty() {
-            self.id = other.id;
-        }
-        if self.name.is_empty() {
-            self.name = other.name;
-        }
-        if self.arguments.is_empty() {
-            self.arguments = other.arguments;
-        } else if !other.arguments.is_empty() {
-            self.arguments.push_str(&other.arguments);
-        }
-    }
-
-    /// Apply a `function_call` item payload; `replace_arguments` is true for
-    /// atomic `output_item.done` payloads and false for `output_item.added`
-    /// placeholders.
-    fn apply_item(&mut self, item: &Value, replace_arguments: bool) {
-        if let Some(call_id) = item["call_id"]
-            .as_str()
-            .filter(|call_id| !call_id.is_empty())
-        {
-            self.id = call_id.to_string();
-        }
-        if let Some(name) = item["name"].as_str().filter(|name| !name.is_empty()) {
-            self.name = name.to_string();
-        }
-        if let Some(arguments) = item["arguments"].as_str() {
-            if replace_arguments || self.arguments.is_empty() || !arguments.is_empty() {
-                self.arguments = arguments.to_string();
-            }
-        }
-    }
 }
 
 impl ResponsesDecoder {
@@ -327,22 +274,21 @@ impl sse::Decoder for ResponsesDecoder {
             }
             "response.function_call_arguments.delta" => {
                 let key = self.key(&event)?;
-                let call = self.calls.entry(key);
                 if let Some(delta) = event["delta"].as_str() {
-                    call.arguments.push_str(delta);
+                    self.calls.entry(key).append_arguments(delta);
                 }
             }
             "response.function_call_arguments.done" => {
                 let key = self.key(&event)?;
                 let call = self.calls.entry(key.clone());
                 if let Some(arguments) = event["arguments"].as_str() {
-                    call.arguments = arguments.to_string();
+                    call.set_arguments(arguments);
                 }
                 if let Some(name) = event["name"].as_str() {
-                    call.name = name.to_string();
+                    call.set_name(name);
                 }
                 if let Some(call_id) = event["call_id"].as_str() {
-                    call.id = call_id.to_string();
+                    call.set_id(call_id);
                 }
                 if let Some(item) = self.emit_call(&key)? {
                     items.push(item);
@@ -373,7 +319,9 @@ impl sse::Decoder for ResponsesDecoder {
                     )));
                 }
                 items.push(ModelEvent::Stop(stop_reason(
-                    response["incomplete_details"]["reason"].as_str() == Some("max_output_tokens"),
+                    response["incomplete_details"]["reason"]
+                        .as_str()
+                        .unwrap_or(""),
                 )));
                 return Ok(sse::DecodeResult::finished(items));
             }
@@ -596,8 +544,8 @@ mod tests {
             model: ModelId::new("test"),
             system: None,
             messages: vec![
-                tool_result("first", Vec::new()),
-                tool_result(
+                crate::test_support::tool_result("first", Vec::new()),
+                crate::test_support::tool_result(
                     "second",
                     vec![Content::Image {
                         media_type: "image/png".into(),
@@ -618,17 +566,5 @@ mod tests {
             body["input"][2]["content"][0]["image_url"],
             "data:image/png;base64,AQID"
         );
-    }
-
-    fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
-        Message {
-            id: MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id: ToolCallId::new(),
-                result: Ok(text.into()),
-                attachments,
-            },
-        }
     }
 }

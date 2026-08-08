@@ -83,10 +83,10 @@ fn parse_entry(entry: &str, index: usize) -> Result<(Vec<String>, Value), Protoc
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if RESERVED_ROOTS.contains(&path[0].as_str()) {
+    let root = &path[0];
+    if RESERVED_ROOTS.contains(&root.as_str()) {
         return Err(ProtocolError::InvalidRequest(format!(
-            "{ENV_VAR} cannot override the '{}' request field",
-            path[0]
+            "{ENV_VAR} cannot override the '{root}' request field"
         )));
     }
 
@@ -116,11 +116,12 @@ fn parse_value(value: &str) -> Value {
 }
 
 fn insert_value(body: &mut Value, path: &[String], value: Value) -> Result<(), ProtocolError> {
+    let root = &path[0];
     if path.len() == 1 {
         let object = body.as_object_mut().ok_or_else(|| {
             ProtocolError::InvalidRequest("request body must be a JSON object".to_string())
         })?;
-        object.insert(path[0].clone(), value);
+        object.insert(root.clone(), value);
         return Ok(());
     }
 
@@ -128,13 +129,12 @@ fn insert_value(body: &mut Value, path: &[String], value: Value) -> Result<(), P
         ProtocolError::InvalidRequest("request body must be a JSON object".to_string())
     })?;
     let child = object
-        .entry(path[0].clone())
+        .entry(root.clone())
         .or_insert_with(|| Value::Object(Map::new()));
     if !child.is_object() {
         return Err(ProtocolError::InvalidRequest(format!(
-            "{ENV_VAR} cannot set '{}': '{}' is not an object",
-            path.join("."),
-            path[0]
+            "{ENV_VAR} cannot set '{}': '{root}' is not an object",
+            path.join(".")
         )));
     }
     insert_value(child, &path[1..], value)

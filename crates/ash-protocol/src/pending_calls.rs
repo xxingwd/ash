@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use ash_core::{ModelEvent, ProtocolError, StopReason, ToolCallId, Usage};
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// Shared construction of provider-neutral usage records. Stream decoders
 /// report token counts under provider-specific field names; once those are
@@ -16,9 +16,13 @@ pub(crate) fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
 }
 
 /// Shared mapping from a provider's "ran out of tokens" signal to the
-/// provider-neutral `StopReason`.
-pub(crate) fn stop_reason(max_token_reason: bool) -> StopReason {
-    if max_token_reason {
+/// provider-neutral `StopReason`. The reason strings cover the three supported
+/// providers; anything else is a normal end of turn.
+pub(crate) fn stop_reason(provider_reason: &str) -> StopReason {
+    if matches!(
+        provider_reason,
+        "length" | "max_tokens" | "max_output_tokens"
+    ) {
         StopReason::MaxTokens
     } else {
         StopReason::EndTurn
@@ -36,9 +40,9 @@ pub(crate) fn stop_reason(max_token_reason: bool) -> StopReason {
 #[derive(Default)]
 pub(crate) struct PendingCall {
     /// Provider tool-call id; empty means the provider never sent one.
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) arguments: String,
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl PendingCall {
@@ -47,6 +51,58 @@ impl PendingCall {
             id: id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
+        }
+    }
+
+    pub(crate) fn set_id(&mut self, id: &str) {
+        self.id = id.to_string();
+    }
+
+    pub(crate) fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
+    /// Replace the accumulated arguments with a complete payload.
+    pub(crate) fn set_arguments(&mut self, arguments: &str) {
+        self.arguments = arguments.to_string();
+    }
+
+    pub(crate) fn append_arguments(&mut self, arguments: &str) {
+        self.arguments.push_str(arguments);
+    }
+
+    /// Merge a call re-keyed from an output index into this item-keyed call.
+    pub(crate) fn merge(&mut self, other: Self) {
+        if self.id.is_empty() {
+            self.id = other.id;
+        }
+        if self.name.is_empty() {
+            self.name = other.name;
+        }
+        if self.arguments.is_empty() {
+            self.arguments = other.arguments;
+        } else if !other.arguments.is_empty() {
+            self.arguments.push_str(&other.arguments);
+        }
+    }
+
+    /// Apply a `function_call` item payload; `replace_arguments` is true for
+    /// atomic `output_item.done` payloads and false for `output_item.added`
+    /// placeholders.
+    pub(crate) fn apply_item(&mut self, item: &Value, replace_arguments: bool) {
+        if let Some(call_id) = item["call_id"]
+            .as_str()
+            .filter(|call_id| !call_id.is_empty())
+        {
+            self.set_id(call_id);
+        }
+        if let Some(name) = item["name"].as_str().filter(|name| !name.is_empty()) {
+            self.set_name(name);
+        }
+        if let Some(arguments) = item["arguments"].as_str() {
+            if replace_arguments || self.arguments.is_empty() || !arguments.is_empty() {
+                self.set_arguments(arguments);
+            }
         }
     }
 
@@ -145,8 +201,8 @@ mod tests {
     #[test]
     fn finish_preserves_provider_id_and_parses_arguments() {
         let mut call = PendingCall::new("toolu_123", "bash");
-        call.arguments.push_str("{\"command\":");
-        call.arguments.push_str("\"pwd\"}");
+        call.append_arguments("{\"command\":");
+        call.append_arguments("\"pwd\"}");
 
         let event = call.finish("Anthropic").unwrap();
 
@@ -167,7 +223,7 @@ mod tests {
     #[test]
     fn finish_names_the_protocol_in_errors() {
         let mut invalid = PendingCall::new("id", "bash");
-        invalid.arguments.push_str("{\"command\":");
+        invalid.append_arguments("{\"command\":");
         let invalid = invalid.finish("Anthropic");
 
         match invalid {
@@ -191,8 +247,8 @@ mod tests {
     #[test]
     fn accumulator_drains_calls_in_key_order() {
         let mut accumulator = PendingCallAccumulator::default();
-        accumulator.entry(1).name = "second".to_string();
-        accumulator.entry(0).name = "first".to_string();
+        accumulator.entry(1).set_name("second");
+        accumulator.entry(0).set_name("first");
 
         let names = accumulator
             .drain()
@@ -210,7 +266,9 @@ mod tests {
         assert_eq!(usage.generation_ms, 0);
         assert!(!usage.estimated);
 
-        assert_eq!(stop_reason(true), StopReason::MaxTokens);
-        assert_eq!(stop_reason(false), StopReason::EndTurn);
+        assert_eq!(stop_reason("length"), StopReason::MaxTokens);
+        assert_eq!(stop_reason("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(stop_reason("max_output_tokens"), StopReason::MaxTokens);
+        assert_eq!(stop_reason("stop"), StopReason::EndTurn);
     }
 }

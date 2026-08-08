@@ -85,6 +85,10 @@ fn find_files(
             continue;
         }
         files.push(search.relative(entry.path()));
+        // `file_walker` traverses in sorted order, so stopping at
+        // `MAX_RESULTS + 1` yields the lexicographically first results without
+        // collecting the whole tree; the extra entry only distinguishes
+        // "exactly full" from "truncated".
         if files.len() > MAX_RESULTS {
             break;
         }
@@ -103,7 +107,9 @@ fn find_files(
         .collect::<Vec<_>>()
         .join("\n");
     if truncated {
-        output.push_str("\n\n[Results truncated at 100 files. Use a narrower path or pattern.]");
+        output.push_str(&format!(
+            "\n\n[Results truncated at {MAX_RESULTS} files. Use a narrower path or pattern.]"
+        ));
     }
     Ok(output)
 }

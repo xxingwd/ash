@@ -46,7 +46,7 @@ fn format_compact(value: u64, scale: u64, suffix: &str) -> String {
 }
 
 pub(crate) fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
-    let model_width = UnicodeWidthStr::width(model) as u16;
+    let model_width = u16::try_from(UnicodeWidthStr::width(model)).unwrap_or(u16::MAX);
     let path_width = width.saturating_sub(model_width.saturating_add(3));
     if model_width >= width || path.is_empty() || path_width == 0 {
         return (truncate_end(model, usize::from(width)), None);

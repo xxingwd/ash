@@ -145,8 +145,17 @@ impl AppState {
         let Some(receiver) = &mut self.subagent_rx else {
             return;
         };
-        if receiver.has_changed().unwrap_or(false) {
-            self.subagents = receiver.borrow_and_update().clone();
+        match receiver.has_changed() {
+            Ok(true) => {
+                self.subagents = receiver.borrow_and_update().clone();
+            }
+            Ok(false) => {}
+            // The monitor channel closed: no further snapshots will arrive, so
+            // stop tracking subagents instead of freezing the last stale list.
+            Err(_) => {
+                self.subagent_rx = None;
+                self.subagents.clear();
+            }
         }
     }
 
@@ -490,15 +499,19 @@ async fn handle_key(
             return Ok(LoopAction::Continue);
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,
-        KeyCode::Char('c')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && !state.input.is_empty() =>
-        {
-            state.input.clear()
-        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if !state.operation.is_busy() {
-                let _ = commands.send(UiCommand::Exit).await;
-                return Ok(LoopAction::Exit);
+            match ctrl_c_action(state.input.is_empty(), state.operation.is_busy()) {
+                CtrlCAction::ClearInput => state.input.clear(),
+                CtrlCAction::CancelTurn => {
+                    // A running turn treats Ctrl+C as a cancellation request
+                    // (like Esc) instead of falling through to insert a literal
+                    // 'c' into the composer.
+                    return cancel_turn(state, terminal, commands).await;
+                }
+                CtrlCAction::Exit => {
+                    let _ = commands.send(UiCommand::Exit).await;
+                    return Ok(LoopAction::Exit);
+                }
             }
         }
         KeyCode::Char('d')
@@ -673,6 +686,27 @@ fn is_cancel_key(state: &AppState, key: &KeyEvent) -> bool {
         && key.code == KeyCode::Esc
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
+}
+
+/// What Ctrl+C should do in the composer. With a draft it clears the input;
+/// while a turn is running it cancels the turn (matching Esc); otherwise it
+/// exits the application. Kept as a pure function so the key dispatch stays
+/// testable.
+#[derive(Debug, Eq, PartialEq)]
+enum CtrlCAction {
+    ClearInput,
+    CancelTurn,
+    Exit,
+}
+
+fn ctrl_c_action(input_is_empty: bool, busy: bool) -> CtrlCAction {
+    if !input_is_empty {
+        CtrlCAction::ClearInput
+    } else if busy {
+        CtrlCAction::CancelTurn
+    } else {
+        CtrlCAction::Exit
+    }
 }
 
 async fn cancel_turn(
@@ -916,6 +950,18 @@ mod tests {
 
         assert!(is_cancel_key(&state, &escape));
         assert_eq!(state.input.text(), "keep this draft");
+    }
+
+    #[test]
+    fn ctrl_c_clears_cancels_or_exits_without_inserting_a_character() {
+        // With a draft, Ctrl+C clears the input.
+        assert_eq!(ctrl_c_action(false, false), CtrlCAction::ClearInput);
+        assert_eq!(ctrl_c_action(false, true), CtrlCAction::ClearInput);
+        // While a turn is running and the composer is empty, Ctrl+C cancels
+        // the turn instead of inserting a literal 'c'.
+        assert_eq!(ctrl_c_action(true, true), CtrlCAction::CancelTurn);
+        // Idle with an empty composer: Ctrl+C exits.
+        assert_eq!(ctrl_c_action(true, false), CtrlCAction::Exit);
     }
 
     #[test]

@@ -3,10 +3,10 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use ash_core::{define_tool, Tool, ToolError};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
@@ -29,72 +29,105 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "bash",
         "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
-        move |_ctx, args: BashArgs| {
+        move |ctx, args: BashArgs| {
             let working_dir = Arc::clone(&working_dir);
-            async move {
-                let timeout = args.timeout.map(parse_timeout).transpose()?;
-                let cwd = match args.cwd {
-                    Some(requested) => {
-                        let working_dir = Arc::clone(&working_dir);
-                        crate::path::run_blocking(move || resolve_cwd(working_dir.as_path(), &requested)).await?
-                    }
-                    None => (*working_dir).clone(),
-                };
-                let stdout = tempfile::Builder::new()
-                    .prefix("ash-bash-stdout-")
-                    .tempfile()
-                    .map_err(|error| ToolError::Execution(format!("cannot capture stdout: {error}")))?;
-                let stderr = tempfile::Builder::new()
-                    .prefix("ash-bash-stderr-")
-                    .tempfile()
-                    .map_err(|error| ToolError::Execution(format!("cannot capture stderr: {error}")))?;
-                let mut command = Command::new("bash");
-                command
-                    .args(["-c", &args.command])
-                    .current_dir(cwd)
-                    .stdout(Stdio::from(stdout.reopen().map_err(|error| {
-                        ToolError::Execution(format!("cannot capture stdout: {error}"))
-                    })?))
-                    .stderr(Stdio::from(stderr.reopen().map_err(|error| {
-                        ToolError::Execution(format!("cannot capture stderr: {error}"))
-                    })?))
-                    .kill_on_drop(true);
-
-                #[cfg(unix)]
-                command.process_group(0);
-                let mut child = ManagedChild::spawn(&mut command).map_err(|error| {
-                    ToolError::Execution(format!("failed to execute bash: {error}"))
-                })?;
-
-                let output = match timeout {
-                    Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
-                        Ok(output) => output,
-                        Err(_) => {
-                            child.terminate().await;
-                            return Err(ToolError::Execution(format!(
-                                "command timed out after {} seconds",
-                                timeout.as_secs_f64()
-                            )));
-                        }
-                    },
-                    None => child.wait().await,
-                }
-                .map_err(|error| ToolError::Execution(format!("failed to execute bash: {error}")))?;
-
-                let rendered = crate::path::run_blocking(move || render_files(stdout, stderr)).await?;
-                if output.success() {
-                    Ok(rendered)
-                } else {
-                    let code = output
-                        .code()
-                        .map_or_else(|| "signal".to_string(), |code| code.to_string());
-                    Err(ToolError::Execution(format!(
-                        "{rendered}\n\nCommand exited with {code}"
-                    )))
-                }
-            }
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
+            async move { run_command(&working_dir, args, cancellation, deadline).await }
         },
     )
+}
+
+async fn run_command(
+    working_dir: &Path,
+    args: BashArgs,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<String, ToolError> {
+    crate::path::ensure_running(&cancellation, deadline)?;
+    let timeout = args
+        .timeout
+        .map(crate::timeout::parse_positive_seconds)
+        .transpose()?;
+    let cwd = match args.cwd {
+        Some(requested) => {
+            let working_dir = working_dir.to_path_buf();
+            crate::path::run_blocking(move || resolve_cwd(&working_dir, &requested)).await?
+        }
+        None => working_dir.to_path_buf(),
+    };
+    crate::path::ensure_running(&cancellation, deadline)?;
+    let stdout = tempfile::Builder::new()
+        .prefix("ash-bash-stdout-")
+        .tempfile()
+        .map_err(|error| ToolError::Execution(format!("cannot capture stdout: {error}")))?;
+    let stderr = tempfile::Builder::new()
+        .prefix("ash-bash-stderr-")
+        .tempfile()
+        .map_err(|error| ToolError::Execution(format!("cannot capture stderr: {error}")))?;
+    let mut command = Command::new("bash");
+    command
+        .args(["-c", &args.command])
+        .current_dir(cwd)
+        .stdout(Stdio::from(stdout.reopen().map_err(|error| {
+            ToolError::Execution(format!("cannot capture stdout: {error}"))
+        })?))
+        .stderr(Stdio::from(stderr.reopen().map_err(|error| {
+            ToolError::Execution(format!("cannot capture stderr: {error}"))
+        })?))
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = ManagedChild::spawn(&mut command)
+        .map_err(|error| ToolError::Execution(format!("failed to execute bash: {error}")))?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let effective_timeout = timeout.map_or(remaining, |timeout| timeout.min(remaining));
+    let output = wait_for_child(&mut child, effective_timeout, &cancellation).await?;
+    let rendered = crate::path::run_blocking(move || render_files(stdout, stderr)).await?;
+    if output.success() {
+        Ok(rendered)
+    } else {
+        Err(ToolError::Execution(format!(
+            "{rendered}\n\nCommand exited with {}",
+            exit_description(&output)
+        )))
+    }
+}
+
+async fn wait_for_child(
+    child: &mut ManagedChild,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<std::process::ExitStatus, ToolError> {
+    let wait = async { child.wait().await };
+    tokio::select! {
+        status = wait => status.map_err(|error| {
+            ToolError::Execution(format!("failed to execute bash: {error}"))
+        }),
+        _ = tokio::time::sleep(timeout) => {
+            child.terminate().await;
+            Err(ToolError::Timeout(timeout))
+        }
+        _ = cancellation.cancelled() => {
+            child.terminate().await;
+            Err(ToolError::Cancelled)
+        }
+    }
+}
+
+fn exit_description(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal}");
+        }
+    }
+    status
+        .code()
+        .map_or_else(|| "unknown".to_string(), |code| code.to_string())
 }
 
 struct ManagedChild {
@@ -184,10 +217,6 @@ fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
     Ok(resolved)
 }
 
-fn parse_timeout(seconds: f64) -> Result<Duration, ToolError> {
-    crate::timeout::parse_positive_seconds(seconds)
-}
-
 fn render_files(
     mut stdout: tempfile::NamedTempFile,
     mut stderr: tempfile::NamedTempFile,
@@ -222,19 +251,70 @@ fn render_output(mut output: tempfile::NamedTempFile) -> Result<String, ToolErro
     }
     let total_lines = count_lines(output.as_file_mut())?;
     if length <= DEFAULT_MAX_BYTES as u64 && total_lines <= DEFAULT_MAX_LINES {
-        output
-            .as_file_mut()
-            .seek(SeekFrom::Start(0))
-            .map_err(output_error)?;
-        let mut bytes = Vec::with_capacity(length as usize);
-        output
-            .as_file_mut()
-            .read_to_end(&mut bytes)
-            .map_err(output_error)?;
-        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        return read_entire_output(&mut output);
     }
 
     let start = length.saturating_sub(DEFAULT_MAX_BYTES as u64);
+    let (mut rendered, partial_line, limited_by) = render_tail_window(&mut output, start, length)?;
+    let oversized_line = if partial_line {
+        Some(oversized_line_length(&mut output, start, length)?)
+    } else {
+        None
+    };
+    let path = output
+        .into_temp_path()
+        .keep()
+        .map_err(|error| ToolError::Execution(format!("cannot keep output file: {error}")))?;
+
+    if let Some(line_length) = oversized_line {
+        rendered.push_str(&format!(
+            "\n\n[Showing the last {} of an oversized line of {}. Full output: {}]",
+            truncate::format_size(rendered.len()),
+            truncate::format_size(line_length),
+            path.display()
+        ));
+        return Ok(rendered);
+    }
+
+    let shown_lines = line_count(rendered.as_bytes());
+    let first_line = total_lines.saturating_sub(shown_lines).saturating_add(1);
+    let reason = match limited_by {
+        Some(LimitKind::Lines) => format!("{} line limit", DEFAULT_MAX_LINES),
+        Some(LimitKind::Bytes) | None => {
+            format!("{} limit", truncate::format_size(DEFAULT_MAX_BYTES))
+        }
+    };
+    rendered.push_str(&format!(
+        "\n\n[Showing lines {first_line}-{} of {} ({reason}). Full output: {}]",
+        total_lines,
+        total_lines,
+        path.display()
+    ));
+    Ok(rendered)
+}
+
+fn read_entire_output(output: &mut tempfile::NamedTempFile) -> Result<String, ToolError> {
+    let length = output.as_file().metadata().map_err(output_error)?.len();
+    output
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(output_error)?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    output
+        .as_file_mut()
+        .read_to_end(&mut bytes)
+        .map_err(output_error)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads the final `DEFAULT_MAX_BYTES` bytes and trims it to a line-boundary
+/// tail. Returns the rendered tail, whether its first line was cut mid-line
+/// (an oversized line), and which limit triggered the truncation.
+fn render_tail_window(
+    output: &mut tempfile::NamedTempFile,
+    start: u64,
+    length: u64,
+) -> Result<(String, bool, Option<LimitKind>), ToolError> {
     output
         .as_file_mut()
         .seek(SeekFrom::Start(start))
@@ -248,6 +328,7 @@ fn render_output(mut output: tempfile::NamedTempFile) -> Result<String, ToolErro
     let truncated = truncate::tail(&suffix);
     let mut rendered = truncated.content;
     let mut partial_line = truncated.partial_line;
+    let limited_by = truncated.limited_by;
     if start > 0 && !truncated.truncated {
         if let Some(newline) = rendered.find('\n') {
             if newline + 1 < rendered.len() {
@@ -259,33 +340,77 @@ fn render_output(mut output: tempfile::NamedTempFile) -> Result<String, ToolErro
             partial_line = true;
         }
     }
-    let output_lines = line_count(rendered.as_bytes());
-    let path = output
-        .into_temp_path()
-        .keep()
-        .map_err(|error| ToolError::Execution(format!("cannot keep output file: {error}")))?;
-    if partial_line {
-        rendered.push_str(&format!(
-            "\n\n[Showing the last {} of an oversized line. Full output: {}]",
-            truncate::format_size(rendered.len()),
-            path.display()
-        ));
-    } else {
-        let first_line = total_lines.saturating_sub(output_lines).saturating_add(1);
-        let reason = match truncated.limited_by {
-            Some(LimitKind::Lines) => format!("{} line limit", DEFAULT_MAX_LINES),
-            Some(LimitKind::Bytes) | None => {
-                format!("{} limit", truncate::format_size(DEFAULT_MAX_BYTES))
-            }
-        };
-        rendered.push_str(&format!(
-            "\n\n[Showing lines {first_line}-{} of {} ({reason}). Full output: {}]",
-            total_lines,
-            total_lines,
-            path.display()
-        ));
+    Ok((rendered, partial_line, limited_by))
+}
+
+/// Byte length of the oversized line that begins at or before `start` and runs
+/// until the next newline (or end of file).
+fn oversized_line_length(
+    output: &mut tempfile::NamedTempFile,
+    start: u64,
+    file_length: u64,
+) -> Result<usize, ToolError> {
+    let line_start = previous_newline_offset(output, start)?;
+    let line_end = next_newline_offset(output, start, file_length)?;
+    Ok((line_end - line_start) as usize)
+}
+
+/// Offset just after the last newline strictly before `offset` (or 0).
+fn previous_newline_offset(
+    output: &mut tempfile::NamedTempFile,
+    offset: u64,
+) -> Result<u64, ToolError> {
+    let mut position = offset;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let window_start = position.saturating_sub(buffer.len() as u64);
+        let window_len = (position - window_start) as usize;
+        if window_len == 0 {
+            return Ok(0);
+        }
+        output
+            .as_file_mut()
+            .seek(SeekFrom::Start(window_start))
+            .map_err(output_error)?;
+        output
+            .as_file_mut()
+            .read_exact(&mut buffer[..window_len])
+            .map_err(output_error)?;
+        if let Some(index) = buffer[..window_len].iter().rposition(|byte| *byte == b'\n') {
+            return Ok(window_start + index as u64 + 1);
+        }
+        position = window_start;
     }
-    Ok(rendered)
+}
+
+/// Offset of the first newline at or after `offset` (or end of file).
+fn next_newline_offset(
+    output: &mut tempfile::NamedTempFile,
+    offset: u64,
+    file_length: u64,
+) -> Result<u64, ToolError> {
+    let mut position = offset;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if position >= file_length {
+            return Ok(file_length);
+        }
+        output
+            .as_file_mut()
+            .seek(SeekFrom::Start(position))
+            .map_err(output_error)?;
+        let count = output
+            .as_file_mut()
+            .read(&mut buffer)
+            .map_err(output_error)?;
+        if count == 0 {
+            return Ok(position);
+        }
+        if let Some(index) = buffer[..count].iter().position(|byte| *byte == b'\n') {
+            return Ok(position + index as u64);
+        }
+        position += count as u64;
+    }
 }
 
 fn count_lines(file: &mut std::fs::File) -> Result<usize, ToolError> {
@@ -325,10 +450,14 @@ mod tests {
     use ash_core::{AgentToolContext, CancellationToken, ThreadId, ToolContext, TreeId, TurnId};
 
     fn test_context() -> ToolContext {
+        test_context_with(CancellationToken::new())
+    }
+
+    fn test_context_with(cancellation: CancellationToken) -> ToolContext {
         ToolContext {
             thread_id: ThreadId::new(),
             turn_id: TurnId::new(),
-            cancellation: CancellationToken::new(),
+            cancellation,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
             agent: AgentToolContext {
                 tree_id: TreeId::new(),
@@ -468,9 +597,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_timeouts() {
-        assert!(parse_timeout(0.0).is_err());
-        assert!(parse_timeout(f64::INFINITY).is_err());
-        assert_eq!(parse_timeout(0.5).unwrap(), Duration::from_millis(500));
+        assert!(crate::timeout::parse_positive_seconds(0.0).is_err());
+        assert!(crate::timeout::parse_positive_seconds(f64::INFINITY).is_err());
+        assert_eq!(
+            crate::timeout::parse_positive_seconds(0.5).unwrap(),
+            Duration::from_millis(500)
+        );
     }
 
     #[cfg(unix)]
@@ -486,7 +618,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timeout"));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!root.path().join("descendant").exists());
     }
@@ -517,6 +649,35 @@ mod tests {
         let _ = task.await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!root.path().join("descendant").exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_execution_terminates_the_command() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let tool = tool(Arc::new(root_path.clone())).unwrap();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let spawned = tokio::spawn(async move {
+            let ctx = test_context_with(task_cancellation);
+            tool.execute(
+                ctx,
+                serde_json::json!({ "command": "printf started > started; sleep 30" }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !root_path.join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cancellation.cancel();
+
+        let error = spawned.await.unwrap().unwrap_err();
+        assert!(matches!(error, ToolError::Cancelled));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use ash_core::{define_tool, Tool, ToolError};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
 use htmd::HtmlToMarkdown;
 use reqwest::{header, Client, Response, Url};
 use schemars::JsonSchema;
@@ -28,15 +28,20 @@ pub fn tool() -> Result<Arc<dyn Tool>, ToolError> {
         "Fetch an HTTP or HTTPS URL. HTML is converted to Markdown; Markdown and other textual responses are returned as text. Responses are limited to 5MB.",
         move |ctx, args: WebFetchArgs| {
             let client = client.clone();
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
             async move {
+                crate::path::ensure_running(&cancellation, deadline)?;
                 let url = parse_url(&args.url)?;
-                let remaining = ctx
-                    .deadline
-                    .saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let timeout = parse_timeout(args.timeout, remaining)?;
-                tokio::time::timeout(timeout, fetch(&client, url))
-                    .await
-                    .map_err(|_| ToolError::Timeout(timeout))?
+                let request = async { fetch(&client, url, &cancellation).await };
+                tokio::select! {
+                    result = tokio::time::timeout(timeout, request) => {
+                        result.map_err(|_| ToolError::Timeout(timeout))?
+                    }
+                    _ = cancellation.cancelled() => Err(ToolError::Cancelled),
+                }
             }
         },
     )
@@ -67,7 +72,11 @@ fn parse_timeout(seconds: Option<f64>, framework_limit: Duration) -> Result<Dura
     Ok(requested.min(framework_limit))
 }
 
-async fn fetch(client: &Client, url: Url) -> Result<String, ToolError> {
+async fn fetch(
+    client: &Client,
+    url: Url,
+    cancellation: &CancellationToken,
+) -> Result<String, ToolError> {
     let response = send(client, url).await?;
 
     if !response.status().is_success() {
@@ -94,10 +103,10 @@ async fn fetch(client: &Client, url: Url) -> Result<String, ToolError> {
         )));
     }
 
-    let body = collect_body(response).await?;
+    let body = collect_body(response, cancellation).await?;
     let text = String::from_utf8_lossy(&body).into_owned();
     if is_html(&content_type, &text) {
-        return html_to_markdown(text).await;
+        return html_to_markdown(text, cancellation).await;
     }
     Ok(nonempty(text))
 }
@@ -113,7 +122,10 @@ async fn send(client: &Client, url: Url) -> Result<Response, ToolError> {
         .map_err(|error| ToolError::Execution(format!("request failed: {error}")))
 }
 
-async fn collect_body(mut response: Response) -> Result<Vec<u8>, ToolError> {
+async fn collect_body(
+    mut response: Response,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, ToolError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -132,6 +144,9 @@ async fn collect_body(mut response: Response) -> Result<Vec<u8>, ToolError> {
         .await
         .map_err(|error| ToolError::Execution(format!("cannot read response: {error}")))?
     {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(response_too_large());
         }
@@ -176,7 +191,13 @@ fn is_html(content_type: &str, text: &str) -> bool {
     prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
 }
 
-async fn html_to_markdown(html: String) -> Result<String, ToolError> {
+async fn html_to_markdown(
+    html: String,
+    cancellation: &CancellationToken,
+) -> Result<String, ToolError> {
+    if cancellation.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
     tokio::task::spawn_blocking(move || {
         HtmlToMarkdown::builder()
             .skip_tags(vec![
@@ -227,9 +248,13 @@ mod tests {
         let body = "<html><body><h1>Hello</h1><p>Read <a href=\"https://example.com\">more</a>.</p><script>bad()</script></body></html>";
         let (url, _) = server(vec![response("200 OK", "text/html", &[], body)]).await;
 
-        let output = fetch(&Client::new(), parse_url(&url).unwrap())
-            .await
-            .unwrap();
+        let output = fetch(
+            &Client::new(),
+            parse_url(&url).unwrap(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains("# Hello"));
         assert!(output.contains("[more](https://example.com)"));
@@ -244,11 +269,29 @@ mod tests {
         );
         let (url, _) = server(vec![raw]).await;
 
-        let error = fetch(&Client::new(), parse_url(&url).unwrap())
+        let error = fetch(
+            &Client::new(),
+            parse_url(&url).unwrap(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("5MB limit"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_returns_cancelled() {
+        let body = "<html><body><p>slow</p></body></html>";
+        let (url, _) = server(vec![response("200 OK", "text/html", &[], body)]).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = fetch(&Client::new(), parse_url(&url).unwrap(), &cancellation)
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("5MB limit"));
+        assert!(matches!(error, ToolError::Cancelled));
     }
 
     fn response(status: &str, content_type: &str, headers: &[(&str, &str)], body: &str) -> String {

@@ -62,19 +62,20 @@ enum FileRecord {
 }
 
 impl FileRecord {
-    fn from_message(message: &Message) -> Self {
-        match &message.content {
-            MessageContent::User(_) => Self::UserMessage(message.clone()),
-            MessageContent::Assistant(_) => Self::AssistantMessage(message.clone()),
-            MessageContent::ToolResult { .. } => Self::ToolResult(message.clone()),
-        }
-    }
-
     fn from_entry(entry: LogEntry) -> Self {
         match entry {
             LogEntry::TurnStart(turn_id) => Self::TurnStart { turn_id },
             LogEntry::Input(input) => Self::InputAccepted(input),
-            LogEntry::Message(message) => Self::from_message(&message),
+            LogEntry::Message(message) => {
+                // Match on a borrow to pick the variant, then move the message
+                // into it without cloning.
+                let variant = match &message.content {
+                    MessageContent::User(_) => Self::UserMessage,
+                    MessageContent::Assistant(_) => Self::AssistantMessage,
+                    MessageContent::ToolResult { .. } => Self::ToolResult,
+                };
+                variant(message)
+            }
             LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(ContextCompactedRecord {
                 summary: checkpoint.summary,
                 tail_start_id: checkpoint.tail_start_id,
@@ -201,24 +202,30 @@ impl Replay {
 #[derive(Debug)]
 pub struct ThreadWriter {
     path: PathBuf,
-    metadata: Option<ThreadMetadata>,
-    file: Option<tokio::fs::File>,
+    state: WriterState,
+}
+
+/// A writer is either brand new (header not yet written) or attached to an
+/// already-open locked file. The two states are mutually exclusive, so they
+/// are modelled as one enum instead of two optional fields.
+#[derive(Debug)]
+enum WriterState {
+    New { metadata: ThreadMetadata },
+    Open { file: tokio::fs::File },
 }
 
 impl ThreadWriter {
     fn new(directory: &Path, metadata: ThreadMetadata) -> Self {
         Self {
             path: directory.join(thread_filename(metadata.thread_id)),
-            metadata: Some(metadata),
-            file: None,
+            state: WriterState::New { metadata },
         }
     }
 
     fn existing(path: PathBuf, file: tokio::fs::File) -> Self {
         Self {
             path,
-            metadata: None,
-            file: Some(file),
+            state: WriterState::Open { file },
         }
     }
 
@@ -226,22 +233,26 @@ impl ThreadWriter {
         if entries.is_empty() {
             return Ok(());
         }
+        let is_new = matches!(self.state, WriterState::New { .. });
         if entries
             .iter()
             .any(|entry| matches!(entry, LogEntry::Rollback))
-            && self.file.is_none()
+            && is_new
         {
             return Err(ash_core::AshError::Config(
                 "thread store has no persisted turn to roll back".to_string(),
             ));
         }
 
-        let is_new = self.file.is_none();
         let mut data = String::new();
         if is_new {
-            let metadata = self.metadata.ok_or_else(|| {
-                ash_core::AshError::Config("new thread is missing metadata".to_string())
-            })?;
+            let WriterState::New { metadata } = &self.state else {
+                // `is_new` was captured before any mutation, so this is
+                // unreachable; fail closed rather than panic.
+                return Err(ash_core::AshError::Config(
+                    "thread writer state changed during append".to_string(),
+                ));
+            };
             push_line(
                 &mut data,
                 FileRecord::ThreadHeader(ThreadHeader {
@@ -259,11 +270,15 @@ impl ThreadWriter {
             if let Some(parent) = self.path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            self.file = Some(create_locked_thread(&self.path).await?);
+            let file = create_locked_thread(&self.path).await?;
+            self.state = WriterState::Open { file };
         }
-        let file = self.file.as_mut().ok_or_else(|| {
-            ash_core::AshError::Config("thread store was not materialized".to_string())
-        })?;
+        let WriterState::Open { file } = &mut self.state else {
+            // Guaranteed by the `is_new` transition above.
+            return Err(ash_core::AshError::Config(
+                "thread store was not materialized".to_string(),
+            ));
+        };
         file.write_all(data.as_bytes()).await?;
         file.flush().await?;
         Ok(())

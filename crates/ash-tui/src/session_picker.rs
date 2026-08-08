@@ -8,8 +8,10 @@ pub(crate) struct SessionPickerState {
 }
 
 impl SessionPickerState {
-    pub(crate) fn open(&mut self, threads: Vec<ThreadSummary>) {
-        self.inner.open(threads);
+    pub(crate) fn with_items(threads: Vec<ThreadSummary>) -> Self {
+        Self {
+            inner: PickerState::with_items(threads),
+        }
     }
 
     pub(crate) fn is_visible(&self) -> bool {
@@ -56,8 +58,7 @@ mod tests {
     fn picker_wraps_navigation_and_returns_the_selected_session() {
         let first = summary("first");
         let second = summary("second");
-        let mut picker = SessionPickerState::default();
-        picker.open(vec![first.clone(), second.clone()]);
+        let mut picker = SessionPickerState::with_items(vec![first.clone(), second.clone()]);
 
         assert_eq!(picker.selected_thread_id(), Some(first.thread_id));
         picker.move_up();

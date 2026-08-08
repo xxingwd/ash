@@ -20,8 +20,6 @@ pub enum ProtocolError {
     Auth,
     #[error("rate limited")]
     RateLimited,
-    #[error("context too long: {tokens}/{limit}")]
-    ContextTooLong { tokens: u64, limit: u64 },
     #[error("upstream {status}: {message}")]
     Upstream { status: u16, message: String },
     #[error("request failed: {0}")]

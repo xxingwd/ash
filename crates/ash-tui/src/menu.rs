@@ -107,15 +107,11 @@ impl ComposerMenuState {
     }
 
     pub(crate) fn open_threads(&mut self, threads: Vec<ThreadSummary>) {
-        let mut picker = SessionPickerState::default();
-        picker.open(threads);
-        *self = Self::Sessions(picker);
+        *self = Self::Sessions(SessionPickerState::with_items(threads));
     }
 
     pub(crate) fn open_fork_points(&mut self, points: Vec<ForkPoint>) {
-        let mut picker = ForkPickerState::default();
-        picker.open(points);
-        *self = Self::ForkPoints(picker);
+        *self = Self::ForkPoints(ForkPickerState::with_items(points));
     }
 
     pub(crate) fn close_threads(&mut self) {

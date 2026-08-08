@@ -8,8 +8,10 @@ pub(crate) struct ForkPickerState {
 }
 
 impl ForkPickerState {
-    pub(crate) fn open(&mut self, points: Vec<ForkPoint>) {
-        self.inner.open(points);
+    pub(crate) fn with_items(points: Vec<ForkPoint>) -> Self {
+        Self {
+            inner: PickerState::with_items(points),
+        }
     }
 
     pub(crate) fn is_visible(&self) -> bool {
@@ -55,8 +57,7 @@ mod tests {
     fn picker_wraps_navigation_and_returns_the_selected_prompt() {
         let first = point("first");
         let second = point("second");
-        let mut picker = ForkPickerState::default();
-        picker.open(vec![first.clone(), second.clone()]);
+        let mut picker = ForkPickerState::with_items(vec![first.clone(), second.clone()]);
 
         assert_eq!(picker.selected_message_id(), Some(first.message_id));
         picker.move_up();

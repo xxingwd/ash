@@ -24,6 +24,19 @@ pub struct ContextRequest {
     pub max_context_tokens: usize,
 }
 
+impl ContextRequest {
+    /// Build a prepared context that needs no durable update, consuming the
+    /// request's message buffers.
+    fn into_prepared(self, estimated_input_tokens: usize) -> PreparedContext {
+        PreparedContext {
+            estimated_input_tokens,
+            messages: self.messages,
+            ephemeral_context: self.ephemeral_context,
+            update: None,
+        }
+    }
+}
+
 pub struct PreparedContext {
     /// Prepared durable conversation context.
     pub messages: Vec<Message>,
@@ -158,20 +171,10 @@ impl ContextPolicy for DefaultContextPolicy {
         }
         let estimated_tokens = estimate_context_request(&request);
         if !needs_compaction(estimated_tokens, request.max_context_tokens) {
-            return Ok(PreparedContext {
-                estimated_input_tokens: estimated_tokens,
-                messages: request.messages,
-                ephemeral_context: request.ephemeral_context,
-                update: None,
-            });
+            return Ok(request.into_prepared(estimated_tokens));
         }
         let Some(compacted) = self.compact(request.clone(), model, cancel).await? else {
-            return Ok(PreparedContext {
-                estimated_input_tokens: estimated_tokens,
-                messages: request.messages,
-                ephemeral_context: request.ephemeral_context,
-                update: None,
-            });
+            return Ok(request.into_prepared(estimated_tokens));
         };
         Ok(PreparedContext {
             estimated_input_tokens: compacted.update.after_tokens,

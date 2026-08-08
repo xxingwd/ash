@@ -25,15 +25,15 @@ const EXPOSED_COLLABORATION_TOOL_NAMES: [&str; 4] = [
 
 const LEGACY_COLLABORATION_TOOL_NAMES: [&str; 3] = ["send_message", "followup_task", "list_agents"];
 
-const COLLABORATION_TOOL_NAMES: [&str; 7] = [
-    "spawn_agent",
-    "message_agent",
-    "send_message",
-    "followup_task",
-    "interrupt_agent",
-    "list_agents",
-    "wait_agent",
-];
+/// Every collaboration tool name, derived from the exposed and legacy sets so
+/// that adding a new tool touches exactly one place.
+fn all_collaboration_tool_names() -> Vec<&'static str> {
+    EXPOSED_COLLABORATION_TOOL_NAMES
+        .iter()
+        .chain(LEGACY_COLLABORATION_TOOL_NAMES.iter())
+        .copied()
+        .collect()
+}
 
 const MULTI_AGENT_INSTRUCTIONS: &str = r#"<multi_agent_mode>
 You are one agent in a team that shares the same workspace and tools. Split work where parallelism pays; keep tightly coupled work local.
@@ -76,7 +76,7 @@ impl AgentRole {
         }
     }
 
-    fn available_roles_description() -> &'static str {
+    const fn available_roles_description() -> &'static str {
         r#"Optional type name for the new agent. If omitted, `default` is used.
 Available roles:
 default: General-purpose agent for a self-contained task that inherits the current configuration.
@@ -84,7 +84,7 @@ explorer: Use whenever a specific, well-scoped codebase question can be answered
 worker: Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared."#
     }
 
-    fn child_instructions(self) -> &'static str {
+    const fn child_instructions(self) -> &'static str {
         match self {
             Self::Default => {
                 "Handle the assigned task directly. Stay within its scope, delegate independent subparts when that creates real parallel progress, and return a concise, evidence-backed result to the parent agent."
@@ -99,6 +99,7 @@ worker: Prefer for bounded implementation and production work such as features, 
     }
 }
 
+#[cfg(test)]
 impl FromStr for AgentRole {
     type Err = ToolError;
 
@@ -114,33 +115,8 @@ impl FromStr for AgentRole {
     }
 }
 
-impl AgentSpawner for InheritedAgentSpawner {
-    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError> {
-        let mut definition = self.definition.clone();
-        definition.system_prompt = Some(subagent_system_prompt(
-            self.system_prompt.as_deref(),
-            request.role,
-            &request.parent_path,
-            &request.task_name,
-        ));
-        let scope = ThreadOptions {
-            working_dir: self.scope.working_dir.clone(),
-            tool_timeout: self.scope.tool_timeout,
-            path: request.task_name,
-            tree_id: Some(request.tree_id),
-            kind: ThreadKind::Subagent,
-        };
-        Ok(ChildAgent {
-            runtime: self.runtime.clone(),
-            agent: definition,
-            options: scope,
-            history: request.messages,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum AgentStatus {
     Pending,
     Running,
@@ -204,6 +180,16 @@ struct SpawnReservation {
     task_name: Option<String>,
 }
 
+/// Remove a pending spawn reservation from the shared state. Used by the
+/// reservation's release path, its `Drop` impl, and the successful spawn path
+/// once the child agent has been registered.
+async fn release_spawn(inner: &Arc<ControlInner>, tree_id: TreeId, task_name: &str) {
+    let mut state = inner.state.lock().await;
+    if let Some(session) = state.threads.get_mut(&tree_id) {
+        session.pending_spawns.remove(task_name);
+    }
+}
+
 impl SpawnReservation {
     fn new(inner: Arc<ControlInner>, tree_id: TreeId, task_name: String) -> Self {
         Self {
@@ -217,10 +203,7 @@ impl SpawnReservation {
         let Some(task_name) = self.task_name.take() else {
             return;
         };
-        let mut state = self.inner.state.lock().await;
-        if let Some(session) = state.threads.get_mut(&self.tree_id) {
-            session.pending_spawns.remove(&task_name);
-        }
+        release_spawn(&self.inner, self.tree_id, &task_name).await;
     }
 
     fn commit(mut self) {
@@ -235,13 +218,19 @@ impl Drop for SpawnReservation {
         };
         let inner = Arc::clone(&self.inner);
         let tree_id = self.tree_id;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let mut state = inner.state.lock().await;
-                if let Some(session) = state.threads.get_mut(&tree_id) {
-                    session.pending_spawns.remove(&task_name);
-                }
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let task_name = task_name.clone();
+                runtime.spawn(async move {
+                    release_spawn(&inner, tree_id, &task_name).await;
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %task_name,
+                    "spawn reservation dropped outside a tokio runtime; the task name may leak"
+                );
+            }
         }
     }
 }
@@ -270,6 +259,31 @@ struct InheritedAgentSpawner {
     system_prompt: Option<String>,
     definition: Agent,
     scope: ThreadOptions,
+}
+
+impl AgentSpawner for InheritedAgentSpawner {
+    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError> {
+        let mut definition = self.definition.clone();
+        definition.system_prompt = Some(subagent_system_prompt(
+            self.system_prompt.as_deref(),
+            request.role,
+            &request.parent_path,
+            &request.task_name,
+        ));
+        let scope = ThreadOptions {
+            working_dir: self.scope.working_dir.clone(),
+            tool_timeout: self.scope.tool_timeout,
+            path: request.task_name,
+            tree_id: Some(request.tree_id),
+            kind: ThreadKind::Subagent,
+        };
+        Ok(ChildAgent {
+            runtime: self.runtime.clone(),
+            agent: definition,
+            options: scope,
+            history: request.messages,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -361,8 +375,7 @@ impl ChildRecord {
     }
 
     fn prepare_delivery(&mut self, delivery: MessageDelivery, message: &str) {
-        self.last_task_message.clear();
-        self.last_task_message.push_str(message);
+        self.last_task_message = message.to_string();
         if delivery == MessageDelivery::Followup {
             self.pending_followups = self.pending_followups.saturating_add(1);
             if !matches!(self.state, ChildState::Running(_)) {
@@ -417,6 +430,12 @@ impl MessageDelivery {
     }
 }
 
+fn sorted_snapshots<'a>(records: impl Iterator<Item = &'a ChildRecord>) -> Vec<AgentSnapshot> {
+    let mut agents = records.map(ChildRecord::snapshot).collect::<Vec<_>>();
+    agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+    agents
+}
+
 impl ControlState {
     fn active_count(&self, tree_id: TreeId) -> usize {
         self.threads
@@ -425,16 +444,13 @@ impl ControlState {
     }
 
     fn snapshots(&self, tree_id: TreeId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
-        let mut agents = self
-            .threads
-            .get(&tree_id)
-            .into_iter()
-            .flat_map(|session| session.agents.values())
-            .filter(|record| agent_path_matches(record, path_prefix))
-            .map(ChildRecord::snapshot)
-            .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
-        agents
+        sorted_snapshots(
+            self.threads
+                .get(&tree_id)
+                .into_iter()
+                .flat_map(|session| session.agents.values())
+                .filter(|record| agent_path_matches(record, path_prefix)),
+        )
     }
 
     fn wait_snapshot(
@@ -511,13 +527,11 @@ impl ChildSession {
         if let Some(revision) = completion_revision {
             self.wait_cursors.insert(waiter_key, revision);
         }
-        let mut agents = self
-            .agents
-            .values()
-            .filter(|record| agent_path_matches(record, path_prefix))
-            .map(ChildRecord::snapshot)
-            .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        let agents = sorted_snapshots(
+            self.agents
+                .values()
+                .filter(|record| agent_path_matches(record, path_prefix)),
+        );
         WaitSnapshot {
             agents,
             has_update: completion_revision.is_some(),
@@ -591,6 +605,9 @@ struct WaitAgentArgs {
     path_prefix: Option<String>,
 }
 
+const INVALID_FORK_TURNS_MESSAGE: &str =
+    "fork_turns must be `none`, `all`, or a positive integer string";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkMode {
     None,
@@ -600,22 +617,19 @@ enum ForkMode {
 
 impl ForkMode {
     fn parse(value: Option<&str>) -> Result<Self, ToolError> {
-        let value = value.map(str::trim).filter(|value| !value.is_empty());
-        match value.unwrap_or("all") {
-            value if value.eq_ignore_ascii_case("none") => Ok(Self::None),
-            value if value.eq_ignore_ascii_case("all") => Ok(Self::All),
+        let Some(value) = value.map(str::trim) else {
+            return Ok(Self::All);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "" => Err(ToolError::Execution(INVALID_FORK_TURNS_MESSAGE.to_string())),
+            "none" => Ok(Self::None),
+            "all" => Ok(Self::All),
             value => {
-                let turns = value.parse::<usize>().map_err(|_| {
-                    ToolError::Execution(
-                        "fork_turns must be `none`, `all`, or a positive integer string"
-                            .to_string(),
-                    )
-                })?;
+                let turns = value
+                    .parse::<usize>()
+                    .map_err(|_| ToolError::Execution(INVALID_FORK_TURNS_MESSAGE.to_string()))?;
                 if turns == 0 {
-                    return Err(ToolError::Execution(
-                        "fork_turns must be `none`, `all`, or a positive integer string"
-                            .to_string(),
-                    ));
+                    return Err(ToolError::Execution(INVALID_FORK_TURNS_MESSAGE.to_string()));
                 }
                 Ok(Self::Last(turns))
             }
@@ -736,23 +750,16 @@ impl AgentControl {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         let messages = fork_messages(&context.agent.messages, fork_mode);
-        let spawned = async {
-            let mut child = self.inner.spawner.spawn(SpawnRequest {
+        let thread = match self
+            .prepare_child(SpawnRequest {
                 role,
                 parent_path,
                 task_name: task_name.clone(),
                 messages,
                 tree_id: context.agent.tree_id,
-            })?;
-            child.agent.tools.extend(self.tools()?);
-            child
-                .runtime
-                .start_with_history(child.agent, child.options, child.history)
-                .await
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .await;
-        let thread = match spawned {
+            })
+            .await
+        {
             Ok(thread) => thread,
             Err(error) => {
                 reservation.release().await;
@@ -761,25 +768,17 @@ impl AgentControl {
         };
         let id = thread.id();
 
-        {
-            let mut state = self.inner.state.lock().await;
-            let session = state.threads.entry(context.agent.tree_id).or_default();
-            session.pending_spawns.remove(&task_name);
-            reservation.commit();
-            session.agents.insert(
-                id,
-                ChildRecord {
-                    id,
-                    task_name: task_name.clone(),
-                    role,
-                    state: ChildState::Pending,
-                    pending_followups: 0,
-                    completion_revision: None,
-                    last_task_message: args.message.clone(),
-                    command_tx,
-                },
-            );
-        }
+        self.register_child(
+            context.agent.tree_id,
+            id,
+            &task_name,
+            role,
+            args.message.clone(),
+            command_tx,
+        )
+        .await;
+        release_spawn(&self.inner, context.agent.tree_id, &task_name).await;
+        reservation.commit();
 
         let control = self.clone();
         let tree_id = context.agent.tree_id;
@@ -797,6 +796,47 @@ impl AgentControl {
             "task_name": task_name,
             "agent_type": role,
         }))
+    }
+
+    /// Build the child agent and start its runtime. Controller state is not
+    /// touched, so the caller decides how to release the spawn reservation on
+    /// failure.
+    async fn prepare_child(&self, request: SpawnRequest) -> Result<Thread, ToolError> {
+        let mut child = self.inner.spawner.spawn(request)?;
+        child.agent.tools.extend(self.tools()?);
+        child
+            .runtime
+            .start_with_history(child.agent, child.options, child.history)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+
+    /// Register the spawned thread as a pending child agent in the shared
+    /// state.
+    async fn register_child(
+        &self,
+        tree_id: TreeId,
+        id: ThreadId,
+        task_name: &str,
+        role: AgentRole,
+        last_task_message: String,
+        command_tx: mpsc::Sender<ChildCommand>,
+    ) {
+        let mut state = self.inner.state.lock().await;
+        let session = state.threads.entry(tree_id).or_default();
+        session.agents.insert(
+            id,
+            ChildRecord {
+                id,
+                task_name: task_name.to_string(),
+                role,
+                state: ChildState::Pending,
+                pending_followups: 0,
+                completion_revision: None,
+                last_task_message,
+                command_tx,
+            },
+        );
     }
 
     async fn message_agent(
@@ -835,16 +875,12 @@ impl AgentControl {
                 &context.agent.path,
                 &target,
             )?;
-            if delivery.needs_new_slot(&record.state)
-                && self
-                    .inner
-                    .max_concurrent_children
-                    .is_some_and(|max| active_count >= max)
-            {
-                return Err(ToolError::Execution(format!(
-                    "maximum of {} concurrent sub-agents reached",
-                    self.inner.max_concurrent_children.unwrap_or_default()
-                )));
+            if let Some(max) = self.inner.max_concurrent_children {
+                if delivery.needs_new_slot(&record.state) && active_count >= max {
+                    return Err(ToolError::Execution(format!(
+                        "maximum of {max} concurrent sub-agents reached"
+                    )));
+                }
             }
             record.prepare_delivery(delivery, &args.message);
             permit.send(delivery.command(args.message));
@@ -1067,7 +1103,7 @@ pub fn install_subagent_tools(
     }
     agent
         .tools
-        .retain(|tool| !COLLABORATION_TOOL_NAMES.contains(&tool.name()));
+        .retain(|tool| !all_collaboration_tool_names().contains(&tool.name()));
     ensure_multi_agent_instructions(agent.system_prompt.get_or_insert_with(String::new));
     let spawner = Arc::new(InheritedAgentSpawner {
         runtime,
@@ -1110,10 +1146,15 @@ fn agent_path_matches(record: &ChildRecord, path_prefix: Option<&str>) -> bool {
     path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix))
 }
 
+/// The canonical path of the root agent; every sub-agent path is derived from
+/// it. The value mirrors the CLI's default working directory, so a sub-agent
+/// spawned without an explicit parent path lives under `/root`.
+const ROOT_AGENT_PATH: &str = "/root";
+
 fn normalized_agent_path(agent_path: &str) -> String {
     let path = agent_path.trim().trim_end_matches('/');
     if path.is_empty() {
-        "/root".to_string()
+        ROOT_AGENT_PATH.to_string()
     } else if path.starts_with('/') {
         path.to_string()
     } else {
@@ -1162,6 +1203,10 @@ fn resolve_target_mut<'a>(
 fn fork_messages(messages: &[Message], mode: ForkMode) -> Vec<Message> {
     let end = complete_history_end(messages);
     let messages = &messages[..end];
+    // `start` always satisfies `start <= end`: `end` comes from
+    // `complete_history_end` (a user boundary or the full length) while
+    // `start` points at a user message inside that range (or 0), so the
+    // slices below cannot panic.
     let start = match mode {
         ForkMode::None => return Vec::new(),
         ForkMode::All => 0,
@@ -1919,53 +1964,8 @@ mod tests {
 
     #[tokio::test]
     async fn runs_a_spawned_agent_and_captures_its_final_message() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for answer in ["child done", "followup done"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                loop {
-                    let read = stream.read(&mut buffer).await.unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..headers_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= headers_end + 4 + content_length {
-                        break;
-                    }
-                }
-
-                let body = format!(
-                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{answer}\"}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n\n"
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                requests.push(String::from_utf8(request).unwrap());
-            }
-            requests
-        });
-
-        let (control, _directory) = make_control(make_model(Some(format!("http://{address}"))), 2);
+        let (base_url, server) = mock_model_server(&["child done", "followup done"]).await;
+        let (control, _directory) = make_control(make_model(Some(base_url)), 2);
         let tree_id = TreeId::new();
         let context = ToolContext {
             thread_id: ThreadId::new(),

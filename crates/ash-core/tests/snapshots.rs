@@ -151,9 +151,11 @@ fn model_id_displays_its_string_form() {
 
 #[test]
 fn role_displays_its_string_form() {
-    assert_eq!(Role::User.to_string(), "User");
-    assert_eq!(Role::Assistant.to_string(), "Assistant");
-    assert_eq!(Role::System.to_string(), "System");
+    // Display shares the lowercase vocabulary with serde and `FromStr`, so
+    // the three representations can never diverge.
+    assert_eq!(Role::User.to_string(), "user");
+    assert_eq!(Role::Assistant.to_string(), "assistant");
+    assert_eq!(Role::System.to_string(), "system");
 }
 
 #[test]

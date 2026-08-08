@@ -124,10 +124,9 @@ pub(crate) fn parse(input: &str) -> ParsedInput {
 
 pub(crate) fn is_bare_exit(input: &str) -> bool {
     let input = input.trim();
-    COMMANDS
-        .iter()
-        .find(|spec| spec.command == SlashCommand::Exit)
-        .is_some_and(|spec| spec.name == input || spec.aliases.contains(&input))
+    COMMANDS.iter().any(|spec| {
+        spec.command == SlashCommand::Exit && (spec.name == input || spec.aliases.contains(&input))
+    })
 }
 
 pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {

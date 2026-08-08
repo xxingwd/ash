@@ -7,6 +7,13 @@ use crate::Skill;
 const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
 const MAX_AGENTS_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 
+/// Build the full system prompt for a working directory: base instructions,
+/// environment context, AGENTS.md instructions, and the skills list.
+///
+/// This performs synchronous filesystem reads (canonicalization, AGENTS.md
+/// discovery). Callers in an async context must wrap it in
+/// `tokio::task::spawn_blocking` so the blocking IO stays off the async
+/// worker threads.
 pub fn build_system_prompt(
     working_dir: &Path,
     skills: &[Skill],

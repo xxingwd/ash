@@ -8,6 +8,7 @@ use std::{
 use ash_core::{define_tool, ModelId, Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tracing::warn;
 
 const SKILL_FILE_LIMIT: usize = 10;
 pub(crate) const SKILL_TOOL_NAME: &str = "skill";
@@ -90,7 +91,7 @@ impl Skill {
             match Self::load_file(&path) {
                 Ok(skill) => skills.push(skill),
                 Err(e) => {
-                    tracing::warn!("failed to load skill {}: {e}", path.display());
+                    warn!("failed to load skill {}: {e}", path.display());
                 }
             }
         }
@@ -112,7 +113,14 @@ impl Skill {
             tools: metadata.tools,
             model: metadata.model,
             instructions: body,
-            source_path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            source_path: std::fs::canonicalize(path).unwrap_or_else(|error| {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "cannot canonicalize skill path; keeping it as given"
+                );
+                path.to_path_buf()
+            }),
         })
     }
 
@@ -134,7 +142,15 @@ pub fn tool(skills: Vec<Skill>) -> Result<Arc<dyn Tool>, ToolError> {
         "Load a specialized skill when its description matches the task. The name must match one of the skills listed in the system prompt.",
         move |_ctx, args: SkillArgs| {
             let skills = Arc::clone(&skills);
-            async move { load_skill(&skills, &args.name) }
+            async move {
+                // Skill discovery and loading are blocking filesystem walks;
+                // run them off the async worker threads.
+                tokio::task::spawn_blocking(move || load_skill(&skills, &args.name))
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("skill loader task failed: {error}"))
+                    })?
+            }
         },
     )
 }

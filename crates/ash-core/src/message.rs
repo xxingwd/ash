@@ -113,7 +113,7 @@ impl From<ThreadId> for TreeId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, strum::EnumString, strum::EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::EnumIter)]
 #[strum(serialize_all = "lowercase")]
 pub enum Role {
     User,
@@ -128,6 +128,14 @@ impl Role {
             Self::Assistant => "assistant",
             Self::System => "system",
         }
+    }
+}
+
+impl std::fmt::Display for Role {
+    /// Same vocabulary as serde, `FromStr`, and `as_serialized`: the stable
+    /// lowercase provider forms. Display and `FromStr` are mutual inverses.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_serialized())
     }
 }
 
@@ -175,7 +183,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MessageContent {
     User(Vec<Content>),
     Assistant(Vec<ContentBlock>),

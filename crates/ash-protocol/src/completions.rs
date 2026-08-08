@@ -1,13 +1,13 @@
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
+use ash_core::{ContentBlock, ProtocolError, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    consecutive_tool_results, image_data_url, join_text_contents, model_config,
+    content_value, image_data_url, model_config,
     pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCallAccumulator},
-    project_request_messages, sse, ProviderConfig,
+    project_request_messages, sse, MessageGroup, MessageGroupIter, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -34,14 +34,12 @@ impl CompletionsAdapter {
         if let Some(system) = &projected.system {
             messages.push(json!({"role": "system", "content": system}));
         }
-        let mut index = 0;
-        while index < projected.messages.len() {
-            match &projected.messages[index].content {
-                MessageContent::User(contents) => {
+        for group in MessageGroupIter::new(&projected.messages) {
+            match group {
+                MessageGroup::User(contents) => {
                     messages.push(json!({"role": "user", "content": chat_content(contents)}));
-                    index += 1;
                 }
-                MessageContent::Assistant(blocks) => {
+                MessageGroup::Assistant(blocks) => {
                     let text = blocks
                         .iter()
                         .filter_map(|block| match block {
@@ -81,10 +79,8 @@ impl CompletionsAdapter {
                     if !text.is_empty() || !reasoning.is_empty() || !calls.is_empty() {
                         messages.push(value);
                     }
-                    index += 1;
                 }
-                MessageContent::ToolResult { .. } => {
-                    let group = consecutive_tool_results(&projected.messages, index);
+                MessageGroup::ToolResults(group) => {
                     for result in group.results {
                         messages.push(json!({
                             "role": "tool",
@@ -92,7 +88,6 @@ impl CompletionsAdapter {
                             "content": result.output,
                         }));
                     }
-                    index = group.next_index;
                     if !group.attachments.is_empty() {
                         messages.push(json!({
                             "role": "user",
@@ -136,25 +131,14 @@ impl CompletionsAdapter {
 }
 
 fn chat_content(contents: &[ash_core::Content]) -> Value {
-    if !contents
-        .iter()
-        .any(|content| matches!(content, ash_core::Content::Image { .. }))
-    {
-        return json!(join_text_contents(contents));
-    }
-
-    json!(contents
-        .iter()
-        .map(|content| match content {
-            ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
-            ash_core::Content::Image { media_type, data } => json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": image_data_url(media_type, data),
-                }
-            }),
+    content_value(contents, "text", |media_type, data| {
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image_data_url(media_type, data),
+            }
         })
-        .collect::<Vec<_>>())
+    })
 }
 
 impl ModelClient for CompletionsAdapter {
@@ -190,11 +174,10 @@ impl CompletionsDecoder {
     }
 
     fn finish_calls(&mut self) -> Result<Vec<ModelEvent>, ProtocolError> {
-        let mut items = Vec::new();
-        for (_, call) in self.calls.drain() {
-            items.push(call.finish("Chat Completions")?);
-        }
-        Ok(items)
+        self.calls
+            .drain()
+            .map(|(_, call)| call.finish("Chat Completions"))
+            .collect()
     }
 
     fn record_stop(&mut self, reason: StopReason) -> Result<(), ProtocolError> {
@@ -258,20 +241,20 @@ impl sse::Decoder for CompletionsDecoder {
             for call in calls {
                 let entry = self.calls.entry(Self::tool_call_index(call)?);
                 if let Some(id) = call["id"].as_str() {
-                    entry.id = id.to_string();
+                    entry.set_id(id);
                 }
                 if let Some(name) = call["function"]["name"].as_str() {
-                    entry.name = name.to_string();
+                    entry.set_name(name);
                 }
                 if let Some(arguments) = call["function"]["arguments"].as_str() {
-                    entry.arguments.push_str(arguments);
+                    entry.append_arguments(arguments);
                 }
             }
         }
 
         if let Some(reason) = choice["finish_reason"].as_str() {
             items.extend(self.finish_calls()?);
-            self.record_stop(stop_reason(reason == "length"))?;
+            self.record_stop(stop_reason(reason))?;
             return Ok(sse::DecodeResult::terminal(items));
         }
         Ok(sse::DecodeResult::continuing(items))
@@ -450,8 +433,8 @@ mod tests {
             model: ModelId::new("test"),
             system: None,
             messages: vec![
-                tool_result("first", Vec::new()),
-                tool_result(
+                crate::test_support::tool_result("first", Vec::new()),
+                crate::test_support::tool_result(
                     "second",
                     vec![Content::Image {
                         media_type: "image/png".into(),
@@ -472,17 +455,5 @@ mod tests {
             body["messages"][2]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AQID"
         );
-    }
-
-    fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
-        Message {
-            id: MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id: ToolCallId::new(),
-                result: Ok(text.into()),
-                attachments,
-            },
-        }
     }
 }

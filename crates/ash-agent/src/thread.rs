@@ -6,7 +6,7 @@ use std::{
 
 use ash_core::{
     CancellationToken, Event, EventKind, ForkPoint, Message, MessageId, StopReason, ThreadId,
-    ThreadView, TurnId, TurnResult, TurnView,
+    ThreadView, TurnId, TurnResult, TurnView, Usage,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -75,7 +75,22 @@ impl Thread {
         let id = state.id();
         let (commands, command_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(256);
-        tokio::spawn(run_thread(state, command_rx, events.clone()));
+        let events_clone = events.clone();
+        tokio::spawn(async move {
+            // Keep actor panics visible: the JoinHandle is dropped here, so a
+            // panic inside the actor would otherwise disappear with it.
+            if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                run_thread(state, command_rx, events_clone),
+            ))
+            .await
+            {
+                tracing::error!(
+                    %id,
+                    message = %panic_payload(&panic),
+                    "thread actor panicked"
+                );
+            }
+        });
         Self {
             id,
             commands,
@@ -424,6 +439,17 @@ fn thread_closed() -> ash_core::AshError {
     ash_core::AshError::Config("thread runtime has stopped".to_string())
 }
 
+/// Extract a human-readable message from a panic payload for logging.
+fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 fn inactive_turn() -> ash_core::AshError {
     ash_core::AshError::Config(INACTIVE_TURN_ERROR.to_string())
 }
@@ -506,18 +532,7 @@ impl ThreadState {
 
     pub fn view(&self) -> ThreadView {
         let mut view = self.log.view();
-        let tools = self
-            .config
-            .tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect::<Vec<_>>();
-        view.context_tokens = u64::try_from(estimate_request_tokens(
-            self.config.system_prompt.as_deref(),
-            &view.context,
-            &tools,
-        ))
-        .ok();
+        view.context_tokens = self.estimate_context_tokens(&view.context);
         view
     }
 
@@ -655,38 +670,11 @@ impl ThreadState {
             Ok((reason, usage)) => (TurnResult::Completed(reason.clone()), *usage),
             Err(error) => (TurnResult::Failed(error.to_string()), None),
         };
-        let tools = self
-            .config
-            .tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect::<Vec<_>>();
-        let context_tokens = u64::try_from(estimate_request_tokens(
-            self.config.system_prompt.as_deref(),
-            &model_context,
-            &tools,
-        ))
-        .ok();
+        let context_tokens = self.estimate_context_tokens(&model_context);
         // Project the turn's terminal entry to compute the committed view,
         // without mutating the log before the commit point.
-        let view = {
-            let mut projected = self.log.clone();
-            for entry in persistence.pending() {
-                projected.push(entry.clone());
-            }
-            projected.push(LogEntry::TurnEnd {
-                id: turn_id,
-                result: turn_result,
-                usage,
-            });
-            let mut view = projected.turn_view(turn_id).ok_or_else(|| {
-                ash_core::AshError::Config(format!(
-                    "projected turn {turn_id} is missing after its terminal entry"
-                ))
-            })?;
-            view.context_tokens = context_tokens;
-            view
-        };
+        let view =
+            self.project_terminal_view(turn_id, &persistence, turn_result, usage, context_tokens)?;
         // Commit point: buffer the turn's terminal entry, then write all
         // buffered messages plus the turn end in one write+flush. On crash
         // before this point the turn has no `TurnEnd`, so the projection
@@ -741,12 +729,7 @@ impl ThreadState {
         model: &dyn ash_core::ModelClient,
         cancel: &CancellationToken,
     ) -> Result<ContextCompaction, ash_core::AshError> {
-        let tools = self
-            .config
-            .tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect::<Vec<_>>();
+        let tools = self.config.tool_definitions();
         let model_context = self.log.model_context();
         let before_tokens =
             estimate_request_tokens(self.config.system_prompt.as_deref(), &model_context, &tools);
@@ -778,6 +761,46 @@ impl ThreadState {
             self.log.push(entry.clone());
         }
         Ok(())
+    }
+
+    /// Estimate the request size (system prompt + tools + history) for the
+    /// given messages, tolerating overflow on the conversion.
+    fn estimate_context_tokens(&self, messages: &[Message]) -> Option<u64> {
+        u64::try_from(estimate_request_tokens(
+            self.config.system_prompt.as_deref(),
+            messages,
+            &self.config.tool_definitions(),
+        ))
+        .ok()
+    }
+
+    /// Project the turn's terminal entry onto a clone of the durable log to
+    /// compute the committed view, without mutating the log before the commit
+    /// point.
+    fn project_terminal_view(
+        &self,
+        turn_id: TurnId,
+        persistence: &crate::store::ThreadPersistence,
+        turn_result: TurnResult,
+        usage: Option<Usage>,
+        context_tokens: Option<u64>,
+    ) -> Result<TurnView, ash_core::AshError> {
+        let mut projected = self.log.clone();
+        for entry in persistence.pending() {
+            projected.push(entry.clone());
+        }
+        projected.push(LogEntry::TurnEnd {
+            id: turn_id,
+            result: turn_result,
+            usage,
+        });
+        let mut view = projected.turn_view(turn_id).ok_or_else(|| {
+            ash_core::AshError::Config(format!(
+                "projected turn {turn_id} is missing after its terminal entry"
+            ))
+        })?;
+        view.context_tokens = context_tokens;
+        Ok(view)
     }
 
     async fn writer(

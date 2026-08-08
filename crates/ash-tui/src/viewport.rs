@@ -116,7 +116,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .iter()
         .filter(|subagent| subagent.state.is_active())
         .collect::<Vec<_>>();
-    let screen_rows = fit_screen_rows(
+    let (screen_rows, fitted_height) = fit_screen_rows(
         ScreenRows {
             transcript: layout.height,
             status: u16::from(input.busy),
@@ -127,7 +127,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
         },
         terminal_height,
     );
-    let screen = layout_screen(width, screen_rows);
+    let screen = layout_screen(width, screen_rows, fitted_height);
     let transcript_view_rows = screen.transcript.height;
 
     let max_scroll_top = layout.height.saturating_sub(transcript_view_rows);
@@ -170,7 +170,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
 
     ViewportFrame {
         buffer,
-        viewport_height: u16::try_from(screen_height(screen_rows))
+        viewport_height: u16::try_from(fitted_height)
             .unwrap_or(u16::MAX)
             .min(terminal_height)
             .max(1),
@@ -264,14 +264,18 @@ impl ScreenRows {
     }
 }
 
-fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> ScreenRows {
+/// Fit the screen rows into the available terminal height, returning the
+/// fitted rows together with their total screen height so callers and
+/// `layout_screen` do not recompute it.
+fn fit_screen_rows(mut rows: ScreenRows, height: u16) -> (ScreenRows, u32) {
     for part in SHRINK_ORDER {
         rows.shrink_to_fit(part, 1, height);
     }
     for part in REMOVE_ORDER {
         rows.remove_if_needed(part, height);
     }
-    rows
+    let fitted_height = screen_height(rows);
+    (rows, fitted_height)
 }
 
 fn screen_overflow(rows: ScreenRows, height: u16) -> u16 {
@@ -300,7 +304,7 @@ fn screen_height(rows: ScreenRows) -> u32 {
     content + gaps * u32::from(SCREEN_SPACING)
 }
 
-fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
+fn layout_screen(width: u16, rows: ScreenRows, fitted_height: u32) -> ScreenAreas {
     let mut regions = Vec::with_capacity(5);
     let mut constraints = Vec::with_capacity(5);
     for (region, rows) in [
@@ -326,7 +330,7 @@ fn layout_screen(width: u16, rows: ScreenRows) -> ScreenAreas {
             0,
             0,
             width,
-            u16::try_from(screen_height(rows)).unwrap_or(u16::MAX),
+            u16::try_from(fitted_height).unwrap_or(u16::MAX),
         ));
     let mut areas = ScreenAreas::default();
     for (region, area) in regions.into_iter().zip(layout.iter().copied()) {
@@ -383,11 +387,7 @@ fn render_active_buffer(width: u16, lines: &[RenderedLine]) -> Arc<Buffer> {
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
     for (index, rendered) in lines.iter().take(usize::from(height)).enumerate() {
-        let mut spans = vec![if index == 0 {
-            Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
-        } else {
-            Span::raw("  ")
-        }];
+        let mut spans = crate::scrollback::content_row_prefix(index == 0);
         spans.extend(rendered.ratatui_line().spans);
         buffer.set_line(
             0,
@@ -509,13 +509,20 @@ fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Bu
             ),
             Span::styled(")", Style::default().add_modifier(Modifier::DIM)),
         ]);
-        buffer.set_line(area.x, area.y + index as u16, &line, area.width);
+        buffer.set_line(
+            area.x,
+            area.y
+                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+            &line,
+            area.width,
+        );
     }
     if subagents.len() > SUBAGENTS_MAX_ROWS {
         let more = subagents.len() - SUBAGENTS_MAX_ROWS;
         buffer.set_line(
             area.x,
-            area.y + SUBAGENTS_MAX_ROWS as u16,
+            area.y
+                .saturating_add(u16::try_from(SUBAGENTS_MAX_ROWS).unwrap_or(u16::MAX)),
             &Line::from(Span::styled(
                 format!("  … and {more} more"),
                 Style::default().add_modifier(Modifier::DIM),
@@ -612,7 +619,8 @@ fn render_composer(area: Rect, prompt: &PromptWindow<'_>, buffer: &mut Buffer) {
         };
         buffer.set_line(
             area.x,
-            area.y.saturating_add(index as u16),
+            area.y
+                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
             &Line::from(vec![prefix, Span::raw(text)]),
             area.width,
         );
@@ -960,7 +968,7 @@ mod tests {
 
     #[test]
     fn screen_layout_handles_saturated_transcript_heights() {
-        let rows = fit_screen_rows(
+        let (rows, fitted_height) = fit_screen_rows(
             ScreenRows {
                 transcript: u16::MAX,
                 status: 1,
@@ -973,12 +981,13 @@ mod tests {
         );
 
         assert_eq!(rows.transcript, 18);
+        assert_eq!(fitted_height, 24);
         assert_eq!(screen_height(rows), 24);
     }
 
     #[test]
     fn screen_layout_keeps_the_composer_in_a_one_row_terminal() {
-        let rows = fit_screen_rows(
+        let (rows, fitted_height) = fit_screen_rows(
             ScreenRows {
                 transcript: 10,
                 status: 1,
@@ -991,6 +1000,7 @@ mod tests {
         );
 
         assert_eq!(rows.composer, 1);
+        assert_eq!(fitted_height, 1);
         assert_eq!(screen_height(rows), 1);
     }
 

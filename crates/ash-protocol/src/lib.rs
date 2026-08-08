@@ -7,9 +7,10 @@ mod sse;
 
 use std::{borrow::Cow, sync::Arc};
 
-use ash_core::{Content, Message, MessageContent, ProtocolError, Role, ToolCallId};
+use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, Role, ToolCallId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use strum::EnumString;
 
 /// Provider protocols supported by the adapters.
@@ -101,6 +102,30 @@ pub(crate) fn join_text_contents(contents: &[Content]) -> String {
         .join("\n")
 }
 
+/// Build a provider content value for a user-shaped message body. `text_type`
+/// is the provider's plain-text item name and `image_block` renders each image
+/// item, because the three adapters differ in both names and shape.
+pub(crate) fn content_value(
+    contents: &[Content],
+    text_type: &str,
+    image_block: impl Fn(&str, &[u8]) -> Value,
+) -> Value {
+    if !contents
+        .iter()
+        .any(|content| matches!(content, Content::Image { .. }))
+    {
+        return json!(join_text_contents(contents));
+    }
+
+    json!(contents
+        .iter()
+        .map(|content| match content {
+            Content::Text(text) => json!({"type": text_type, "text": text}),
+            Content::Image { media_type, data } => image_block(media_type, data),
+        })
+        .collect::<Vec<_>>())
+}
+
 /// Provider-neutral model client and stream vocabulary, re-exported for adapter code.
 pub use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -130,18 +155,17 @@ fn project_request_messages(
     for message in &request.messages {
         match (&message.role, &message.content) {
             (Role::System, MessageContent::User(contents)) => {
-                let mut text = Vec::with_capacity(contents.len());
-                for content in contents {
-                    match content {
-                        Content::Text(value) => text.push(value.as_str()),
-                        Content::Image { .. } => {
-                            return Err(ProtocolError::InvalidRequest(
-                                "system messages cannot contain images".to_string(),
-                            ));
-                        }
-                    }
-                }
-                system_parts.push(text.join("\n"));
+                let text = contents
+                    .iter()
+                    .map(|content| match content {
+                        Content::Text(value) => Ok(value.as_str()),
+                        Content::Image { .. } => Err(ProtocolError::InvalidRequest(
+                            "system messages cannot contain images".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("\n");
+                system_parts.push(text);
             }
             (Role::User, MessageContent::User(_))
             | (Role::Assistant, MessageContent::Assistant(_))
@@ -169,22 +193,23 @@ fn content_kind(content: &MessageContent) -> &'static str {
     }
 }
 
-struct ToolResultGroup<'a> {
-    results: Vec<ToolResultRef<'a>>,
-    attachments: Vec<Content>,
-    next_index: usize,
+/// A maximal run of consecutive tool-result messages grouped for one adapter
+/// request, so providers that key results to calls can emit them as a block.
+pub(crate) struct ToolResultGroup<'a> {
+    pub(crate) results: Vec<ToolResultRef<'a>>,
+    pub(crate) attachments: Vec<Content>,
 }
 
-struct ToolResultRef<'a> {
-    id: &'a ToolCallId,
-    output: Cow<'a, str>,
+pub(crate) struct ToolResultRef<'a> {
+    pub(crate) id: &'a ToolCallId,
+    pub(crate) output: Cow<'a, str>,
 }
 
 fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolResultGroup<'a> {
     let mut results = Vec::new();
     let mut attachments = Vec::new();
-    let mut next_index = start;
-    while let Some(message) = messages.get(next_index) {
+    let mut index = start;
+    while let Some(message) = messages.get(index) {
         let MessageContent::ToolResult {
             id,
             result,
@@ -199,12 +224,72 @@ fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolR
         };
         results.push(ToolResultRef { id, output });
         attachments.extend(result_attachments.iter().cloned());
-        next_index += 1;
+        index += 1;
     }
     ToolResultGroup {
         results,
         attachments,
-        next_index,
+    }
+}
+
+/// One request-building step over the projected history: a user turn, an
+/// assistant turn, or a maximal run of tool results.
+pub(crate) enum MessageGroup<'a> {
+    User(&'a [Content]),
+    Assistant(&'a [ContentBlock]),
+    ToolResults(ToolResultGroup<'a>),
+}
+
+/// Iterates `MessageGroup`s over the projected messages, merging consecutive
+/// tool-result messages into a single group. Both request-building adapters
+/// share this walk so their per-message grouping never diverges.
+pub(crate) struct MessageGroupIter<'a> {
+    messages: &'a [&'a Message],
+    index: usize,
+}
+
+impl<'a> MessageGroupIter<'a> {
+    pub(crate) fn new(messages: &'a [&'a Message]) -> Self {
+        Self { messages, index: 0 }
+    }
+}
+
+impl<'a> Iterator for MessageGroupIter<'a> {
+    type Item = MessageGroup<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let message = *self.messages.get(self.index)?;
+        let group = match &message.content {
+            MessageContent::User(contents) => MessageGroup::User(contents.as_slice()),
+            MessageContent::Assistant(blocks) => MessageGroup::Assistant(blocks.as_slice()),
+            MessageContent::ToolResult { .. } => {
+                let group = consecutive_tool_results(self.messages, self.index);
+                self.index += group.results.len();
+                MessageGroup::ToolResults(group)
+            }
+        };
+        if !matches!(group, MessageGroup::ToolResults(_)) {
+            self.index += 1;
+        }
+        Some(group)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ash_core::{Content, Message, MessageContent, MessageId, Role, ToolCallId};
+
+    /// A provider-neutral tool-result message shared by the adapter tests.
+    pub(crate) fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
+        Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id: ToolCallId::new(),
+                result: Ok(text.into()),
+                attachments,
+            },
+        }
     }
 }
 

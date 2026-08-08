@@ -1,5 +1,4 @@
 use derive_more::Display;
-use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Message, MessageId, ThreadId, ToolCallId, TurnId};
@@ -101,7 +100,7 @@ pub struct ForkPoint {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A turn started executing; its input was already accepted.
     TurnStart,

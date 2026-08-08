@@ -14,6 +14,14 @@ pub(crate) enum DecodeResult {
     WireDone(Vec<ModelEvent>),
 }
 
+pub(crate) struct DecodedParts {
+    pub(crate) items: Vec<ModelEvent>,
+    /// A provider-level terminal marker was observed.
+    pub(crate) terminal: bool,
+    /// The wire can stop after this event.
+    pub(crate) wire_done: bool,
+}
+
 impl DecodeResult {
     pub(crate) fn continuing(items: Vec<ModelEvent>) -> Self {
         Self::Continue(items)
@@ -31,18 +39,34 @@ impl DecodeResult {
         Self::WireDone(items)
     }
 
-    fn into_parts(self) -> (Vec<ModelEvent>, bool, bool) {
+    fn into_parts(self) -> DecodedParts {
         match self {
-            Self::Continue(items) => (items, false, false),
-            Self::Terminal(items) => (items, true, false),
-            Self::Finished(items) => (items, true, true),
-            Self::WireDone(items) => (items, false, true),
+            Self::Continue(items) => DecodedParts {
+                items,
+                terminal: false,
+                wire_done: false,
+            },
+            Self::Terminal(items) => DecodedParts {
+                items,
+                terminal: true,
+                wire_done: false,
+            },
+            Self::Finished(items) => DecodedParts {
+                items,
+                terminal: true,
+                wire_done: true,
+            },
+            Self::WireDone(items) => DecodedParts {
+                items,
+                terminal: false,
+                wire_done: true,
+            },
         }
     }
 
     #[cfg(test)]
     pub(crate) fn into_items(self) -> Vec<ModelEvent> {
-        self.into_parts().0
+        self.into_parts().items
     }
 }
 
@@ -88,15 +112,20 @@ where
                         tracing::warn!(%error, data = %event.data, "sse decode failed");
                         error
                     })?;
-                    let (items, terminal, wire_done) = result.into_parts();
-                    tracing::debug!(terminal, wire_done, data = %event.data, "sse event");
-                    terminated |= terminal;
-                    for item in items {
+                    let parts = result.into_parts();
+                    tracing::debug!(
+                        terminal = parts.terminal,
+                        wire_done = parts.wire_done,
+                        data = %event.data,
+                        "sse event"
+                    );
+                    terminated |= parts.terminal;
+                    for item in parts.items {
                         log_model_event(&item);
                         record_stop(&item, &mut saw_stop)?;
                         yield item;
                     }
-                    if wire_done {
+                    if parts.wire_done {
                         break;
                     }
                 }

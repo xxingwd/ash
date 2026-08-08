@@ -31,7 +31,7 @@ pub(crate) fn truncate_start(value: &str, width: usize) -> String {
         return String::new();
     }
 
-    let mut suffix = String::new();
+    let mut suffix = Vec::new();
     let mut used = 0;
     let available = width.saturating_sub(1);
     for character in value.chars().rev() {
@@ -39,9 +39,12 @@ pub(crate) fn truncate_start(value: &str, width: usize) -> String {
         if used + character_width > available {
             break;
         }
-        suffix.insert(0, character);
+        suffix.push(character);
         used += character_width;
     }
+    // Collected in reverse order; flip once so the final string is built
+    // without repeatedly inserting at the front.
+    let suffix: String = suffix.into_iter().rev().collect();
     format!("…{suffix}")
 }
 

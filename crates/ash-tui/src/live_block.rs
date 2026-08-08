@@ -363,7 +363,12 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
     for (offset, line) in lines.into_iter().enumerate() {
         let mut spans = vec![Span::raw("  ")];
         spans.extend(line.ratatui_line().spans);
-        buffer.set_line(0, offset as u16 + 1, &Line::from(spans), width);
+        buffer.set_line(
+            0,
+            u16::try_from(offset).unwrap_or(u16::MAX).saturating_add(1),
+            &Line::from(spans),
+            width,
+        );
     }
     buffer
 }
@@ -482,11 +487,7 @@ fn render_markdown_rows(
         let Some(rendered) = markdown_line(stable, tail, index) else {
             continue;
         };
-        let mut spans = vec![if index == 0 {
-            Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
-        } else {
-            Span::raw("  ")
-        }];
+        let mut spans = crate::scrollback::content_row_prefix(index == 0);
         spans.extend(rendered.ratatui_line().spans.into_iter().map(|mut span| {
             span.style = span.style.patch(style);
             span
@@ -496,10 +497,7 @@ fn render_markdown_rows(
 }
 
 fn markdown_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
-    stable
-        .len()
-        .saturating_add(usize::from(!stable.is_empty() && !tail.is_empty()))
-        .saturating_add(tail.len())
+    crate::markdown::combined_line_count(stable, tail)
 }
 
 fn markdown_line<'a>(
@@ -507,17 +505,7 @@ fn markdown_line<'a>(
     tail: &'a [RenderedLine],
     index: usize,
 ) -> Option<&'a RenderedLine> {
-    if index < stable.len() {
-        return stable.get(index);
-    }
-    let has_gap = !stable.is_empty() && !tail.is_empty();
-    if has_gap && index == stable.len() {
-        return None;
-    }
-    let tail_index = index
-        .saturating_sub(stable.len())
-        .saturating_sub(usize::from(has_gap));
-    tail.get(tail_index)
+    crate::markdown::combined_line(stable, tail, index)
 }
 
 /// Stack multiple row buffers vertically into one buffer, copying cells from
@@ -681,9 +669,16 @@ fn render_bash_command_line(
     } else {
         const CONTINUATION_PREFIX: &str = "  │ ";
         let prefix_width = UnicodeWidthStr::width(CONTINUATION_PREFIX);
-        let content_width = width.saturating_sub(prefix_width as u16).max(1);
+        let content_width = width
+            .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+            .max(1);
         let shown = truncate_command_lines(&mut highlighted, expanded);
-        let mut continuation = Buffer::empty(Rect::new(0, 0, width.max(1), shown as u16));
+        let mut continuation = Buffer::empty(Rect::new(
+            0,
+            0,
+            width.max(1),
+            u16::try_from(shown).unwrap_or(u16::MAX),
+        ));
         for (offset, line) in highlighted.drain(..).enumerate() {
             // Dim the pipe prefix so it matches the `└` output corner; the
             // command text itself keeps its syntax colors.
@@ -692,7 +687,12 @@ fn render_bash_command_line(
                 Style::default().add_modifier(Modifier::DIM),
             )];
             spans.extend(line.spans);
-            continuation.set_line(0, offset as u16, &Line::from(spans), content_width);
+            continuation.set_line(
+                0,
+                u16::try_from(offset).unwrap_or(u16::MAX),
+                &Line::from(spans),
+                content_width,
+            );
         }
         (title, Some(continuation), 1)
     }
@@ -743,9 +743,14 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     if lines.is_empty() {
         return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
     }
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), lines.len() as u16));
+    let mut buffer = Buffer::empty(Rect::new(
+        0,
+        0,
+        width.max(1),
+        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+    ));
     for (offset, line) in lines.into_iter().enumerate() {
-        buffer.set_line(0, offset as u16, &line, width);
+        buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &line, width);
     }
     buffer
 }
@@ -771,18 +776,20 @@ fn render_tool_title(action: String, detail: String, is_error: bool, width: u16)
     // Wrap long titles (e.g. a long grep pattern or path) instead of letting
     // `set_line` truncate them, consistent with the bash command line.
     let rows = crate::ansi::wrap_highlighted_line(&line, usize::from(width.max(1)));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), rows.len() as u16));
+    let mut buffer = Buffer::empty(Rect::new(
+        0,
+        0,
+        width.max(1),
+        u16::try_from(rows.len()).unwrap_or(u16::MAX),
+    ));
     for (offset, row) in rows.into_iter().enumerate() {
-        buffer.set_line(0, offset as u16, &row, width);
+        buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &row, width);
     }
     buffer
 }
 
-/// Append the bash tool output below the tool title: the first 25 lines and
-/// the last 25 lines (with an ellipsis marker between them when truncated),
-/// parsed so ANSI colors from the command output survive into the TUI.
-/// Truncation happens at the display layer only; the agent still receives the
-/// full output for reasoning.
+/// Prefix each line of a write-preview body with "+" so added content reads
+/// as a diff-style insertion when shown inside the tool block.
 fn write_preview(content: &str) -> String {
     sanitize_terminal_text(content)
         .lines()

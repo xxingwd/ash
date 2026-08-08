@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use ash_core::{ModelId, Tool, TreeId};
+use ash_core::{ModelId, Tool, ToolDefinition, TreeId};
 
 use crate::{ContextPolicy, ThreadKind};
 
@@ -33,26 +33,35 @@ impl Default for ThreadOptions {
         Self {
             working_dir: PathBuf::from("."),
             tool_timeout: Duration::from_secs(120),
-            path: "/root".to_string(),
+            path: default_agent_path(),
             tree_id: None,
             kind: ThreadKind::Root,
         }
     }
 }
 
+/// The agent's root path defaults to the process working directory, matching
+/// the relative `working_dir` default. Falls back to `/root` only when the
+/// directory cannot be resolved (for example because it was removed).
+fn default_agent_path() -> String {
+    std::env::current_dir()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_else(|_| "/root".to_string())
+}
+
 /// Exponential retry backoff for safe model-call retries.
 /// First retry waits `base`, then doubles each attempt, capped at `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryBackoff {
-    pub base: std::time::Duration,
-    pub max: std::time::Duration,
+    pub base: Duration,
+    pub max: Duration,
 }
 
 impl Default for RetryBackoff {
     fn default() -> Self {
         Self {
-            base: std::time::Duration::from_secs(1),
-            max: std::time::Duration::from_secs(10),
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(10),
         }
     }
 }
@@ -98,5 +107,11 @@ impl RunConfig {
             max_retries: 5,
             retry_backoff: RetryBackoff::default(),
         }
+    }
+
+    /// Collect tool definitions once for request sizing, context policy, and
+    /// projections so every call site shares the same mapping.
+    pub(crate) fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.iter().map(|tool| tool.definition()).collect()
     }
 }

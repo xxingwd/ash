@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet,
-    io,
+    collections::{HashMap, HashSet},
+    fmt, io,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -23,7 +23,7 @@ use crate::{
     operation::CancellationMode,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
-    stream_state::{format_elapsed, FinishedStream, StreamState},
+    stream_state::{format_elapsed, FinishedThought, StreamState},
     viewport::{self, ViewportInput, COMPOSER_TEXT_COLUMN},
 };
 
@@ -695,13 +695,13 @@ impl TerminalUi {
         }
     }
 
-    fn commit_finished_stream(&mut self, finished: Option<FinishedStream>) {
-        match finished {
-            Some(FinishedStream::Thought {
-                source,
-                elapsed_seconds,
-            }) => self.push_thought_block(source, elapsed_seconds),
-            None => {}
+    fn commit_finished_stream(&mut self, finished: Option<FinishedThought>) {
+        if let Some(FinishedThought {
+            source,
+            elapsed_seconds,
+        }) = finished
+        {
+            self.push_thought_block(source, elapsed_seconds);
         }
     }
 
@@ -751,20 +751,28 @@ impl TerminalUi {
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
             terminal.render_viewport(width, height)?;
-            insert_history_blocks(
+            let inserted = insert_history_blocks(
                 &mut terminal.surface,
                 &committed,
                 render_width,
                 tools_expanded,
             )?;
-            terminal.render_viewport(width, height)
+            terminal.render_viewport(width, height)?;
+            Ok(inserted)
         });
-        if result.is_ok() {
-            self.history.extend(committed);
-        } else {
-            self.transcript = committed;
+        match &result {
+            Ok(inserted) => self.history.extend(committed.into_iter().take(*inserted)),
+            Err(error) => {
+                // Blocks written to the terminal before the failure stay
+                // committed; only the untouched remainder returns to the
+                // transcript so a retry never re-renders them.
+                let inserted = inserted_blocks(error);
+                self.history
+                    .extend(committed.iter().take(inserted).cloned());
+                self.transcript = committed.into_iter().skip(inserted).collect();
+            }
         }
-        result
+        result.map(|_| ())
     }
 
     fn rebuild_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
@@ -774,19 +782,26 @@ impl TerminalUi {
         let result = self.synchronized(|terminal| {
             terminal.surface.reset()?;
             terminal.render_viewport(width, height)?;
-            insert_history_blocks(
+            let inserted = insert_history_blocks(
                 &mut terminal.surface,
                 &history,
                 render_width,
                 tools_expanded,
             )?;
-            terminal.render_viewport(width, height)
+            terminal.render_viewport(width, height)?;
+            Ok(inserted)
         });
-        for block in &history {
-            block.clear_render_cache();
+        match &result {
+            Ok(_) => self.history = history,
+            Err(error) => {
+                // Blocks already written to the terminal before the failure are
+                // not restored, otherwise the next commit would render them a
+                // second time.
+                let inserted = inserted_blocks(error);
+                self.history = history.into_iter().skip(inserted).collect();
+            }
         }
-        self.history = history;
-        result
+        result.map(|_| ())
     }
 
     fn scroll_up(&mut self, rows: u16, width: u16, height: u16) -> io::Result<()> {
@@ -805,14 +820,18 @@ impl TerminalUi {
         self.redraw_at(width, height)
     }
 
-    fn synchronized(
+    fn synchronized<T>(
         &mut self,
-        operation: impl FnOnce(&mut Self) -> io::Result<()>,
-    ) -> io::Result<()> {
+        operation: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
         self.surface.begin_synchronized()?;
         let operation_result = operation(self);
         let finish_result = self.surface.end_synchronized();
-        operation_result.and(finish_result)
+        match (operation_result, finish_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     fn render_viewport(&mut self, width: u16, height: u16) -> io::Result<()> {
@@ -878,7 +897,7 @@ impl TerminalUi {
                 self.next_turn_id = self.next_turn_id.saturating_add(1);
                 self.current_turn_id = Some(turn_id);
             }
-            self.push_restored_message(message, &tool_results);
+            self.push_turn_message(message, &tool_results, true);
         }
         self.current_turn_id = None;
     }
@@ -899,17 +918,30 @@ impl TerminalUi {
     fn push_restored_turn_messages(&mut self, messages: &[Message]) {
         let tool_results = tool_results_map(messages);
         for message in messages {
-            self.push_restored_message(message, &tool_results);
+            self.push_turn_message(message, &tool_results, true);
         }
     }
 
-    fn push_restored_message(
+    /// Project one settled turn's canonical messages into transcript blocks.
+    /// When `render_user` is set (restored sessions) the user input is
+    /// committed as a block; during a live turn it is skipped because the
+    /// composer already committed it when the turn started (or when steering
+    /// was accepted).
+    fn push_turn_messages(&mut self, messages: &[Message]) {
+        let tool_results = tool_results_map(messages);
+        for message in messages {
+            self.push_turn_message(message, &tool_results, false);
+        }
+    }
+
+    fn push_turn_message(
         &mut self,
         message: &Message,
-        tool_results: &std::collections::HashMap<ToolCallId, (bool, &str)>,
+        tool_results: &HashMap<ToolCallId, (bool, &str)>,
+        render_user: bool,
     ) {
         match &message.content {
-            MessageContent::User(contents) => {
+            MessageContent::User(contents) if render_user => {
                 let text = contents
                     .iter()
                     .map(|content| match content {
@@ -920,6 +952,7 @@ impl TerminalUi {
                     .join("\n");
                 self.push_history_block(HistoryBlock::user(&text));
             }
+            MessageContent::User(_) => {}
             MessageContent::Assistant(blocks) => {
                 self.push_assistant_blocks(blocks, tool_results);
             }
@@ -927,26 +960,10 @@ impl TerminalUi {
         }
     }
 
-    /// Project one settled turn's canonical messages into transcript blocks.
-    /// User inputs are skipped: the composer already committed them when the
-    /// turn started (or when steering was accepted).
-    fn push_turn_messages(&mut self, messages: &[Message]) {
-        let tool_results = tool_results_map(messages);
-        for message in messages {
-            match &message.content {
-                MessageContent::User(_) => {}
-                MessageContent::Assistant(blocks) => {
-                    self.push_assistant_blocks(blocks, &tool_results);
-                }
-                MessageContent::ToolResult { .. } => {}
-            }
-        }
-    }
-
     fn push_assistant_blocks(
         &mut self,
         blocks: &[ContentBlock],
-        tool_results: &std::collections::HashMap<ToolCallId, (bool, &str)>,
+        tool_results: &HashMap<ToolCallId, (bool, &str)>,
     ) {
         for block in blocks {
             match block {
@@ -1010,18 +1027,65 @@ impl TerminalUi {
     }
 }
 
+/// Number of blocks that were rendered into the terminal before the first
+/// failure. Carried inside the error so a partial insert can roll back only
+/// the blocks that were never written.
+#[derive(Debug)]
+struct PartialInsert {
+    inserted: usize,
+    source: io::Error,
+}
+
+impl fmt::Display for PartialInsert {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed after inserting {} of {} history blocks",
+            self.inserted, self.source
+        )
+    }
+}
+
+impl std::error::Error for PartialInsert {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<PartialInsert> for io::Error {
+    fn from(partial: PartialInsert) -> Self {
+        io::Error::new(partial.source.kind(), partial)
+    }
+}
+
+fn inserted_blocks(error: &io::Error) -> usize {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<PartialInsert>())
+        .map_or(0, |partial| partial.inserted)
+}
+
+/// Inserts the blocks into the terminal surface, returning the number of
+/// blocks physically written. On failure, the error carries how many blocks
+/// were already inserted so callers never re-commit already-rendered rows.
 fn insert_history_blocks(
     surface: &mut InlineScreen,
     blocks: &[LiveBlock],
     render_width: u16,
     tools_expanded: bool,
-) -> io::Result<()> {
-    for block in blocks {
+) -> io::Result<usize> {
+    for (index, block) in blocks.iter().enumerate() {
         let buffer = block.render(render_width, tools_expanded);
-        surface.insert_buffer(&buffer, 1)?;
+        if let Err(source) = surface.insert_buffer(&buffer, 1) {
+            return Err(PartialInsert {
+                inserted: index,
+                source,
+            }
+            .into());
+        }
         block.clear_render_cache();
     }
-    Ok(())
+    Ok(blocks.len())
 }
 
 fn status_dots(frame: usize) -> &'static str {
@@ -1047,8 +1111,8 @@ fn composer_text_width(terminal_width: u16) -> u16 {
         .max(1)
 }
 
-fn tool_results_map(messages: &[Message]) -> std::collections::HashMap<ToolCallId, (bool, &str)> {
-    let mut results = std::collections::HashMap::new();
+fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, (bool, &str)> {
+    let mut results = HashMap::new();
     for message in messages {
         if let MessageContent::ToolResult { id, result, .. } = &message.content {
             let (is_error, output) = match result {

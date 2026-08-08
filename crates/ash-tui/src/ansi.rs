@@ -277,9 +277,9 @@ pub(crate) fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<L
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<(Style, String)> = Vec::new();
     let mut current_width = 0usize;
-    // Byte index (into `current`) of the last breakable space, and the row
-    // width at that point.
-    let mut last_break: Option<(usize, usize)> = None;
+    // Byte index (into `current`) where the next row can break at the last
+    // breakable space.
+    let mut last_break: Option<usize> = None;
 
     let flush = |rows: &mut Vec<Line<'static>>, segment: &[(Style, String)]| {
         let mut row = Line::default();
@@ -294,7 +294,7 @@ pub(crate) fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<L
         let is_space = text == " ";
         if current_width > 0 && current_width + cw > width {
             // Row is full. Break at the last space if one was seen, else here.
-            let (split, _) = last_break.unwrap_or((current.len(), current_width));
+            let split = last_break.unwrap_or(current.len());
             flush(&mut rows, &current[..split]);
             // The remainder after the split becomes the start of the next row.
             current = current.split_off(split);
@@ -302,15 +302,12 @@ pub(crate) fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<L
             for (_, c) in &current {
                 current_width += char_width(c);
             }
-            last_break = current
-                .iter()
-                .rposition(|(_, c)| c == " ")
-                .map(|position| (position, 0));
+            last_break = current.iter().rposition(|(_, c)| c == " ");
         }
         current.push((style, text));
         current_width += cw;
         if is_space {
-            last_break = Some((current.len(), current_width));
+            last_break = Some(current.len());
         }
     }
     if !current.is_empty() {

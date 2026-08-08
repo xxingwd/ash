@@ -20,6 +20,7 @@ pub(crate) struct WorkspacePath {
 }
 
 pub(crate) struct SearchPath {
+    dir: Dir,
     workspace: PathBuf,
     full_path: PathBuf,
 }
@@ -115,7 +116,14 @@ impl SearchPath {
                 full_path.display()
             )));
         }
+        let dir = Dir::open_ambient_dir(&workspace, ambient_authority()).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot access working directory {}: {error}",
+                workspace.display()
+            ))
+        })?;
         Ok(Self {
+            dir,
             workspace,
             full_path,
         })
@@ -126,9 +134,27 @@ impl SearchPath {
     }
 
     pub(crate) fn relative(&self, path: &Path) -> PathBuf {
+        // `path` always comes from walking `self.full_path`, so stripping the
+        // canonical workspace prefix cannot fail; keep the full path as a
+        // defensive fallback.
         path.strip_prefix(&self.workspace)
             .unwrap_or(path)
             .to_path_buf()
+    }
+
+    /// Opens a file inside the workspace through the capability-backed
+    /// directory handle, so symlink escapes and absolute/`..` redirects are
+    /// rejected by the sandbox instead of being followed.
+    pub(crate) fn open_file(&self, path: &Path) -> std::io::Result<cap_std::fs::File> {
+        let relative = path.strip_prefix(&self.workspace).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path escapes the workspace",
+            )
+        })?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        self.dir.open_with(relative, &options)
     }
 }
 
@@ -183,20 +209,7 @@ impl WorkspacePath {
             .map_err(|error| self.write_error(error))?;
         ensure_running(cancellation, deadline)?;
 
-        let permissions = match permissions {
-            Some(permissions) => Some(permissions),
-            None => match self.dir.symlink_metadata(&self.relative) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(ToolError::Execution(format!(
-                        "cannot write {}: symbolic links are not writable",
-                        self.full_path.display()
-                    )))
-                }
-                Ok(metadata) => Some(metadata.permissions()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(self.write_error(error)),
-            },
-        };
+        let permissions = self.prepare_permissions(permissions)?;
         let file_name = self
             .relative
             .file_name()
@@ -211,25 +224,19 @@ impl WorkspacePath {
                 ".{file_name}.ash-write-{}-{id}",
                 std::process::id()
             ));
-            let mut file = match self.dir.open_with(&temp, &options) {
+            let file = match self.dir.open_with(&temp, &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(self.write_error(error)),
             };
-            let result = (|| {
-                if let Some(permissions) = &permissions {
-                    file.set_permissions(permissions.clone())
-                        .map_err(|error| self.write_error(error))?;
-                }
-                write_all(&mut file, content, &self.full_path, cancellation, deadline)?;
-                ensure_running(cancellation, deadline)?;
-                file.sync_all().map_err(|error| self.write_error(error))?;
-                drop(file);
-                ensure_running(cancellation, deadline)?;
-                self.dir
-                    .rename(&temp, &self.dir, &self.relative)
-                    .map_err(|error| self.write_error(error))
-            })();
+            let result = self.commit_temp_file(
+                file,
+                &temp,
+                content,
+                permissions.as_ref(),
+                cancellation,
+                deadline,
+            );
             if result.is_err() {
                 let _ = self.dir.remove_file(&temp);
             }
@@ -240,6 +247,56 @@ impl WorkspacePath {
             "cannot write {}: could not allocate a temporary file after {MAX_TEMP_FILE_ATTEMPTS} attempts",
             self.full_path.display()
         )))
+    }
+
+    /// Decides the permissions for the replacement file: an explicit request,
+    /// the existing file's permissions, or none for a new file. Existing
+    /// symlinks are rejected because the atomic rename would otherwise replace
+    /// the link itself.
+    fn prepare_permissions(
+        &self,
+        permissions: Option<cap_std::fs::Permissions>,
+    ) -> Result<Option<cap_std::fs::Permissions>, ToolError> {
+        if let Some(permissions) = permissions {
+            return Ok(Some(permissions));
+        }
+        match self.dir.symlink_metadata(&self.relative) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(ToolError::Execution(format!(
+                    "cannot write {}: symbolic links are not writable",
+                    self.full_path.display()
+                )))
+            }
+            Ok(metadata) => Ok(Some(metadata.permissions())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(self.write_error(error)),
+        }
+    }
+
+    /// Writes the content into the freshly-created temporary file, syncs it,
+    /// and renames it over the target path. On error the caller removes the
+    /// temporary file.
+    fn commit_temp_file(
+        &self,
+        mut file: cap_std::fs::File,
+        temp: &Path,
+        content: &[u8],
+        permissions: Option<&cap_std::fs::Permissions>,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ToolError> {
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())
+                .map_err(|error| self.write_error(error))?;
+        }
+        write_all(&mut file, content, &self.full_path, cancellation, deadline)?;
+        ensure_running(cancellation, deadline)?;
+        file.sync_all().map_err(|error| self.write_error(error))?;
+        drop(file);
+        ensure_running(cancellation, deadline)?;
+        self.dir
+            .rename(temp, &self.dir, &self.relative)
+            .map_err(|error| self.write_error(error))
     }
 
     fn write_error(&self, error: std::io::Error) -> ToolError {
@@ -301,6 +358,9 @@ fn relative_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
                     )));
                 }
             }
+            // `relative` is always the result of `strip_prefix` (for absolute
+            // requests) or a plain relative request, so it never begins with a
+            // root or prefix component; this arm is defensive and unreachable.
             Component::RootDir | Component::Prefix(_) => {
                 return Err(ToolError::Execution(format!(
                     "invalid path: {}",

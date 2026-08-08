@@ -261,8 +261,8 @@ fn render_reader(
     }
 
     let mut output = String::from_utf8_lossy(&state.selected).into_owned();
+    let last_line = offset + state.output_lines.saturating_sub(1);
     if let Some(limited_by) = state.limited_by {
-        let last_line = offset + state.output_lines.saturating_sub(1);
         let next_offset = last_line + 1;
         let reason = match limited_by {
             LimitKind::Lines => format!("{} line limit", DEFAULT_MAX_LINES),
@@ -272,15 +272,12 @@ fn render_reader(
             "\n\n[Showing lines {offset}-{last_line} of {} ({reason}). Use offset={next_offset} to continue.]",
             total_lines
         ));
-    } else {
-        let last_line = offset + state.output_lines.saturating_sub(1);
-        if last_line < total_lines {
-            output.push_str(&format!(
-                "\n\n[{} more lines in file. Use offset={} to continue.]",
-                total_lines - last_line,
-                last_line + 1
-            ));
-        }
+    } else if last_line < total_lines {
+        output.push_str(&format!(
+            "\n\n[{} more lines in file. Use offset={} to continue.]",
+            total_lines - last_line,
+            last_line + 1
+        ));
     }
     Ok(output)
 }
@@ -301,6 +298,18 @@ mod tests {
         assert!(rendered.contains("line 2000"));
         assert!(!rendered.contains("line 2001"));
         assert!(rendered.contains("offset=2001"));
+    }
+
+    #[test]
+    fn renders_empty_files_without_a_misleading_tail_message() {
+        let rendered = render_text("", None, None).unwrap();
+        assert_eq!(rendered, "");
+    }
+
+    #[test]
+    fn renders_all_empty_lines_without_a_misleading_tail_message() {
+        let rendered = render_text("\n\n\n", None, None).unwrap();
+        assert_eq!(rendered, "\n\n\n");
     }
 
     #[test]
