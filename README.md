@@ -61,7 +61,7 @@ cargo run -p ash-cli -- \
 写入请求 body；`model`、`messages`、`input`、`tools`、`stream`、`system` 和
 `instructions` 等请求结构字段不能覆盖。
 
-模型上下文窗口默认是 200K token，可用 `--max-context-tokens` 或
+模型上下文窗口默认是 1M token，可用 `--max-context-tokens` 或
 `ASH_MAX_CONTEXT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
 1 token 的轻量估算，不引入 tokenizer 依赖。每轮结束后的 `Worked` 行显示输入、输出
 token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地估算值。
@@ -78,7 +78,8 @@ token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地�
 单次输出模式：
 
 ```bash
-cargo run -p ash-cli -- --print "inspect this project"
+cargo run -p ash-cli -- run "inspect this project"
+cargo run -p ash-cli -- run --log "inspect this project"  # 额外输出 debug 日志到 stderr，便于排查
 ```
 
 ## 项目上下文
@@ -125,10 +126,11 @@ Review the relevant code and report concrete findings.
 ```
 
 普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
-首行保存格式版本、Session ID、模型、协议、工作目录、最终系统提示词、工具定义和上下文
-限制等配置快照；后续按顺序追加完整用户消息、Assistant 消息、工具结果和 Turn 结束状态。
-压缩时只追加摘要和近期历史起点；恢复会话后，UI 重放完整消息，模型请求则使用该
-checkpoint 构造压缩上下文。API Key、访问令牌和自定义接口地址内容不会写入文件。
+首行只保存时间戳、Session ID、标题和会话类型等列表元数据；后续按顺序追加完整用户
+消息、Assistant 消息、工具结果和 Turn 结束状态。压缩时只追加摘要和近期历史起点；
+恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。恢复时
+沿用当前运行配置，不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此
+API Key、访问令牌和自定义接口地址内容不会写入文件。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
 Session。`/status` 显示当前会话的模型、协议和工作目录。`/exit`（别名 `/quit`）退出
@@ -137,8 +139,8 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 并把该输入恢复到输入框，便于修改后重新提交。`/fork` 会列出当前会话的历史用户输入；
 选中后创建一个新的 fork Session，继承该输入之前的消息，并把所选输入恢复到输入框。
 原 Session 的内存历史和 JSONL 都不会改变。
-通过 `/new` 或 `/clear` 建立的 Session 会立即获得 ID 和创建时间，但在第一条用户消息
-发出前不会创建文件；会话名称取第一条有效用户消息。
+通过 `/new` 或 `/clear` 建立的 Session 会立即获得 ID，但在第一条用户消息发出前不会
+创建文件；会话列表中的创建时间取第一次持久化记录，会话名称取第一条有效用户消息。
 `/resume` 和 `/fork` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
 历史单独保存在 `~/.local/share/ash/history.jsonl`。
 
@@ -196,25 +198,29 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 头尾加省略号）。按 `Ctrl-O` 可全局展开到 50 行预算，再次按恢复折叠；展开状态跨会话
 保持。
 
-- `Enter`：提交
+- `Enter`：空闲时提交新一轮；任务运行时向当前轮追加 steer 指令
 - 输入 `/`：显示斜杠命令补全；继续输入会按命令名或别名过滤
 - 补全菜单中 `↑` / `↓`（或 `Ctrl-P` / `Ctrl-N`）：切换选择
-- 补全菜单中 `Tab`：补全命令；`Enter`：执行当前选择；`Esc`：关闭菜单
+- 补全菜单中 `Tab`：补全命令；`Enter`：执行当前选择；空闲时 `Esc`：关闭菜单
 - `↑` / `↓`：输入历史
 - `PageUp` / `PageDown`：按页浏览当前 live turn
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
 - `Ctrl-O`：在所有工具输出与思考区之间切换折叠（5 行预览）与展开（50 行）
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
-- 任务运行时按一次 `Esc`：取消并撤销当前一轮，将原问题恢复到输入框
+- 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；只有已完成的工具结果会
+  保留本轮，否则撤销整轮并把原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求
 - 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出
 
-按下 `Esc` 会从模型会话历史和 live viewport 中移除当前轮，并把问题恢复到输入框；它不会
-反向撤销已经由工具写入文件系统的修改。`/undo` 同样不会撤销工具副作用；它只移除最近
-一轮并把该输入恢复到输入框。`/fork` 也不会修改原 Session；它会从所选输入之前的历史
-创建新 Session，随后重放继承的历史并恢复该输入。
+运行中提交的 steer 指令会在当前轮的下一次模型迭代前生效，不会创建独立的排队轮次；
+如果当前轮恰好已经结束，指令会恢复到输入框并显示失败原因。`Esc` 不会反向撤销已经由
+工具写入文件系统的修改。斜杠命令始终显示；运行中输入 `/new`、`/clear`、`/resume`、
+`/undo`、`/fork` 或 `/compact` 时，命令不会发出，输入会保留，界面不显示额外状态。
+`/status` 仍可查看状态，`/exit` 会直接结束程序。`/undo` 会移除最近一轮并恢复其输入，
+但不会撤销工具副作用。`/fork` 不会修改原 Session；它会从所选输入之前的历史创建新
+Session，随后重放继承的历史并恢复该输入。
 
 ## 开发检查
 

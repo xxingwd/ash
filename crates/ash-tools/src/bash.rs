@@ -9,6 +9,7 @@ use std::{
 use ash_core::{define_tool, Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::process::{Child, Command};
 
 use crate::truncate::{self, LimitKind, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
@@ -24,68 +25,132 @@ struct BashArgs {
     timeout: Option<f64>,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "bash",
         "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
         move |_ctx, args: BashArgs| {
             let working_dir = Arc::clone(&working_dir);
             async move {
-            let timeout = args.timeout.map(parse_timeout).transpose()?;
-            let cwd = match args.cwd {
-                Some(requested) => {
-                    let working_dir = Arc::clone(&working_dir);
-                    crate::path::run_blocking(move || resolve_cwd(working_dir.as_path(), &requested)).await?
+                let timeout = args.timeout.map(parse_timeout).transpose()?;
+                let cwd = match args.cwd {
+                    Some(requested) => {
+                        let working_dir = Arc::clone(&working_dir);
+                        crate::path::run_blocking(move || resolve_cwd(working_dir.as_path(), &requested)).await?
+                    }
+                    None => (*working_dir).clone(),
+                };
+                let stdout = tempfile::Builder::new()
+                    .prefix("ash-bash-stdout-")
+                    .tempfile()
+                    .map_err(|error| ToolError::Execution(format!("cannot capture stdout: {error}")))?;
+                let stderr = tempfile::Builder::new()
+                    .prefix("ash-bash-stderr-")
+                    .tempfile()
+                    .map_err(|error| ToolError::Execution(format!("cannot capture stderr: {error}")))?;
+                let mut command = Command::new("bash");
+                command
+                    .args(["-c", &args.command])
+                    .current_dir(cwd)
+                    .stdout(Stdio::from(stdout.reopen().map_err(|error| {
+                        ToolError::Execution(format!("cannot capture stdout: {error}"))
+                    })?))
+                    .stderr(Stdio::from(stderr.reopen().map_err(|error| {
+                        ToolError::Execution(format!("cannot capture stderr: {error}"))
+                    })?))
+                    .kill_on_drop(true);
+
+                #[cfg(unix)]
+                command.process_group(0);
+                let mut child = ManagedChild::spawn(&mut command).map_err(|error| {
+                    ToolError::Execution(format!("failed to execute bash: {error}"))
+                })?;
+
+                let output = match timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
+                        Ok(output) => output,
+                        Err(_) => {
+                            child.terminate().await;
+                            return Err(ToolError::Execution(format!(
+                                "command timed out after {} seconds",
+                                timeout.as_secs_f64()
+                            )));
+                        }
+                    },
+                    None => child.wait().await,
                 }
-                None => (*working_dir).clone(),
-            };
-            let stdout = tempfile::Builder::new()
-                .prefix("ash-bash-stdout-")
-                .tempfile()
-                .map_err(|error| ToolError::Execution(format!("cannot capture stdout: {error}")))?;
-            let stderr = tempfile::Builder::new()
-                .prefix("ash-bash-stderr-")
-                .tempfile()
-                .map_err(|error| ToolError::Execution(format!("cannot capture stderr: {error}")))?;
-            let mut command = tokio::process::Command::new("bash");
-            command
-                .args(["-c", &args.command])
-                .current_dir(cwd)
-                .stdout(Stdio::from(stdout.reopen().map_err(|error| {
-                    ToolError::Execution(format!("cannot capture stdout: {error}"))
-                })?))
-                .stderr(Stdio::from(stderr.reopen().map_err(|error| {
-                    ToolError::Execution(format!("cannot capture stderr: {error}"))
-                })?))
-                .kill_on_drop(true);
+                .map_err(|error| ToolError::Execution(format!("failed to execute bash: {error}")))?;
 
-            let output = match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, command.status())
-                    .await
-                    .map_err(|_| {
-                        ToolError::Execution(format!(
-                            "command timed out after {} seconds",
-                            timeout.as_secs_f64()
-                        ))
-                    })?,
-                None => command.status().await,
-            }
-            .map_err(|error| ToolError::Execution(format!("failed to execute bash: {error}")))?;
-
-            let rendered = crate::path::run_blocking(move || render_files(stdout, stderr)).await?;
-            if output.success() {
-                Ok(rendered)
-            } else {
-                let code = output
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |code| code.to_string());
-                Err(ToolError::Execution(format!(
-                    "{rendered}\n\nCommand exited with {code}"
-                )))
-            }
+                let rendered = crate::path::run_blocking(move || render_files(stdout, stderr)).await?;
+                if output.success() {
+                    Ok(rendered)
+                } else {
+                    let code = output
+                        .code()
+                        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+                    Err(ToolError::Execution(format!(
+                        "{rendered}\n\nCommand exited with {code}"
+                    )))
+                }
             }
         },
     )
+}
+
+struct ManagedChild {
+    child: Child,
+    #[cfg(unix)]
+    process_group: Option<rustix::process::Pid>,
+}
+
+impl ManagedChild {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let child = command.spawn()?;
+        #[cfg(unix)]
+        let process_group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        Ok(Self {
+            child,
+            #[cfg(unix)]
+            process_group,
+        })
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.disarm();
+        Ok(status)
+    }
+
+    async fn terminate(&mut self) {
+        self.kill_processes();
+        let _ = self.child.wait().await;
+        self.disarm();
+    }
+
+    fn kill_processes(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.start_kill();
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.process_group = None;
+        }
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.kill_processes();
+    }
 }
 
 fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
@@ -274,11 +339,23 @@ mod tests {
     }
 
     async fn run_in(root: &Path, command: &str, cwd: Option<&str>) -> Result<String, ToolError> {
-        let tool = tool(Arc::new(root.to_path_buf()));
+        run_with_timeout(root, command, cwd, None).await
+    }
+
+    async fn run_with_timeout(
+        root: &Path,
+        command: &str,
+        cwd: Option<&str>,
+        timeout: Option<f64>,
+    ) -> Result<String, ToolError> {
+        let tool = tool(Arc::new(root.to_path_buf())).unwrap();
         let mut args = serde_json::Map::new();
         args.insert("command".into(), serde_json::Value::String(command.into()));
         if let Some(cwd) = cwd {
             args.insert("cwd".into(), serde_json::Value::String(cwd.into()));
+        }
+        if let Some(timeout) = timeout {
+            args.insert("timeout".into(), serde_json::Value::from(timeout));
         }
         let output = tool
             .execute(test_context(), serde_json::Value::Object(args))
@@ -394,6 +471,52 @@ mod tests {
         assert!(parse_timeout(0.0).is_err());
         assert!(parse_timeout(f64::INFINITY).is_err());
         assert_eq!(parse_timeout(0.5).unwrap(), Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_background_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let error = run_with_timeout(
+            root.path(),
+            "(sleep 0.2; printf survived > descendant) & wait",
+            None,
+            Some(0.05),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!root.path().join("descendant").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_execution_terminates_background_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = tool(Arc::new(root.path().to_path_buf())).unwrap();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                test_context(),
+                serde_json::json!({
+                    "command": "printf started > started; (sleep 0.2; printf survived > descendant) & wait"
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !root.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!root.path().join("descendant").exists());
     }
 
     #[test]

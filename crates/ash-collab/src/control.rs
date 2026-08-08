@@ -1,4 +1,9 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use ash_agent::{Agent, Input, InputSource, Runtime, Thread, ThreadKind, ThreadOptions};
 use ash_core::{
@@ -95,14 +100,16 @@ worker: Prefer for bounded implementation and production work such as features, 
 }
 
 impl FromStr for AgentRole {
-    type Err = String;
+    type Err = ToolError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
             "default" => Ok(Self::Default),
             "explorer" => Ok(Self::Explorer),
             "worker" => Ok(Self::Worker),
-            other => Err(format!("unknown agent_type '{other}'")),
+            other => Err(ToolError::Execution(format!(
+                "unknown agent_type '{other}'"
+            ))),
         }
     }
 }
@@ -191,6 +198,54 @@ struct ControlInner {
     subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
 }
 
+struct SpawnReservation {
+    inner: Arc<ControlInner>,
+    tree_id: TreeId,
+    task_name: Option<String>,
+}
+
+impl SpawnReservation {
+    fn new(inner: Arc<ControlInner>, tree_id: TreeId, task_name: String) -> Self {
+        Self {
+            inner,
+            tree_id,
+            task_name: Some(task_name),
+        }
+    }
+
+    async fn release(&mut self) {
+        let Some(task_name) = self.task_name.take() else {
+            return;
+        };
+        let mut state = self.inner.state.lock().await;
+        if let Some(session) = state.threads.get_mut(&self.tree_id) {
+            session.pending_spawns.remove(&task_name);
+        }
+    }
+
+    fn commit(mut self) {
+        self.task_name = None;
+    }
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        let Some(task_name) = self.task_name.take() else {
+            return;
+        };
+        let inner = Arc::clone(&self.inner);
+        let tree_id = self.tree_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut state = inner.state.lock().await;
+                if let Some(session) = state.threads.get_mut(&tree_id) {
+                    session.pending_spawns.remove(&task_name);
+                }
+            });
+        }
+    }
+}
+
 pub(crate) struct SpawnRequest {
     pub role: AgentRole,
     pub parent_path: String,
@@ -225,6 +280,7 @@ struct ControlState {
 #[derive(Default)]
 struct ChildSession {
     agents: HashMap<ThreadId, ChildRecord>,
+    pending_spawns: HashSet<String>,
     next_completion_revision: u64,
     wait_cursors: HashMap<String, u64>,
 }
@@ -321,7 +377,6 @@ impl ChildRecord {
     /// finished, so waiters never observe an intermediate completion.
     fn finish_turn(&mut self, completed: ChildState, was_followup: bool) -> bool {
         if was_followup {
-            debug_assert!(self.pending_followups > 0);
             self.pending_followups = self.pending_followups.saturating_sub(1);
         }
         if self.pending_followups == 0 {
@@ -414,6 +469,29 @@ impl ChildSession {
             .values()
             .filter(|record| record.state.is_active())
             .count()
+            .saturating_add(self.pending_spawns.len())
+    }
+
+    fn reserve_spawn(&mut self, task_name: &str, max: Option<usize>) -> Result<(), ToolError> {
+        if let Some(max) = max {
+            if self.active_count() >= max {
+                return Err(ToolError::Execution(format!(
+                    "maximum of {max} concurrent sub-agents reached"
+                )));
+            }
+        }
+        if self.pending_spawns.contains(task_name)
+            || self
+                .agents
+                .values()
+                .any(|record| record.task_name == task_name)
+        {
+            return Err(ToolError::Execution(format!(
+                "agent task name already exists: {task_name}; use message_agent with start_turn=true to reuse it"
+            )));
+        }
+        self.pending_spawns.insert(task_name.to_string());
+        Ok(())
     }
 
     fn wait_snapshot(&mut self, waiter: &str, path_prefix: Option<&str>) -> WaitSnapshot {
@@ -583,7 +661,7 @@ impl AgentControl {
         let _ = self.inner.subagent_tx.send(snapshots);
     }
 
-    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+    pub fn tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let spawn = self.clone();
         let spawn_description = format!(
             "Spawn a sub-agent for a concrete, bounded task that can make progress independently. Spawned agents use the same Runtime -> Thread -> Turn execution pipeline as the parent and inherit the current model, environment, AGENTS.md instructions, skills, and tools.\n\nUse this when a separate agent makes the plan simpler or can answer an independent question:\n- Use `explorer` for an independent read-only codebase question.\n- Prefer `worker` for a bounded code change with explicit file or module ownership.\n- Use `default` for another self-contained task.\n- Multiple sub-agents are supported, but do not spawn for trivial tasks or immediate blockers.\n- Give the agent the exact output you need; do not duplicate its work locally.\n- After spawning, continue non-overlapping work when available and call `wait_agent` only when its result becomes relevant.\n\n{}",
@@ -596,7 +674,7 @@ impl AgentControl {
                 let control = spawn.clone();
                 async move { control.spawn(context, args).await }
             },
-        );
+        )?;
 
         let message = self.clone();
         let message_tool = define_tool(
@@ -606,7 +684,7 @@ impl AgentControl {
                 let control = message.clone();
                 async move { control.message_agent(&context, args).await }
             },
-        );
+        )?;
 
         let interrupt = self.clone();
         let interrupt_tool = define_tool(
@@ -616,7 +694,7 @@ impl AgentControl {
                 let control = interrupt.clone();
                 async move { control.interrupt(&context, args).await }
             },
-        );
+        )?;
 
         let wait = self.clone();
         let wait_tool = define_tool(
@@ -626,9 +704,9 @@ impl AgentControl {
                 let control = wait.clone();
                 async move { control.wait(&context, args).await }
             },
-        );
+        )?;
 
-        vec![spawn_tool, message_tool, interrupt_tool, wait_tool]
+        Ok(vec![spawn_tool, message_tool, interrupt_tool, wait_tool])
     }
 
     async fn spawn(&self, context: ToolContext, args: SpawnAgentArgs) -> Result<String, ToolError> {
@@ -642,43 +720,52 @@ impl AgentControl {
         let fork_mode = ForkMode::parse(args.fork_turns.as_deref())?;
         let parent_path = normalized_agent_path(&context.agent.path);
         let task_name = format!("{parent_path}/{}", args.task_name);
+        let mut reservation = {
+            let mut state = self.inner.state.lock().await;
+            state
+                .threads
+                .entry(context.agent.tree_id)
+                .or_default()
+                .reserve_spawn(&task_name, self.inner.max_concurrent_children)?;
+            SpawnReservation::new(
+                Arc::clone(&self.inner),
+                context.agent.tree_id,
+                task_name.clone(),
+            )
+        };
         let (command_tx, command_rx) = mpsc::channel(32);
 
         let messages = fork_messages(&context.agent.messages, fork_mode);
-        let mut child = self.inner.spawner.spawn(SpawnRequest {
-            role,
-            parent_path,
-            task_name: task_name.clone(),
-            messages,
-            tree_id: context.agent.tree_id,
-        })?;
-        child.agent.tools.extend(self.tools());
-        let thread = child
-            .runtime
-            .start_with_history(child.agent, child.options, child.history)
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let spawned = async {
+            let mut child = self.inner.spawner.spawn(SpawnRequest {
+                role,
+                parent_path,
+                task_name: task_name.clone(),
+                messages,
+                tree_id: context.agent.tree_id,
+            })?;
+            child.agent.tools.extend(self.tools()?);
+            child
+                .runtime
+                .start_with_history(child.agent, child.options, child.history)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))
+        }
+        .await;
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(error) => {
+                reservation.release().await;
+                return Err(error);
+            }
+        };
         let id = thread.id();
 
         {
             let mut state = self.inner.state.lock().await;
             let session = state.threads.entry(context.agent.tree_id).or_default();
-            if let Some(max) = self.inner.max_concurrent_children {
-                if session.active_count() >= max {
-                    return Err(ToolError::Execution(format!(
-                        "maximum of {max} concurrent sub-agents reached"
-                    )));
-                }
-            }
-            if session
-                .agents
-                .values()
-                .any(|record| record.task_name == task_name)
-            {
-                return Err(ToolError::Execution(format!(
-                    "agent task name already exists: {task_name}; use message_agent with start_turn=true to reuse it"
-                )));
-            }
+            session.pending_spawns.remove(&task_name);
+            reservation.commit();
             session.agents.insert(
                 id,
                 ChildRecord {
@@ -967,7 +1054,7 @@ pub fn install_subagent_tools(
     options: ThreadOptions,
     runtime: Runtime,
     max_concurrent_children: Option<usize>,
-) -> Option<Arc<AgentControl>> {
+) -> Result<Option<Arc<AgentControl>>, ToolError> {
     let has_exposed_tools = EXPOSED_COLLABORATION_TOOL_NAMES
         .iter()
         .all(|name| agent.tools.iter().any(|tool| tool.name() == *name));
@@ -976,7 +1063,7 @@ pub fn install_subagent_tools(
         .any(|name| agent.tools.iter().any(|tool| tool.name() == *name));
     if has_exposed_tools && !has_legacy_tools {
         ensure_multi_agent_instructions(agent.system_prompt.get_or_insert_with(String::new));
-        return None;
+        return Ok(None);
     }
     agent
         .tools
@@ -989,8 +1076,8 @@ pub fn install_subagent_tools(
         scope: options,
     });
     let control = AgentControl::new(max_concurrent_children, spawner);
-    agent.tools.extend(control.tools());
-    Some(Arc::new(control))
+    agent.tools.extend(control.tools()?);
+    Ok(Some(Arc::new(control)))
 }
 
 fn ensure_multi_agent_instructions(system_prompt: &mut String) {
@@ -1195,7 +1282,7 @@ mod tests {
         AgentControl::new(None, Arc::new(RejectingSpawner))
     }
 
-    fn test_agent() -> Agent {
+    fn make_agent() -> Agent {
         Agent {
             system_prompt: Some("base prompt".to_string()),
             tools: Vec::new(),
@@ -1206,7 +1293,7 @@ mod tests {
         }
     }
 
-    fn test_options() -> ThreadOptions {
+    fn make_options() -> ThreadOptions {
         ThreadOptions {
             working_dir: PathBuf::from("."),
             tool_timeout: Duration::from_secs(5),
@@ -1214,7 +1301,7 @@ mod tests {
         }
     }
 
-    fn test_context(tree_id: TreeId) -> ToolContext {
+    fn make_context(tree_id: TreeId) -> ToolContext {
         ToolContext {
             thread_id: ThreadId::new(),
             turn_id: ash_core::TurnId::new(),
@@ -1228,7 +1315,7 @@ mod tests {
         }
     }
 
-    fn test_model(base_url: Option<String>) -> Arc<dyn ModelClient> {
+    fn make_model(base_url: Option<String>) -> Arc<dyn ModelClient> {
         create_adapter(ProviderConfig {
             protocol: Protocol::Responses,
             api_key: "test".into(),
@@ -1236,7 +1323,7 @@ mod tests {
         })
     }
 
-    fn test_control(
+    fn make_control(
         model: Arc<dyn ModelClient>,
         max_turns: u32,
     ) -> (AgentControl, tempfile::TempDir) {
@@ -1246,9 +1333,9 @@ mod tests {
         let directory = tempfile::TempDir::new().expect("create temp thread directory");
         let runtime = Runtime::new(model, "test")
             .with_thread_store(Arc::new(ash_agent::JsonlThreadStore::new(directory.path())));
-        let mut agent = test_agent();
+        let mut agent = make_agent();
         agent.max_turns = max_turns;
-        let options = test_options();
+        let options = make_options();
         let spawner = Arc::new(InheritedAgentSpawner {
             runtime,
             system_prompt: agent.system_prompt.clone(),
@@ -1260,19 +1347,22 @@ mod tests {
 
     #[test]
     fn exposes_the_codex_0_144_3_builtin_roles() {
-        assert_eq!(AgentRole::from_str("default"), Ok(AgentRole::Default));
-        assert_eq!(AgentRole::from_str("explorer"), Ok(AgentRole::Explorer));
-        assert_eq!(AgentRole::from_str("worker"), Ok(AgentRole::Worker));
+        assert_eq!(AgentRole::from_str("default").unwrap(), AgentRole::Default);
+        assert_eq!(
+            AgentRole::from_str("explorer").unwrap(),
+            AgentRole::Explorer
+        );
+        assert_eq!(AgentRole::from_str("worker").unwrap(), AgentRole::Worker);
         assert!(AgentRole::from_str("awaiter").is_err());
     }
 
     #[test]
     fn installs_the_codex_style_collaboration_tools_and_prompt() {
-        let mut agent = test_agent();
-        let options = test_options();
-        let runtime = Runtime::new(test_model(None), "test");
-        install_subagent_tools(&mut agent, options.clone(), runtime.clone(), None);
-        install_subagent_tools(&mut agent, options, runtime, None);
+        let mut agent = make_agent();
+        let options = make_options();
+        let runtime = Runtime::new(make_model(None), "test");
+        install_subagent_tools(&mut agent, options.clone(), runtime.clone(), None).unwrap();
+        install_subagent_tools(&mut agent, options, runtime, None).unwrap();
         let names = agent
             .tools
             .iter()
@@ -1335,6 +1425,80 @@ mod tests {
         assert!(validate_task_name("Parser").is_err());
         assert!(validate_task_name("parser-tests").is_err());
         assert!(validate_task_name("").is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_releases_the_task_name_reservation() {
+        let control = state_only_control();
+        let context = make_context(TreeId::new());
+
+        for _ in 0..2 {
+            let error = control
+                .spawn(
+                    context.clone(),
+                    SpawnAgentArgs {
+                        task_name: "inspect".to_string(),
+                        message: "Inspect the parser.".to_string(),
+                        agent_type: None,
+                        fork_turns: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("spawn is not used"));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_before_calling_the_spawner() {
+        let control = AgentControl::new(Some(0), Arc::new(RejectingSpawner));
+        let error = control
+            .spawn(
+                make_context(TreeId::new()),
+                SpawnAgentArgs {
+                    task_name: "inspect".to_string(),
+                    message: "Inspect the parser.".to_string(),
+                    agent_type: None,
+                    fork_turns: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("maximum of 0 concurrent sub-agents reached"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_reservation_rejects_before_calling_the_spawner() {
+        let control = state_only_control();
+        let tree_id = TreeId::new();
+        control
+            .inner
+            .state
+            .lock()
+            .await
+            .threads
+            .entry(tree_id)
+            .or_default()
+            .pending_spawns
+            .insert("/root/inspect".to_string());
+
+        let error = control
+            .spawn(
+                make_context(tree_id),
+                SpawnAgentArgs {
+                    task_name: "inspect".to_string(),
+                    message: "Inspect the parser.".to_string(),
+                    agent_type: None,
+                    fork_turns: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("task name already exists"));
     }
 
     #[test]
@@ -1424,7 +1588,7 @@ mod tests {
 
         let result = control
             .message_agent(
-                &test_context(tree_id),
+                &make_context(tree_id),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "follow up".to_string(),
@@ -1470,7 +1634,7 @@ mod tests {
 
         let result = control
             .message_agent(
-                &test_context(tree_id),
+                &make_context(tree_id),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "keep this in mind".to_string(),
@@ -1644,7 +1808,7 @@ mod tests {
             );
         }
 
-        let context = test_context(tree_id);
+        let context = make_context(tree_id);
         let first = control
             .wait(
                 &context,
@@ -1723,7 +1887,7 @@ mod tests {
             );
         }
 
-        let context = test_context(tree_id);
+        let context = make_context(tree_id);
         let snapshot = control
             .wait(
                 &context,
@@ -1801,7 +1965,7 @@ mod tests {
             requests
         });
 
-        let (control, _directory) = test_control(test_model(Some(format!("http://{address}"))), 2);
+        let (control, _directory) = make_control(make_model(Some(format!("http://{address}"))), 2);
         let tree_id = TreeId::new();
         let context = ToolContext {
             thread_id: ThreadId::new(),
@@ -1944,7 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn subscribers_receive_subagent_snapshot_updates() {
         let (base_url, _server) = mock_model_server(&["child done"]).await;
-        let (control, _directory) = test_control(test_model(Some(base_url)), 1);
+        let (control, _directory) = make_control(make_model(Some(base_url)), 1);
         let tree_id = TreeId::new();
         let mut snapshots = control.subscribe();
         let context = ToolContext {
@@ -1993,7 +2157,7 @@ mod tests {
     #[tokio::test]
     async fn default_configuration_allows_more_than_three_concurrent_subagents() {
         let (base_url, _server) = mock_model_server(&["a", "b", "c", "d"]).await;
-        let (control, _directory) = test_control(test_model(Some(base_url)), 1);
+        let (control, _directory) = make_control(make_model(Some(base_url)), 1);
         let tree_id = TreeId::new();
         let context = ToolContext {
             thread_id: ThreadId::new(),

@@ -1,14 +1,17 @@
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
-use ash_core::ToolError;
+use ash_core::{CancellationToken, ToolError};
 use cap_std::{ambient_authority, fs::Dir};
+use ignore::WalkBuilder;
 
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
+const IO_BUFFER_BYTES: usize = 8 * 1024;
 
 pub(crate) struct WorkspacePath {
     dir: Dir,
@@ -19,6 +22,64 @@ pub(crate) struct WorkspacePath {
 pub(crate) struct SearchPath {
     workspace: PathBuf,
     full_path: PathBuf,
+}
+
+pub(crate) fn file_walker(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .require_git(false)
+        .sort_by_file_path(|left, right| left.cmp(right));
+    builder
+}
+
+pub(crate) fn ensure_running(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), ToolError> {
+    if cancellation.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ToolError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
+pub(crate) fn read_all(
+    reader: &mut impl Read,
+    path: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<u8>, ToolError> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
+    loop {
+        ensure_running(cancellation, deadline)?;
+        let count = reader.read(&mut buffer).map_err(|error| {
+            ToolError::Execution(format!("cannot read {}: {error}", path.display()))
+        })?;
+        if count == 0 {
+            return Ok(output);
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn write_all(
+    writer: &mut impl Write,
+    content: &[u8],
+    path: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), ToolError> {
+    for chunk in content.chunks(IO_BUFFER_BYTES) {
+        ensure_running(cancellation, deadline)?;
+        writer.write_all(chunk).map_err(|error| {
+            ToolError::Execution(format!("cannot write {}: {error}", path.display()))
+        })?;
+    }
+    Ok(())
 }
 
 impl SearchPath {
@@ -101,17 +162,6 @@ impl WorkspacePath {
         &self.full_path
     }
 
-    pub(crate) fn read(&self) -> std::io::Result<Vec<u8>> {
-        self.dir.read(&self.relative)
-    }
-
-    pub(crate) fn write(&self, content: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = self.relative.parent() {
-            self.dir.create_dir_all(parent)?;
-        }
-        self.dir.write(&self.relative, content)
-    }
-
     pub(crate) fn open_with(
         &self,
         options: &cap_std::fs::OpenOptions,
@@ -119,12 +169,34 @@ impl WorkspacePath {
         self.dir.open_with(&self.relative, options)
     }
 
-    pub(crate) fn atomic_replace(
+    pub(crate) fn atomic_write(
         &self,
         content: &[u8],
-        permissions: cap_std::fs::Permissions,
-    ) -> std::io::Result<()> {
+        permissions: Option<cap_std::fs::Permissions>,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ToolError> {
+        ensure_running(cancellation, deadline)?;
         let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
+        self.dir
+            .create_dir_all(parent)
+            .map_err(|error| self.write_error(error))?;
+        ensure_running(cancellation, deadline)?;
+
+        let permissions = match permissions {
+            Some(permissions) => Some(permissions),
+            None => match self.dir.symlink_metadata(&self.relative) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(ToolError::Execution(format!(
+                        "cannot write {}: symbolic links are not writable",
+                        self.full_path.display()
+                    )))
+                }
+                Ok(metadata) => Some(metadata.permissions()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(self.write_error(error)),
+            },
+        };
         let file_name = self
             .relative
             .file_name()
@@ -135,18 +207,28 @@ impl WorkspacePath {
 
         for _ in 0..MAX_TEMP_FILE_ATTEMPTS {
             let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-            let temp = parent.join(format!(".{file_name}.ash-edit-{}-{id}", std::process::id()));
+            let temp = parent.join(format!(
+                ".{file_name}.ash-write-{}-{id}",
+                std::process::id()
+            ));
             let mut file = match self.dir.open_with(&temp, &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(self.write_error(error)),
             };
             let result = (|| {
-                file.set_permissions(permissions.clone())?;
-                file.write_all(content)?;
-                file.sync_all()?;
+                if let Some(permissions) = &permissions {
+                    file.set_permissions(permissions.clone())
+                        .map_err(|error| self.write_error(error))?;
+                }
+                write_all(&mut file, content, &self.full_path, cancellation, deadline)?;
+                ensure_running(cancellation, deadline)?;
+                file.sync_all().map_err(|error| self.write_error(error))?;
                 drop(file);
-                self.dir.rename(&temp, &self.dir, &self.relative)
+                ensure_running(cancellation, deadline)?;
+                self.dir
+                    .rename(&temp, &self.dir, &self.relative)
+                    .map_err(|error| self.write_error(error))
             })();
             if result.is_err() {
                 let _ = self.dir.remove_file(&temp);
@@ -154,11 +236,16 @@ impl WorkspacePath {
             return result;
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "could not allocate a temporary edit file after {MAX_TEMP_FILE_ATTEMPTS} attempts"
-            ),
+        Err(ToolError::Execution(format!(
+            "cannot write {}: could not allocate a temporary file after {MAX_TEMP_FILE_ATTEMPTS} attempts",
+            self.full_path.display()
+        )))
+    }
+
+    fn write_error(&self, error: std::io::Error) -> ToolError {
+        ToolError::Execution(format!(
+            "cannot write {}: {error}",
+            self.full_path.display()
         ))
     }
 }
@@ -170,6 +257,20 @@ where
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| ToolError::Execution(format!("filesystem task failed: {error}")))?
+}
+
+pub(crate) async fn run_tool_blocking<T>(
+    cancellation: CancellationToken,
+    deadline: Instant,
+    operation: impl FnOnce(CancellationToken, Instant) -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError>
+where
+    T: Send + 'static,
+{
+    ensure_running(&cancellation, deadline)?;
+    tokio::task::spawn_blocking(move || operation(cancellation, deadline))
         .await
         .map_err(|error| ToolError::Execution(format!("filesystem task failed: {error}")))?
 }
@@ -214,6 +315,99 @@ fn relative_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    struct CancellingReader {
+        cancellation: CancellationToken,
+        read: bool,
+    }
+
+    impl Read for CancellingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.read, "reader was called after cancellation");
+            self.read = true;
+            buffer[0] = b'x';
+            self.cancellation.cancel();
+            Ok(1)
+        }
+    }
+
+    struct CancellingWriter {
+        cancellation: CancellationToken,
+        writes: usize,
+    }
+
+    impl Write for CancellingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            assert_eq!(self.writes, 0, "writer was called after cancellation");
+            self.writes += 1;
+            self.cancellation.cancel();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ensure_running_rejects_cancellation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            ensure_running(&cancellation, Instant::now() + Duration::from_secs(60)),
+            Err(ToolError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn ensure_running_rejects_expired_deadline() {
+        assert!(matches!(
+            ensure_running(&CancellationToken::new(), Instant::now()),
+            Err(ToolError::DeadlineExceeded)
+        ));
+    }
+
+    #[test]
+    fn read_all_stops_between_chunks_when_cancelled() {
+        let cancellation = CancellationToken::new();
+        let mut reader = CancellingReader {
+            cancellation: cancellation.clone(),
+            read: false,
+        };
+
+        let error = read_all(
+            &mut reader,
+            Path::new("file"),
+            &cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
+    }
+
+    #[test]
+    fn write_all_stops_between_chunks_when_cancelled() {
+        let cancellation = CancellationToken::new();
+        let mut writer = CancellingWriter {
+            cancellation: cancellation.clone(),
+            writes: 0,
+        };
+
+        let error = write_all(
+            &mut writer,
+            &vec![b'x'; IO_BUFFER_BYTES + 1],
+            Path::new("file"),
+            &cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
+    }
 
     #[test]
     fn rejects_parent_escape() {
@@ -253,7 +447,9 @@ mod tests {
         std::os::unix::fs::symlink(target, &link).unwrap();
 
         let path = WorkspacePath::new(root.path(), "outside.txt").unwrap();
-        assert!(path.read().is_err());
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        assert!(path.open_with(&options).is_err());
         assert!(SearchPath::new(root.path(), "outside.txt").is_err());
     }
 }

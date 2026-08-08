@@ -2,9 +2,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
-use ash_core::{define_tool, Content, Tool, ToolError, ToolOutput};
+use ash_core::{define_tool, CancellationToken, Content, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -99,13 +100,25 @@ impl TextReadState {
     }
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "read",
         "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Supported images: jpg, png, gif, webp, and bmp.",
-        move |_ctx, args: ReadArgs| {
+        move |ctx, args: ReadArgs| {
             let working_dir = Arc::clone(&working_dir);
-            async move { read_file(&working_dir, &args.path, args.offset, args.limit).await }
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
+            async move {
+                read_file(
+                    &working_dir,
+                    &args.path,
+                    args.offset,
+                    args.limit,
+                    cancellation,
+                    deadline,
+                )
+                .await
+            }
         },
     )
 }
@@ -115,18 +128,26 @@ async fn read_file(
     requested: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    cancellation: CancellationToken,
+    deadline: Instant,
 ) -> Result<ToolOutput, ToolError> {
     let root = root.to_path_buf();
     let requested = requested.to_string();
-    crate::path::run_blocking(move || {
+    crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
+        crate::path::ensure_running(&cancellation, deadline)?;
         let path = crate::path::WorkspacePath::new(&root, &requested)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        crate::path::ensure_running(&cancellation, deadline)?;
+        let mut file = path.open_with(&options).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot read {}: {error}",
+                path.full_path().display()
+            ))
+        })?;
         if let Some(media_type) = image_media_type(path.full_path()) {
-            let bytes = path.read().map_err(|error| {
-                ToolError::Execution(format!(
-                    "cannot read {}: {error}",
-                    path.full_path().display()
-                ))
-            })?;
+            let bytes =
+                crate::path::read_all(&mut file, path.full_path(), &cancellation, deadline)?;
             return Ok(ToolOutput::with_attachments(
                 format!("Read image file [{media_type}]"),
                 vec![Content::Image {
@@ -135,16 +156,7 @@ async fn read_file(
                 }],
             ));
         }
-
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true);
-        let file = path.open_with(&options).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot read {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
-        render_reader(file, offset, limit).map(Into::into)
+        render_reader(file, offset, limit, &cancellation, deadline).map(Into::into)
     })
     .await
 }
@@ -171,14 +183,23 @@ fn render_text(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<String, ToolError> {
-    render_reader(std::io::Cursor::new(content), offset, limit)
+    render_reader(
+        std::io::Cursor::new(content),
+        offset,
+        limit,
+        &CancellationToken::new(),
+        Instant::now() + std::time::Duration::from_secs(60),
+    )
 }
 
 fn render_reader(
     mut reader: impl Read,
     offset: Option<usize>,
     limit: Option<usize>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Result<String, ToolError> {
+    crate::path::ensure_running(cancellation, deadline)?;
     let offset = offset.unwrap_or(1);
     if offset == 0 {
         return Err(ToolError::Execution("offset must be at least 1".into()));
@@ -194,6 +215,7 @@ fn render_reader(
     let mut buffer = [0_u8; 8 * 1024];
 
     loop {
+        crate::path::ensure_running(cancellation, deadline)?;
         let count = reader
             .read(&mut buffer)
             .map_err(|error| ToolError::Execution(format!("cannot read file: {error}")))?;
@@ -216,6 +238,7 @@ fn render_reader(
             }
         }
     }
+    crate::path::ensure_running(cancellation, deadline)?;
 
     let total_lines = state.line;
     if offset > total_lines {
@@ -265,6 +288,7 @@ fn render_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn limits_reads_by_lines_and_reports_the_next_offset() {
@@ -309,9 +333,16 @@ mod tests {
             .await
             .unwrap();
 
-        let output = read_file(root.path(), "image.png", None, None)
-            .await
-            .unwrap();
+        let output = read_file(
+            root.path(),
+            "image.png",
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(output.text, "Read image file [image/png]");
         assert!(matches!(
@@ -319,5 +350,28 @@ mod tests {
             [Content::Image { media_type, data }]
                 if media_type == "image/png" && data == &[0x89, 0x50, 0x4e, 0x47]
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_does_not_open_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::write(root.path().join("notes.txt"), "secret\n")
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = read_file(
+            root.path(),
+            "notes.txt",
+            None,
+            None,
+            cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
     }
 }

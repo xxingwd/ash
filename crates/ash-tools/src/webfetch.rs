@@ -21,7 +21,7 @@ struct WebFetchArgs {
     timeout: Option<f64>,
 }
 
-pub fn tool() -> Arc<dyn Tool> {
+pub fn tool() -> Result<Arc<dyn Tool>, ToolError> {
     let client = Client::new();
     define_tool(
         "webfetch",

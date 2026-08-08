@@ -1,11 +1,10 @@
 use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
-use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    consecutive_tool_results, model_config,
+    consecutive_tool_results, image_data_url, join_text_contents, model_config,
     pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCallAccumulator},
     project_request_messages, sse, ProviderConfig,
@@ -26,11 +25,7 @@ impl CompletionsAdapter {
     }
 
     fn base_url(&self) -> &str {
-        self.config
-            .base_url
-            .as_deref()
-            .unwrap_or("https://api.openai.com")
-            .trim_end_matches('/')
+        self.config.base_url("https://api.openai.com")
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
@@ -54,6 +49,13 @@ impl CompletionsAdapter {
                             ContentBlock::Thought { .. } | ContentBlock::ToolCall { .. } => None,
                         })
                         .collect::<String>();
+                    let reasoning = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Thought { text, .. } => Some(text.as_str()),
+                            ContentBlock::Text(_) | ContentBlock::ToolCall { .. } => None,
+                        })
+                        .collect::<String>();
                     let calls: Vec<Value> = blocks
                         .iter()
                         .filter_map(|block| match block {
@@ -70,10 +72,13 @@ impl CompletionsAdapter {
                         })
                         .collect();
                     let mut value = json!({"role": "assistant", "content": text});
+                    if !reasoning.is_empty() {
+                        value["reasoning_content"] = json!(reasoning);
+                    }
                     if !calls.is_empty() {
                         value["tool_calls"] = json!(calls);
                     }
-                    if !text.is_empty() || !calls.is_empty() {
+                    if !text.is_empty() || !reasoning.is_empty() || !calls.is_empty() {
                         messages.push(value);
                     }
                     index += 1;
@@ -135,14 +140,7 @@ fn chat_content(contents: &[ash_core::Content]) -> Value {
         .iter()
         .any(|content| matches!(content, ash_core::Content::Image { .. }))
     {
-        return json!(contents
-            .iter()
-            .filter_map(|content| match content {
-                ash_core::Content::Text(text) => Some(text.as_str()),
-                ash_core::Content::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"));
+        return json!(join_text_contents(contents));
     }
 
     json!(contents
@@ -152,10 +150,7 @@ fn chat_content(contents: &[ash_core::Content]) -> Value {
             ash_core::Content::Image { media_type, data } => json!({
                 "type": "image_url",
                 "image_url": {
-                    "url": format!(
-                        "data:{media_type};base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(data)
-                    )
+                    "url": image_data_url(media_type, data),
                 }
             }),
         })
@@ -368,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_persisted_thoughts_from_chat_completion_history() {
+    fn includes_persisted_thoughts_in_chat_completion_history() {
         let adapter = CompletionsAdapter::new(ProviderConfig {
             protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
@@ -394,8 +389,54 @@ mod tests {
 
         let body = adapter.build_request(&request).unwrap();
 
+        assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"], "visible answer");
-        assert!(!body.to_string().contains("private reasoning"));
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            "private reasoning"
+        );
+    }
+
+    #[test]
+    fn includes_persisted_thoughts_alongside_tool_calls_in_chat_completion_history() {
+        // DeepSeek requires the `reasoning_content` of a tool-calling turn to be
+        // echoed back verbatim in the next request; the assistant message then
+        // carries both the thought and the tool calls together.
+        let adapter = CompletionsAdapter::new(ProviderConfig {
+            protocol: Protocol::Completions,
+            api_key: SecretString::from("test"),
+            base_url: None,
+        });
+        let request = ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: MessageContent::Assistant(vec![
+                    ContentBlock::Thought {
+                        text: "step reasoning".into(),
+                        elapsed_seconds: 2,
+                    },
+                    ContentBlock::ToolCall {
+                        id: ToolCallId::from_provider("call_1"),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "pwd"}),
+                    },
+                ]),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = adapter.build_request(&request).unwrap();
+
+        let message = &body["messages"][0];
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["content"], "");
+        assert_eq!(message["reasoning_content"], "step reasoning");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "bash");
     }
 
     #[test]

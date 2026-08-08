@@ -127,7 +127,7 @@ impl Skill {
     }
 }
 
-pub fn tool(skills: Vec<Skill>) -> Arc<dyn Tool> {
+pub fn tool(skills: Vec<Skill>) -> Result<Arc<dyn Tool>, ToolError> {
     let skills = Arc::new(skills);
     define_tool(
         SKILL_TOOL_NAME,
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn runtime_tool_exposes_only_its_name_argument() {
-        let definition = tool(Vec::new()).definition();
+        let definition = tool(Vec::new()).unwrap().definition();
         let properties = definition.parameters_schema["properties"]
             .as_object()
             .unwrap()

@@ -140,11 +140,6 @@ impl LiveBlock {
         self.turn_id
     }
 
-    pub(crate) fn is_response_for_turn(&self, turn_id: u64) -> bool {
-        self.belongs_to_turn(turn_id)
-            && !matches!(self.kind, LiveBlockKind::History(HistoryBlock::User(_)))
-    }
-
     /// Blocks produced by live streaming for this turn (assistant text,
     /// reasoning, tool output). They are replaced by the canonical projection
     /// when the turn settles; user input and error blocks are kept.
@@ -157,6 +152,33 @@ impl LiveBlock {
                     | LiveBlockKind::ReadGroup(_)
                     | LiveBlockKind::Tool { .. }
             )
+    }
+
+    /// Whether this turn has a completed tool result. Tool completion is the
+    /// only reliable boundary while a streamed response is still active;
+    /// finalized text and reasoning do not keep an interrupted turn.
+    pub(crate) fn is_completed_tool_for_turn(&self, turn_id: u64) -> bool {
+        self.belongs_to_turn(turn_id)
+            && matches!(
+                self.kind,
+                LiveBlockKind::ReadGroup(_) | LiveBlockKind::Tool { .. }
+            )
+    }
+
+    pub(crate) fn is_unfinished_response_for_turn(&self, turn_id: u64) -> bool {
+        self.belongs_to_turn(turn_id)
+            && matches!(
+                self.kind,
+                LiveBlockKind::Assistant {
+                    streaming: true,
+                    ..
+                }
+            )
+    }
+
+    pub(crate) fn matches_history_for_turn(&self, turn_id: u64, expected: &HistoryBlock) -> bool {
+        self.belongs_to_turn(turn_id)
+            && matches!(&self.kind, LiveBlockKind::History(actual) if actual == expected)
     }
 
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
@@ -953,11 +975,19 @@ mod tests {
     #[test]
     fn blocks_keep_turn_ownership() {
         let response = LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(7));
-        let input = LiveBlock::history(2, HistoryBlock::user("question")).with_turn(Some(7));
 
         assert!(response.belongs_to_turn(7));
-        assert!(response.is_response_for_turn(7));
-        assert!(!input.is_response_for_turn(7));
+        assert!(!response.belongs_to_turn(8));
+    }
+
+    #[test]
+    fn history_matching_requires_the_same_content_and_turn() {
+        let error = HistoryBlock::error("provider failed");
+        let block = LiveBlock::history(1, error.clone()).with_turn(Some(7));
+
+        assert!(block.matches_history_for_turn(7, &error));
+        assert!(!block.matches_history_for_turn(8, &error));
+        assert!(!block.matches_history_for_turn(7, &HistoryBlock::error("other error")));
     }
 
     #[test]
@@ -1209,6 +1239,40 @@ mod generic_output_tests {
             .filter_map(|column| buffer.cell((column, row)))
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn finalized_assistant_does_not_count_as_a_completed_tool() {
+        let mut block = LiveBlock::assistant(1, String::new()).with_turn(Some(7));
+        assert!(block.append_markdown_source("partial"));
+        assert!(block.is_unfinished_response_for_turn(7));
+        assert!(!block.is_completed_tool_for_turn(7));
+
+        block.finalize_markdown();
+        assert!(!block.is_unfinished_response_for_turn(7));
+        assert!(!block.is_completed_tool_for_turn(7));
+    }
+
+    #[test]
+    fn completed_thought_does_not_count_as_a_completed_tool() {
+        let block = LiveBlock::thought(1, "finished reasoning".to_string(), 3).with_turn(Some(7));
+
+        assert!(!block.is_completed_tool_for_turn(7));
+    }
+
+    #[test]
+    fn completed_tool_result_keeps_the_interrupted_turn() {
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "pwd"}),
+            "/work/ash".to_string(),
+            false,
+        )
+        .with_turn(Some(7));
+
+        assert!(block.is_completed_tool_for_turn(7));
+        assert!(!block.is_completed_tool_for_turn(8));
     }
 
     #[test]

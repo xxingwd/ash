@@ -90,7 +90,11 @@ pub struct FnTool<Args, F, Fut, Output> {
     _phantom: std::marker::PhantomData<fn(Args) -> (Fut, Output)>,
 }
 
-pub fn define_tool<Args, F, Fut, Output>(name: &str, description: &str, f: F) -> Arc<dyn Tool>
+pub fn define_tool<Args, F, Fut, Output>(
+    name: &str,
+    description: &str,
+    f: F,
+) -> Result<Arc<dyn Tool>, ToolError>
 where
     Args: serde::de::DeserializeOwned + Send + Sync + schemars::JsonSchema + 'static,
     F: Fn(ToolContext, Args) -> Fut + Send + Sync + Clone + 'static,
@@ -98,15 +102,19 @@ where
     Output: Into<ToolOutput> + Send + Sync + 'static,
 {
     let schema = schemars::schema_for!(Args);
-    let schema_value = serde_json::to_value(schema).unwrap_or_default();
+    let schema_value = serde_json::to_value(schema).map_err(|error| {
+        ToolError::Execution(format!(
+            "cannot serialize schema for tool '{name}': {error}"
+        ))
+    })?;
 
-    Arc::new(FnTool {
+    Ok(Arc::new(FnTool {
         name: name.to_string(),
         description: description.to_string(),
         schema: schema_value,
         execute: f,
         _phantom: std::marker::PhantomData,
-    })
+    }))
 }
 
 #[async_trait::async_trait]

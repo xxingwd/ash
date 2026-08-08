@@ -49,10 +49,10 @@ decide when queued work starts. This gives chat gateways, CLI/TUI clients, sched
 heartbeats, and child agents identical ordering and cancellation behavior.
 
 `Thread::submit` returns a `Turn` handle. `Thread::enqueue` creates fire-and-forget work for
-external triggers. `Thread::notify` attaches a message to the next submitted turn without
-starting work, which is useful for child-agent mailboxes. Schedulers and heartbeat timers remain
-product infrastructure; they create typed `Input` values and call `enqueue` instead of bypassing
-the thread.
+external triggers. `Thread::notify` queues a message without starting work; the inbox is prepended
+when the next queued turn starts, including a turn that was already submitted while another turn
+was active. This is useful for child-agent mailboxes. Schedulers and heartbeat timers remain product
+infrastructure; they create typed `Input` values and call `enqueue` instead of bypassing the thread.
 
 ## Submit And Steer
 
@@ -101,7 +101,8 @@ on the JSONL writer type.
 
 The default `JsonlThreadStore` stores new threads as `{thread_id}.jsonl`. Its compact first record
 contains only list metadata, so listing does not replay thread logs. Loading addresses files
-directly by id and only replays the selected thread.
+directly by id and only replays the selected thread. The header must be valid; later malformed
+records are skipped with a warning so valid records after a damaged line can still be recovered.
 
 `ThreadMetadata` carries the typed `ThreadKind` (`Root` or `Subagent`) used by persistence and
 session listing. Runtime code derives that value from `ThreadOptions.kind`.
@@ -203,11 +204,22 @@ from memory and from the staged log (`ThreadPersistence::rollback_to`), so a
 successful retry leaves no trace of the failed attempt; when the retry budget
 is exhausted the final partial output is kept and the turn ends with
 `StopReason::Truncated`, visible to the user as an incomplete response.
+Context preparation happens before the retry snapshot, so a compaction checkpoint
+created for the request remains durable across failed attempts.
 
 ## Product Boundary
 
-The TUI owns drafts, menus, viewport state, and a display projection of queued prompts. The CLI
-routes UI commands and continuously forwards thread events. Neither layer owns execution order.
+The TUI owns drafts, menus, viewport state, and interaction feedback. While idle, Enter submits a
+new turn; while a turn is running, Enter steers that exact turn. Escape discards the open response
+block and interrupts the active turn. Only a completed tool result keeps an interrupted turn; text
+and reasoning are not reliable completion boundaries while a response is streaming. Without a
+completed tool result, the controller settles and rolls back the whole turn so the original prompt
+returns to the composer. Commands remain visible while work is active, but
+session-mutating commands are silently rejected locally and remain in the composer; read-only
+commands execute immediately. The CLI retains the active `Turn` handle, routes UI commands, and
+continuously forwards thread events. Cancellation only cancels that handle; after its `Turn` event,
+the TUI either commits the interrupted turn or requests an ordinary rollback. Neither layer owns
+execution order.
 
 A chat integration follows the same pattern:
 

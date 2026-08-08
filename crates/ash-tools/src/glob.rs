@@ -1,10 +1,11 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
-use ash_core::{define_tool, Tool, ToolError};
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
+use ignore::overrides::OverrideBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -20,23 +21,38 @@ struct GlobArgs {
     path: Option<String>,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "glob",
         "Find files by glob pattern inside the working directory. Respects ignore files and returns at most 100 workspace-relative paths.",
-        move |_ctx, args: GlobArgs| {
+        move |ctx, args: GlobArgs| {
             let root = Arc::clone(&working_dir);
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
             async move {
-            crate::path::run_blocking(move || {
-                find_files(&root, args.path.as_deref().unwrap_or("."), &args.pattern)
-            })
-            .await
+                crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
+                    find_files(
+                        &root,
+                        args.path.as_deref().unwrap_or("."),
+                        &args.pattern,
+                        cancellation,
+                        deadline,
+                    )
+                })
+                .await
             }
         },
     )
 }
 
-fn find_files(root: &Path, requested: &str, pattern: &str) -> Result<String, ToolError> {
+fn find_files(
+    root: &Path,
+    requested: &str,
+    pattern: &str,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<String, ToolError> {
+    crate::path::ensure_running(&cancellation, deadline)?;
     if pattern.is_empty() {
         return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
@@ -55,14 +71,11 @@ fn find_files(root: &Path, requested: &str, pattern: &str) -> Result<String, Too
     let overrides = overrides
         .build()
         .map_err(|error| ToolError::Execution(format!("invalid glob pattern: {error}")))?;
-    let mut builder = WalkBuilder::new(search.full_path());
-    builder
-        .follow_links(false)
-        .require_git(false)
-        .sort_by_file_path(|left, right| left.cmp(right));
+    let builder = crate::path::file_walker(search.full_path());
 
     let mut files = Vec::new();
     for entry in builder.build() {
+        crate::path::ensure_running(&cancellation, deadline)?;
         let entry =
             entry.map_err(|error| ToolError::Execution(format!("cannot search files: {error}")))?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -79,6 +92,7 @@ fn find_files(root: &Path, requested: &str, pattern: &str) -> Result<String, Too
     files.sort();
     let truncated = files.len() > MAX_RESULTS;
     files.truncate(MAX_RESULTS);
+    crate::path::ensure_running(&cancellation, deadline)?;
 
     if files.is_empty() {
         return Ok("No files found".into());
@@ -97,6 +111,7 @@ fn find_files(root: &Path, requested: &str, pattern: &str) -> Result<String, Too
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn matches_files_and_respects_gitignore() {
@@ -107,7 +122,14 @@ mod tests {
         std::fs::write(root.path().join("src/ignored.rs"), "").unwrap();
         std::fs::write(root.path().join(".gitignore"), "src/ignored.rs\n").unwrap();
 
-        let output = find_files(root.path(), ".", "*.rs").unwrap();
+        let output = find_files(
+            root.path(),
+            ".",
+            "*.rs",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert!(output.contains("src/lib.rs"));
         assert!(output.contains("src/nested/mod.rs"));
@@ -119,7 +141,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file.rs"), "").unwrap();
 
-        assert!(find_files(root.path(), "file.rs", "*.rs").is_err());
+        assert!(find_files(
+            root.path(),
+            "file.rs",
+            "*.rs",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .is_err());
     }
 
     #[test]
@@ -129,7 +158,14 @@ mod tests {
             std::fs::write(root.path().join(format!("{index:03}.rs")), "").unwrap();
         }
 
-        let output = find_files(root.path(), ".", "*.rs").unwrap();
+        let output = find_files(
+            root.path(),
+            ".",
+            "*.rs",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert_eq!(
             output.lines().filter(|line| line.ends_with(".rs")).count(),
@@ -146,8 +182,34 @@ mod tests {
         std::fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
 
-        let output = find_files(root.path(), ".", "*.rs").unwrap();
+        let output = find_files(
+            root.path(),
+            ".",
+            "*.rs",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert_eq!(output, "No files found");
+    }
+
+    #[test]
+    fn cancelled_search_returns_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = find_files(
+            root.path(),
+            ".",
+            "*.rs",
+            cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
     }
 }

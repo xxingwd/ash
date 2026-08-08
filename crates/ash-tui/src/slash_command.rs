@@ -1,3 +1,5 @@
+use crate::picker::PickerState;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlashCommand {
     New,
@@ -35,8 +37,7 @@ pub(crate) struct CommandCompletion {
 pub(crate) struct CommandCompletionState {
     filter: Option<String>,
     dismissed_filter: Option<String>,
-    items: Vec<CommandCompletion>,
-    selected: usize,
+    picker: PickerState<CommandCompletion>,
 }
 
 const COMMANDS: &[CommandSpec] = &[
@@ -91,15 +92,11 @@ const COMMANDS: &[CommandSpec] = &[
 ];
 
 impl SlashCommand {
-    pub(crate) fn available_during_task(self) -> bool {
-        matches!(self, Self::Exit)
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        COMMANDS
-            .iter()
-            .find(|spec| spec.command == self)
-            .map_or("command", |spec| spec.name)
+    pub(crate) fn requires_idle(self) -> bool {
+        matches!(
+            self,
+            Self::New | Self::Clear | Self::Undo | Self::Fork | Self::Compact | Self::Resume
+        )
     }
 }
 
@@ -146,13 +143,10 @@ pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {
     Some(input[1..cursor.max(1)].to_ascii_lowercase())
 }
 
-fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
+fn completions(filter: &str) -> Vec<CommandCompletion> {
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
-    for spec in COMMANDS
-        .iter()
-        .filter(|spec| !busy || spec.command.available_during_task())
-    {
+    for spec in COMMANDS {
         let names = std::iter::once(spec.name).chain(spec.aliases.iter().copied());
         let is_exact = names.clone().any(|name| name == filter);
         let is_prefix = names.into_iter().any(|name| name.starts_with(filter));
@@ -171,65 +165,49 @@ fn completions(filter: &str, busy: bool) -> Vec<CommandCompletion> {
 }
 
 impl CommandCompletionState {
-    pub(crate) fn sync(&mut self, input: &str, cursor: usize, busy: bool) {
+    pub(crate) fn sync(&mut self, input: &str, cursor: usize) {
         let filter = completion_filter(input, cursor);
         if filter != self.filter {
             self.filter.clone_from(&filter);
             self.dismissed_filter = None;
-            self.selected = 0;
+            self.picker.set_selected(0);
         }
         if filter.is_some() && filter == self.dismissed_filter {
-            self.items.clear();
+            self.picker.clear();
             return;
         }
-        self.items = filter
-            .as_deref()
-            .map(|filter| completions(filter, busy))
-            .unwrap_or_default();
-        if self.items.is_empty() {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(self.items.len() - 1);
-        }
+        let items = filter.as_deref().map(completions).unwrap_or_default();
+        self.picker.replace_items(items);
     }
 
     pub(crate) fn items(&self) -> &[CommandCompletion] {
-        &self.items
+        self.picker.items()
     }
 
     pub(crate) fn selected_index(&self) -> usize {
-        self.selected
+        self.picker.selected_index()
     }
 
     pub(crate) fn selected(&self) -> Option<CommandCompletion> {
-        self.items.get(self.selected).copied()
+        let index = self.picker.selected_index();
+        self.picker.items().get(index).copied()
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.items.is_empty() {
-            return;
-        }
-        self.selected = if self.selected == 0 {
-            self.items.len() - 1
-        } else {
-            self.selected - 1
-        };
+        self.picker.move_up();
     }
 
     pub(crate) fn move_down(&mut self) {
-        if !self.items.is_empty() {
-            self.selected = (self.selected + 1) % self.items.len();
-        }
+        self.picker.move_down();
     }
 
     pub(crate) fn dismiss(&mut self) {
         self.dismissed_filter.clone_from(&self.filter);
-        self.items.clear();
-        self.selected = 0;
+        self.picker.clear();
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        !self.items.is_empty()
+        self.picker.is_visible()
     }
 }
 
@@ -264,35 +242,40 @@ mod tests {
     }
 
     #[test]
-    fn only_exit_is_available_during_a_task() {
-        assert!(SlashCommand::Exit.available_during_task());
-        assert!(!SlashCommand::New.available_during_task());
-        assert!(!SlashCommand::Clear.available_during_task());
-        assert!(!SlashCommand::Resume.available_during_task());
-        assert!(!SlashCommand::Undo.available_during_task());
-        assert!(!SlashCommand::Fork.available_during_task());
-        assert!(!SlashCommand::Compact.available_during_task());
+    fn only_non_mutating_commands_can_run_during_a_turn() {
+        for command in [
+            SlashCommand::New,
+            SlashCommand::Clear,
+            SlashCommand::Undo,
+            SlashCommand::Fork,
+            SlashCommand::Compact,
+            SlashCommand::Resume,
+        ] {
+            assert!(command.requires_idle(), "{command:?}");
+        }
+        assert!(!SlashCommand::Status.requires_idle());
+        assert!(!SlashCommand::Exit.requires_idle());
     }
 
     #[test]
     fn completes_commands_by_name_and_alias_prefix() {
         assert_eq!(
-            completions("cl", false),
+            completions("cl"),
             vec![CommandCompletion {
                 name: "clear",
                 description: "start a new chat",
             }]
         );
-        assert_eq!(completions("q", false)[0].name, "exit");
+        assert_eq!(completions("q")[0].name, "exit");
         assert_eq!(
-            completions("fork", false),
+            completions("fork"),
             vec![CommandCompletion {
                 name: "fork",
                 description: "choose a prompt to fork from",
             }]
         );
         assert_eq!(
-            completions("undo", false),
+            completions("undo"),
             vec![CommandCompletion {
                 name: "undo",
                 description: "undo the last submitted prompt",
@@ -303,23 +286,22 @@ mod tests {
     #[test]
     fn completion_state_navigates_and_can_be_dismissed() {
         let mut state = CommandCompletionState::default();
-        state.sync("/", 1, false);
+        state.sync("/", 1);
         assert_eq!(state.selected().unwrap().name, "new");
         state.move_down();
         assert_eq!(state.selected().unwrap().name, "clear");
         state.move_up();
         assert_eq!(state.selected().unwrap().name, "new");
         state.dismiss();
-        state.sync("/", 1, false);
+        state.sync("/", 1);
         assert!(!state.is_visible());
-        state.sync("/st", 3, false);
+        state.sync("/st", 3);
         assert_eq!(state.selected().unwrap().name, "status");
     }
 
     #[test]
-    fn busy_completion_only_shows_available_commands() {
-        let items = completions("", true);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, "exit");
+    fn completion_always_shows_every_command() {
+        let items = completions("");
+        assert_eq!(items.len(), COMMANDS.len());
     }
 }

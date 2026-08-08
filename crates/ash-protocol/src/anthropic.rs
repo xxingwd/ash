@@ -1,11 +1,10 @@
 use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
-use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    model_config,
+    base64_image, model_config,
     pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
     project_request_messages, sse, ProviderConfig,
@@ -28,11 +27,7 @@ impl AnthropicAdapter {
     }
 
     fn base_url(&self) -> &str {
-        self.config
-            .base_url
-            .as_deref()
-            .unwrap_or("https://api.anthropic.com")
-            .trim_end_matches('/')
+        self.config.base_url("https://api.anthropic.com")
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
@@ -53,7 +48,7 @@ impl AnthropicAdapter {
                                 "source": {
                                     "type": "base64",
                                     "media_type": media_type,
-                                    "data": base64::engine::general_purpose::STANDARD.encode(data),
+                                    "data": base64_image(data),
                                 }
                             }),
                         })
@@ -63,19 +58,22 @@ impl AnthropicAdapter {
                 MessageContent::Assistant(blocks) => {
                     let content: Vec<Value> = blocks
                         .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text(text) => Some(json!({"type": "text", "text": text})),
-                            ContentBlock::Thought { .. } => None,
+                        .map(|block| match block {
+                            ContentBlock::Text(text) => json!({"type": "text", "text": text}),
+                            ContentBlock::Thought { text, .. } => json!({
+                                "type": "thinking",
+                                "thinking": text,
+                            }),
                             ContentBlock::ToolCall {
                                 id,
                                 name,
                                 arguments,
-                            } => Some(json!({
+                            } => json!({
                                 "type": "tool_use",
                                 "id": id.as_str(),
                                 "name": name,
                                 "input": arguments,
-                            })),
+                            }),
                         })
                         .collect();
                     (!content.is_empty()).then(|| json!({"role": "assistant", "content": content}))
@@ -97,7 +95,7 @@ impl AnthropicAdapter {
                             "source": {
                                 "type": "base64",
                                 "media_type": media_type,
-                                "data": base64::engine::general_purpose::STANDARD.encode(data),
+                                "data": base64_image(data),
                             }
                         }),
                     }));
@@ -396,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_persisted_thoughts_from_anthropic_history() {
+    fn includes_persisted_thoughts_in_anthropic_history() {
         let adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
@@ -422,8 +420,11 @@ mod tests {
 
         let body = adapter.build_request(&request).unwrap();
 
-        assert_eq!(body["messages"][0]["content"][0]["text"], "visible answer");
-        assert!(!body.to_string().contains("private reasoning"));
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "private reasoning");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "visible answer");
     }
 
     #[test]

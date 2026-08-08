@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ash_core::{ContentBlock, MessageContent, ProtocolError};
-use base64::Engine;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    consecutive_tool_results, model_config,
+    consecutive_tool_results, image_data_url, join_text_contents, model_config,
     pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
     project_request_messages, sse, ProviderConfig,
@@ -28,11 +27,7 @@ impl ResponsesAdapter {
     }
 
     fn base_url(&self) -> &str {
-        self.config
-            .base_url
-            .as_deref()
-            .unwrap_or("https://api.openai.com")
-            .trim_end_matches('/')
+        self.config.base_url("https://api.openai.com")
     }
 
     fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
@@ -56,6 +51,13 @@ impl ResponsesAdapter {
                     if !text.is_empty() {
                         input.push(json!({"role": "assistant", "content": text}));
                     }
+                    input.extend(blocks.iter().filter_map(|block| match block {
+                        ContentBlock::Thought { text, .. } => Some(json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": text}],
+                        })),
+                        ContentBlock::Text(_) | ContentBlock::ToolCall { .. } => None,
+                    }));
                     input.extend(blocks.iter().filter_map(|block| match block {
                         ContentBlock::ToolCall {
                             id,
@@ -127,14 +129,7 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
         .iter()
         .any(|content| matches!(content, ash_core::Content::Image { .. }))
     {
-        return json!(contents
-            .iter()
-            .filter_map(|content| match content {
-                ash_core::Content::Text(text) => Some(text.as_str()),
-                ash_core::Content::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"));
+        return json!(join_text_contents(contents));
     }
 
     json!(contents
@@ -143,10 +138,7 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
             ash_core::Content::Text(text) => json!({"type": "input_text", "text": text}),
             ash_core::Content::Image { media_type, data } => json!({
                 "type": "input_image",
-                "image_url": format!(
-                    "data:{media_type};base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(data)
-                ),
+                "image_url": image_data_url(media_type, data),
             }),
         })
         .collect::<Vec<_>>())
@@ -324,6 +316,9 @@ impl sse::Decoder for ResponsesDecoder {
             "response.output_item.added" => {
                 let item = &event["item"];
                 if item["type"].as_str() == Some("reasoning") {
+                    // A new reasoning item starts a fresh summary sequence and may
+                    // reuse summary indices from the previous item, so drop the
+                    // tracking before its deltas arrive.
                     self.streamed_reasoning_summaries.clear();
                 } else if item["type"].as_str() == Some("function_call") {
                     let key = self.item_key(&event)?;
@@ -558,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_persisted_thoughts_from_responses_history() {
+    fn includes_persisted_thoughts_in_responses_history() {
         let adapter = ResponsesAdapter::new(ProviderConfig {
             protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
@@ -584,8 +579,10 @@ mod tests {
 
         let body = adapter.build_request(&request).unwrap();
 
+        assert_eq!(body["input"][0]["role"], "assistant");
         assert_eq!(body["input"][0]["content"], "visible answer");
-        assert!(!body.to_string().contains("private reasoning"));
+        assert_eq!(body["input"][1]["type"], "reasoning");
+        assert_eq!(body["input"][1]["summary"][0]["text"], "private reasoning");
     }
 
     #[test]

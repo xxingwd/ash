@@ -232,9 +232,8 @@ impl Projector {
                     open.events.push(OpenEvent::Checkpoint(checkpoint.clone()));
                 }
             }
-            LogEntry::TurnEnd { id, result, usage } => {
+            LogEntry::TurnEnd { result, usage, .. } => {
                 if let Some(open) = self.open.take() {
-                    debug_assert_eq!(open.id, *id);
                     self.settle(&open);
                     self.turns.push(TurnView {
                         id: open.id,

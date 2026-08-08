@@ -417,9 +417,18 @@ fn push_line(data: &mut String, record: FileRecord) -> Result<(), ash_core::AshE
 }
 
 fn default_thread_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "ash")
-        .map(|dirs| dirs.data_dir().join("threads"))
-        .unwrap_or_else(|| PathBuf::from(".ash/threads"))
+    thread_dir_from_data_dir(
+        directories::ProjectDirs::from("", "", "ash").map(|dirs| dirs.data_dir().to_path_buf()),
+    )
+}
+
+/// The default threads directory is the platform data dir plus `threads`, or
+/// the relative `.ash/threads` fallback when no platform data dir is
+/// available. Pure so both branches are covered by regression tests.
+fn thread_dir_from_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
+    data_dir
+        .map(|dir| dir.join("threads"))
+        .unwrap_or_else(|| PathBuf::from(".ash").join("threads"))
 }
 
 fn thread_filename(thread_id: ThreadId) -> String {
@@ -438,21 +447,23 @@ fn canonical_thread_id(path: &Path) -> Option<ThreadId> {
 }
 
 async fn create_locked_thread(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    let file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .open(path)
-        .await?;
-    lock_thread(file, path).await
+    locked_thread(path, true).await
 }
 
 async fn open_locked_thread(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)
-        .await?;
+    locked_thread(path, false).await
+}
+
+async fn locked_thread(
+    path: &Path,
+    create_new: bool,
+) -> Result<tokio::fs::File, ash_core::AshError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).append(true);
+    if create_new {
+        options.create_new(true);
+    }
+    let file = options.open(path).await?;
     lock_thread(file, path).await
 }
 
@@ -890,6 +901,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loading_skips_a_malformed_record_and_keeps_the_valid_tail() {
+        let directory = TempDir::new().unwrap();
+        let thread_id = ThreadId::new();
+        let path = directory.path().join(thread_filename(thread_id));
+        let mut contents = String::new();
+        push_line(
+            &mut contents,
+            FileRecord::ThreadHeader(ThreadHeader {
+                thread_id,
+                title: Some("recoverable".to_string()),
+                kind: ThreadKind::Root,
+            }),
+        )
+        .unwrap();
+        push_line(
+            &mut contents,
+            FileRecord::UserMessage(Message::user("before damage")),
+        )
+        .unwrap();
+        contents.push_str("malformed record\n");
+        push_line(
+            &mut contents,
+            FileRecord::UserMessage(Message::user("after damage")),
+        )
+        .unwrap();
+        tokio::fs::write(path, contents).await.unwrap();
+
+        let store = JsonlThreadStore::new(directory.path());
+        let loaded = store.load(thread_id).await.unwrap().unwrap();
+        let prompts = loaded
+            .log
+            .messages()
+            .iter()
+            .filter_map(Message::user_turn_text)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["before damage", "after damage"]);
+    }
+
+    #[tokio::test]
     async fn rejects_a_header_that_does_not_match_the_filename() {
         let directory = TempDir::new().unwrap();
         let filename_id = ThreadId::new();
@@ -974,6 +1024,23 @@ mod tests {
 
         let loaded = store.load(thread_id).await.unwrap().unwrap();
         assert_eq!(loaded.log.messages().len(), 2);
+    }
+
+    #[test]
+    fn default_thread_dir_appends_threads_to_the_platform_data_dir() {
+        let data_dir = PathBuf::from("var/lib/ash");
+        assert_eq!(
+            thread_dir_from_data_dir(Some(data_dir.clone())),
+            data_dir.join("threads")
+        );
+    }
+
+    #[test]
+    fn default_thread_dir_falls_back_to_a_relative_dot_ash_dir() {
+        assert_eq!(
+            thread_dir_from_data_dir(None),
+            PathBuf::from(".ash").join("threads")
+        );
     }
 
     #[test]

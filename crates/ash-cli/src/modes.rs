@@ -1,18 +1,16 @@
 use anyhow::{Context, Result};
 use ash_agent::{
     build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
-    ThreadOptions, DEFAULT_MAX_CONTEXT_TOKENS,
+    ThreadOptions, Turn, DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_core::{
-    CancellationToken, EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId,
-};
+use ash_core::{EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, TurnId};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
-use ash_tui::UiCommand;
+use ash_tui::{UiCommand, UiError};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
 
-use crate::Cli;
+use crate::{Cli, Command};
 
 const DEFAULT_MAX_TURNS: u32 = 100;
 const DEFAULT_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -29,47 +27,35 @@ struct InteractiveController {
 
 #[derive(Default)]
 struct TurnState {
-    cancellations: std::collections::HashMap<TurnId, CancellationToken>,
-    active: Option<TurnId>,
-    rollback_after_cancel: Option<TurnId>,
+    active: Option<Turn>,
 }
 
 impl TurnState {
-    fn track(&mut self, id: TurnId, cancellation: CancellationToken) {
-        self.cancellations.insert(id, cancellation);
+    fn track(&mut self, turn: Turn) {
+        self.active = Some(turn);
     }
 
-    fn start(&mut self, id: Option<TurnId>) {
-        self.active = id;
-    }
-
-    fn finish(&mut self, id: Option<TurnId>) -> bool {
-        let Some(id) = id else {
-            return false;
-        };
-        self.cancellations.remove(&id);
-        if self.active == Some(id) {
+    fn finish(&mut self, id: Option<TurnId>) {
+        if self.active.as_ref().map(Turn::id) == id {
             self.active = None;
         }
-        if self.rollback_after_cancel == Some(id) {
-            self.rollback_after_cancel = None;
-            return true;
-        }
-        false
     }
 
-    fn cancel_active(&mut self, rollback: bool) -> bool {
-        let Some(id) = self.active else {
+    fn cancel_active(&self) -> bool {
+        let Some(turn) = &self.active else {
             return false;
         };
-        let Some(cancellation) = self.cancellations.get(&id) else {
-            return false;
-        };
-        if rollback {
-            self.rollback_after_cancel = Some(id);
-        }
-        cancellation.cancel();
+        turn.cancellation_token().cancel();
         true
+    }
+
+    async fn steer_active(&self, input: String) -> Result<(), UiError> {
+        let turn = self.active.as_ref().ok_or_else(|| {
+            UiError::Agent(ash_core::AshError::Config(
+                "the active turn has already finished".to_string(),
+            ))
+        })?;
+        turn.steer(input).await.map_err(UiError::from)
     }
 
     fn reset(&mut self) {
@@ -85,11 +71,15 @@ struct AgentSetup {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let setup = build_config(&cli)?;
-    if cli.print {
-        run_print(setup, cli.prompt).await
-    } else {
-        run_interactive(setup).await
+    match &cli.command {
+        Some(Command::Run { prompt, .. }) => {
+            let setup = build_config(&cli)?;
+            run_print(setup, prompt.clone()).await
+        }
+        None => {
+            let setup = build_config(&cli)?;
+            run_interactive(setup).await
+        }
     }
 }
 
@@ -135,7 +125,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
             .as_ref()
             .and_then(|skill| skill.tools.as_deref()),
     )?;
-    tools.push(skill_tool(skills.clone()));
+    tools.push(skill_tool(skills.clone())?);
 
     let provider = ProviderConfig {
         protocol: protocol.clone(),
@@ -165,7 +155,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         options.clone(),
         runtime.clone(),
         max_concurrent_agents,
-    )
+    )?
     .map(|control| control.subscribe());
 
     Ok(AgentSetup {
@@ -238,7 +228,29 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         }
     }
     println!();
+    print_usage(&thread).await;
     Ok(())
+}
+
+/// Print the completed turn's token usage to stderr, mirroring the tool
+/// diagnostics already shown there. Useful when diagnosing a run.
+async fn print_usage(thread: &Thread) {
+    let Ok(view) = thread.view().await else {
+        return;
+    };
+    let Some(turn) = view.turns.last() else {
+        return;
+    };
+    let Some(usage) = turn.usage else {
+        return;
+    };
+    eprintln!(
+        "[usage: {} in / {} out tokens, {} ms{}]",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.generation_ms,
+        if usage.estimated { " (estimated)" } else { "" }
+    );
 }
 
 fn print_event(event: EventKind) {
@@ -308,18 +320,12 @@ impl InteractiveController {
         let mut turns = TurnState::default();
         loop {
             tokio::select! {
-                biased;
                 event = events.next() => match event {
                     Some(Ok(event)) => {
-                        if matches!(event.kind, EventKind::TurnStart) {
-                            turns.start(event.turn_id);
+                        if matches!(event.kind, EventKind::Turn(_)) {
+                            turns.finish(event.turn_id);
                         }
-                        let completed = matches!(event.kind, EventKind::Turn(_));
-                        let completed_turn = event.turn_id;
                         let _ = self.event_tx.send(event.kind).await;
-                        if completed && turns.finish(completed_turn) {
-                            self.rollback_last_turn().await;
-                        }
                     }
                     Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
                     None => break,
@@ -327,26 +333,26 @@ impl InteractiveController {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else { break };
                     match command {
-                        UiCommand::Submit(input) => {
-                            if let Err(error) = self.history_store.append(self.thread.id(), &input).await {
-                                tracing::warn!(%error, "failed to persist input history");
-                            }
-                            match self.thread.submit(input).await {
+                        UiCommand::Submit { input, reply } => {
+                            let result = match self.thread.submit(input.clone()).await {
                                 Ok(turn) => {
-                                    turns.track(turn.id(), turn.cancellation_token());
+                                    turns.track(turn);
+                                    self.record_input(&input).await;
+                                    Ok(())
                                 }
-                                Err(error) => {
-                                    let _ = self.event_tx.send(EventKind::Error(error.to_string())).await;
-                                }
+                                Err(error) => Err(error.into()),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        UiCommand::Steer { input, reply } => {
+                            let result = turns.steer_active(input.clone()).await;
+                            if result.is_ok() {
+                                self.record_input(&input).await;
                             }
+                            let _ = reply.send(result);
                         }
                         UiCommand::Cancel => {
-                            turns.cancel_active(false);
-                        }
-                        UiCommand::CancelAndRollback => {
-                            if !turns.cancel_active(true) {
-                                self.rollback_last_turn().await;
-                            }
+                            turns.cancel_active();
                         }
                         UiCommand::Rollback => self.rollback_last_turn().await,
                         UiCommand::Compact => self.compact_thread().await,
@@ -368,12 +374,18 @@ impl InteractiveController {
                             turns.reset();
                         }
                         UiCommand::Exit => {
-                            turns.cancel_active(false);
+                            turns.cancel_active();
                             break;
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn record_input(&self, input: &str) {
+        if let Err(error) = self.history_store.append(self.thread.id(), input).await {
+            tracing::warn!(%error, "failed to persist input history");
         }
     }
 
@@ -501,33 +513,5 @@ mod tests {
             assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);
         }
         assert!(parse_protocol("responses").is_err());
-    }
-
-    #[test]
-    fn rollback_is_bound_to_the_cancelled_turn() {
-        let turn_id = TurnId::new();
-        let mut turns = TurnState::default();
-        turns.track(turn_id, CancellationToken::new());
-        turns.start(Some(turn_id));
-
-        assert!(turns.cancel_active(true));
-        assert!(turns.finish(Some(turn_id)));
-        assert!(!turns.finish(Some(turn_id)));
-    }
-
-    #[test]
-    fn switching_sessions_clears_pending_rollback() {
-        let old_turn = TurnId::new();
-        let mut turns = TurnState::default();
-        turns.track(old_turn, CancellationToken::new());
-        turns.start(Some(old_turn));
-        assert!(turns.cancel_active(true));
-
-        turns.reset();
-        let new_turn = TurnId::new();
-        turns.track(new_turn, CancellationToken::new());
-        turns.start(Some(new_turn));
-
-        assert!(!turns.finish(Some(new_turn)));
     }
 }

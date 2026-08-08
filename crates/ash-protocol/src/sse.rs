@@ -84,17 +84,16 @@ where
         while let Some(event) = source.next().await {
             match event {
                 Ok(event) => {
-                    let (items, terminal, wire_done) = decoder.decode(&event.data)?.into_parts();
+                    let result = decoder.decode(&event.data).map_err(|error| {
+                        tracing::warn!(%error, data = %event.data, "sse decode failed");
+                        error
+                    })?;
+                    let (items, terminal, wire_done) = result.into_parts();
+                    tracing::debug!(terminal, wire_done, data = %event.data, "sse event");
                     terminated |= terminal;
                     for item in items {
-                        if matches!(item, ModelEvent::Stop(_)) {
-                            if saw_stop {
-                                Err(ProtocolError::InvalidResponse(
-                                    "provider stream emitted more than one stop event".into(),
-                                ))?;
-                            }
-                            saw_stop = true;
-                        }
+                        log_model_event(&item);
+                        record_stop(&item, &mut saw_stop)?;
                         yield item;
                     }
                     if wire_done {
@@ -107,15 +106,9 @@ where
             }
         }
         if terminated {
+            tracing::debug!("sse stream terminated by provider marker");
             for item in decoder.finish()? {
-                if matches!(item, ModelEvent::Stop(_)) {
-                    if saw_stop {
-                        Err(ProtocolError::InvalidResponse(
-                            "provider stream emitted more than one stop event".into(),
-                        ))?;
-                    }
-                    saw_stop = true;
-                }
+                record_stop(&item, &mut saw_stop)?;
                 yield item;
             }
             if !saw_stop {
@@ -124,11 +117,37 @@ where
                 ))?;
             }
         } else {
+            tracing::debug!("sse stream ended without provider terminal marker");
             // EOF (or a wire-only marker) without a provider terminal means
             // the response was truncated, even if partial output was emitted.
             yield ModelEvent::Stop(StopReason::Truncated);
         }
     }))
+}
+
+/// Log the non-streaming model events from the wire. Text and reasoning
+/// deltas are already visible in the raw SSE data and the agent event log,
+/// so only the structural events (tool calls, usage, stop) are logged here
+/// to keep the stream readable.
+fn log_model_event(item: &ModelEvent) {
+    match item {
+        ModelEvent::Text(_) | ModelEvent::Reasoning(_) => {}
+        other => tracing::debug!(?other, "model event"),
+    }
+}
+
+/// Record one streamed item, rejecting a second stop event: a provider
+/// stream must emit exactly one `Stop`, so anything else is malformed.
+fn record_stop(item: &ModelEvent, saw_stop: &mut bool) -> Result<(), ProtocolError> {
+    if matches!(item, ModelEvent::Stop(_)) {
+        if *saw_stop {
+            return Err(ProtocolError::InvalidResponse(
+                "provider stream emitted more than one stop event".into(),
+            ));
+        }
+        *saw_stop = true;
+    }
+    Ok(())
 }
 
 fn map_status(status: reqwest::StatusCode) -> ProtocolError {

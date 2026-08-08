@@ -2,7 +2,7 @@ use ash_core::*;
 use insta::assert_json_snapshot;
 
 #[test]
-fn test_user_message_snapshot() {
+fn serializes_user_message_with_the_stable_contract() {
     let msg = Message::user("Hello, world!");
     assert_json_snapshot!("user_message", msg, {
         ".id" => "[uuid]",
@@ -10,7 +10,7 @@ fn test_user_message_snapshot() {
 }
 
 #[test]
-fn test_assistant_message_snapshot() {
+fn serializes_assistant_message_with_the_stable_contract() {
     let msg = Message::assistant_text("I can help with that.");
     assert_json_snapshot!("assistant_message", msg, {
         ".id" => "[uuid]",
@@ -18,7 +18,7 @@ fn test_assistant_message_snapshot() {
 }
 
 #[test]
-fn test_system_message_snapshot() {
+fn serializes_system_message_with_the_stable_contract() {
     let msg = Message::system("You are a helpful assistant.");
     assert_json_snapshot!("system_message", msg, {
         ".id" => "[uuid]",
@@ -26,7 +26,7 @@ fn test_system_message_snapshot() {
 }
 
 #[test]
-fn test_tool_call_block_snapshot() {
+fn serializes_tool_call_block_with_the_stable_contract() {
     let block = ContentBlock::ToolCall {
         id: ToolCallId::new(),
         name: "bash".to_string(),
@@ -38,7 +38,7 @@ fn test_tool_call_block_snapshot() {
 }
 
 #[test]
-fn test_tool_result_message_snapshot() {
+fn serializes_tool_result_message_with_the_stable_contract() {
     let msg = Message {
         id: MessageId::new(),
         role: Role::User,
@@ -55,7 +55,7 @@ fn test_tool_result_message_snapshot() {
 }
 
 #[test]
-fn test_tool_result_error_snapshot() {
+fn serializes_tool_result_error_with_the_stable_contract() {
     let msg = Message {
         id: MessageId::new(),
         role: Role::User,
@@ -72,7 +72,7 @@ fn test_tool_result_error_snapshot() {
 }
 
 #[test]
-fn test_image_content_snapshot() {
+fn serializes_image_content_with_the_stable_contract() {
     let content = Content::Image {
         media_type: "image/png".to_string(),
         data: vec![0x89, 0x50, 0x4E, 0x47],
@@ -81,24 +81,26 @@ fn test_image_content_snapshot() {
 }
 
 #[test]
-fn test_text_content_snapshot() {
+fn serializes_text_content_with_the_stable_contract() {
     let content = Content::Text("Hello".to_string());
     assert_json_snapshot!("text_content", content);
 }
 
 #[test]
-fn test_event_text_delta_snapshot() {
+fn serializes_event_text_delta_with_the_stable_contract() {
     let event = EventKind::Live(LiveEvent::TextDelta("Hello".to_string()));
     assert_json_snapshot!("event_text_delta", event);
 }
 
 #[test]
-fn test_event_envelope_snapshot() {
+fn serializes_event_envelope_with_the_stable_contract() {
     let event = Event {
         thread_id: ThreadId::new(),
         turn_id: Some(TurnId::new()),
         sequence: 3,
-        timestamp: "2026-07-31T06:15:28Z".to_string(),
+        timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-31T06:15:28Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
         kind: EventKind::Live(LiveEvent::TextDelta("Hello".to_string())),
     };
     assert_json_snapshot!("event_envelope", event, {
@@ -108,7 +110,7 @@ fn test_event_envelope_snapshot() {
 }
 
 #[test]
-fn test_event_tool_call_start_snapshot() {
+fn serializes_event_tool_call_start_with_the_stable_contract() {
     let event = EventKind::Live(LiveEvent::ToolStarted {
         id: ToolCallId::new(),
         name: "read".to_string(),
@@ -120,7 +122,7 @@ fn test_event_tool_call_start_snapshot() {
 }
 
 #[test]
-fn test_event_usage_snapshot() {
+fn serializes_event_usage_with_the_stable_contract() {
     let usage = Usage {
         input_tokens: 100,
         output_tokens: 50,
@@ -131,7 +133,7 @@ fn test_event_usage_snapshot() {
 }
 
 #[test]
-fn test_event_context_compacted_snapshot() {
+fn serializes_event_context_compacted_with_the_stable_contract() {
     let event = EventKind::Compacted {
         before: 180_000,
         after: 12_000,
@@ -142,14 +144,33 @@ fn test_event_context_compacted_snapshot() {
 }
 
 #[test]
-fn test_model_id_display() {
+fn model_id_displays_its_string_form() {
     let model = ModelId::new("claude-sonnet-4-20250514");
     assert_eq!(model.to_string(), "claude-sonnet-4-20250514");
 }
 
 #[test]
-fn test_role_display() {
+fn role_displays_its_string_form() {
     assert_eq!(Role::User.to_string(), "User");
     assert_eq!(Role::Assistant.to_string(), "Assistant");
     assert_eq!(Role::System.to_string(), "System");
+}
+
+#[test]
+fn role_serde_and_strum_parse_share_lowercase_vocabulary() {
+    for (role, serialized) in [
+        (Role::User, "user"),
+        (Role::Assistant, "assistant"),
+        (Role::System, "system"),
+    ] {
+        let json = serde_json::to_value(role).unwrap();
+        assert_eq!(json, serde_json::json!(serialized));
+        let parsed: Role = serialized.parse().unwrap();
+        assert_eq!(parsed, role);
+    }
+
+    assert_eq!(
+        serde_json::from_value::<Role>(serde_json::json!("User")).unwrap(),
+        Role::User
+    );
 }

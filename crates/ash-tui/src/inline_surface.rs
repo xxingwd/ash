@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_a_viewport_clears_stale_menu_borders_from_retained_rows() {
+    fn shrinking_a_viewport_clears_stale_menu_rows_from_retained_rows() {
         let previous = Rect::new(0, 0, 8, 5);
         let current = Rect::new(0, 0, 8, 3);
         let backend = TestBackend::new(8, 5);

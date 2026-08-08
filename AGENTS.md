@@ -1,31 +1,52 @@
-# Repository Guidelines
+# 仓库指南
 
-## Project Structure & Module Organization
+## 项目结构与模块组织
 
-Ash is a Rust 2021 workspace under `crates/`. `ash-core` defines shared types; `ash-protocol` implements streaming adapters; `ash-tools` contains file and shell tools; `ash-agent` owns sessions, prompts, skills, and MCP; `ash-collab` implements sub-agent coordination; `ash-tui` implements the inline UI; and `ash-cli` builds the binary. Unit tests generally sit beside modules. Integration and Insta snapshot tests are in `crates/ash-core/tests/`. Architecture constraints are documented in `DESIGN.md`; keep `target/` untracked.
+Ash 是位于 `crates/` 下的 Rust 2021 workspace。`ash-core` 定义共享类型；`ash-protocol` 实现流式适配器；`ash-tools` 包含文件和 shell 工具；`ash-agent` 负责会话、提示词、技能与 MCP；`ash-collab` 实现子代理协调；`ash-tui` 实现内联 UI；`ash-cli` 构建可执行二进制。集成测试与 Insta 快照测试位于 `crates/ash-core/tests/`。架构约束记录在 `DESIGN.md` 中。
 
-## Build, Test, and Development Commands
+## 构建、测试与开发命令
 
-- `cargo build --workspace` builds every crate in debug mode.
-- `cargo run -p ash-cli -- --print "inspect this project"` runs a single non-interactive request.
-- `cargo test --workspace` runs all unit, integration, and snapshot tests.
-- `cargo fmt --all -- --check` verifies standard Rust formatting.
-- `cargo clippy --workspace --all-targets -- -D warnings` treats every lint warning as an error.
+- `cargo run -p ash-cli -- --print "inspect this project"` 运行一次非交互式请求。
+- `cargo test --workspace` 运行所有单元测试、集成测试与快照测试。
+- `cargo fmt --all -- --check` 校验标准 Rust 格式。
+- `cargo clippy --workspace --all-targets -- -D warnings` 将所有 lint 警告视为错误。
 
-Run formatting, Clippy, and the full test suite before submitting changes.
+## 编码风格与命名约定
 
-## Coding Style & Naming Conventions
+### 工程原则
 
-Use default `rustfmt` output (four-space indentation). Follow Rust conventions: `snake_case` for modules, functions, and tests; `PascalCase` for types and traits; `SCREAMING_SNAKE_CASE` for constants. Keep protocol-specific translation inside `ash-protocol`, shared abstractions in `ash-core`, and terminal state out of the agent layer. Prefer typed errors and cancellation-aware async code over panics or blocking operations.
+- 优先强类型、低冗余、可读性和优雅性；类型即文档，编译器是第一位评审者。
+- 优先小而清晰的函数，不堆砌超长过程式逻辑；一个函数只做一件事，函数名说明一切。
+- 优先稳定、直接、可解释的抽象；按职责命名，名字直白、短、稳定。
+- DRY 是硬约束，但不要为了去重制造更难读的共享层；只抽取稳定重复的部分，强业务语义留在领域内。
+- 新增抽象之前，先判断它是否真的减少了重复、复杂度或心智负担。
+- 对外结构优先简单、扁平、易导航；不要堆砌多层空目录和空包装。
 
-## Testing Guidelines
+### 函数式风格
 
-Add focused `#[test]` or `#[tokio::test]` cases near changed code. Name tests after observable behavior, such as `rejects_path_outside_workdir`. Use `insta::assert_json_snapshot!` for stable serialization contracts; review changed `.snap` files rather than accepting them mechanically. New default-path behavior should have a regression test. No numeric coverage target is defined, but affected branches and error cases should be exercised.
+- 优先纯函数式的数据转换，输入输出明确；副作用集中在边界层（IO、外部调用、状态变更处）。
+- 优先组合，谨慎使用继承式或过重的面向对象抽象；用 `map`/`filter`/`fold` 表达流程，少写命令式循环。
+- 优先不可变数据流，状态显式传递，让代码可预测、可测试、易推理。
 
-## Commit & Pull Request Guidelines
+### Rust 语言特性
 
-This checkout has no Git history, so use concise, imperative subjects with an optional crate scope, for example `ash-tools: reject symlink escapes`. Keep commits focused. Pull requests should explain the behavior change, identify affected crates, link relevant issues, and list verification commands. Include terminal captures for visible TUI changes and call out configuration or protocol compatibility impacts.
+- 充分利用强类型与代数类型：用 `enum` 建模状态，用 `Option`/`Result` 建模可能性与错误，让非法状态不可表达。
+- 充分利用所有权与借用：明确「谁拥有、谁借用、借用多久」，在无 GC 的前提下实现内存安全。
+- 充分利用模式匹配：用 `match` 穷尽处理所有分支，让编译器强制覆盖，而不是运行时检查与 `unwrap`。
+- 充分利用零成本抽象：迭代器、闭包、泛型、trait 提升表达力，同时不牺牲性能。
 
-## Security & Configuration
+### 仓库约定
 
-Never commit API keys, provider tokens, logs, or generated files. Preserve the tool layer's working-directory boundary and cancellation/timeout behavior when changing file or process execution.
+使用默认 `rustfmt` 输出（四空格缩进）。遵循 Rust 命名约定：模块、函数、测试用 `snake_case`；类型与 trait 用 `PascalCase`；常量用 `SCREAMING_SNAKE_CASE`。协议相关的翻译逻辑放在 `ash-protocol`，共享抽象放在 `ash-core`，终端状态不要进入 agent 层。优先使用 typed errors 与可取消的异步代码，避免 panic 或阻塞操作。
+
+## 测试指南
+
+单元测试一般与模块放在一起；在被修改代码附近添加有针对性的 `#[test]` 或 `#[tokio::test]` 用例。按可观察行为命名测试，例如 `rejects_path_outside_workdir`。对稳定的序列化契约使用 `insta::assert_json_snapshot!`；审查变更后的 `.snap` 文件，不要机械地接受它们。新的默认路径行为应有回归测试。
+
+## 提交与 Pull Request 规范
+
+使用简洁的祈使句主题，可选加 crate 作用域，例如 `ash-tools: reject symlink escapes`。保持提交聚焦。Pull Request 应说明行为变更、指出受影响的 crate、关联相关 issue，并列出验证命令。对可见的 TUI 变更附上终端截图，并说明配置或协议兼容性影响。
+
+## 安全与配置
+
+绝不提交 API 密钥、提供商令牌、日志或生成的文件。修改文件或进程执行相关代码时，保留工具层的工作目录边界以及取消/超时行为。

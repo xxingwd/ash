@@ -8,6 +8,7 @@ mod sse;
 use std::{borrow::Cow, sync::Arc};
 
 use ash_core::{Content, Message, MessageContent, ProtocolError, Role, ToolCallId};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
@@ -70,6 +71,34 @@ pub struct ProviderConfig {
     pub protocol: Protocol,
     pub api_key: secrecy::SecretString,
     pub base_url: Option<String>,
+}
+
+impl ProviderConfig {
+    pub(crate) fn base_url<'a>(&'a self, default: &'a str) -> &'a str {
+        self.base_url
+            .as_deref()
+            .unwrap_or(default)
+            .trim_end_matches('/')
+    }
+}
+
+pub(crate) fn base64_image(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+pub(crate) fn image_data_url(media_type: &str, data: &[u8]) -> String {
+    format!("data:{media_type};base64,{}", base64_image(data))
+}
+
+pub(crate) fn join_text_contents(contents: &[Content]) -> String {
+    contents
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text(text) => Some(text.as_str()),
+            Content::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Provider-neutral model client and stream vocabulary, re-exported for adapter code.
@@ -224,6 +253,49 @@ mod tests {
             let parsed: Protocol = protocol.as_cli_name().parse().unwrap();
             assert_eq!(parsed, protocol);
         }
+    }
+
+    #[test]
+    fn provider_base_url_uses_default_and_trims_trailing_slashes() {
+        let default = ProviderConfig {
+            protocol: Protocol::Completions,
+            api_key: secrecy::SecretString::new("key".into()),
+            base_url: None,
+        };
+        assert_eq!(
+            default.base_url("https://api.openai.com"),
+            "https://api.openai.com"
+        );
+
+        let configured = ProviderConfig {
+            protocol: Protocol::Completions,
+            api_key: secrecy::SecretString::new("key".into()),
+            base_url: Some("https://example.com/v1/".to_string()),
+        };
+        assert_eq!(
+            configured.base_url("https://api.openai.com"),
+            "https://example.com/v1"
+        );
+    }
+
+    #[test]
+    fn image_helpers_share_one_base64_encoding() {
+        assert_eq!(
+            image_data_url("image/png", b"\x00\x01\x02"),
+            "data:image/png;base64,AAEC"
+        );
+        assert_eq!(join_text_contents(&[Content::Text("one".into())]), "one");
+        assert_eq!(
+            join_text_contents(&[
+                Content::Text("one".into()),
+                Content::Image {
+                    media_type: "image/png".into(),
+                    data: vec![1],
+                },
+                Content::Text("two".into()),
+            ]),
+            "one\ntwo"
+        );
     }
 
     #[test]

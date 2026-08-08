@@ -1,12 +1,13 @@
 use std::{
+    collections::HashSet,
     io,
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use ash_core::{
-    Content, ContentBlock, ForkPoint, Message, MessageContent, SubagentSnapshot, ThreadSummary,
-    ToolCallId, TurnView, Usage,
+    Content, ContentBlock, ForkPoint, Message, MessageContent, MessageId, StopReason,
+    SubagentSnapshot, ThreadSummary, ThreadView, ToolCallId, TurnResult, TurnView, Usage,
 };
 use crossterm::terminal;
 use serde_json::Value;
@@ -19,6 +20,7 @@ use crate::{
     input::InputState,
     live_block::LiveBlock,
     menu::MenuView,
+    operation::CancellationMode,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
     stream_state::{format_elapsed, FinishedStream, StreamState},
@@ -95,7 +97,6 @@ pub(crate) struct TerminalView<'a> {
     pub(crate) input: &'a InputState,
     pub(crate) menu: MenuView<'a>,
     pub(crate) busy: bool,
-    pub(crate) queued_messages: usize,
 }
 
 impl ComposerState {
@@ -202,7 +203,6 @@ struct ViewState {
     composer: ComposerState,
     menu: RenderedMenu,
     busy: bool,
-    queued_messages: usize,
 }
 
 pub(crate) struct TerminalUi {
@@ -365,12 +365,22 @@ impl TerminalUi {
 
     pub fn restore_session(
         &mut self,
-        messages: &[Message],
+        thread: &ThreadView,
         context_tokens: Option<u64>,
     ) -> io::Result<()> {
         self.begin_fresh_viewport()?;
         self.enqueue_welcome();
-        self.push_restored_messages(messages);
+        if thread.turns.is_empty() {
+            self.push_restored_messages(&thread.messages);
+        } else {
+            let turn_message_ids = thread
+                .turns
+                .iter()
+                .flat_map(|turn| turn.messages.iter().map(|message| message.id))
+                .collect::<HashSet<_>>();
+            self.push_restored_messages_excluding(&thread.messages, &turn_message_ids);
+            self.push_restored_turns(&thread.turns);
+        }
         // `begin_fresh_viewport` resets usage; restore the estimated context
         // size so the status line reflects current occupancy before any API
         // usage is reported for the new history.
@@ -378,12 +388,6 @@ impl TerminalUi {
             self.usage.set_context_tokens(tokens);
         }
         self.commit_transcript_to_scrollback()
-    }
-
-    pub fn command_blocked(&mut self, command: &str) -> io::Result<()> {
-        self.view.composer.clear();
-        self.status.header = format!("/{command} unavailable while working");
-        self.refresh_status()
     }
 
     pub fn sync_view(&mut self, view: TerminalView<'_>) -> io::Result<()> {
@@ -405,20 +409,10 @@ impl TerminalUi {
         self.view.composer.cursor_column = input.cursor_column;
         self.view.menu.set(view.menu);
         self.view.busy = view.busy;
-        self.view.queued_messages = view.queued_messages;
     }
 
     pub fn composer_text_width(&self) -> io::Result<u16> {
         Ok(composer_text_width(terminal_size()?.0))
-    }
-
-    pub fn has_response_block(&self) -> bool {
-        self.stream.has_content()
-            || self.current_turn_id.is_some_and(|turn_id| {
-                self.transcript
-                    .iter()
-                    .any(|block| block.is_response_for_turn(turn_id))
-            })
     }
 
     pub fn commit_input(&mut self, input: &str) -> io::Result<()> {
@@ -427,6 +421,13 @@ impl TerminalUi {
         self.current_turn_id = Some(turn_id);
         self.scroll_top = None;
         self.status.start("Working");
+        self.commit_user_message(input)
+    }
+
+    pub fn commit_steer(&mut self, input: &str) -> io::Result<()> {
+        self.finish_stream();
+        self.assistant_block_id = None;
+        self.scroll_top = None;
         self.commit_user_message(input)
     }
 
@@ -525,6 +526,30 @@ impl TerminalUi {
         self.redraw()
     }
 
+    /// Prepare the live projection for cancellation. A completed tool result
+    /// keeps the turn; otherwise all streamed output is removed immediately
+    /// because text and reasoning have no reliable completion boundary.
+    pub fn prepare_cancellation(&mut self) -> CancellationMode {
+        self.stream.reset();
+        let Some(turn_id) = self.current_turn_id else {
+            self.assistant_block_id = None;
+            return CancellationMode::Rollback;
+        };
+        let mode = if self
+            .transcript
+            .iter()
+            .any(|block| block.is_completed_tool_for_turn(turn_id))
+        {
+            CancellationMode::Interrupt
+        } else {
+            CancellationMode::Rollback
+        };
+        self.transcript
+            .retain(|block| keep_during_cancellation(block, turn_id, mode));
+        self.assistant_block_id = None;
+        mode
+    }
+
     pub fn error(&mut self, error: &str) -> io::Result<()> {
         self.finish_stream();
         self.push_history_block(HistoryBlock::error(error));
@@ -539,25 +564,27 @@ impl TerminalUi {
     /// projection of the turn's messages, then move it into the scrollback.
     pub fn commit_turn(&mut self, view: &TurnView) -> io::Result<()> {
         self.finish_stream();
-        if let Some(turn_id) = self.current_turn_id {
-            self.transcript
-                .retain(|block| !block.is_streamed_for_turn(turn_id));
-        }
-        self.assistant_block_id = None;
-        self.push_turn_messages(&view.messages);
         let elapsed_seconds = self.status.elapsed_seconds();
         if let Some(tokens) = view.context_tokens {
             self.usage.set_context_tokens(tokens);
         }
         let usage = self.usage.commit_turn_usage(view.usage.as_ref());
+        let footer = turn_footer(&view.result, elapsed_seconds, usage);
+        if let Some(turn_id) = self.current_turn_id {
+            self.transcript.retain(|block| {
+                !block.is_streamed_for_turn(turn_id)
+                    && !footer
+                        .as_ref()
+                        .is_some_and(|footer| block.matches_history_for_turn(turn_id, footer))
+            });
+        }
+        self.assistant_block_id = None;
+        self.push_turn_messages(&view.messages);
         self.status.stop();
         self.view.busy = false;
-        self.push_history_block(HistoryBlock::worked(
-            format_elapsed(elapsed_seconds),
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.generation_ms,
-        ));
+        if let Some(footer) = footer {
+            self.push_history_block(footer);
+        }
         self.current_turn_id = None;
         self.commit_transcript_to_scrollback()
     }
@@ -832,33 +859,72 @@ impl TerminalUi {
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
+        self.push_restored_messages_excluding(messages, &HashSet::new());
+    }
+
+    fn push_restored_messages_excluding(
+        &mut self,
+        messages: &[Message],
+        excluded: &HashSet<MessageId>,
+    ) {
         let tool_results = tool_results_map(messages);
 
-        for message in messages {
-            match &message.content {
-                MessageContent::User(contents) => {
-                    let turn_id = self.next_turn_id;
-                    self.next_turn_id = self.next_turn_id.saturating_add(1);
-                    self.current_turn_id = Some(turn_id);
-                    let text = contents
-                        .iter()
-                        .map(|content| match content {
-                            Content::Text(text) => text.clone(),
-                            Content::Image { media_type, .. } => {
-                                format!("[image: {media_type}]")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    self.push_history_block(HistoryBlock::user(&text));
-                }
-                MessageContent::Assistant(blocks) => {
-                    self.push_assistant_blocks(blocks, &tool_results);
-                }
-                MessageContent::ToolResult { .. } => {}
+        for message in messages
+            .iter()
+            .filter(|message| !excluded.contains(&message.id))
+        {
+            if matches!(&message.content, MessageContent::User(_)) {
+                let turn_id = self.next_turn_id;
+                self.next_turn_id = self.next_turn_id.saturating_add(1);
+                self.current_turn_id = Some(turn_id);
+            }
+            self.push_restored_message(message, &tool_results);
+        }
+        self.current_turn_id = None;
+    }
+
+    fn push_restored_turns(&mut self, turns: &[TurnView]) {
+        for turn in turns {
+            let turn_id = self.next_turn_id;
+            self.next_turn_id = self.next_turn_id.saturating_add(1);
+            self.current_turn_id = Some(turn_id);
+            self.push_restored_turn_messages(&turn.messages);
+            if let Some(footer) = restored_turn_footer(&turn.result) {
+                self.push_history_block(footer);
             }
         }
         self.current_turn_id = None;
+    }
+
+    fn push_restored_turn_messages(&mut self, messages: &[Message]) {
+        let tool_results = tool_results_map(messages);
+        for message in messages {
+            self.push_restored_message(message, &tool_results);
+        }
+    }
+
+    fn push_restored_message(
+        &mut self,
+        message: &Message,
+        tool_results: &std::collections::HashMap<ToolCallId, (bool, &str)>,
+    ) {
+        match &message.content {
+            MessageContent::User(contents) => {
+                let text = contents
+                    .iter()
+                    .map(|content| match content {
+                        Content::Text(text) => text.clone(),
+                        Content::Image { media_type, .. } => format!("[image: {media_type}]"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.push_history_block(HistoryBlock::user(&text));
+            }
+            MessageContent::Assistant(blocks) => {
+                self.push_assistant_blocks(blocks, tool_results);
+            }
+            MessageContent::ToolResult { .. } => {}
+        }
     }
 
     /// Project one settled turn's canonical messages into transcript blocks.
@@ -917,7 +983,6 @@ impl TerminalUi {
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
         let elapsed = format_elapsed(self.status.elapsed_seconds());
         let status_header = sanitize_single_line(&self.status.header);
-        let queued = queued_status(self.view.queued_messages);
         let model = sanitize_single_line(&self.session.model);
         let protocol = sanitize_single_line(&self.session.protocol);
         viewport::render(ViewportInput {
@@ -930,7 +995,6 @@ impl TerminalUi {
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
-            queued: &queued,
             prompt_lines: &self.view.composer.lines,
             prompt_cursor_row: self.view.composer.cursor_row,
             prompt_cursor_column: self.view.composer.cursor_column,
@@ -983,14 +1047,6 @@ fn composer_text_width(terminal_width: u16) -> u16 {
         .max(1)
 }
 
-fn queued_status(queued_messages: usize) -> String {
-    match queued_messages {
-        0 => String::new(),
-        1 => " · 1 queued".to_string(),
-        count => format!(" · {count} queued"),
-    }
-}
-
 fn tool_results_map(messages: &[Message]) -> std::collections::HashMap<ToolCallId, (bool, &str)> {
     let mut results = std::collections::HashMap::new();
     for message in messages {
@@ -1013,6 +1069,42 @@ fn latest_turn_id(
     current_turn_id
         .or_else(|| transcript.iter().rev().find_map(LiveBlock::turn_id))
         .or_else(|| history.iter().rev().find_map(LiveBlock::turn_id))
+}
+
+fn keep_during_cancellation(block: &LiveBlock, turn_id: u64, mode: CancellationMode) -> bool {
+    match mode {
+        CancellationMode::Interrupt => !block.is_unfinished_response_for_turn(turn_id),
+        CancellationMode::Rollback => !block.is_streamed_for_turn(turn_id),
+    }
+}
+
+fn turn_footer(
+    result: &TurnResult,
+    elapsed_seconds: u64,
+    usage: TurnUsage,
+) -> Option<HistoryBlock> {
+    match result {
+        TurnResult::Completed(StopReason::Aborted) => Some(HistoryBlock::interrupted()),
+        TurnResult::Completed(_) => Some(HistoryBlock::worked(
+            format_elapsed(elapsed_seconds),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.generation_ms,
+        )),
+        TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
+            Some(HistoryBlock::error(error))
+        }
+    }
+}
+
+fn restored_turn_footer(result: &TurnResult) -> Option<HistoryBlock> {
+    match result {
+        TurnResult::Completed(StopReason::Aborted) => Some(HistoryBlock::interrupted()),
+        TurnResult::Completed(_) => None,
+        TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
+            Some(HistoryBlock::error(error))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1079,13 +1171,6 @@ mod tests {
     }
 
     #[test]
-    fn formats_queued_message_status() {
-        assert_eq!(queued_status(0), "");
-        assert_eq!(queued_status(1), " · 1 queued");
-        assert_eq!(queued_status(3), " · 3 queued");
-    }
-
-    #[test]
     fn explicit_scroll_position_tracks_the_rendered_position() {
         let mut scroll_top = Some(20);
         normalize_scroll_top(&mut scroll_top, 8);
@@ -1105,5 +1190,100 @@ mod tests {
         ];
 
         assert_eq!(latest_turn_id(None, &[], &history), Some(7));
+    }
+
+    #[test]
+    fn rollback_cancellation_removes_finalized_text_from_the_live_projection() {
+        let mut text = LiveBlock::assistant(1, String::new()).with_turn(Some(7));
+        assert!(text.append_markdown_source("Inspecting before the tool call."));
+        text.finalize_markdown();
+
+        assert!(keep_during_cancellation(
+            &text,
+            7,
+            CancellationMode::Interrupt
+        ));
+        assert!(!keep_during_cancellation(
+            &text,
+            7,
+            CancellationMode::Rollback
+        ));
+
+        let prompt = LiveBlock::history(2, HistoryBlock::user("inspect")).with_turn(Some(7));
+        assert!(keep_during_cancellation(
+            &prompt,
+            7,
+            CancellationMode::Rollback
+        ));
+    }
+
+    #[test]
+    fn completed_turns_end_with_work_summary() {
+        let footer = turn_footer(
+            &TurnResult::Completed(ash_core::StopReason::EndTurn),
+            3,
+            TurnUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                generation_ms: 100,
+            },
+        );
+
+        assert_eq!(
+            footer,
+            Some(HistoryBlock::worked("3s".to_string(), 10, 2, 100))
+        );
+    }
+
+    #[test]
+    fn aborted_turns_use_a_distinct_interruption_footer() {
+        assert_eq!(
+            turn_footer(
+                &TurnResult::Completed(StopReason::Aborted),
+                3,
+                TurnUsage::default()
+            ),
+            Some(HistoryBlock::interrupted())
+        );
+        assert_eq!(
+            restored_turn_footer(&TurnResult::Completed(StopReason::Aborted)),
+            Some(HistoryBlock::interrupted())
+        );
+    }
+
+    #[test]
+    fn failed_and_interrupted_turns_end_with_their_error() {
+        assert_eq!(
+            turn_footer(
+                &TurnResult::Failed("invalid response".into()),
+                3,
+                TurnUsage::default()
+            ),
+            Some(HistoryBlock::error("invalid response"))
+        );
+        assert_eq!(
+            turn_footer(
+                &TurnResult::Interrupted("session closed".into()),
+                3,
+                TurnUsage::default(),
+            ),
+            Some(HistoryBlock::error("session closed"))
+        );
+    }
+
+    #[test]
+    fn restored_turns_replay_non_success_terminal_states() {
+        assert_eq!(
+            restored_turn_footer(&TurnResult::Completed(ash_core::StopReason::EndTurn)),
+            None
+        );
+        assert_eq!(
+            restored_turn_footer(&TurnResult::Failed("invalid response".into())),
+            Some(HistoryBlock::error("invalid response"))
+        );
+        assert_eq!(
+            restored_turn_footer(&TurnResult::Interrupted("session closed".into())),
+            Some(HistoryBlock::error("session closed"))
+        );
     }
 }

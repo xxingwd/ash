@@ -4,7 +4,7 @@ expression: msg
 ---
 {
   "id": "[uuid]",
-  "role": "User",
+  "role": "user",
   "content": {
     "User": [
       {

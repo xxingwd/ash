@@ -3,10 +3,11 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
-use ash_core::{define_tool, Tool, ToolError};
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
+use ignore::overrides::OverrideBuilder;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,22 +48,26 @@ enum LineRead {
     Oversized,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "grep",
         "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
-        move |_ctx, args: GrepArgs| {
+        move |ctx, args: GrepArgs| {
             let root = Arc::clone(&working_dir);
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
             async move {
-            crate::path::run_blocking(move || {
-                search(
-                    &root,
-                    args.path.as_deref().unwrap_or("."),
-                    &args.pattern,
-                    args.include.as_deref(),
-                )
-            })
-            .await
+                crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
+                    search(
+                        &root,
+                        args.path.as_deref().unwrap_or("."),
+                        &args.pattern,
+                        args.include.as_deref(),
+                        cancellation,
+                        deadline,
+                    )
+                })
+                .await
             }
         },
     )
@@ -73,7 +78,10 @@ fn search(
     requested: &str,
     pattern: &str,
     include: Option<&str>,
+    cancellation: CancellationToken,
+    deadline: Instant,
 ) -> Result<String, ToolError> {
+    crate::path::ensure_running(&cancellation, deadline)?;
     if pattern.is_empty() {
         return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
@@ -89,14 +97,17 @@ fn search(
             None => true,
         };
         if included {
-            progress = search_file(&search, search.full_path(), &regex, &mut matches)?;
+            progress = search_file(
+                &search,
+                search.full_path(),
+                &regex,
+                &mut matches,
+                &cancellation,
+                deadline,
+            )?;
         }
     } else if search.full_path().is_dir() {
-        let mut builder = WalkBuilder::new(search.full_path());
-        builder
-            .follow_links(false)
-            .require_git(false)
-            .sort_by_file_path(|left, right| left.cmp(right));
+        let builder = crate::path::file_walker(search.full_path());
         let include = if let Some(pattern) = include {
             let mut overrides = OverrideBuilder::new(search.full_path());
             overrides.add(pattern).map_err(|error| {
@@ -109,6 +120,7 @@ fn search(
             None
         };
         for entry in builder.build() {
+            crate::path::ensure_running(&cancellation, deadline)?;
             let entry = entry
                 .map_err(|error| ToolError::Execution(format!("cannot search files: {error}")))?;
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -120,8 +132,14 @@ fn search(
             {
                 continue;
             }
-            if search_file(&search, entry.path(), &regex, &mut matches)?
-                == SearchProgress::MatchLimitReached
+            if search_file(
+                &search,
+                entry.path(),
+                &regex,
+                &mut matches,
+                &cancellation,
+                deadline,
+            )? == SearchProgress::MatchLimitReached
             {
                 progress = SearchProgress::MatchLimitReached;
                 break;
@@ -135,8 +153,10 @@ fn search(
     }
 
     if matches.is_empty() {
+        crate::path::ensure_running(&cancellation, deadline)?;
         return Ok("No matches found".into());
     }
+    crate::path::ensure_running(&cancellation, deadline)?;
     matches.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -184,7 +204,10 @@ fn search_file(
     path: &Path,
     regex: &Regex,
     matches: &mut Vec<Match>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Result<SearchProgress, ToolError> {
+    crate::path::ensure_running(cancellation, deadline)?;
     let file = File::open(path).map_err(|error| {
         ToolError::Execution(format!("cannot read {}: {error}", path.display()))
     })?;
@@ -192,9 +215,8 @@ fn search_file(
     let mut buffer = Vec::new();
     let mut line = 0;
     loop {
-        let line_read = read_line(&mut reader, &mut buffer).map_err(|error| {
-            ToolError::Execution(format!("cannot read {}: {error}", path.display()))
-        })?;
+        crate::path::ensure_running(cancellation, deadline)?;
+        let line_read = read_line(&mut reader, &mut buffer, path, cancellation, deadline)?;
         if line_read == LineRead::EndOfFile {
             return Ok(SearchProgress::Complete);
         }
@@ -224,12 +246,21 @@ fn search_file(
     }
 }
 
-fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<LineRead> {
+fn read_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    path: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<LineRead, ToolError> {
     output.clear();
     let mut read_any = false;
     let mut truncated = false;
     loop {
-        let available = reader.fill_buf()?;
+        crate::path::ensure_running(cancellation, deadline)?;
+        let available = reader.fill_buf().map_err(|error| {
+            ToolError::Execution(format!("cannot read {}: {error}", path.display()))
+        })?;
         if available.is_empty() {
             return Ok(if !read_any {
                 LineRead::EndOfFile
@@ -261,6 +292,7 @@ fn read_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn searches_regexes_and_filters_files() {
@@ -273,7 +305,15 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("src/lib.txt"), "needle 3\n").unwrap();
 
-        let output = search(root.path(), "src", r"needle \d", Some("*.rs")).unwrap();
+        let output = search(
+            root.path(),
+            "src",
+            r"needle \d",
+            Some("*.rs"),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert!(output.contains("Found 2 matching lines"));
         assert!(output.contains("src/lib.rs:"));
@@ -286,11 +326,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("notes.txt"), "one\ntwo\n").unwrap();
 
-        let output = search(root.path(), "notes.txt", "two", None).unwrap();
+        let output = search(
+            root.path(),
+            "notes.txt",
+            "two",
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert!(output.contains("notes.txt:"));
         assert!(output.contains("Line 2: two"));
-        assert!(search(root.path(), ".", "[", None).is_err());
+        assert!(search(
+            root.path(),
+            ".",
+            "[",
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .is_err());
     }
 
     #[test]
@@ -302,7 +358,15 @@ mod tests {
             .join("\n");
         std::fs::write(root.path().join("matches.txt"), content).unwrap();
 
-        let output = search(root.path(), ".", "match", None).unwrap();
+        let output = search(
+            root.path(),
+            ".",
+            "match",
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert!(output.starts_with("Found 100 matching lines (more available)"));
         assert_eq!(
@@ -317,19 +381,42 @@ mod tests {
         let input = format!("{}\nneedle\n", "x".repeat(MAX_SEARCH_LINE_BYTES + 1));
         let mut reader = BufReader::new(input.as_bytes());
         let mut buffer = Vec::new();
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
 
         assert_eq!(
-            read_line(&mut reader, &mut buffer).unwrap(),
+            read_line(
+                &mut reader,
+                &mut buffer,
+                Path::new("input"),
+                &cancellation,
+                deadline,
+            )
+            .unwrap(),
             LineRead::Oversized
         );
         assert!(buffer.len() <= MAX_SEARCH_LINE_BYTES);
         assert_eq!(
-            read_line(&mut reader, &mut buffer).unwrap(),
+            read_line(
+                &mut reader,
+                &mut buffer,
+                Path::new("input"),
+                &cancellation,
+                deadline,
+            )
+            .unwrap(),
             LineRead::Complete
         );
         assert_eq!(buffer, b"needle");
         assert_eq!(
-            read_line(&mut reader, &mut buffer).unwrap(),
+            read_line(
+                &mut reader,
+                &mut buffer,
+                Path::new("input"),
+                &cancellation,
+                deadline,
+            )
+            .unwrap(),
             LineRead::EndOfFile
         );
     }
@@ -342,8 +429,36 @@ mod tests {
         std::fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
 
-        let output = search(root.path(), ".", "needle", None).unwrap();
+        let output = search(
+            root.path(),
+            ".",
+            "needle",
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
 
         assert_eq!(output, "No matches found");
+    }
+
+    #[test]
+    fn cancelled_search_returns_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.txt"), "needle\n").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = search(
+            root.path(),
+            ".",
+            "needle",
+            None,
+            cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
     }
 }

@@ -10,13 +10,16 @@ pub struct Event {
     pub thread_id: ThreadId,
     pub turn_id: Option<TurnId>,
     pub sequence: u64,
-    pub timestamp: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
     pub kind: EventKind,
 }
 
 /// Provider-neutral usage accounting. `estimated` marks locally estimated
-/// values (no API usage was reported); `generation_ms` measures wall-clock
-/// generation time.
+/// values (no API usage was reported); `generation_ms` measures the wall-clock
+/// time from the first output token of any kind (reasoning, text, or tool
+/// call) to the end of the stream. Provider-reported `output_tokens` includes
+/// reasoning/thinking tokens, so the clock must start at the first reasoning
+/// delta for the rate (output_tokens / generation_ms) to be honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,

@@ -81,13 +81,6 @@ impl StreamState {
         matches!(self.mode, StreamMode::Reasoning { .. })
     }
 
-    pub(crate) fn has_content(&self) -> bool {
-        match &self.mode {
-            StreamMode::Reasoning { source, .. } => !source.trim().is_empty(),
-            StreamMode::Idle => false,
-        }
-    }
-
     pub(crate) fn finish(&mut self) -> Option<FinishedStream> {
         match std::mem::take(&mut self.mode) {
             StreamMode::Idle => None,
@@ -256,18 +249,18 @@ mod tests {
 
     #[test]
     fn reasoning_ends_when_text_output_starts() {
-        // 正常时序: thinking 流完 -> text 开始。
-        // 第一个 text delta 必须结束 reasoning（返回 Thought）并清空活动区。
+        // Normal sequence: thinking streams to completion, then text starts.
+        // The first text delta must end reasoning (returning a Thought) and
+        // clear the active area.
         let mut stream = StreamState::default();
         stream.start_reasoning();
         stream.push_reasoning("inspect first");
         assert!(stream.is_reasoning());
 
-        // 模拟 append_assistant 里的 finish: 固化 thinking
+        // Mimic the `finish` inside `append_assistant`: solidify the thought.
         let finished = stream.finish();
         assert!(matches!(finished, Some(FinishedStream::Thought { .. })));
         assert!(!stream.is_reasoning());
         assert!(stream.active_lines().is_empty());
-        assert!(!stream.has_content());
     }
 }

@@ -18,7 +18,7 @@ const RESERVED_ROOTS: &[&str] = &[
 
 pub(crate) fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
     match std::env::var(ENV_VAR) {
-        Ok(config) => apply(body, &config).map_err(ProtocolError::InvalidRequest),
+        Ok(config) => apply(body, &config),
         Err(VarError::NotPresent) => Ok(()),
         Err(VarError::NotUnicode(_)) => Err(ProtocolError::InvalidRequest(format!(
             "{ENV_VAR} must contain valid Unicode"
@@ -26,7 +26,7 @@ pub(crate) fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
     }
 }
 
-pub(crate) fn apply(body: &mut Value, config: &str) -> Result<(), String> {
+pub(crate) fn apply(body: &mut Value, config: &str) -> Result<(), ProtocolError> {
     let mut entries = Vec::new();
     let mut paths = HashSet::new();
 
@@ -38,15 +38,17 @@ pub(crate) fn apply(body: &mut Value, config: &str) -> Result<(), String> {
         let (path, value) = parse_entry(entry, index + 1)?;
         let display_path = path.join(".");
         if !paths.insert(path.clone()) {
-            return Err(format!("{ENV_VAR} sets '{display_path}' more than once"));
+            return Err(ProtocolError::InvalidRequest(format!(
+                "{ENV_VAR} sets '{display_path}' more than once"
+            )));
         }
         if paths
             .iter()
             .any(|other| other != &path && (other.starts_with(&path) || path.starts_with(other)))
         {
-            return Err(format!(
+            return Err(ProtocolError::InvalidRequest(format!(
                 "{ENV_VAR} has conflicting paths involving '{display_path}'"
-            ));
+            )));
         }
         entries.push((path, value));
     }
@@ -57,13 +59,15 @@ pub(crate) fn apply(body: &mut Value, config: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_entry(entry: &str, index: usize) -> Result<(Vec<String>, Value), String> {
-    let (raw_path, raw_value) = entry
-        .split_once('=')
-        .ok_or_else(|| format!("{ENV_VAR} entry {index} must use key=value syntax"))?;
+fn parse_entry(entry: &str, index: usize) -> Result<(Vec<String>, Value), ProtocolError> {
+    let (raw_path, raw_value) = entry.split_once('=').ok_or_else(|| {
+        ProtocolError::InvalidRequest(format!("{ENV_VAR} entry {index} must use key=value syntax"))
+    })?;
     let raw_path = raw_path.trim();
     if raw_path.is_empty() {
-        return Err(format!("{ENV_VAR} entry {index} has an empty key"));
+        return Err(ProtocolError::InvalidRequest(format!(
+            "{ENV_VAR} entry {index} has an empty key"
+        )));
     }
 
     let path = raw_path
@@ -71,19 +75,19 @@ fn parse_entry(entry: &str, index: usize) -> Result<(Vec<String>, Value), String
         .map(|part| {
             let part = part.trim();
             if part.is_empty() || part.chars().any(char::is_whitespace) {
-                Err(format!(
+                Err(ProtocolError::InvalidRequest(format!(
                     "{ENV_VAR} entry {index} has an invalid key '{raw_path}'"
-                ))
+                )))
             } else {
                 Ok(part.to_string())
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
     if RESERVED_ROOTS.contains(&path[0].as_str()) {
-        return Err(format!(
+        return Err(ProtocolError::InvalidRequest(format!(
             "{ENV_VAR} cannot override the '{}' request field",
             path[0]
-        ));
+        )));
     }
 
     Ok((path, parse_value(raw_value.trim())))
@@ -111,27 +115,27 @@ fn parse_value(value: &str) -> Value {
     }
 }
 
-fn insert_value(body: &mut Value, path: &[String], value: Value) -> Result<(), String> {
+fn insert_value(body: &mut Value, path: &[String], value: Value) -> Result<(), ProtocolError> {
     if path.len() == 1 {
-        let object = body
-            .as_object_mut()
-            .ok_or_else(|| "request body must be a JSON object".to_string())?;
+        let object = body.as_object_mut().ok_or_else(|| {
+            ProtocolError::InvalidRequest("request body must be a JSON object".to_string())
+        })?;
         object.insert(path[0].clone(), value);
         return Ok(());
     }
 
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+    let object = body.as_object_mut().ok_or_else(|| {
+        ProtocolError::InvalidRequest("request body must be a JSON object".to_string())
+    })?;
     let child = object
         .entry(path[0].clone())
         .or_insert_with(|| Value::Object(Map::new()));
     if !child.is_object() {
-        return Err(format!(
+        return Err(ProtocolError::InvalidRequest(format!(
             "{ENV_VAR} cannot set '{}': '{}' is not an object",
             path.join("."),
             path[0]
-        ));
+        )));
     }
     insert_value(child, &path[1..], value)
 }
@@ -191,7 +195,10 @@ mod tests {
             "instructions=replace",
         ] {
             let error = apply(&mut body, config).unwrap_err();
-            assert!(error.contains("cannot override"), "{config}: {error}");
+            assert!(
+                error.to_string().contains("cannot override"),
+                "{config}: {error}"
+            );
         }
     }
 

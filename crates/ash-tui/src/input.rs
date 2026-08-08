@@ -406,13 +406,13 @@ mod tests {
     }
 
     #[test]
-    fn queued_drafts_are_not_added_to_history() {
+    fn rejected_submissions_are_not_added_to_history() {
         let mut input = InputState::default();
         input.set_text("active");
         assert_eq!(input.submit(), "active");
         input.record_submission("active");
-        input.set_text("queued");
-        assert_eq!(input.submit(), "queued");
+        input.set_text("rejected");
+        assert_eq!(input.submit(), "rejected");
 
         input.restore_submission("active".to_string());
 

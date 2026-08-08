@@ -1,21 +1,23 @@
-use std::collections::VecDeque;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{EventKind, LiveEvent, MessageId, SubagentSnapshot, ThreadId};
+use ash_core::{AshError, EventKind, LiveEvent, MessageId, SubagentSnapshot, ThreadId};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use futures::StreamExt;
 
+#[cfg(test)]
+use crate::operation::CancellationMode;
 use crate::{
     fork_picker::ForkPickerState,
     inline::{TerminalUi, TerminalView},
     input::InputState,
     menu::ComposerMenuState,
     operation::{
-        AgentStart, BackgroundAction, Cancellation, EventRoute, FailureCompletion, OperationState,
-        RollbackCompletion, SubmissionPolicy,
+        AgentStart, BackgroundAction, FailureCompletion, OperationState, SubmissionPolicy,
+        TurnCompletion,
     },
     session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
@@ -26,11 +28,42 @@ use crate::{
 /// status refresh redraws anything that did not complete a line yet.
 const STATUS_INTERVAL: Duration = Duration::from_millis(350);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+pub enum UiError {
+    Agent(AshError),
+    ControllerStopped,
+    InputDropped,
+}
+
+impl fmt::Display for UiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Agent(error) => write!(formatter, "{error}"),
+            Self::ControllerStopped => formatter.write_str("thread controller has stopped"),
+            Self::InputDropped => formatter.write_str("thread controller dropped the input"),
+        }
+    }
+}
+
+impl std::error::Error for UiError {}
+
+impl From<AshError> for UiError {
+    fn from(error: AshError) -> Self {
+        Self::Agent(error)
+    }
+}
+
+#[derive(Debug)]
 pub enum UiCommand {
-    Submit(String),
+    Submit {
+        input: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), UiError>>,
+    },
+    Steer {
+        input: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), UiError>>,
+    },
     Cancel,
-    CancelAndRollback,
     Rollback,
     Compact,
     NewSession,
@@ -45,7 +78,6 @@ struct AppState {
     input: InputState,
     operation: OperationState,
     menu: ComposerMenuState,
-    pending_inputs: VecDeque<String>,
     subagent_rx: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
     subagents: Vec<SubagentSnapshot>,
 }
@@ -104,7 +136,6 @@ impl AppState {
             input: InputState::with_history(input_history),
             operation: OperationState::default(),
             menu: ComposerMenuState::default(),
-            pending_inputs: VecDeque::new(),
             subagent_rx: None,
             subagents: Vec::new(),
         }
@@ -120,11 +151,8 @@ impl AppState {
     }
 
     fn sync_menu(&mut self) {
-        self.menu.sync_commands(
-            self.input.text(),
-            self.input.cursor(),
-            self.operation.is_busy(),
-        );
+        self.menu
+            .sync_commands(self.input.text(), self.input.cursor());
     }
 
     fn view(&self) -> TerminalView<'_> {
@@ -132,7 +160,6 @@ impl AppState {
             input: &self.input,
             menu: self.menu.view(),
             busy: self.operation.shows_activity(),
-            queued_messages: self.pending_inputs.len(),
         }
     }
 
@@ -224,14 +251,6 @@ impl App {
                 }
                 event = events.next() => {
                     let Some(event) = event else { break };
-                    match state.operation.route_event(&event) {
-                        EventRoute::Handle => {}
-                        EventRoute::Ignore => continue,
-                        EventRoute::Render => {
-                            state.render(&mut terminal)?;
-                            continue;
-                        }
-                    }
                     match handle_agent_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
@@ -262,20 +281,12 @@ impl App {
 async fn handle_agent_event(
     state: &mut AppState,
     terminal: &mut TerminalUi,
-    _commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    commands: &tokio::sync::mpsc::Sender<UiCommand>,
     event: EventKind,
 ) -> anyhow::Result<LoopAction> {
     match event {
         EventKind::TurnStart => {
-            let start = if state.operation.is_busy() {
-                state.operation.agent_started()
-            } else if let Some(input) = state.pending_inputs.pop_front() {
-                state.operation.start_turn(Some(input.clone()));
-                terminal.commit_input(&input)?;
-                AgentStart::StartedTurn
-            } else {
-                state.operation.agent_started()
-            };
+            let start = state.operation.agent_started();
             terminal.agent_started()?;
             state.render(terminal)?;
             Ok(match start {
@@ -283,6 +294,7 @@ async fn handle_agent_event(
                 AgentStart::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
+        EventKind::Live(_) if !state.operation.accepts_live_output() => Ok(LoopAction::Continue),
         EventKind::Live(LiveEvent::TextDelta(text)) => {
             terminal.text(&text)?;
             Ok(LoopAction::Continue)
@@ -317,22 +329,30 @@ async fn handle_agent_event(
             Ok(LoopAction::Continue)
         }
         EventKind::Turn(view) => {
-            state.operation.complete_turn();
-            terminal.commit_turn(&view)?;
-            state.render(terminal)?;
+            match state.operation.complete_turn() {
+                TurnCompletion::Commit => {
+                    terminal.commit_turn(&view)?;
+                    state.render(terminal)?;
+                }
+                TurnCompletion::AwaitRollback => {
+                    if commands.send(UiCommand::Rollback).await.is_err() {
+                        return Ok(LoopAction::Exit);
+                    }
+                }
+            }
             Ok(LoopAction::Continue)
         }
         EventKind::TurnRolledBack {
             prompt,
             context_tokens,
         } => {
-            let rollback = state.operation.finish_rollback();
+            state
+                .operation
+                .finish_background(BackgroundAction::Rollback);
             if state.input.text() != prompt {
                 state.input.restore_submission(prompt);
             }
-            if rollback == RollbackCompletion::ReplayViewport {
-                terminal.rollback_turn()?;
-            }
+            terminal.rollback_turn()?;
             if let Some(tokens) = context_tokens {
                 terminal.record_rollback_context(tokens)?;
             }
@@ -360,7 +380,7 @@ async fn handle_agent_event(
         } => {
             state.menu.close_picker();
             state.operation.finish();
-            terminal.restore_session(&view.messages, context_tokens)?;
+            terminal.restore_session(&view, context_tokens)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -395,7 +415,7 @@ async fn handle_agent_event(
         } => {
             state.menu.close_picker();
             state.operation.finish_background(BackgroundAction::Fork);
-            terminal.restore_session(&view.messages, context_tokens)?;
+            terminal.restore_session(&view, context_tokens)?;
             state.input.set_text(prompt);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -440,11 +460,11 @@ async fn handle_key(
     if state.menu.fork_picker_is_visible() {
         return handle_fork_key(state, terminal, commands, key).await;
     }
-    if handle_completion_key(state, terminal, key)? {
-        return Ok(LoopAction::Continue);
-    }
     if is_cancel_key(state, &key) {
         return cancel_turn(state, terminal, commands).await;
+    }
+    if handle_completion_key(state, terminal, key)? {
+        return Ok(LoopAction::Continue);
     }
 
     match key.code {
@@ -650,7 +670,6 @@ fn handle_completion_key(
 
 fn is_cancel_key(state: &AppState, key: &KeyEvent) -> bool {
     state.operation.can_cancel()
-        && state.input.is_empty()
         && key.code == KeyCode::Esc
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
@@ -661,24 +680,12 @@ async fn cancel_turn(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    let Some(cancellation) = state
-        .operation
-        .begin_cancellation(terminal.has_response_block())
-    else {
+    let mode = terminal.prepare_cancellation();
+    if !state.operation.begin_cancellation(mode) {
         return Ok(LoopAction::Continue);
-    };
-    let command = match cancellation {
-        Cancellation::KeepResponse => UiCommand::Cancel,
-        Cancellation::RemoveTurn { prompt } => {
-            if let Some(prompt) = prompt {
-                state.input.restore_submission(prompt);
-            }
-            terminal.rollback_turn()?;
-            UiCommand::CancelAndRollback
-        }
-    };
+    }
     state.render(terminal)?;
-    Ok(if commands.send(command).await.is_err() {
+    Ok(if commands.send(UiCommand::Cancel).await.is_err() {
         LoopAction::Exit
     } else {
         LoopAction::Continue
@@ -690,9 +697,11 @@ async fn submit_input(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    if state.operation.submission_policy() == SubmissionPolicy::Block {
-        terminal.command_blocked("input")?;
-        state.render(terminal)?;
+    let Some(policy) = state.operation.submission_policy() else {
+        return Ok(LoopAction::Continue);
+    };
+    let parsed = slash_command::parse(state.input.text());
+    if submission_is_blocked(policy, &parsed) {
         return Ok(LoopAction::Continue);
     }
     let input = state.input.submit();
@@ -706,48 +715,20 @@ async fn submit_input(
         return Ok(LoopAction::Exit);
     }
 
-    match slash_command::parse(&input) {
-        ParsedInput::Message => submit_message(state, terminal, commands, input).await,
-        ParsedInput::Invalid(error) => {
-            if state.operation.is_busy() {
-                terminal.command_blocked("command")?;
-            } else {
-                terminal.command_error(&error)?;
-            }
+    match (policy, parsed) {
+        (SubmissionPolicy::Start, ParsedInput::Message) => {
+            start_message(state, terminal, commands, input).await
+        }
+        (SubmissionPolicy::Steer, ParsedInput::Message) => {
+            steer_message(state, terminal, commands, input).await
+        }
+        (_, ParsedInput::Invalid(error)) => {
+            terminal.command_error(&error)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        ParsedInput::Command(command) => {
+        (_, ParsedInput::Command(command)) => {
             run_command(state, terminal, commands, command, &input).await
-        }
-    }
-}
-
-async fn submit_message(
-    state: &mut AppState,
-    terminal: &mut TerminalUi,
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    input: String,
-) -> anyhow::Result<LoopAction> {
-    match state.operation.submission_policy() {
-        SubmissionPolicy::Enqueue => {
-            if commands
-                .send(UiCommand::Submit(input.clone()))
-                .await
-                .is_err()
-            {
-                return Ok(LoopAction::Exit);
-            }
-            state.pending_inputs.push_back(input.clone());
-            state.input.record_submission(&input);
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        SubmissionPolicy::Start => start_message(state, terminal, commands, input).await,
-        SubmissionPolicy::Block => {
-            terminal.command_blocked("input")?;
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
         }
     }
 }
@@ -758,18 +739,68 @@ async fn start_message(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     input: String,
 ) -> anyhow::Result<LoopAction> {
-    state.operation.start_turn(Some(input.clone()));
-    terminal.commit_input(&input)?;
-    if commands
-        .send(UiCommand::Submit(input.clone()))
-        .await
-        .is_err()
-    {
-        return Ok(LoopAction::Exit);
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let command = UiCommand::Submit {
+        input: input.clone(),
+        reply,
+    };
+    match send_confirmed(commands, command, result).await {
+        Ok(()) => {
+            state.operation.start_turn();
+            terminal.commit_input(&input)?;
+            state.input.record_submission(&input);
+            state.render(terminal)?;
+            Ok(LoopAction::ResetTimers)
+        }
+        Err(error) => reject_input(state, terminal, input, "submit", &error),
     }
-    state.input.record_submission(&input);
+}
+
+async fn steer_message(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    input: String,
+) -> anyhow::Result<LoopAction> {
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let command = UiCommand::Steer {
+        input: input.clone(),
+        reply,
+    };
+    match send_confirmed(commands, command, result).await {
+        Ok(()) => {
+            terminal.commit_steer(&input)?;
+            state.input.record_submission(&input);
+            state.render(terminal)?;
+            Ok(LoopAction::Continue)
+        }
+        Err(error) => reject_input(state, terminal, input, "steer", &error),
+    }
+}
+
+async fn send_confirmed(
+    commands: &tokio::sync::mpsc::Sender<UiCommand>,
+    command: UiCommand,
+    result: tokio::sync::oneshot::Receiver<Result<(), UiError>>,
+) -> Result<(), UiError> {
+    commands
+        .send(command)
+        .await
+        .map_err(|_| UiError::ControllerStopped)?;
+    result.await.map_err(|_| UiError::InputDropped)?
+}
+
+fn reject_input(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    input: String,
+    action: &str,
+    error: &UiError,
+) -> anyhow::Result<LoopAction> {
+    state.input.set_text(input);
+    terminal.error(&format!("Failed to {action} input: {error}"))?;
     state.render(terminal)?;
-    Ok(LoopAction::ResetTimers)
+    Ok(LoopAction::Continue)
 }
 
 async fn run_command(
@@ -779,12 +810,6 @@ async fn run_command(
     command: SlashCommand,
     input: &str,
 ) -> anyhow::Result<LoopAction> {
-    if state.operation.is_busy() && !command.available_during_task() {
-        terminal.command_blocked(command.name())?;
-        state.render(terminal)?;
-        return Ok(LoopAction::Continue);
-    }
-
     let outgoing = match command {
         SlashCommand::New | SlashCommand::Clear => {
             state.menu.close_picker();
@@ -798,7 +823,7 @@ async fn run_command(
             Some(UiCommand::ListSessions)
         }
         SlashCommand::Undo => {
-            state.operation.start_rollback();
+            state.operation.start_background(BackgroundAction::Rollback);
             Some(UiCommand::Rollback)
         }
         SlashCommand::Fork => {
@@ -831,6 +856,16 @@ async fn run_command(
     Ok(LoopAction::Continue)
 }
 
+fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
+    matches!(
+        (policy, input),
+        (
+            SubmissionPolicy::Steer,
+            ParsedInput::Command(command)
+        ) if command.requires_idle()
+    )
+}
+
 fn inserts_newline(key: &KeyEvent) -> bool {
     (key.code == KeyCode::Enter
         && key
@@ -842,50 +877,97 @@ fn inserts_newline(key: &KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::TurnCompletion;
 
     #[test]
     fn derives_terminal_view_from_one_app_state() {
         let mut state = AppState::new(Vec::new());
         state.input.set_text("/");
-        state.operation.start_turn(Some("question".into()));
-        state.pending_inputs.push_back("next".into());
+        state.operation.start_turn();
 
         state.sync_menu();
         let view = state.view();
 
         assert!(view.busy);
-        assert_eq!(view.queued_messages, 1);
-        assert_eq!(
-            match view.menu {
-                crate::menu::MenuView::Commands { items, .. } =>
-                    items.iter().map(|command| command.name).collect::<Vec<_>>(),
-                crate::menu::MenuView::None
-                | crate::menu::MenuView::Sessions { .. }
-                | crate::menu::MenuView::ForkPoints { .. } => Vec::new(),
-            },
-            ["exit"]
-        );
+        let crate::menu::MenuView::Commands { items, .. } = view.menu else {
+            panic!("expected command completions");
+        };
+        assert_eq!(items.len(), 8);
     }
 
     #[test]
-    fn cancellation_keeps_the_core_owned_pending_projection() {
+    fn cancellation_finishes_when_the_turn_finishes() {
         let mut state = AppState::new(Vec::new());
-        state.operation.start_turn(None);
-        state.operation.begin_cancellation(true);
-        state.pending_inputs.push_back("next".into());
-        state.pending_inputs.push_back("later".into());
+        state.operation.start_turn();
+        assert!(state
+            .operation
+            .begin_cancellation(CancellationMode::Interrupt));
 
-        assert_eq!(
-            state.operation.complete_turn(),
-            Some(TurnCompletion::Cancelled)
-        );
+        assert_eq!(state.operation.complete_turn(), TurnCompletion::Commit);
         assert!(!state.operation.is_busy());
         assert!(state.input.is_empty());
-        assert_eq!(
-            state.pending_inputs,
-            VecDeque::from(["next".to_string(), "later".to_string()])
-        );
+    }
+
+    #[test]
+    fn escape_cancels_a_running_turn_even_with_a_draft() {
+        let mut state = AppState::new(Vec::new());
+        state.operation.start_turn();
+        state.input.set_text("keep this draft");
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(is_cancel_key(&state, &escape));
+        assert_eq!(state.input.text(), "keep this draft");
+    }
+
+    #[test]
+    fn unavailable_input_is_blocked_without_changing_the_draft() {
+        let mut state = AppState::new(Vec::new());
+        state.operation.start_turn();
+        state.input.set_text("/new");
+
+        let policy = state.operation.submission_policy().unwrap();
+        let parsed = slash_command::parse(state.input.text());
+        assert!(submission_is_blocked(policy, &parsed));
+        assert_eq!(state.input.text(), "/new");
+
+        let parsed = slash_command::parse("/status");
+        assert!(!submission_is_blocked(policy, &parsed));
+
+        let parsed = slash_command::parse("steer this turn");
+        assert!(!submission_is_blocked(policy, &parsed));
+
+        assert!(state
+            .operation
+            .begin_cancellation(CancellationMode::Interrupt));
+        assert_eq!(state.operation.submission_policy(), None);
+        assert_eq!(state.input.text(), "/new");
+    }
+
+    #[tokio::test]
+    async fn confirmed_input_returns_the_controller_rejection() {
+        let (commands, mut incoming) = tokio::sync::mpsc::channel(1);
+        let client = tokio::spawn(async move {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            send_confirmed(
+                &commands,
+                UiCommand::Steer {
+                    input: "change direction".into(),
+                    reply,
+                },
+                result,
+            )
+            .await
+        });
+
+        let Some(UiCommand::Steer { input, reply }) = incoming.recv().await else {
+            panic!("expected steer command");
+        };
+        assert_eq!(input, "change direction");
+        reply
+            .send(Err(UiError::Agent(AshError::Config("turn ended".into()))))
+            .unwrap();
+
+        let error = client.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "config: turn ended");
     }
 
     #[test]

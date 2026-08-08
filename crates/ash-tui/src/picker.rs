@@ -51,4 +51,29 @@ impl<T> PickerState<T> {
             self.selected = (self.selected + 1) % self.items.len();
         }
     }
+
+    /// Clamp the selection into the current item range, or reset it to the
+    /// first item when the list is empty. Used when the item list changes
+    /// while a selection already exists.
+    pub(crate) fn set_selected(&mut self, index: usize) {
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = index.min(self.items.len() - 1);
+        }
+    }
+
+    /// Replace the wrapped items while keeping the selection clamped into
+    /// the new range (or reset when empty).
+    pub(crate) fn replace_items(&mut self, items: Vec<T>) {
+        self.items = items;
+        self.set_selected(self.selected);
+    }
+
+    /// Drop all items and reset the selection. Keeps the wrapped list owned
+    /// so the type stays a single navigation state.
+    pub(crate) fn clear(&mut self) {
+        self.items.clear();
+        self.selected = 0;
+    }
 }

@@ -9,8 +9,6 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::agent::RetryBackoff;
-#[cfg(test)]
-use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
 use crate::store::ThreadPersistence;
 use crate::{
     context::count_output_tokens,
@@ -53,6 +51,12 @@ enum StreamExit {
     Exhausted,
     Cancelled,
     Failed(ash_core::ProtocolError),
+}
+
+#[derive(Clone, Copy)]
+enum OpenResponseBlock {
+    Thought,
+    Text,
 }
 
 pub(crate) struct CompactedHistory {
@@ -203,21 +207,6 @@ async fn run_agent_turn_inner(
         .await
 }
 
-#[cfg(test)]
-async fn run_with_adapter(
-    config: &RunConfig,
-    messages: &mut Vec<Message>,
-    tx: mpsc::Sender<EventKind>,
-    cancel: CancellationToken,
-    thread_id: ThreadId,
-    model: &dyn ModelClient,
-    persistence: Option<&mut ThreadPersistence>,
-) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
-    let (_, steering) = mpsc::unbounded_channel();
-    let execution = TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering, Vec::new());
-    run_agent_turn_inner(model, config, messages, execution, persistence).await
-}
-
 impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     fn new(
         config: &'config RunConfig,
@@ -272,8 +261,10 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     ) -> Result<Step, ash_core::AshError> {
         let mut retries = 0u32;
         loop {
-            let pending_base = self.persistence.as_ref().map(|p| p.pending_len());
             let estimated_input_tokens = self.prepare_context(messages).await?;
+            // Context preparation may stage a durable checkpoint. A retry must
+            // retain it and discard only records produced by the model attempt.
+            let pending_base = self.persistence.as_ref().map(|p| p.pending_len());
             // Snapshot after context preparation (compaction may have
             // reshaped `messages`); truncating to this length on retry
             // removes only the partial assistant message pushed below.
@@ -474,14 +465,15 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         calls: Vec<PendingToolCall>,
     ) -> Result<(), ash_core::AshError> {
         for call in calls {
-            let _ = self
-                .tx
-                .send(EventKind::Live(LiveEvent::ToolStarted {
+            send_live(
+                &self.tx,
+                EventKind::Live(LiveEvent::ToolStarted {
                     id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                }))
-                .await;
+                }),
+            )
+            .await;
             let result = limit_tool_result(
                 self.execute_tool(messages, &call.name, call.arguments.clone())
                     .await,
@@ -496,16 +488,17 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     (text.clone(), true, Err(text), Vec::new())
                 }
             };
-            let _ = self
-                .tx
-                .send(EventKind::Live(LiveEvent::ToolFinished {
+            send_live(
+                &self.tx,
+                EventKind::Live(LiveEvent::ToolFinished {
                     id: call.id.clone(),
                     name: call.name,
                     arguments: call.arguments,
                     output,
                     is_error,
-                }))
-                .await;
+                }),
+            )
+            .await;
             let message = Message {
                 id: ash_core::MessageId::new(),
                 role: Role::User,
@@ -562,6 +555,16 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     }
 }
 
+/// Send one live event to the thread actor. A closed receiver means the
+/// thread is shutting down (or already gone): the turn keeps running to a
+/// result, but its streaming preview has nowhere to go. Log instead of
+/// failing the turn silently.
+async fn send_live(tx: &mpsc::Sender<EventKind>, kind: EventKind) {
+    if let Err(error) = tx.send(kind).await {
+        tracing::warn!(%error, "dropping live event: agent event receiver closed");
+    }
+}
+
 async fn collect_response(
     stream: &mut ModelStream,
     tx: &mpsc::Sender<EventKind>,
@@ -574,6 +577,7 @@ async fn collect_response(
     let mut saw_stop = false;
     let mut usage = UsageAccumulator::default();
     let mut first_output_at = None;
+    let mut open_block = None;
 
     let stream_exit = loop {
         let next = tokio::select! {
@@ -595,7 +599,8 @@ async fn collect_response(
                     Some(ContentBlock::Text(text)) => text.push_str(&delta),
                     _ => blocks.push(ContentBlock::Text(delta.clone())),
                 }
-                let _ = tx.send(EventKind::Live(LiveEvent::TextDelta(delta))).await;
+                open_block = Some(OpenResponseBlock::Text);
+                send_live(tx, EventKind::Live(LiveEvent::TextDelta(delta))).await;
             }
             ModelEvent::Reasoning(delta) => {
                 first_output_at.get_or_insert_with(Instant::now);
@@ -609,9 +614,8 @@ async fn collect_response(
                         });
                     }
                 }
-                let _ = tx
-                    .send(EventKind::Live(LiveEvent::ReasoningDelta(delta)))
-                    .await;
+                open_block = Some(OpenResponseBlock::Thought);
+                send_live(tx, EventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
             }
             ModelEvent::ToolCall {
                 id,
@@ -620,6 +624,7 @@ async fn collect_response(
             } => {
                 first_output_at.get_or_insert_with(Instant::now);
                 finish_open_thought(&mut blocks, &mut thought_started_at);
+                open_block = None;
                 blocks.push(ContentBlock::ToolCall {
                     id,
                     name,
@@ -630,12 +635,18 @@ async fn collect_response(
                 usage.record(reported.input_tokens, reported.output_tokens)
             }
             ModelEvent::Stop(reason) => {
+                finish_open_thought(&mut blocks, &mut thought_started_at);
+                open_block = None;
                 saw_stop = true;
                 stop_reason = reason;
             }
         }
     };
-    finish_open_thought(&mut blocks, &mut thought_started_at);
+    if matches!(stream_exit, StreamExit::Cancelled) {
+        discard_open_block(&mut blocks, open_block, &mut thought_started_at);
+    } else {
+        finish_open_thought(&mut blocks, &mut thought_started_at);
+    }
 
     // Defense in depth for truncated streams: the protocol adapters emit
     // `Stop(Truncated)` when a stream ends without a terminal marker, but any
@@ -736,6 +747,24 @@ fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Inst
     }
 }
 
+fn discard_open_block(
+    blocks: &mut Vec<ContentBlock>,
+    open_block: Option<OpenResponseBlock>,
+    thought_started_at: &mut Option<Instant>,
+) {
+    let matches_open = match (open_block, blocks.last()) {
+        (Some(OpenResponseBlock::Thought), Some(ContentBlock::Thought { .. }))
+        | (Some(OpenResponseBlock::Text), Some(ContentBlock::Text(_))) => true,
+        (None, _) | (Some(OpenResponseBlock::Thought), _) | (Some(OpenResponseBlock::Text), _) => {
+            false
+        }
+    };
+    if matches_open {
+        blocks.pop();
+    }
+    thought_started_at.take();
+}
+
 fn limit_tool_result(result: Result<ToolOutput, ToolError>) -> Result<ToolOutput, ToolError> {
     match result {
         Ok(mut output) => {
@@ -787,7 +816,23 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
     use crate::{JsonlThreadStore, SharedThreadStore, StoredThread, ThreadMetadata};
+
+    async fn run_with_adapter(
+        config: &RunConfig,
+        messages: &mut Vec<Message>,
+        tx: mpsc::Sender<EventKind>,
+        cancel: CancellationToken,
+        thread_id: ThreadId,
+        model: &dyn ModelClient,
+        persistence: Option<&mut ThreadPersistence>,
+    ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
+        let (_, steering) = mpsc::unbounded_channel();
+        let execution =
+            TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering, Vec::new());
+        run_agent_turn_inner(model, config, messages, execution, persistence).await
+    }
 
     fn metadata(thread_id: ThreadId) -> ThreadMetadata {
         ThreadMetadata {
@@ -1059,6 +1104,77 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn retry_after_automatic_compaction_keeps_the_checkpoint() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([
+                vec![
+                    ModelEvent::Text("condensed facts".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+                vec![ModelEvent::Text("partial".into())],
+                vec![
+                    ModelEvent::Text("complete".into()),
+                    ModelEvent::Stop(StopReason::EndTurn),
+                ],
+            ])),
+            requests: requests.clone(),
+        };
+        let config = RunConfig {
+            system_prompt: Some("system".to_string()),
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 1_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            max_retries: 1,
+            retry_backoff: RetryBackoff {
+                base: Duration::from_millis(1),
+                max: Duration::from_millis(10),
+            },
+        };
+        let mut messages = vec![
+            Message::user(&format!("old request {}", "x".repeat(10_000))),
+            Message::assistant_text("old answer"),
+            Message::user("recent one"),
+            Message::assistant_text("answer one"),
+            Message::user("recent two"),
+            Message::assistant_text("answer two"),
+        ];
+        let directory = TempDir::new().unwrap();
+        let (thread_id, store, mut persistence) =
+            persisted_thread(directory.path(), &messages).await;
+        let (tx, _rx) = mpsc::channel(16);
+
+        let (reason, _usage) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            thread_id,
+            &adapter,
+            Some(&mut persistence),
+        )
+        .await
+        .unwrap();
+        persistence.commit().await.unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        let stored = load_thread(&store, thread_id).await;
+        assert_eq!(stored.log.model_context(), messages);
+        assert_eq!(stored.log.messages().len(), 7);
+        let persisted = serde_json::to_string(&stored.log).unwrap();
+        assert!(persisted.contains("checkpoint"));
+        assert!(!persisted.contains("partial"));
     }
 
     #[tokio::test]
@@ -1428,6 +1544,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_time_counts_towards_the_generation_window() {
+        struct ReasoningThenTextAdapter;
+
+        #[async_trait::async_trait]
+        impl ModelClient for ReasoningThenTextAdapter {
+            fn stream(&self, _req: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+                // A 30ms thinking phase followed by a text burst. The
+                // generation clock must start at the first reasoning delta:
+                // provider `output_tokens` includes thinking tokens, so an
+                // excluded thinking phase would inflate the tok/s rate.
+                let stream = futures::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((Ok(ModelEvent::Reasoning("thinking".into())), 1)),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            Some((Ok(ModelEvent::Text("answer".into())), 2))
+                        }
+                        2 => Some((Ok(ModelEvent::Stop(StopReason::EndTurn)), 3)),
+                        _ => None,
+                    }
+                });
+                Ok(Box::pin(stream))
+            }
+        }
+
+        let adapter = ReasoningThenTextAdapter;
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            working_dir: PathBuf::from("."),
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            agent_path: "/root".to_string(),
+            tree_id: None,
+            kind: crate::ThreadKind::Root,
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, usage) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            ThreadId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        let usage = usage.unwrap();
+        // The 30ms thinking phase must be part of the generation window;
+        // starting the clock at the trailing text burst would measure ~0ms
+        // and report an absurd tok/s.
+        assert!(
+            usage.generation_ms >= 20,
+            "generation_ms = {}",
+            usage.generation_ms
+        );
+    }
+
+    #[tokio::test]
     async fn persists_reasoning_blocks_in_thread_history() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
@@ -1485,7 +1670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_preserves_partial_assistant_text() {
+    async fn cancellation_discards_partial_assistant_text() {
         struct PendingAdapter;
 
         impl ModelClient for PendingAdapter {
@@ -1539,11 +1724,50 @@ mod tests {
         };
         assert_eq!(reason, StopReason::Aborted);
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert!(matches!(
-            &messages[1].content,
-            MessageContent::Assistant(blocks)
-                if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "partial")
+            &messages[0],
+            Message {
+                role: Role::User,
+                content: MessageContent::User(content),
+                ..
+            } if content.as_slice() == [ash_core::Content::Text("question".into())]
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_completed_blocks_before_the_open_block() {
+        let mut stream: ModelStream = Box::pin(
+            futures::stream::iter([
+                Ok(ModelEvent::Reasoning("completed thought".into())),
+                Ok(ModelEvent::Text("partial answer".into())),
+            ])
+            .chain(futures::stream::pending()),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let response = collect_response(&mut stream, &tx, &cancel, Instant::now());
+        tokio::pin!(response);
+
+        for expected in ["completed thought", "partial answer"] {
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                result = &mut response => panic!("response ended before cancellation: {}", result.message.is_some()),
+            };
+            assert!(matches!(
+                event,
+                Some(EventKind::Live(LiveEvent::ReasoningDelta(text)))
+                    | Some(EventKind::Live(LiveEvent::TextDelta(text))) if text == expected
+            ));
+        }
+        cancel.cancel();
+        let collected = response.await;
+
+        assert!(matches!(collected.outcome, ResponseOutcome::Cancelled));
+        assert!(matches!(
+            collected.message.map(|message| message.content),
+            Some(MessageContent::Assistant(blocks))
+                if matches!(blocks.as_slice(), [ContentBlock::Thought { text, .. }] if text == "completed thought")
         ));
     }
 

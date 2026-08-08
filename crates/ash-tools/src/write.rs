@@ -1,9 +1,10 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
-use ash_core::{define_tool, Tool, ToolError};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -15,19 +16,23 @@ struct WriteArgs {
     content: String,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "write",
         "Write complete content to a file. Creates missing parent directories and overwrites an existing file; use edit for local changes.",
-        move |_ctx, args: WriteArgs| {
+        move |ctx, args: WriteArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
             async move {
-            let path = write_file(&working_dir, &args.path, &args.content).await?;
-            Ok(format!(
-                "Wrote {} bytes to {}.",
-                args.content.len(),
-                path.display()
-            ))
+                let path =
+                    write_file(&working_dir, &args.path, &args.content, cancellation, deadline)
+                        .await?;
+                Ok(format!(
+                    "Wrote {} bytes to {}.",
+                    args.content.len(),
+                    path.display()
+                ))
             }
         },
     )
@@ -37,18 +42,16 @@ async fn write_file(
     root: &Path,
     requested: &str,
     content: &str,
+    cancellation: CancellationToken,
+    deadline: Instant,
 ) -> Result<std::path::PathBuf, ToolError> {
     let root = root.to_path_buf();
     let requested = requested.to_string();
     let content = content.as_bytes().to_vec();
-    crate::path::run_blocking(move || {
+    crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
+        crate::path::ensure_running(&cancellation, deadline)?;
         let path = crate::path::WorkspacePath::new(&root, &requested)?;
-        path.write(&content).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot write {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
+        path.atomic_write(&content, None, &cancellation, deadline)?;
         Ok(path.full_path().to_path_buf())
     })
     .await
@@ -57,22 +60,65 @@ async fn write_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn creates_parent_directories_and_overwrites_files() {
         let root = tempfile::tempdir().unwrap();
-        write_file(root.path(), "src/new.rs", "first")
-            .await
-            .unwrap();
-        write_file(root.path(), "src/new.rs", "second")
-            .await
-            .unwrap();
+        write_file(
+            root.path(),
+            "src/new.rs",
+            "first",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        write_file(
+            root.path(),
+            "src/new.rs",
+            "second",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             tokio::fs::read_to_string(root.path().join("src/new.rs"))
                 .await
                 .unwrap(),
             "second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_permissions_when_overwriting() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("existing.txt");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&path)
+            .unwrap();
+
+        write_file(
+            root.path(),
+            "existing.txt",
+            "changed",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
         );
     }
 
@@ -85,9 +131,35 @@ mod tests {
         std::fs::write(&target, "secret").unwrap();
         std::os::unix::fs::symlink(&target, root.path().join("link.txt")).unwrap();
 
-        assert!(write_file(root.path(), "link.txt", "changed")
-            .await
-            .is_err());
+        assert!(write_file(
+            root.path(),
+            "link.txt",
+            "changed",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_does_not_create_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = write_file(
+            root.path(),
+            "new.txt",
+            "content",
+            cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
+        assert!(!root.path().join("new.txt").exists());
     }
 }

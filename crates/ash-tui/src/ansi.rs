@@ -65,153 +65,181 @@ pub(crate) fn highlight_bash_command(command: &str) -> Vec<Line<'static>> {
 }
 
 fn highlight_bash_line(line: &str) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut plain = String::new();
-    let mut chars = line.char_indices().peekable();
-    // True when the next word starts a command (start of line or right after
-    // `&&`, `||`, `;`, `|`).
-    let mut at_command_pos = true;
-
-    macro_rules! flush_plain {
-        () => {
-            if !plain.is_empty() {
-                spans.push(Span::raw(std::mem::take(&mut plain)));
-            }
-        };
-    }
-
-    while let Some((index, ch)) = chars.next() {
+    let mut highlight = BashLineHighlight::new(line);
+    while let Some((index, ch)) = highlight.chars.next() {
         match ch {
-            // Single-quoted string: literal until the closing quote.
             '\'' => {
-                flush_plain!();
-                let mut content = String::from("'");
-                let mut closed = false;
-                for (_, c) in chars.by_ref() {
-                    content.push(c);
-                    if c == '\'' {
-                        closed = true;
-                        break;
-                    }
-                }
-                spans.push(Span::styled(
-                    content,
-                    Style::default().fg(bash_palette::STRING),
-                ));
-                let _ = closed;
+                let span = highlight.read_single_quote();
+                highlight.push_styled(span);
             }
-            // Double-quoted string: honor backslash escapes.
             '"' => {
-                flush_plain!();
-                let mut content = String::from("\"");
-                let mut closed = false;
-                let mut escaped = false;
-                for (_, c) in chars.by_ref() {
-                    content.push(c);
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == '"' {
-                        closed = true;
-                        break;
-                    }
-                }
-                spans.push(Span::styled(
-                    content,
-                    Style::default().fg(bash_palette::STRING),
-                ));
-                let _ = closed;
+                let span = highlight.read_double_quote();
+                highlight.push_styled(span);
             }
-            // Variable: `$name`, `${name}`, `$1`.
             '$' => {
-                flush_plain!();
-                let mut content = String::from("$");
-                if let Some((_, '{')) = chars.peek() {
-                    chars.next();
-                    content.push('{');
-                    for (_, c) in chars.by_ref() {
-                        content.push(c);
-                        if c == '}' {
-                            break;
-                        }
-                    }
-                } else {
-                    for (_, c) in chars.by_ref() {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            content.push(c);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                spans.push(Span::styled(
-                    content,
-                    Style::default().fg(bash_palette::VARIABLE),
-                ));
+                let span = highlight.read_variable();
+                highlight.push_styled(span);
             }
-            // Comment: to end of line.
-            '#' if index == 0 || line.as_bytes()[index - 1] == b' ' => {
-                flush_plain!();
-                let content: String = chars.by_ref().map(|(_, c)| c).collect::<String>();
-                spans.push(Span::styled(
-                    format!("#{content}"),
-                    Style::default().fg(bash_palette::COMMENT),
-                ));
+            '#' if highlight.starts_comment(index) => {
+                let span = highlight.read_comment();
+                highlight.push_styled(span);
                 break;
             }
-            // Alphanumeric run: command, keyword, or plain word.
             c if c.is_ascii_alphanumeric() || c == '_' => {
-                flush_plain!();
-                let mut word = String::from(c);
-                while let Some((_, c)) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || *c == '_' {
-                        word.push(*c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let is_keyword = BASH_KEYWORDS.contains(&word.as_str());
-                let style = if is_keyword {
-                    Style::default().fg(bash_palette::KEYWORD)
-                } else if at_command_pos {
-                    Style::default().fg(bash_palette::COMMAND)
-                } else {
-                    Style::default()
-                };
-                // A control-flow keyword does not consume the command
-                // position: `if cd /tmp` still colors `cd` as a command.
-                if !is_keyword {
-                    at_command_pos = false;
-                }
-                spans.push(Span::styled(word, style));
+                highlight.push_word(c);
             }
             '-' => {
-                flush_plain!();
-                let mut word = String::from("-");
-                while let Some((_, c)) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || *c == '-' || *c == '_' {
-                        word.push(*c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                spans.push(Span::styled(word, Style::default().fg(bash_palette::FLAG)));
+                let span = highlight.read_flag();
+                highlight.push_styled(span);
             }
-            // Command separator: the next word is a command.
             c if is_command_boundary(c) => {
-                plain.push(ch);
-                at_command_pos = true;
+                highlight.plain.push(ch);
+                highlight.at_command_pos = true;
             }
             _ => {
-                plain.push(ch);
+                highlight.plain.push(ch);
             }
         }
     }
-    flush_plain!();
-    Line::from(spans)
+    highlight.finish()
+}
+
+struct BashLineHighlight<'a> {
+    spans: Vec<Span<'static>>,
+    plain: String,
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+    line: &'a str,
+    at_command_pos: bool,
+}
+
+impl<'a> BashLineHighlight<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            spans: Vec::new(),
+            plain: String::new(),
+            chars: line.char_indices().peekable(),
+            line,
+            at_command_pos: true,
+        }
+    }
+
+    fn finish(mut self) -> Line<'static> {
+        self.flush_plain();
+        Line::from(self.spans)
+    }
+
+    fn flush_plain(&mut self) {
+        if !self.plain.is_empty() {
+            self.spans.push(Span::raw(std::mem::take(&mut self.plain)));
+        }
+    }
+
+    fn push_styled(&mut self, span: Span<'static>) {
+        self.flush_plain();
+        self.spans.push(span);
+    }
+
+    fn starts_comment(&self, index: usize) -> bool {
+        index == 0 || self.line.as_bytes()[index - 1] == b' '
+    }
+
+    fn read_single_quote(&mut self) -> Span<'static> {
+        let mut content = String::from("'");
+        for (_, c) in self.chars.by_ref() {
+            content.push(c);
+            if c == '\'' {
+                break;
+            }
+        }
+        styled_span(content, bash_palette::STRING)
+    }
+
+    fn read_double_quote(&mut self) -> Span<'static> {
+        let mut content = String::from("\"");
+        let mut escaped = false;
+        for (_, c) in self.chars.by_ref() {
+            content.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                break;
+            }
+        }
+        styled_span(content, bash_palette::STRING)
+    }
+
+    fn read_variable(&mut self) -> Span<'static> {
+        let mut content = String::from("$");
+        if let Some((_, '{')) = self.chars.peek() {
+            self.chars.next();
+            content.push('{');
+            for (_, c) in self.chars.by_ref() {
+                content.push(c);
+                if c == '}' {
+                    break;
+                }
+            }
+        } else {
+            for (_, c) in self.chars.by_ref() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    content.push(c);
+                } else {
+                    break;
+                }
+            }
+        }
+        styled_span(content, bash_palette::VARIABLE)
+    }
+
+    fn read_comment(&mut self) -> Span<'static> {
+        let content: String = self.chars.by_ref().map(|(_, c)| c).collect();
+        styled_span(format!("#{content}"), bash_palette::COMMENT)
+    }
+
+    fn push_word(&mut self, first: char) {
+        let mut word = String::from(first);
+        while let Some((_, c)) = self.chars.peek() {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                word.push(*c);
+                self.chars.next();
+            } else {
+                break;
+            }
+        }
+        let is_keyword = BASH_KEYWORDS.contains(&word.as_str());
+        let style = if is_keyword {
+            Style::default().fg(bash_palette::KEYWORD)
+        } else if self.at_command_pos {
+            Style::default().fg(bash_palette::COMMAND)
+        } else {
+            Style::default()
+        };
+        // A control-flow keyword does not consume the command position:
+        // `if cd /tmp` still colors `cd` as a command.
+        if !is_keyword {
+            self.at_command_pos = false;
+        }
+        self.push_styled(Span::styled(word, style));
+    }
+
+    fn read_flag(&mut self) -> Span<'static> {
+        let mut word = String::from("-");
+        while let Some((_, c)) = self.chars.peek() {
+            if c.is_ascii_alphanumeric() || *c == '-' || *c == '_' {
+                word.push(*c);
+                self.chars.next();
+            } else {
+                break;
+            }
+        }
+        styled_span(word, bash_palette::FLAG)
+    }
+}
+
+fn styled_span(content: String, color: ratatui::style::Color) -> Span<'static> {
+    Span::styled(content, Style::default().fg(color))
 }
 
 /// Parse one line of text that may contain ANSI escape sequences into a

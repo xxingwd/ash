@@ -20,6 +20,8 @@ use crate::{
 
 const EMPTY_INPUT_ERROR: &str = "thread input cannot be empty";
 const INACTIVE_TURN_ERROR: &str = "the target turn is not active";
+const BUSY_THREAD_ERROR: &str =
+    "thread is busy; cancel and wait for the active turn before retrying";
 
 #[derive(Clone)]
 pub struct Thread {
@@ -46,7 +48,6 @@ struct QueuedTurn {
 #[derive(Default)]
 struct ActorQueues {
     turns: VecDeque<QueuedTurn>,
-    commands: VecDeque<Command>,
     inbox: Vec<Input>,
 }
 
@@ -60,58 +61,13 @@ enum Command {
     },
     Rollback(oneshot::Sender<Result<Option<String>, ash_core::AshError>>),
     Compact(oneshot::Sender<Result<ContextCompaction, ash_core::AshError>>),
-    Messages(oneshot::Sender<Vec<Message>>),
-    View(oneshot::Sender<ThreadView>),
-    ForkPoints(oneshot::Sender<Vec<ForkPoint>>),
+    Messages(oneshot::Sender<Result<Vec<Message>, ash_core::AshError>>),
+    View(oneshot::Sender<Result<ThreadView, ash_core::AshError>>),
+    ForkPoints(oneshot::Sender<Result<Vec<ForkPoint>, ash_core::AshError>>),
     Fork {
         message_id: MessageId,
         reply: oneshot::Sender<Result<Option<Fork>, ash_core::AshError>>,
     },
-}
-
-/// Result of routing a command: either fully handled (queued immediately) or
-/// handed to the turn-aware dispatcher.
-enum RouteOutcome {
-    /// Queued immediately (submit/notify), independent of turn state.
-    Handled,
-    /// A steer for the active turn.
-    Steer {
-        turn_id: TurnId,
-        input: Input,
-        reply: oneshot::Sender<Result<(), ash_core::AshError>>,
-    },
-    /// Deferred until the thread is idle.
-    Deferred(Command),
-}
-
-impl Command {
-    fn route(self, queues: &mut ActorQueues) -> RouteOutcome {
-        match self {
-            Command::Submit(turn) => {
-                queues.turns.push_back(turn);
-                RouteOutcome::Handled
-            }
-            Command::Notify(input) => {
-                queues.inbox.push(input);
-                RouteOutcome::Handled
-            }
-            Command::Steer {
-                turn_id,
-                input,
-                reply,
-            } => RouteOutcome::Steer {
-                turn_id,
-                input,
-                reply,
-            },
-            Command::Rollback(_)
-            | Command::Compact(_)
-            | Command::Messages(_)
-            | Command::View(_)
-            | Command::ForkPoints(_)
-            | Command::Fork { .. } => RouteOutcome::Deferred(self),
-        }
-    }
 }
 
 impl Thread {
@@ -168,7 +124,7 @@ impl Thread {
         Ok(id)
     }
 
-    /// Attach input to the next submitted turn without starting work by itself.
+    /// Attach input when the next queued turn starts, without starting work by itself.
     pub async fn notify(&self, input: impl Into<Input>) -> Result<(), ash_core::AshError> {
         let input = input.into();
         ensure_nonempty(&input)?;
@@ -192,28 +148,27 @@ impl Thread {
     }
 
     pub async fn rollback(&self) -> Result<Option<String>, ash_core::AshError> {
-        self.ask(Command::Rollback).await?
+        self.ask(Command::Rollback).await
     }
 
     pub async fn fork_at(&self, message_id: MessageId) -> Result<Option<Fork>, ash_core::AshError> {
-        self.ask(|reply| Command::Fork { message_id, reply })
-            .await?
+        self.ask(|reply| Command::Fork { message_id, reply }).await
     }
 
     pub async fn compact(&self) -> Result<ContextCompaction, ash_core::AshError> {
-        self.ask(Command::Compact).await?
+        self.ask(Command::Compact).await
     }
 
     async fn ask<T>(
         &self,
-        make_command: impl FnOnce(oneshot::Sender<T>) -> Command,
+        make_command: impl FnOnce(oneshot::Sender<Result<T, ash_core::AshError>>) -> Command,
     ) -> Result<T, ash_core::AshError> {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(make_command(reply))
             .await
             .map_err(|_| thread_closed())?;
-        result.await.map_err(|_| thread_closed())
+        result.await.map_err(|_| inactive_turn())?
     }
 }
 
@@ -258,10 +213,6 @@ async fn run_thread(
     let mut queues = ActorQueues::default();
     let mut sequence = 0_u64;
     loop {
-        if let Some(command) = queues.commands.pop_front() {
-            dispatch_idle_command(command, &mut state, &mut queues).await;
-            continue;
-        }
         if let Some(turn) = queues.turns.pop_front() {
             run_turn(
                 &mut state,
@@ -309,6 +260,7 @@ async fn run_turn(
     let mut commands_open = true;
     let result = loop {
         tokio::select! {
+            biased;
             result = &mut execution => break result,
             payload = payload_rx.recv() => {
                 if let Some(kind) = payload {
@@ -367,14 +319,24 @@ fn dispatch_active_command(
     active: TurnId,
     steer: &mpsc::UnboundedSender<Input>,
 ) {
-    match command.route(queues) {
-        RouteOutcome::Handled => {}
-        RouteOutcome::Steer {
+    match command {
+        Command::Submit(turn) => queues.turns.push_back(turn),
+        Command::Notify(input) => queues.inbox.push(input),
+        Command::Steer {
             turn_id,
             input,
             reply,
-        } => handle_steer(turn_id, input, reply, Some(active), Some(steer)),
-        RouteOutcome::Deferred(command) => queues.commands.push_back(command),
+        } if turn_id == active => {
+            let result = steer.send(input).map_err(|_| inactive_turn());
+            let _ = reply.send(result);
+        }
+        Command::Steer { reply, .. } => reject_steer(reply),
+        Command::Rollback(reply) => reject_busy(reply),
+        Command::Compact(reply) => reject_busy(reply),
+        Command::Messages(reply) => reject_busy(reply),
+        Command::View(reply) => reject_busy(reply),
+        Command::ForkPoints(reply) => reject_busy(reply),
+        Command::Fork { reply, .. } => reject_busy(reply),
     }
 }
 
@@ -384,41 +346,10 @@ async fn dispatch_idle_command(
     state: &mut ThreadState,
     queues: &mut ActorQueues,
 ) {
-    match command.route(queues) {
-        RouteOutcome::Handled => {}
-        RouteOutcome::Steer {
-            turn_id,
-            input,
-            reply,
-        } => handle_steer(turn_id, input, reply, None, None),
-        RouteOutcome::Deferred(command) => handle_idle_command(command, state).await,
-    }
-}
-
-fn handle_steer(
-    turn_id: TurnId,
-    input: Input,
-    reply: oneshot::Sender<Result<(), ash_core::AshError>>,
-    active: Option<TurnId>,
-    steer: Option<&mpsc::UnboundedSender<Input>>,
-) {
-    match (active, steer) {
-        (Some(active), Some(steer)) if turn_id == active => {
-            let result = steer.send(input).map_err(|_| thread_closed());
-            let _ = reply.send(result);
-        }
-        _ => reject_steer(reply),
-    }
-}
-
-fn reject_steer(reply: oneshot::Sender<Result<(), ash_core::AshError>>) {
-    let _ = reply.send(Err(ash_core::AshError::Config(
-        INACTIVE_TURN_ERROR.to_string(),
-    )));
-}
-
-async fn handle_idle_command(command: Command, state: &mut ThreadState) {
     match command {
+        Command::Submit(turn) => queues.turns.push_back(turn),
+        Command::Notify(input) => queues.inbox.push(input),
+        Command::Steer { reply, .. } => reject_steer(reply),
         Command::Rollback(reply) => {
             let _ = reply.send(state.rollback_last_turn().await);
         }
@@ -426,13 +357,13 @@ async fn handle_idle_command(command: Command, state: &mut ThreadState) {
             let _ = reply.send(state.compact().await);
         }
         Command::Messages(reply) => {
-            let _ = reply.send(state.messages());
+            let _ = reply.send(Ok(state.messages()));
         }
         Command::View(reply) => {
-            let _ = reply.send(state.view());
+            let _ = reply.send(Ok(state.view()));
         }
         Command::ForkPoints(reply) => {
-            let _ = reply.send(state.fork_points());
+            let _ = reply.send(Ok(state.fork_points()));
         }
         Command::Fork { message_id, reply } => {
             let result = state.fork_at(message_id).await.map(|forked| {
@@ -447,10 +378,15 @@ async fn handle_idle_command(command: Command, state: &mut ThreadState) {
             });
             let _ = reply.send(result);
         }
-        // `Command::route` only hands Deferred commands to this handler, so
-        // any other variant here is a routing bug, not a user error.
-        _ => unreachable!("idle dispatch only hands Deferred commands here"),
     }
+}
+
+fn reject_steer(reply: oneshot::Sender<Result<(), ash_core::AshError>>) {
+    let _ = reply.send(Err(inactive_turn()));
+}
+
+fn reject_busy<T>(reply: oneshot::Sender<Result<T, ash_core::AshError>>) {
+    let _ = reply.send(Err(busy_thread()));
 }
 
 fn publish(
@@ -461,17 +397,39 @@ fn publish(
     kind: EventKind,
 ) {
     *sequence = sequence.saturating_add(1);
-    let _ = events.send(Event {
+    let event = Event {
         thread_id,
         turn_id,
         sequence: *sequence,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: chrono::Utc::now(),
         kind,
-    });
+    };
+    // The thread is the single publisher of everything the UI can observe.
+    // Log every event here so agent output is always visible in the logs,
+    // regardless of whether any UI is attached. Streaming deltas are too
+    // chatty for info level; everything else is a stable boundary event.
+    match &event.kind {
+        EventKind::Live(ash_core::LiveEvent::TextDelta(_))
+        | EventKind::Live(ash_core::LiveEvent::ReasoningDelta(_)) => {
+            tracing::debug!(%thread_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+        }
+        _ => {
+            tracing::info!(%thread_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+        }
+    }
+    let _ = events.send(event);
 }
 
 fn thread_closed() -> ash_core::AshError {
     ash_core::AshError::Config("thread runtime has stopped".to_string())
+}
+
+fn inactive_turn() -> ash_core::AshError {
+    ash_core::AshError::Config(INACTIVE_TURN_ERROR.to_string())
+}
+
+fn busy_thread() -> ash_core::AshError {
+    ash_core::AshError::Config(BUSY_THREAD_ERROR.to_string())
 }
 
 fn ensure_nonempty(input: &Input) -> Result<(), ash_core::AshError> {
@@ -721,9 +679,11 @@ impl ThreadState {
                 result: turn_result,
                 usage,
             });
-            let mut view = projected
-                .turn_view(turn_id)
-                .expect("a projected turn end must produce its turn view");
+            let mut view = projected.turn_view(turn_id).ok_or_else(|| {
+                ash_core::AshError::Config(format!(
+                    "projected turn {turn_id} is missing after its terminal entry"
+                ))
+            })?;
             view.context_tokens = context_tokens;
             view
         };
@@ -752,21 +712,21 @@ impl ThreadState {
             self.log.push(entry);
         }
         engine_result?;
-        let mut committed = self
-            .log
-            .turn_view(turn_id)
-            .expect("a committed turn end must produce its turn view");
+        let mut committed = self.log.turn_view(turn_id).ok_or_else(|| {
+            ash_core::AshError::Config(format!(
+                "committed turn {turn_id} is missing from the durable projection"
+            ))
+        })?;
         committed.context_tokens = context_tokens;
         Ok(committed)
     }
 
     pub async fn rollback_last_turn(&mut self) -> Result<Option<String>, ash_core::AshError> {
         let messages = self.log.messages();
-        let Some((turn_start, prompt)) = last_user_turn(&messages) else {
+        let Some((_, prompt)) = last_user_turn(&messages) else {
             return Ok(None);
         };
         self.append(&[LogEntry::Rollback]).await?;
-        debug_assert_eq!(self.log.messages().len(), turn_start);
         Ok(Some(prompt))
     }
 
@@ -876,6 +836,7 @@ mod tests {
     };
     use futures::StreamExt;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     struct MockAdapter {
         responses: Mutex<VecDeque<Vec<ModelEvent>>>,
@@ -885,6 +846,23 @@ mod tests {
     struct DelayedAdapter {
         calls: AtomicUsize,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct BlockingAdapter {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl ModelClient for BlockingAdapter {
+        fn stream(&self, _: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            Ok(Box::pin(futures::stream::once(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(ModelEvent::Stop(StopReason::EndTurn))
+            })))
+        }
     }
 
     impl ModelClient for DelayedAdapter {
@@ -1231,6 +1209,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_commands_are_rejected_while_a_turn_is_active() {
+        let directory = TempDir::new().unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let runtime = Runtime::new(
+            Arc::new(BlockingAdapter {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            "test",
+        )
+        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
+        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        let turn = thread.submit("work").await.unwrap();
+        started.notified().await;
+
+        let errors = [
+            thread.rollback().await.unwrap_err(),
+            thread.compact().await.unwrap_err(),
+            thread.messages().await.unwrap_err(),
+            thread.view().await.unwrap_err(),
+            thread.fork_points().await.unwrap_err(),
+            thread.fork_at(MessageId::new()).await.err().unwrap(),
+        ];
+
+        for error in errors {
+            assert!(
+                matches!(error, ash_core::AshError::Config(message) if message == BUSY_THREAD_ERROR)
+            );
+        }
+
+        release.notify_one();
+        turn.wait().await.unwrap();
+        assert_eq!(thread.messages().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn public_input_apis_share_one_empty_input_error() {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(
@@ -1326,6 +1341,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notify_joins_the_next_queued_turn_when_it_starts() {
+        let directory = TempDir::new().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            Arc::new(DelayedAdapter {
+                calls: AtomicUsize::new(0),
+                requests,
+            }),
+            "test",
+        )
+        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
+        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+
+        let first = thread.submit("first").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = thread.submit("second").await.unwrap();
+        thread
+            .notify(Input::from_text(crate::InputSource::Agent, "note"))
+            .await
+            .unwrap();
+        first.wait().await.unwrap();
+        second.wait().await.unwrap();
+
+        let prompts = thread
+            .messages()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(Message::user_turn_text)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["first", "note", "second"]);
+    }
+
+    #[tokio::test]
     async fn enqueue_creates_a_trackable_fire_and_forget_turn() {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(
@@ -1384,6 +1433,37 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.user_turn_text().as_deref() == Some("updated direction")));
+    }
+
+    #[tokio::test]
+    async fn steer_rejects_a_finished_turn() {
+        let directory = TempDir::new().unwrap();
+        let runtime = Runtime::new(
+            Arc::new(MockAdapter {
+                responses: Mutex::new(VecDeque::from([vec![ModelEvent::Stop(
+                    StopReason::EndTurn,
+                )]])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            "test",
+        )
+        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
+        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        let mut events = thread.events();
+        let turn = thread.submit("first").await.unwrap();
+
+        loop {
+            let event = events.next().await.unwrap().unwrap();
+            if matches!(event.kind, EventKind::Turn(_)) {
+                break;
+            }
+        }
+
+        let error = turn.steer("too late").await.unwrap_err();
+        assert!(
+            matches!(error, ash_core::AshError::Config(message) if message == INACTIVE_TURN_ERROR)
+        );
+        turn.wait().await.unwrap();
     }
 
     #[tokio::test]

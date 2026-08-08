@@ -225,6 +225,7 @@ dependencies = [
  "ignore",
  "regex",
  "reqwest",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

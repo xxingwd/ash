@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ash_core::{Tool, ToolContext, ToolError, ToolOutput};
 use rmcp::model::{CallToolRequestParams, JsonObject};
 use rmcp::serve_client;
-use rmcp::service::{Peer, RoleClient};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -16,27 +16,27 @@ pub struct McpServerConfig {
     pub env: Option<std::collections::HashMap<String, String>>,
 }
 
-pub struct McpToolAdapter {
+struct McpToolAdapter {
     name: String,
     description: String,
     schema: serde_json::Value,
-    peer: Peer<RoleClient>,
+    connection: Arc<McpConnection>,
     tool_name: String,
 }
 
 impl McpToolAdapter {
-    pub fn new(
+    fn new(
         name: String,
         description: String,
         schema: serde_json::Value,
-        peer: Peer<RoleClient>,
+        connection: Arc<McpConnection>,
         tool_name: String,
     ) -> Self {
         Self {
             name,
             description,
             schema,
-            peer,
+            connection,
             tool_name,
         }
     }
@@ -70,6 +70,7 @@ impl Tool for McpToolAdapter {
         }
 
         let result = self
+            .connection
             .peer
             .call_tool(request)
             .await
@@ -92,8 +93,22 @@ impl Tool for McpToolAdapter {
     }
 }
 
+struct McpConnection {
+    peer: Peer<RoleClient>,
+    _service: RunningService<RoleClient, ()>,
+}
+
+impl McpConnection {
+    fn new(service: RunningService<RoleClient, ()>) -> Self {
+        Self {
+            peer: service.peer().clone(),
+            _service: service,
+        }
+    }
+}
+
 pub struct McpManager {
-    peers: Vec<(McpServerConfig, Peer<RoleClient>)>,
+    connections: Vec<(McpServerConfig, Arc<McpConnection>)>,
 }
 
 impl Default for McpManager {
@@ -104,7 +119,9 @@ impl Default for McpManager {
 
 impl McpManager {
     pub fn new() -> Self {
-        Self { peers: Vec::new() }
+        Self {
+            connections: Vec::new(),
+        }
     }
 
     pub async fn connect(&mut self, config: McpServerConfig) -> Result<(), ash_core::AshError> {
@@ -122,16 +139,16 @@ impl McpManager {
             .await
             .map_err(|e| ash_core::AshError::Config(format!("MCP init failed: {e}")))?;
 
-        let peer = running.peer().clone();
-        self.peers.push((config, peer));
+        self.connections
+            .push((config, Arc::new(McpConnection::new(running))));
         Ok(())
     }
 
     pub async fn discover_tools(&self) -> Vec<Arc<dyn Tool>> {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
-        for (config, peer) in &self.peers {
-            let remote_tools = match peer.list_all_tools().await {
+        for (config, connection) in &self.connections {
+            let remote_tools = match connection.peer.list_all_tools().await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("failed to list tools from {}: {e}", config.name);
@@ -151,7 +168,7 @@ impl McpManager {
                     tool_info.name.to_string(),
                     tool_info.description.unwrap_or_default().to_string(),
                     schema,
-                    peer.clone(),
+                    Arc::clone(connection),
                     tool_info.name.to_string(),
                 )));
             }
@@ -171,4 +188,100 @@ pub async fn load_mcp_tools(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
     }
 
     manager.discover_tools().await
+}
+
+#[cfg(test)]
+mod tests {
+    use ash_core::{AgentToolContext, CancellationToken, ThreadId, ToolContext, TreeId, TurnId};
+    use rmcp::{
+        model::{
+            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+            ServerCapabilities, ServerInfo, Tool as McpTool,
+        },
+        service::{RequestContext, RoleServer},
+        ServerHandler, ServiceExt,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct EchoServer;
+
+    impl ServerHandler for EchoServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult {
+                tools: vec![McpTool::new(
+                    "echo",
+                    "Echo a fixed response",
+                    JsonObject::new(),
+                )],
+                ..Default::default()
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            Ok(CallToolResult::success(vec![ContentBlock::text("connected")]).into())
+        }
+    }
+
+    fn tool_context() -> ToolContext {
+        ToolContext {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            cancellation: CancellationToken::new(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            agent: AgentToolContext {
+                tree_id: TreeId::new(),
+                path: "/root".to_string(),
+                messages: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_tools_keep_the_mcp_connection_alive() {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let service = EchoServer.serve(server_transport).await.unwrap();
+            service.waiting().await.unwrap();
+        });
+        let running = serve_client((), client_transport).await.unwrap();
+        let manager = McpManager {
+            connections: vec![(
+                McpServerConfig {
+                    name: "test".to_string(),
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: None,
+                },
+                Arc::new(McpConnection::new(running)),
+            )],
+        };
+
+        let tools = manager.discover_tools().await;
+        drop(manager);
+        let output = tools[0]
+            .execute(tool_context(), serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(output.text, "connected");
+        drop(tools);
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

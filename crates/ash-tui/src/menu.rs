@@ -49,9 +49,9 @@ impl Default for ComposerMenuState {
 }
 
 impl ComposerMenuState {
-    pub(crate) fn sync_commands(&mut self, input: &str, cursor: usize, busy: bool) {
+    pub(crate) fn sync_commands(&mut self, input: &str, cursor: usize) {
         if let Self::Commands(completion) = self {
-            completion.sync(input, cursor, busy);
+            completion.sync(input, cursor);
         }
     }
 
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn opening_sessions_replaces_command_completion() {
         let mut menu = ComposerMenuState::default();
-        menu.sync_commands("/", 1, false);
+        menu.sync_commands("/", 1);
         assert!(matches!(menu.view(), MenuView::Commands { .. }));
 
         menu.open_threads(vec![ThreadSummary {
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn opening_fork_points_replaces_command_completion() {
         let mut menu = ComposerMenuState::default();
-        menu.sync_commands("/", 1, false);
+        menu.sync_commands("/", 1);
 
         menu.open_fork_points(vec![ForkPoint {
             message_id: MessageId::new(),

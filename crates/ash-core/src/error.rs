@@ -38,6 +38,8 @@ pub enum ToolError {
     Execution(String),
     #[error("timeout after {0:?}")]
     Timeout(Duration),
+    #[error("deadline exceeded")]
+    DeadlineExceeded,
     #[error("cancelled")]
     Cancelled,
 }

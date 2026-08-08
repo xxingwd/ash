@@ -1,10 +1,10 @@
 use std::{
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
-use ash_core::{define_tool, Tool, ToolError};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -25,20 +25,23 @@ struct EditArgs {
     edits: Vec<Replacement>,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Arc<dyn Tool> {
+pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "edit",
         "Edit one file using one or more exact replacements. Every edits[].oldText must be unique and non-overlapping in the original file; replacements are not applied incrementally.",
-        move |_ctx, args: EditArgs| {
+        move |ctx, args: EditArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let cancellation = ctx.cancellation;
+            let deadline = ctx.deadline;
             async move {
-            let count = args.edits.len();
-            let path = edit_file(&working_dir, &args.path, args.edits).await?;
-            Ok(format!(
-                "Successfully replaced {} block(s) in {}.",
-                count,
-                path.display()
-            ))
+                let count = args.edits.len();
+                let path =
+                    edit_file(&working_dir, &args.path, args.edits, cancellation, deadline).await?;
+                Ok(format!(
+                    "Successfully replaced {} block(s) in {}.",
+                    count,
+                    path.display()
+                ))
             }
         },
     )
@@ -48,13 +51,17 @@ async fn edit_file(
     root: &Path,
     requested: &str,
     edits: Vec<Replacement>,
+    cancellation: CancellationToken,
+    deadline: Instant,
 ) -> Result<std::path::PathBuf, ToolError> {
     let root = root.to_path_buf();
     let requested = requested.to_string();
-    crate::path::run_blocking(move || {
+    crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
+        crate::path::ensure_running(&cancellation, deadline)?;
         let path = crate::path::WorkspacePath::new(&root, &requested)?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
+        crate::path::ensure_running(&cancellation, deadline)?;
         let mut file = path.open_with(&options).map_err(|error| {
             ToolError::Execution(format!(
                 "cannot open {}: {error}",
@@ -62,7 +69,6 @@ async fn edit_file(
             ))
         })?;
 
-        let mut raw = String::new();
         let permissions = file
             .metadata()
             .map_err(|error| {
@@ -72,10 +78,12 @@ async fn edit_file(
                 ))
             })?
             .permissions();
-        file.read_to_string(&mut raw).map_err(|error| {
+        let raw = crate::path::read_all(&mut file, path.full_path(), &cancellation, deadline)?;
+        let raw = String::from_utf8(raw).map_err(|error| {
             ToolError::Execution(format!(
-                "cannot read {}: {error}",
-                path.full_path().display()
+                "cannot read {}: {}",
+                path.full_path().display(),
+                error.utf8_error()
             ))
         })?;
         let (bom, content) = raw
@@ -102,13 +110,12 @@ async fn edit_file(
         };
         let content = format!("{bom}{edited}");
 
-        path.atomic_replace(content.as_bytes(), permissions)
-            .map_err(|error| {
-                ToolError::Execution(format!(
-                    "cannot write {}: {error}",
-                    path.full_path().display()
-                ))
-            })?;
+        path.atomic_write(
+            content.as_bytes(),
+            Some(permissions),
+            &cancellation,
+            deadline,
+        )?;
 
         Ok(path.full_path().to_path_buf())
     })
@@ -174,6 +181,7 @@ fn apply_edits(content: &str, edits: &[Replacement]) -> Result<String, ToolError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn replacement(old_text: &str, new_text: &str) -> Replacement {
         Replacement {
@@ -220,6 +228,8 @@ mod tests {
             root.path(),
             "input.txt",
             vec![replacement("one\ntwo", "three")],
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -240,13 +250,43 @@ mod tests {
         std::fs::write(&path, "echo old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
 
-        edit_file(root.path(), "script.sh", vec![replacement("old", "new")])
-            .await
-            .unwrap();
+        edit_file(
+            root.path(),
+            "script.sh",
+            vec![replacement("old", "new")],
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o750
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_edit_does_not_replace_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input.txt"), "old\n").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = edit_file(
+            root.path(),
+            "input.txt",
+            vec![replacement("old", "new")],
+            cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::Cancelled));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("input.txt")).unwrap(),
+            "old\n"
         );
     }
 }

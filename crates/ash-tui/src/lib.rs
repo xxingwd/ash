@@ -22,4 +22,4 @@ mod tool_display;
 mod viewport;
 mod welcome_card;
 
-pub use app::{App, UiCommand};
+pub use app::{App, UiCommand, UiError};

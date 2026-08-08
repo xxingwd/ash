@@ -6,7 +6,6 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -24,7 +23,6 @@ use crate::{
 const FOOTER_ROWS: u16 = 1;
 const MAX_COMPOSER_ROWS: u16 = 8;
 const MENU_MAX_ROWS: usize = 8;
-const MENU_BORDER_ROWS: u16 = 2;
 const SCREEN_SPACING: u16 = 1;
 const COMPACT_STATUS_WIDTH: u16 = 32;
 const SUBAGENTS_MAX_ROWS: usize = 4;
@@ -54,7 +52,6 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) status_header: &'a str,
     pub(crate) status_dots: &'a str,
     pub(crate) elapsed: &'a str,
-    pub(crate) queued: &'a str,
     pub(crate) prompt_lines: &'a [String],
     pub(crate) prompt_cursor_row: u16,
     pub(crate) prompt_cursor_column: u16,
@@ -113,14 +110,7 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let regions = transcript_regions(&rendered_blocks, active_rows);
     let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
-    let menu_item_rows = input.menu.item_count();
-    let menu_rows = if menu_item_rows == 0 {
-        0
-    } else {
-        u16::try_from(menu_item_rows.min(MENU_MAX_ROWS))
-            .unwrap_or(u16::MAX)
-            .saturating_add(MENU_BORDER_ROWS)
-    };
+    let menu_rows = u16::try_from(input.menu.item_count().min(MENU_MAX_ROWS)).unwrap_or(u16::MAX);
     let active_subagents = input
         .subagents
         .iter()
@@ -168,16 +158,13 @@ pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
     match input.menu {
         MenuView::None => render_footer(screen.footer, &input, &mut buffer),
         MenuView::Commands { items, selected } => {
-            let content = render_menu_frame(screen.menu, &mut buffer);
-            render_command_menu(content, items, selected, &mut buffer);
+            render_command_menu(screen.menu, items, selected, &mut buffer);
         }
         MenuView::Sessions { items, selected } => {
-            let content = render_menu_frame(screen.menu, &mut buffer);
-            render_session_menu(content, items, selected, &mut buffer);
+            render_session_menu(screen.menu, items, selected, &mut buffer);
         }
         MenuView::ForkPoints { items, selected } => {
-            let content = render_menu_frame(screen.menu, &mut buffer);
-            render_fork_menu(content, items, selected, &mut buffer);
+            render_fork_menu(screen.menu, items, selected, &mut buffer);
         }
     }
 
@@ -573,16 +560,10 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         return;
     }
     let line = if area.width < COMPACT_STATUS_WIDTH {
-        Line::from(vec![
-            Span::styled(
-                format!("{}{}", input.status_header, input.status_dots),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                input.queued.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
+        Line::from(Span::styled(
+            format!("{}{}", input.status_header, input.status_dots),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(vec![
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
@@ -595,7 +576,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
-                format!(" ({} • esc to interrupt){}", input.elapsed, input.queued),
+                format!(" ({} • esc to interrupt)", input.elapsed),
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])
@@ -793,25 +774,12 @@ fn footer_right_width(context: Option<&ContextDisplay>, protocol: Option<&str>) 
         .saturating_add(u16::from(context_width > 0 && protocol_width > 0) * 3)
 }
 
-fn render_menu_frame(area: Rect, buffer: &mut Buffer) -> Rect {
-    if area.width < 3 || area.height < 3 {
-        return area;
-    }
-    let block = Block::bordered().border_style(Style::default().add_modifier(Modifier::DIM));
-    let content = block.inner(area);
-    block.render(area, buffer);
-    content
-}
-
 fn render_command_menu(
     area: Rect,
     items: &[CommandCompletion],
     selected: usize,
     buffer: &mut Buffer,
 ) {
-    let Some(window) = menu_window(items.len(), selected, usize::from(area.height)) else {
-        return;
-    };
     let name_width = items
         .iter()
         .map(|item| UnicodeWidthStr::width(item.name))
@@ -820,6 +788,98 @@ fn render_command_menu(
     let description_column = COMMAND_NAME_PREFIX_COLUMNS
         .saturating_add(name_width)
         .saturating_add(MENU_COLUMN_GAP);
+    render_menu_rows(
+        area,
+        items,
+        selected,
+        buffer,
+        |_index, style, prefix, item| {
+            let mut spans = vec![Span::styled(
+                format!("{prefix}/{:<name_width$}", item.name),
+                style,
+            )];
+            if usize::from(area.width) > description_column {
+                let available = usize::from(area.width) - description_column;
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    truncate_end(item.description, available),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans
+        },
+    );
+}
+
+fn render_session_menu(
+    area: Rect,
+    threads: &[ThreadSummary],
+    selected: usize,
+    buffer: &mut Buffer,
+) {
+    render_menu_rows(
+        area,
+        threads,
+        selected,
+        buffer,
+        |_index, style, prefix, session| {
+            let created_width = UnicodeWidthStr::width(session.created_at.as_str());
+            let show_created = usize::from(area.width)
+                > created_width.saturating_add(SESSION_CREATED_MIN_LEFT_COLUMNS);
+            let title_width = if show_created {
+                usize::from(area.width)
+                    .saturating_sub(MENU_PREFIX_COLUMNS)
+                    .saturating_sub(created_width)
+                    .saturating_sub(MENU_COLUMN_GAP)
+            } else {
+                usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS)
+            };
+            let title = truncate_end(&session.title, title_width);
+            let title_used = UnicodeWidthStr::width(title.as_str());
+            let mut spans = vec![Span::styled(prefix, style), Span::styled(title, style)];
+            if show_created {
+                let spacing = usize::from(area.width)
+                    .saturating_sub(MENU_PREFIX_COLUMNS)
+                    .saturating_sub(title_used)
+                    .saturating_sub(created_width);
+                spans.push(Span::raw(" ".repeat(spacing)));
+                spans.push(Span::styled(
+                    session.created_at.clone(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans
+        },
+    );
+}
+
+fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &mut Buffer) {
+    let prompt_width = usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS);
+    render_menu_rows(
+        area,
+        points,
+        selected,
+        buffer,
+        |_index, style, prefix, point| {
+            let prompt = sanitize_single_line(&point.prompt);
+            vec![
+                Span::styled(prefix, style),
+                Span::styled(truncate_end(&prompt, prompt_width), style),
+            ]
+        },
+    );
+}
+
+fn render_menu_rows<T>(
+    area: Rect,
+    items: &[T],
+    selected: usize,
+    buffer: &mut Buffer,
+    row: impl Fn(usize, Style, &'static str, &T) -> Vec<Span<'static>>,
+) {
+    let Some(window) = menu_window(items.len(), selected, usize::from(area.height)) else {
+        return;
+    };
     for (offset, item) in items[window.start..window.end()].iter().enumerate() {
         let index = window.start + offset;
         let selected_style = Style::default()
@@ -835,109 +895,11 @@ fn render_command_menu(
         } else {
             "  "
         };
-        let mut spans = vec![Span::styled(
-            format!("{prefix}/{:<name_width$}", item.name),
-            style,
-        )];
-        if usize::from(area.width) > description_column {
-            let available = usize::from(area.width) - description_column;
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                truncate_end(item.description, available),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
+        let spans = row(index, style, prefix, item);
         let y = area
             .y
             .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
         buffer.set_line(area.x, y, &Line::from(spans), area.width);
-    }
-}
-
-fn render_session_menu(
-    area: Rect,
-    threads: &[ThreadSummary],
-    selected: usize,
-    buffer: &mut Buffer,
-) {
-    let Some(window) = menu_window(threads.len(), selected, usize::from(area.height)) else {
-        return;
-    };
-    for (offset, session) in threads[window.start..window.end()].iter().enumerate() {
-        let index = window.start + offset;
-        let selected_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        let prefix = if index == window.selected {
-            "› "
-        } else {
-            "  "
-        };
-        let created_width = UnicodeWidthStr::width(session.created_at.as_str());
-        let show_created = usize::from(area.width)
-            > created_width.saturating_add(SESSION_CREATED_MIN_LEFT_COLUMNS);
-        let title_width = if show_created {
-            usize::from(area.width)
-                .saturating_sub(MENU_PREFIX_COLUMNS)
-                .saturating_sub(created_width)
-                .saturating_sub(MENU_COLUMN_GAP)
-        } else {
-            usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS)
-        };
-        let title = truncate_end(&session.title, title_width);
-        let title_used = UnicodeWidthStr::width(title.as_str());
-        let style = if index == window.selected {
-            selected_style
-        } else {
-            Style::default()
-        };
-        let mut spans = vec![Span::styled(prefix, style), Span::styled(title, style)];
-        if show_created {
-            let spacing = usize::from(area.width)
-                .saturating_sub(MENU_PREFIX_COLUMNS)
-                .saturating_sub(title_used)
-                .saturating_sub(created_width);
-            spans.push(Span::raw(" ".repeat(spacing)));
-            spans.push(Span::styled(
-                session.created_at.clone(),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        let y = area
-            .y
-            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
-        buffer.set_line(area.x, y, &Line::from(spans), area.width);
-    }
-}
-
-fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &mut Buffer) {
-    let Some(window) = menu_window(points.len(), selected, usize::from(area.height)) else {
-        return;
-    };
-    let prompt_width = usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS);
-    for (offset, point) in points[window.start..window.end()].iter().enumerate() {
-        let index = window.start + offset;
-        let style = if index == window.selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let prefix = if index == window.selected {
-            "› "
-        } else {
-            "  "
-        };
-        let prompt = sanitize_single_line(&point.prompt);
-        let line = Line::from(vec![
-            Span::styled(prefix, style),
-            Span::styled(truncate_end(&prompt, prompt_width), style),
-        ]);
-        let y = area
-            .y
-            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
-        buffer.set_line(area.x, y, &line, area.width);
     }
 }
 
@@ -1045,7 +1007,6 @@ mod tests {
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
-            queued: "",
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1103,7 +1064,6 @@ mod tests {
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
-            queued: "",
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1148,7 +1108,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1190,7 +1149,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &["/".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 1,
@@ -1218,12 +1176,11 @@ mod tests {
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(baseline.viewport_height, 3);
-        assert_eq!(frame.viewport_height, 5);
+        assert_eq!(frame.viewport_height, 3);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› /");
-        assert!(row_text(&frame.buffer, 1).starts_with('┌'));
-        assert!(row_text(&frame.buffer, 2).contains("/new"));
-        assert!(row_text(&frame.buffer, 3).contains("/clear"));
-        assert!(row_text(&frame.buffer, 3).contains("start a new chat"));
+        assert!(row_text(&frame.buffer, 1).contains("/new"));
+        assert!(row_text(&frame.buffer, 2).contains("/clear"));
+        assert!(row_text(&frame.buffer, 2).contains("start a new chat"));
     }
 
     #[test]
@@ -1255,7 +1212,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1283,16 +1239,15 @@ mod tests {
         assert_eq!(frame.scroll_top, baseline.scroll_top);
         assert_eq!(frame.max_scroll_top, baseline.max_scroll_top);
         assert_eq!(baseline.viewport_height, 3);
-        assert_eq!(frame.viewport_height, 6);
-        assert!(row_text(&frame.buffer, 1).starts_with('┌'));
-        let title_row = row_text(&frame.buffer, 2);
+        assert_eq!(frame.viewport_height, 4);
+        let title_row = row_text(&frame.buffer, 1);
         assert!(
             title_row.contains("继续这个中文会话"),
             "unexpected session title row: {title_row:?}"
         );
-        assert!(row_text(&frame.buffer, 3).contains("Inspect the session picker"));
-        assert!(row_text(&frame.buffer, 3).contains("2026-07-15 12:30"));
-        assert!(row_text(&frame.buffer, 4).contains("Third saved chat"));
+        assert!(row_text(&frame.buffer, 2).contains("Inspect the session picker"));
+        assert!(row_text(&frame.buffer, 2).contains("2026-07-15 12:30"));
+        assert!(row_text(&frame.buffer, 3).contains("Third saved chat"));
     }
 
     #[test]
@@ -1317,7 +1272,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1335,8 +1289,8 @@ mod tests {
             subagents: &[],
         });
 
-        assert!(row_text(&frame.buffer, 2).contains("latest prompt continued"));
-        assert!(row_text(&frame.buffer, 3).contains("older prompt"));
+        assert!(row_text(&frame.buffer, 1).contains("latest prompt continued"));
+        assert!(row_text(&frame.buffer, 2).contains("older prompt"));
     }
 
     #[test]
@@ -1352,7 +1306,6 @@ mod tests {
             status_header: "Thinking",
             status_dots: "...",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1386,7 +1339,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1425,7 +1377,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1464,7 +1415,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &prompt,
             prompt_cursor_row: 2,
             prompt_cursor_column: 5,
@@ -1504,7 +1454,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &prompt,
             prompt_cursor_row: 9,
             prompt_cursor_column: 6,
@@ -1546,7 +1495,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1591,7 +1539,6 @@ mod tests {
             status_header: "",
             status_dots: "",
             elapsed: "0s",
-            queued: "",
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,

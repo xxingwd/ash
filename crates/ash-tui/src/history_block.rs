@@ -17,6 +17,7 @@ const USER_HORIZONTAL_INSET: u16 = 2;
 pub(crate) enum HistoryBlock {
     User(String),
     Info(String),
+    Interrupted,
     Error(String),
     Worked(Worked),
 }
@@ -42,6 +43,10 @@ impl HistoryBlock {
         Self::Error(normalize_multiline(error))
     }
 
+    pub(crate) const fn interrupted() -> Self {
+        Self::Interrupted
+    }
+
     pub(crate) fn worked(
         elapsed: String,
         input_tokens: u64,
@@ -60,6 +65,7 @@ impl HistoryBlock {
         match self {
             Self::User(text) => render_user(text, width.max(1)),
             Self::Info(message) => render_info(message, width.max(1)),
+            Self::Interrupted => render_interrupted(width.max(1)),
             Self::Error(error) => render_error(error, width.max(1)),
             Self::Worked(worked) => render_worked(worked, width.max(1)),
         }
@@ -124,6 +130,23 @@ fn render_info(message: &str, width: u16) -> Buffer {
             buffer.set_string(0, y, "•", Style::default().add_modifier(Modifier::DIM));
         }
         buffer.set_string(content_x, y, row, Style::default());
+    }
+    buffer
+}
+
+fn render_interrupted(width: u16) -> Buffer {
+    const MESSAGE: &str = "Conversation interrupted.";
+    let content_x = if width > 1 { 2 } else { 0 };
+    let rows = wrap_text(MESSAGE, width.saturating_sub(content_x).max(1));
+    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    let style = Style::default().fg(Color::Red);
+    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
+        let y = u16::try_from(index).unwrap_or(u16::MAX);
+        if index == 0 && content_x > 0 {
+            buffer.set_string(0, y, "■", style);
+        }
+        buffer.set_string(content_x, y, row, style);
     }
     buffer
 }
@@ -275,6 +298,15 @@ mod tests {
             .expect("label")
             .modifier
             .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn interrupted_block_uses_the_codex_square_marker() {
+        let buffer = HistoryBlock::interrupted().render(30);
+
+        assert_eq!(row_text(&buffer, 0), "■ Conversation interrupted.");
+        assert_eq!(buffer.cell((0, 0)).expect("marker").fg, Color::Red);
+        assert_eq!(buffer.cell((2, 0)).expect("message").fg, Color::Red);
     }
 
     #[test]
