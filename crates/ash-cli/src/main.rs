@@ -50,11 +50,11 @@ async fn main() -> anyhow::Result<()> {
     modes::run(cli).await
 }
 
-fn run_with_logs(cli: &Cli) -> bool {
+const fn run_with_logs(cli: &Cli) -> bool {
     matches!(&cli.command, Some(Command::Run { log: true, .. }))
 }
 
-/// RUST_LOG always wins; without it, `ash run --log` raises the default level
+/// `RUST_LOG` always wins; without it, `ash run --log` raises the default level
 /// to debug so request/retry steps are visible, and everything else stays
 /// quiet unless something is actually wrong.
 fn init_logging(enabled: bool) {

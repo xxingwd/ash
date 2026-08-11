@@ -35,7 +35,7 @@ fn all_collaboration_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
-const MULTI_AGENT_INSTRUCTIONS: &str = r#"<multi_agent_mode>
+const MULTI_AGENT_INSTRUCTIONS: &str = r"<multi_agent_mode>
 You are one agent in a team that shares the same workspace and tools. Split work where parallelism pays; keep tightly coupled work local.
 
 Delegation is available when it simplifies the work. You do not need separate permission to delegate work that is already inside the user's request.
@@ -57,7 +57,7 @@ Operating rules:
 - Reuse context with `message_agent` and `start_turn: true`; use `message_agent` with `start_turn: false` for guidance that should not start a new turn.
 - Interrupt a sub-agent only from the parent when the current turn is stale, wrong, or blocking the plan.
 - Review returned changes before integrating them.
-</multi_agent_mode>"#;
+</multi_agent_mode>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -68,7 +68,7 @@ pub(crate) enum AgentRole {
 }
 
 impl AgentRole {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Explorer => "explorer",
@@ -77,11 +77,11 @@ impl AgentRole {
     }
 
     const fn available_roles_description() -> &'static str {
-        r#"Optional type name for the new agent. If omitted, `default` is used.
+        r"Optional type name for the new agent. If omitted, `default` is used.
 Available roles:
 default: General-purpose agent for a self-contained task that inherits the current configuration.
 explorer: Use whenever a specific, well-scoped codebase question can be answered independently. Explorers are fast, read-only, and authoritative. Spawn multiple explorers in the same round for distinct questions; reuse an existing explorer for related follow-ups.
-worker: Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared."#
+worker: Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared."
     }
 
     const fn child_instructions(self) -> &'static str {
@@ -191,7 +191,7 @@ async fn release_spawn(inner: &Arc<ControlInner>, tree_id: TreeId, task_name: &s
 }
 
 impl SpawnReservation {
-    fn new(inner: Arc<ControlInner>, tree_id: TreeId, task_name: String) -> Self {
+    const fn new(inner: Arc<ControlInner>, tree_id: TreeId, task_name: String) -> Self {
         Self {
             inner,
             tree_id,
@@ -220,7 +220,6 @@ impl Drop for SpawnReservation {
         let tree_id = self.tree_id;
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                let task_name = task_name.clone();
                 runtime.spawn(async move {
                     release_spawn(&inner, tree_id, &task_name).await;
                 });
@@ -324,7 +323,7 @@ enum ChildState {
 }
 
 impl ChildState {
-    fn status(&self) -> AgentStatus {
+    const fn status(&self) -> AgentStatus {
         match self {
             Self::Pending => AgentStatus::Pending,
             Self::Running(_) => AgentStatus::Running,
@@ -334,7 +333,7 @@ impl ChildState {
         }
     }
 
-    fn is_active(&self) -> bool {
+    const fn is_active(&self) -> bool {
         matches!(self, Self::Pending | Self::Running(_))
     }
 
@@ -414,18 +413,18 @@ enum MessageDelivery {
 }
 
 impl MessageDelivery {
-    fn triggers_turn(self) -> bool {
+    const fn triggers_turn(self) -> bool {
         matches!(self, Self::Followup)
     }
 
-    fn command(self, message: String) -> ChildCommand {
+    const fn command(self, message: String) -> ChildCommand {
         match self {
             Self::Queue => ChildCommand::Queue(message),
             Self::Followup => ChildCommand::Followup(message),
         }
     }
 
-    fn needs_new_slot(self, state: &ChildState) -> bool {
+    const fn needs_new_slot(self, state: &ChildState) -> bool {
         self.triggers_turn() && !state.is_active()
     }
 }
@@ -511,10 +510,10 @@ impl ChildSession {
     }
 
     fn wait_snapshot(&mut self, waiter: &str, path_prefix: Option<&str>) -> WaitSnapshot {
-        let waiter_key = match path_prefix {
-            Some(prefix) => format!("{waiter}\n{prefix}"),
-            None => waiter.to_string(),
-        };
+        let waiter_key = path_prefix.map_or_else(
+            || waiter.to_string(),
+            |prefix| format!("{waiter}\n{prefix}"),
+        );
         let cursor = self.wait_cursors.get(&waiter_key).copied().unwrap_or(0);
         let completion_revision = self
             .agents
@@ -561,7 +560,7 @@ struct WaitSnapshot {
 }
 
 impl WaitSnapshot {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             agents: Vec::new(),
             has_update: false,
@@ -657,6 +656,7 @@ impl AgentControl {
     /// Subscribe to display-oriented snapshots of every sub-agent managed by
     /// this control. The receiver is updated whenever a sub-agent is spawned,
     /// transitions state, or receives a follow-up message.
+    #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<Vec<SubagentSnapshot>> {
         self.inner.subagent_tx.subscribe()
     }
@@ -675,6 +675,11 @@ impl AgentControl {
         let _ = self.inner.subagent_tx.send(snapshots);
     }
 
+    /// Build the collaboration tools (spawn, message, wait, interrupt).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolError` when a tool cannot be defined.
     pub fn tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let spawn = self.clone();
         let spawn_description = format!(
@@ -741,6 +746,7 @@ impl AgentControl {
                 .entry(context.agent.tree_id)
                 .or_default()
                 .reserve_spawn(&task_name, self.inner.max_concurrent_children)?;
+            drop(state);
             SpawnReservation::new(
                 Arc::clone(&self.inner),
                 context.agent.tree_id,
@@ -837,6 +843,7 @@ impl AgentControl {
                 command_tx,
             },
         );
+        drop(state);
     }
 
     async fn message_agent(
@@ -860,7 +867,9 @@ impl AgentControl {
                 &context.agent.path,
                 &args.target,
             )?;
-            (record.task_name.clone(), record.command_tx.clone())
+            let result = (record.task_name.clone(), record.command_tx.clone());
+            drop(state);
+            result
         };
         let permit = command_tx
             .reserve()
@@ -884,6 +893,7 @@ impl AgentControl {
             }
             record.prepare_delivery(delivery, &args.message);
             permit.send(delivery.command(args.message));
+            drop(state);
         }
         self.inner.updates.notify_waiters();
         self.publish().await;
@@ -907,11 +917,13 @@ impl AgentControl {
                 &context.agent.path,
                 &args.target,
             )?;
-            (
+            let result = (
                 record.task_name.clone(),
                 record.state.status(),
                 record.state.cancel(),
-            )
+            );
+            drop(state);
+            result
         };
         if let Some(cancel) = cancel {
             cancel.cancel();
@@ -960,8 +972,8 @@ impl AgentControl {
             }
 
             let timed_out = tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => true,
-                _ = &mut notified => false,
+                () = tokio::time::sleep_until(deadline) => true,
+                () = &mut notified => false,
             };
             if timed_out {
                 let snapshot = self.inner.state.lock().await.wait_snapshot(
@@ -1056,6 +1068,7 @@ impl AgentControl {
                 return;
             };
             record.state = ChildState::Running(cancel.clone());
+            drop(state);
         }
         self.inner.updates.notify_waiters();
         self.publish().await;
@@ -1085,6 +1098,11 @@ impl AgentControl {
     }
 }
 
+/// Install the collaboration tools on an agent and return the controller.
+///
+/// # Errors
+///
+/// Returns `ToolError` when a tool cannot be defined.
 pub fn install_subagent_tools(
     agent: &mut Agent,
     options: ThreadOptions,
@@ -1851,6 +1869,7 @@ mod tests {
                     command_tx: running_tx,
                 },
             );
+            drop(state);
         }
 
         let context = make_context(tree_id);
@@ -1894,6 +1913,7 @@ mod tests {
                 ChildState::Completed(Some("second result".to_string())),
                 false,
             ));
+            drop(state);
         }
         control.inner.updates.notify_waiters();
 
@@ -1930,6 +1950,7 @@ mod tests {
                     command_tx,
                 },
             );
+            drop(state);
         }
 
         let context = make_context(tree_id);
@@ -2054,7 +2075,7 @@ mod tests {
         let (address_tx, address_rx) = tokio::sync::oneshot::channel();
         let responses = responses
             .iter()
-            .map(|answer| answer.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>();
         let server = tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

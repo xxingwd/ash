@@ -18,7 +18,7 @@ use tokio::io::AsyncBufReadExt;
 use crate::{Cli, Command};
 
 const DEFAULT_MAX_TURNS: u32 = 100;
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct InteractiveController {
     thread: Thread,
@@ -105,7 +105,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
             .as_ref()
             .and_then(|skill| skill.tools.as_deref()),
     )?;
-    tools.push(skill_tool(skills.clone())?);
+    tools.push(skill_tool(skills)?);
 
     let provider = ProviderConfig {
         protocol: protocol.clone(),
@@ -212,16 +212,15 @@ fn resolve_max_context_tokens(configured: Option<usize>) -> Result<usize> {
 }
 
 async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
-    let input = match prompt {
-        Some(prompt) => prompt,
-        None => {
-            let mut input = String::new();
-            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-            stdin.read_line(&mut input).await?;
-            input
-        }
+    let input = if let Some(prompt) = prompt {
+        prompt
+    } else {
+        let mut input = String::new();
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        stdin.read_line(&mut input).await?;
+        input
     };
-    let thread = setup.runtime.start(setup.agent, setup.options);
+    let thread = setup.runtime.start(&setup.agent, &setup.options);
     let mut events = thread.events();
     let turn = thread.submit(input).await?;
     let mut completion = Box::pin(turn.wait());
@@ -309,7 +308,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         .with_input_history(input_history)
         .with_subagent_monitor(subagent_monitor);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
-    let thread = runtime.start(agent.clone(), options.clone());
+    let thread = runtime.start(&agent, &options);
 
     InteractiveController {
         thread,
@@ -370,7 +369,7 @@ impl InteractiveController {
                         UiCommand::Rollback => self.rollback_last_turn().await,
                         UiCommand::Compact => self.compact_thread().await,
                         UiCommand::NewSession => {
-                            self.thread = self.runtime.start(self.agent.clone(), self.options.clone());
+                            self.thread = self.runtime.start(&self.agent, &self.options);
                             events = self.thread.events();
                             turns.reset();
                         }
@@ -402,7 +401,7 @@ impl InteractiveController {
         }
     }
 
-    async fn rollback_last_turn(&mut self) {
+    async fn rollback_last_turn(&self) {
         let event = match self.thread.rollback().await {
             Ok(Some(prompt)) => {
                 if let Err(error) = self.history_store.undo(self.thread.id(), &prompt).await {
@@ -425,7 +424,7 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn compact_thread(&mut self) {
+    async fn compact_thread(&self) {
         let event = match self.thread.compact().await {
             Ok(result) => EventKind::Compacted {
                 before: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
@@ -499,7 +498,7 @@ impl InteractiveController {
     /// Read the thread's current view and map it to an event. Centralizes the
     /// error event produced when the view cannot be read.
     async fn with_current_view(
-        &mut self,
+        &self,
         view_error_context: &str,
         on_view: impl FnOnce(ThreadView) -> EventKind,
     ) -> EventKind {
