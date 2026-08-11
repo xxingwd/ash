@@ -26,11 +26,11 @@ pub enum Protocol {
     #[serde(rename = "anthropic")]
     #[strum(serialize = "anthropic")]
     AnthropicMessages,
-    /// OpenAI Chat Completions API.
+    /// `OpenAI` Chat Completions API.
     #[serde(rename = "openai")]
     #[strum(serialize = "openai")]
     Completions,
-    /// OpenAI Responses API.
+    /// `OpenAI` Responses API.
     #[serde(rename = "openai-responses")]
     #[strum(serialize = "openai-responses")]
     Responses,
@@ -49,6 +49,7 @@ const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 
 impl Protocol {
     /// Stable configuration name used by the CLI and `ASH_PROTOCOL`.
+    #[must_use]
     pub const fn as_cli_name(&self) -> &'static str {
         match self {
             Self::AnthropicMessages => "anthropic",
@@ -59,6 +60,7 @@ impl Protocol {
 
     /// Built-in default model for this protocol, if one exists. Protocols
     /// without a default require an explicit `--model` or `ASH_MODEL`.
+    #[must_use]
     pub const fn default_model(&self) -> Option<&'static str> {
         match self {
             Self::AnthropicMessages => Some(DEFAULT_ANTHROPIC_MODEL),
@@ -129,6 +131,7 @@ pub(crate) fn content_value(
 /// Provider-neutral model client and stream vocabulary, re-exported for adapter code.
 pub use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
+#[must_use]
 pub fn create_adapter(cfg: ProviderConfig) -> Arc<dyn ModelClient> {
     match cfg.protocol {
         Protocol::AnthropicMessages => Arc::new(anthropic::AnthropicAdapter::new(cfg)),
@@ -167,9 +170,8 @@ fn project_request_messages(
                     .join("\n");
                 system_parts.push(text);
             }
-            (Role::User, MessageContent::User(_))
-            | (Role::Assistant, MessageContent::Assistant(_))
-            | (Role::User, MessageContent::ToolResult { .. }) => messages.push(message),
+            (Role::User, MessageContent::User(_) | MessageContent::ToolResult { .. })
+            | (Role::Assistant, MessageContent::Assistant(_)) => messages.push(message),
             (role, content) => {
                 return Err(ProtocolError::InvalidRequest(format!(
                     "message role {role:?} does not match {} content",
@@ -185,7 +187,7 @@ fn project_request_messages(
     })
 }
 
-fn content_kind(content: &MessageContent) -> &'static str {
+const fn content_kind(content: &MessageContent) -> &'static str {
     match content {
         MessageContent::User(_) => "user",
         MessageContent::Assistant(_) => "assistant",
@@ -249,7 +251,7 @@ pub(crate) struct MessageGroupIter<'a> {
 }
 
 impl<'a> MessageGroupIter<'a> {
-    pub(crate) fn new(messages: &'a [&'a Message]) -> Self {
+    pub(crate) const fn new(messages: &'a [&'a Message]) -> Self {
         Self { messages, index: 0 }
     }
 }
@@ -280,7 +282,7 @@ pub(crate) mod test_support {
     use ash_core::{Content, Message, MessageContent, MessageId, Role, ToolCallId};
 
     /// A provider-neutral tool-result message shared by the adapter tests.
-    pub(crate) fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
+    pub fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
         Message {
             id: MessageId::new(),
             role: Role::User,

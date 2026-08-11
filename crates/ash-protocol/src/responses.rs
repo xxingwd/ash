@@ -30,7 +30,7 @@ impl ResponsesAdapter {
         self.config.base_url("https://api.openai.com")
     }
 
-    fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
+    fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let mut input = Vec::new();
         for group in MessageGroupIter::new(&projected.messages) {
@@ -130,18 +130,18 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
 
 impl ModelClient for ResponsesAdapter {
     fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
-        let body = self.build_request(&req)?;
+        let body = Self::build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/responses", self.base_url()))
             .bearer_auth(self.config.api_key.expose_secret())
             .json(&body);
-        sse::stream(request, ResponsesDecoder::default())
+        Ok(sse::stream(request, ResponsesDecoder::default()))
     }
 }
 
 #[derive(Default)]
-pub(crate) struct ResponsesDecoder {
+pub struct ResponsesDecoder {
     calls: PendingCallAccumulator<ResponseItemKey>,
     emitted_calls: BTreeSet<ResponseItemKey>,
     output_keys: BTreeMap<u64, ResponseItemKey>,
@@ -176,7 +176,7 @@ impl ResponsesDecoder {
                 .get(&index)
                 .cloned()
                 .unwrap_or(ResponseItemKey::OutputIndex(index))),
-            key => Ok(key),
+            key @ ResponseItemKey::Id(_) => Ok(key),
         }
     }
 
@@ -240,102 +240,156 @@ impl sse::Decoder for ResponsesDecoder {
             ProtocolError::InvalidResponse("Responses event is missing type".to_string())
         })?;
         match event_type {
-            "response.output_text.delta" => {
-                if let Some(delta) = event["delta"].as_str() {
-                    items.push(ModelEvent::Text(delta.to_string()));
-                }
-            }
+            "response.output_text.delta" => Self::output_text_delta(&event, &mut items),
             "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = event["delta"].as_str() {
-                    self.streamed_reasoning_summaries
-                        .insert(Self::summary_index(&event)?);
-                    items.push(ModelEvent::Reasoning(delta.to_string()));
-                }
+                self.reasoning_summary_delta(&event, &mut items)?;
             }
             "response.reasoning_summary_text.done" => {
-                let summary_index = Self::summary_index(&event)?;
-                if !self.streamed_reasoning_summaries.contains(&summary_index) {
-                    if let Some(text) = event["text"].as_str() {
-                        items.push(ModelEvent::Reasoning(text.to_string()));
-                    }
-                }
+                self.reasoning_summary_done(&event, &mut items)?;
             }
-            "response.output_item.added" => {
-                let item = &event["item"];
-                if item["type"].as_str() == Some("reasoning") {
-                    // A new reasoning item starts a fresh summary sequence and may
-                    // reuse summary indices from the previous item, so drop the
-                    // tracking before its deltas arrive.
-                    self.streamed_reasoning_summaries.clear();
-                } else if item["type"].as_str() == Some("function_call") {
-                    let key = self.item_key(&event)?;
-                    self.calls.entry(key).apply_item(item, false);
-                }
-            }
+            "response.output_item.added" => self.output_item_added(&event)?,
             "response.function_call_arguments.delta" => {
-                let key = self.key(&event)?;
-                if let Some(delta) = event["delta"].as_str() {
-                    self.calls.entry(key).append_arguments(delta);
-                }
+                self.function_call_arguments_delta(&event)?;
             }
             "response.function_call_arguments.done" => {
-                let key = self.key(&event)?;
-                let call = self.calls.entry(key.clone());
-                if let Some(arguments) = event["arguments"].as_str() {
-                    call.set_arguments(arguments);
-                }
-                if let Some(name) = event["name"].as_str() {
-                    call.set_name(name);
-                }
-                if let Some(call_id) = event["call_id"].as_str() {
-                    call.set_id(call_id);
-                }
-                if let Some(item) = self.emit_call(&key)? {
-                    items.push(item);
-                }
+                self.function_call_arguments_done(&event, &mut items)?;
             }
-            "response.output_item.done" => {
-                let item = &event["item"];
-                if item["type"].as_str() == Some("function_call") {
-                    let key = self.item_key(&event)?;
-                    self.calls.entry(key.clone()).apply_item(item, true);
-                    if let Some(call) = self.emit_call(&key)? {
-                        items.push(call);
-                    }
-                }
-            }
-            "response.completed" => {
-                if !self.calls.is_empty() {
-                    return Err(ProtocolError::InvalidResponse(
-                        "Responses API completed with an unfinished tool call".to_string(),
-                    ));
-                }
-                let response = &event["response"];
-                let usage = response.get("usage").unwrap_or(&event["usage"]);
-                if !usage.is_null() {
-                    items.push(ModelEvent::Usage(build_usage(
-                        usage["input_tokens"].as_u64().unwrap_or(0),
-                        usage["output_tokens"].as_u64().unwrap_or(0),
-                    )));
-                }
-                items.push(ModelEvent::Stop(stop_reason(
-                    response["incomplete_details"]["reason"]
-                        .as_str()
-                        .unwrap_or(""),
-                )));
-                return Ok(sse::DecodeResult::finished(items));
-            }
-            "response.failed" => {
-                return Err(ProtocolError::InvalidResponse(
-                    event["response"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Responses API stream failed")
-                        .to_string(),
-                ));
-            }
+            "response.output_item.done" => self.output_item_done(&event, &mut items)?,
+            "response.completed" => return self.completed(&event, &mut items),
+            "response.failed" => return Err(Self::stream_error_message(&event)),
             _ => {}
         }
         Ok(sse::DecodeResult::continuing(items))
+    }
+}
+
+impl ResponsesDecoder {
+    fn output_text_delta(event: &Value, items: &mut Vec<ModelEvent>) {
+        if let Some(delta) = event["delta"].as_str() {
+            items.push(ModelEvent::Text(delta.to_string()));
+        }
+    }
+
+    fn reasoning_summary_delta(
+        &mut self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        if let Some(delta) = event["delta"].as_str() {
+            self.streamed_reasoning_summaries
+                .insert(Self::summary_index(event)?);
+            items.push(ModelEvent::Reasoning(delta.to_string()));
+        }
+        Ok(())
+    }
+
+    fn reasoning_summary_done(
+        &self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        let summary_index = Self::summary_index(event)?;
+        if !self.streamed_reasoning_summaries.contains(&summary_index) {
+            if let Some(text) = event["text"].as_str() {
+                items.push(ModelEvent::Reasoning(text.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn output_item_added(&mut self, event: &Value) -> Result<(), ProtocolError> {
+        let item = &event["item"];
+        if item["type"].as_str() == Some("reasoning") {
+            // A new reasoning item starts a fresh summary sequence and may
+            // reuse summary indices from the previous item, so drop the
+            // tracking before its deltas arrive.
+            self.streamed_reasoning_summaries.clear();
+        } else if item["type"].as_str() == Some("function_call") {
+            let key = self.item_key(event)?;
+            self.calls.entry(key).apply_item(item, false);
+        }
+        Ok(())
+    }
+
+    fn function_call_arguments_delta(&mut self, event: &Value) -> Result<(), ProtocolError> {
+        let key = self.key(event)?;
+        if let Some(delta) = event["delta"].as_str() {
+            self.calls.entry(key).append_arguments(delta);
+        }
+        Ok(())
+    }
+
+    fn function_call_arguments_done(
+        &mut self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        let key = self.key(event)?;
+        let call = self.calls.entry(key.clone());
+        if let Some(arguments) = event["arguments"].as_str() {
+            call.set_arguments(arguments);
+        }
+        if let Some(name) = event["name"].as_str() {
+            call.set_name(name);
+        }
+        if let Some(call_id) = event["call_id"].as_str() {
+            call.set_id(call_id);
+        }
+        if let Some(item) = self.emit_call(&key)? {
+            items.push(item);
+        }
+        Ok(())
+    }
+
+    fn output_item_done(
+        &mut self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        let item = &event["item"];
+        if item["type"].as_str() == Some("function_call") {
+            let key = self.item_key(event)?;
+            self.calls.entry(key.clone()).apply_item(item, true);
+            if let Some(call) = self.emit_call(&key)? {
+                items.push(call);
+            }
+        }
+        Ok(())
+    }
+
+    fn completed(
+        &self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<sse::DecodeResult, ProtocolError> {
+        if !self.calls.is_empty() {
+            return Err(ProtocolError::InvalidResponse(
+                "Responses API completed with an unfinished tool call".to_string(),
+            ));
+        }
+        let response = &event["response"];
+        let usage = response.get("usage").unwrap_or_else(|| &event["usage"]);
+        if !usage.is_null() {
+            items.push(ModelEvent::Usage(build_usage(
+                usage["input_tokens"].as_u64().unwrap_or(0),
+                usage["output_tokens"].as_u64().unwrap_or(0),
+            )));
+        }
+        items.push(ModelEvent::Stop(stop_reason(
+            response["incomplete_details"]["reason"]
+                .as_str()
+                .unwrap_or(""),
+        )));
+        Ok(sse::DecodeResult::finished(std::mem::take(items)))
+    }
+
+    fn stream_error_message(event: &Value) -> ProtocolError {
+        ProtocolError::InvalidResponse(
+            event["response"]["error"]["message"]
+                .as_str()
+                .unwrap_or("Responses API stream failed")
+                .to_string(),
+        )
     }
 }
 
@@ -502,7 +556,7 @@ mod tests {
 
     #[test]
     fn includes_persisted_thoughts_in_responses_history() {
-        let adapter = ResponsesAdapter::new(ProviderConfig {
+        let _adapter = ResponsesAdapter::new(ProviderConfig {
             protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -525,7 +579,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = ResponsesAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["input"][0]["role"], "assistant");
         assert_eq!(body["input"][0]["content"], "visible answer");
@@ -535,7 +589,7 @@ mod tests {
 
     #[test]
     fn sends_tool_images_after_all_response_function_outputs() {
-        let adapter = ResponsesAdapter::new(ProviderConfig {
+        let _adapter = ResponsesAdapter::new(ProviderConfig {
             protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -557,7 +611,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = ResponsesAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["input"][0]["type"], "function_call_output");
         assert_eq!(body["input"][1]["type"], "function_call_output");

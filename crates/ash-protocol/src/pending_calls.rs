@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 /// Shared construction of provider-neutral usage records. Stream decoders
 /// report token counts under provider-specific field names; once those are
 /// read, every protocol builds the same `Usage` shape.
-pub(crate) fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
+pub const fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
     Usage {
         input_tokens,
         output_tokens,
@@ -18,7 +18,7 @@ pub(crate) fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
 /// Shared mapping from a provider's "ran out of tokens" signal to the
 /// provider-neutral `StopReason`. The reason strings cover the three supported
 /// providers; anything else is a normal end of turn.
-pub(crate) fn stop_reason(provider_reason: &str) -> StopReason {
+pub fn stop_reason(provider_reason: &str) -> StopReason {
     if matches!(
         provider_reason,
         "length" | "max_tokens" | "max_output_tokens"
@@ -38,7 +38,7 @@ pub(crate) fn stop_reason(provider_reason: &str) -> StopReason {
 /// `{}`, a missing id falls back to a fresh `ToolCallId`, invalid JSON is a
 /// protocol error named after the provider).
 #[derive(Default)]
-pub(crate) struct PendingCall {
+pub struct PendingCall {
     /// Provider tool-call id; empty means the provider never sent one.
     id: String,
     name: String,
@@ -137,7 +137,7 @@ impl PendingCall {
 
 /// Tool calls keyed by the provider's own call identifier (a block index, a
 /// delta index, or an item key).
-pub(crate) struct PendingCallAccumulator<K: Ord> {
+pub struct PendingCallAccumulator<K: Ord> {
     calls: BTreeMap<K, PendingCall>,
 }
 

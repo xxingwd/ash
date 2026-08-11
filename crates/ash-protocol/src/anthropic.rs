@@ -41,7 +41,7 @@ impl AnthropicAdapter {
         self.config.base_url("https://api.anthropic.com")
     }
 
-    fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
+    fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let messages: Vec<Value> = projected
             .messages
@@ -144,14 +144,14 @@ impl AnthropicAdapter {
 
 impl ModelClient for AnthropicAdapter {
     fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
-        let body = self.build_request(&req)?;
+        let body = Self::build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url()))
             .header("x-api-key", self.config.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .json(&body);
-        sse::stream(request, AnthropicDecoder::default())
+        Ok(sse::stream(request, AnthropicDecoder::default()))
     }
 }
 
@@ -180,101 +180,128 @@ impl sse::Decoder for AnthropicDecoder {
             ProtocolError::InvalidResponse("Anthropic event is missing type".to_string())
         })?;
         match event_type {
-            "message_start" => {
-                if let Some(usage) = event["message"].get("usage") {
-                    items.push(ModelEvent::Usage(build_usage(
-                        usage["input_tokens"].as_u64().unwrap_or(0),
-                        usage["output_tokens"].as_u64().unwrap_or(0),
-                    )));
+            "message_start" => Self::message_start(&event, &mut items),
+            "content_block_start" => self.content_block_start(&event)?,
+            "content_block_delta" => self.content_block_delta(&event, &mut items)?,
+            "content_block_stop" => self.content_block_stop(&event, &mut items)?,
+            "message_delta" => self.message_delta(&event, &mut items),
+            "message_stop" => return self.message_stop(&mut items),
+            "error" => return Err(Self::stream_error_message(&event)),
+            _ => {}
+        }
+        Ok(sse::DecodeResult::continuing(items))
+    }
+}
+
+impl AnthropicDecoder {
+    fn message_start(event: &Value, items: &mut Vec<ModelEvent>) {
+        if let Some(usage) = event["message"].get("usage") {
+            items.push(ModelEvent::Usage(build_usage(
+                usage["input_tokens"].as_u64().unwrap_or(0),
+                usage["output_tokens"].as_u64().unwrap_or(0),
+            )));
+        }
+    }
+
+    fn content_block_start(&mut self, event: &Value) -> Result<(), ProtocolError> {
+        let block = &event["content_block"];
+        if block["type"].as_str() == Some("tool_use") {
+            let index = Self::block_index(event)?;
+            let id = block["id"].as_str().ok_or_else(|| {
+                ProtocolError::InvalidResponse("Anthropic tool-use block is missing id".to_string())
+            })?;
+            let name = block["name"].as_str().ok_or_else(|| {
+                ProtocolError::InvalidResponse(
+                    "Anthropic tool-use block is missing name".to_string(),
+                )
+            })?;
+            self.calls.insert(index, PendingCall::new(id, name));
+        }
+        Ok(())
+    }
+
+    fn content_block_delta(
+        &mut self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        let delta = &event["delta"];
+        match delta["type"].as_str() {
+            Some("text_delta") => {
+                if let Some(text) = delta["text"].as_str() {
+                    items.push(ModelEvent::Text(text.to_string()));
                 }
             }
-            "content_block_start" => {
-                let block = &event["content_block"];
-                if block["type"].as_str() == Some("tool_use") {
-                    let index = Self::block_index(&event)?;
-                    let id = block["id"].as_str().ok_or_else(|| {
-                        ProtocolError::InvalidResponse(
-                            "Anthropic tool-use block is missing id".to_string(),
-                        )
-                    })?;
-                    let name = block["name"].as_str().ok_or_else(|| {
-                        ProtocolError::InvalidResponse(
-                            "Anthropic tool-use block is missing name".to_string(),
-                        )
-                    })?;
-                    self.calls.insert(index, PendingCall::new(id, name));
+            Some("thinking_delta") => {
+                if let Some(text) = delta["thinking"].as_str() {
+                    items.push(ModelEvent::Reasoning(text.to_string()));
                 }
             }
-            "content_block_delta" => {
-                let delta = &event["delta"];
-                match delta["type"].as_str() {
-                    Some("text_delta") => {
-                        if let Some(text) = delta["text"].as_str() {
-                            items.push(ModelEvent::Text(text.to_string()));
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        if let Some(text) = delta["thinking"].as_str() {
-                            items.push(ModelEvent::Reasoning(text.to_string()));
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        let index = Self::block_index(&event)?;
-                        let partial = delta["partial_json"].as_str().ok_or_else(|| {
-                            ProtocolError::InvalidResponse(
-                                "Anthropic tool-input delta is missing partial_json".to_string(),
-                            )
-                        })?;
-                        let call = self.calls.get_mut(&index).ok_or_else(|| {
-                            ProtocolError::InvalidResponse(format!(
-                                "Anthropic tool-input delta references unknown block {index}"
-                            ))
-                        })?;
-                        call.append_arguments(partial);
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_stop" => {
-                let index = Self::block_index(&event)?;
-                if let Some(call) = self.calls.remove(&index) {
-                    items.push(call.finish("Anthropic")?);
-                }
-            }
-            "message_delta" => {
-                if let Some(usage) = event.get("usage") {
-                    items.push(ModelEvent::Usage(build_usage(
-                        0,
-                        usage["output_tokens"].as_u64().unwrap_or(0),
-                    )));
-                }
-                self.stop = Some(stop_reason(
-                    event["delta"]["stop_reason"].as_str().unwrap_or(""),
-                ));
-            }
-            "message_stop" => {
-                if !self.calls.is_empty() {
-                    return Err(ProtocolError::InvalidResponse(
-                        "Anthropic message stopped with an unfinished tool call".to_string(),
-                    ));
-                }
-                items.push(ModelEvent::Stop(
-                    self.stop.take().unwrap_or(StopReason::EndTurn),
-                ));
-                return Ok(sse::DecodeResult::finished(items));
-            }
-            "error" => {
-                return Err(ProtocolError::InvalidResponse(
-                    event["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Anthropic stream error")
-                        .to_string(),
-                ));
+            Some("input_json_delta") => {
+                let index = Self::block_index(event)?;
+                let partial = delta["partial_json"].as_str().ok_or_else(|| {
+                    ProtocolError::InvalidResponse(
+                        "Anthropic tool-input delta is missing partial_json".to_string(),
+                    )
+                })?;
+                let call = self.calls.get_mut(&index).ok_or_else(|| {
+                    ProtocolError::InvalidResponse(format!(
+                        "Anthropic tool-input delta references unknown block {index}"
+                    ))
+                })?;
+                call.append_arguments(partial);
             }
             _ => {}
         }
+        Ok(())
+    }
 
-        Ok(sse::DecodeResult::continuing(items))
+    fn content_block_stop(
+        &mut self,
+        event: &Value,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<(), ProtocolError> {
+        let index = Self::block_index(event)?;
+        if let Some(call) = self.calls.remove(&index) {
+            items.push(call.finish("Anthropic")?);
+        }
+        Ok(())
+    }
+
+    fn message_delta(&mut self, event: &Value, items: &mut Vec<ModelEvent>) {
+        if let Some(usage) = event.get("usage") {
+            items.push(ModelEvent::Usage(build_usage(
+                0,
+                usage["output_tokens"].as_u64().unwrap_or(0),
+            )));
+        }
+        self.stop = Some(stop_reason(
+            event["delta"]["stop_reason"].as_str().unwrap_or(""),
+        ));
+    }
+
+    fn message_stop(
+        &mut self,
+        items: &mut Vec<ModelEvent>,
+    ) -> Result<sse::DecodeResult, ProtocolError> {
+        if !self.calls.is_empty() {
+            return Err(ProtocolError::InvalidResponse(
+                "Anthropic message stopped with an unfinished tool call".to_string(),
+            ));
+        }
+        items.push(ModelEvent::Stop(
+            self.stop.take().unwrap_or(StopReason::EndTurn),
+        ));
+        Ok(sse::DecodeResult::finished(std::mem::take(items)))
+    }
+
+    fn stream_error_message(event: &Value) -> ProtocolError {
+        ProtocolError::InvalidResponse(
+            event["error"]["message"]
+                .as_str()
+                .unwrap_or("Anthropic stream error")
+                .to_string(),
+        )
     }
 }
 
@@ -356,7 +383,7 @@ mod tests {
 
     #[test]
     fn uses_the_default_output_limit() {
-        let adapter = AnthropicAdapter::new(ProviderConfig {
+        let _adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -369,14 +396,14 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = AnthropicAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["max_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
     }
 
     #[test]
     fn honors_an_explicit_output_limit() {
-        let adapter = AnthropicAdapter::new(ProviderConfig {
+        let _adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -389,14 +416,14 @@ mod tests {
             max_tokens: Some(1_024),
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = AnthropicAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["max_tokens"], 1_024);
     }
 
     #[test]
     fn includes_persisted_thoughts_in_anthropic_history() {
-        let adapter = AnthropicAdapter::new(ProviderConfig {
+        let _adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -419,7 +446,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = AnthropicAdapter::build_request(&request).unwrap();
 
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["type"], "thinking");
@@ -430,7 +457,7 @@ mod tests {
 
     #[test]
     fn sends_tool_images_inside_the_anthropic_tool_result() {
-        let adapter = AnthropicAdapter::new(ProviderConfig {
+        let _adapter = AnthropicAdapter::new(ProviderConfig {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -454,7 +481,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = AnthropicAdapter::build_request(&request).unwrap();
 
         assert_eq!(
             body["messages"][0]["content"][0]["content"][1]["type"],

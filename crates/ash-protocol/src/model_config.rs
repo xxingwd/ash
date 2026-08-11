@@ -16,7 +16,7 @@ const RESERVED_ROOTS: &[&str] = &[
     "tools",
 ];
 
-pub(crate) fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
+pub fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
     match std::env::var(ENV_VAR) {
         Ok(config) => apply(body, &config),
         Err(VarError::NotPresent) => Ok(()),
@@ -26,7 +26,7 @@ pub(crate) fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
     }
 }
 
-pub(crate) fn apply(body: &mut Value, config: &str) -> Result<(), ProtocolError> {
+pub fn apply(body: &mut Value, config: &str) -> Result<(), ProtocolError> {
     let mut entries = Vec::new();
     let mut paths = HashSet::new();
 

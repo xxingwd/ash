@@ -28,7 +28,7 @@ impl CompletionsAdapter {
         self.config.base_url("https://api.openai.com")
     }
 
-    fn build_request(&self, req: &ModelRequest) -> Result<Value, ProtocolError> {
+    fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let mut messages = Vec::new();
         if let Some(system) = &projected.system {
@@ -143,18 +143,18 @@ fn chat_content(contents: &[ash_core::Content]) -> Value {
 
 impl ModelClient for CompletionsAdapter {
     fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
-        let body = self.build_request(&req)?;
+        let body = Self::build_request(&req)?;
         let request = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url()))
             .bearer_auth(self.config.api_key.expose_secret())
             .json(&body);
-        sse::stream(request, CompletionsDecoder::default())
+        Ok(sse::stream(request, CompletionsDecoder::default()))
     }
 }
 
 #[derive(Default)]
-pub(crate) struct CompletionsDecoder {
+pub struct CompletionsDecoder {
     calls: PendingCallAccumulator<usize>,
     stop: Option<StopReason>,
 }
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn includes_persisted_thoughts_in_chat_completion_history() {
-        let adapter = CompletionsAdapter::new(ProviderConfig {
+        let _adapter = CompletionsAdapter::new(ProviderConfig {
             protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -370,7 +370,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = CompletionsAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"], "visible answer");
@@ -385,7 +385,7 @@ mod tests {
         // DeepSeek requires the `reasoning_content` of a tool-calling turn to be
         // echoed back verbatim in the next request; the assistant message then
         // carries both the thought and the tool calls together.
-        let adapter = CompletionsAdapter::new(ProviderConfig {
+        let _adapter = CompletionsAdapter::new(ProviderConfig {
             protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -412,7 +412,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = CompletionsAdapter::build_request(&request).unwrap();
 
         let message = &body["messages"][0];
         assert_eq!(message["role"], "assistant");
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn sends_tool_images_after_all_chat_completion_tool_results() {
-        let adapter = CompletionsAdapter::new(ProviderConfig {
+        let _adapter = CompletionsAdapter::new(ProviderConfig {
             protocol: Protocol::Completions,
             api_key: SecretString::from("test"),
             base_url: None,
@@ -446,7 +446,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = adapter.build_request(&request).unwrap();
+        let body = CompletionsAdapter::build_request(&request).unwrap();
 
         assert_eq!(body["messages"][0]["role"], "tool");
         assert_eq!(body["messages"][1]["role"], "tool");

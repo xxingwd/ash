@@ -3,7 +3,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
 
-pub(crate) enum DecodeResult {
+pub enum DecodeResult {
     Continue(Vec<ModelEvent>),
     /// A provider-level terminal marker was observed, but more wire events may
     /// follow (for example Chat Completions sends usage after `finish_reason`).
@@ -14,7 +14,7 @@ pub(crate) enum DecodeResult {
     WireDone(Vec<ModelEvent>),
 }
 
-pub(crate) struct DecodedParts {
+pub struct DecodedParts {
     pub(crate) items: Vec<ModelEvent>,
     /// A provider-level terminal marker was observed.
     pub(crate) terminal: bool,
@@ -23,19 +23,19 @@ pub(crate) struct DecodedParts {
 }
 
 impl DecodeResult {
-    pub(crate) fn continuing(items: Vec<ModelEvent>) -> Self {
+    pub(crate) const fn continuing(items: Vec<ModelEvent>) -> Self {
         Self::Continue(items)
     }
 
-    pub(crate) fn terminal(items: Vec<ModelEvent>) -> Self {
+    pub(crate) const fn terminal(items: Vec<ModelEvent>) -> Self {
         Self::Terminal(items)
     }
 
-    pub(crate) fn finished(items: Vec<ModelEvent>) -> Self {
+    pub(crate) const fn finished(items: Vec<ModelEvent>) -> Self {
         Self::Finished(items)
     }
 
-    pub(crate) fn wire_done(items: Vec<ModelEvent>) -> Self {
+    pub(crate) const fn wire_done(items: Vec<ModelEvent>) -> Self {
         Self::WireDone(items)
     }
 
@@ -70,7 +70,7 @@ impl DecodeResult {
     }
 }
 
-pub(crate) trait Decoder: Send + 'static {
+pub trait Decoder: Send + 'static {
     fn decode(&mut self, data: &str) -> Result<DecodeResult, ProtocolError>;
 
     /// Emit events buffered until the wire closes. Most protocols emit their
@@ -81,14 +81,11 @@ pub(crate) trait Decoder: Send + 'static {
     }
 }
 
-pub(crate) fn stream<D>(
-    request: RequestBuilder,
-    mut decoder: D,
-) -> Result<ModelStream, ProtocolError>
+pub fn stream<D>(request: RequestBuilder, mut decoder: D) -> ModelStream
 where
     D: Decoder,
 {
-    Ok(Box::pin(async_stream::try_stream! {
+    Box::pin(async_stream::try_stream! {
         let response = request
             .send()
             .await
@@ -151,7 +148,7 @@ where
             // the response was truncated, even if partial output was emitted.
             yield ModelEvent::Stop(StopReason::Truncated);
         }
-    }))
+    })
 }
 
 /// Log the non-streaming model events from the wire. Text and reasoning
@@ -237,7 +234,7 @@ mod tests {
             .post(format!("http://{addr}{path}"))
             .bearer_auth("test-key")
             .json(&serde_json::json!({"model": "test", "stream": true}));
-        let mut stream = super::stream(request, decoder).unwrap();
+        let mut stream = super::stream(request, decoder);
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
             events.push(item.unwrap());
