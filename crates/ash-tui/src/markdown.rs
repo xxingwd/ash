@@ -1,22 +1,22 @@
 use pulldown_cmark::{
-    CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, CodeBlockKind, Event as MarkdownEvent, HeadingLevel, LinkType, Options, Parser, Tag,
+    TagEnd,
 };
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line as RatatuiLine, Span as RatatuiSpan},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::text_width::truncate_end;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct StyledSpan {
+pub struct StyledSpan {
     pub(crate) text: String,
     pub(crate) style: Style,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RenderedLine {
+pub struct RenderedLine {
     spans: Vec<StyledSpan>,
 }
 
@@ -47,9 +47,10 @@ impl RenderedLine {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct StreamingMarkdownCache {
+pub struct StreamingMarkdownCache {
     width: Option<u16>,
     stable_source_len: usize,
+    stable_reference_links: usize,
     stable_lines: Vec<RenderedLine>,
 }
 
@@ -59,7 +60,17 @@ impl StreamingMarkdownCache {
         if self.width != Some(width) || self.stable_source_len > source.len() {
             self.width = Some(width);
             self.stable_source_len = 0;
+            self.stable_reference_links = 0;
             self.stable_lines.clear();
+        }
+
+        if self.stable_source_len > 0 {
+            let reference_links = reference_link_count_before(source, self.stable_source_len);
+            if reference_links != self.stable_reference_links {
+                self.stable_source_len = 0;
+                self.stable_reference_links = 0;
+                self.stable_lines.clear();
+            }
         }
 
         let remaining = &source[self.stable_source_len..];
@@ -71,6 +82,7 @@ impl StreamingMarkdownCache {
                 }
                 self.stable_lines.extend(fragment);
             }
+            self.stable_reference_links += reference_link_count_before(&remaining[..split], split);
             self.stable_source_len += split;
         }
 
@@ -96,7 +108,7 @@ impl StreamingMarkdownCache {
 
 /// Total combined row count: stable lines, an optional blank gap row between
 /// the stable and streaming tail, then the tail lines.
-pub(crate) fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
+pub fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
     stable
         .len()
         .saturating_add(usize::from(!stable.is_empty() && !tail.is_empty()))
@@ -106,7 +118,7 @@ pub(crate) fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]
 /// Maps a combined row index (stable lines, then the optional blank gap row,
 /// then the streaming tail lines) to the underlying line. Returns `None` for
 /// the gap row and for out-of-range indices.
-pub(crate) fn combined_line<'a>(
+pub fn combined_line<'a>(
     stable: &'a [RenderedLine],
     tail: &'a [RenderedLine],
     index: usize,
@@ -126,8 +138,14 @@ pub(crate) fn combined_line<'a>(
 
 #[derive(Clone, Debug, Default)]
 struct LogicalLine {
+    /// Prefix rendered only on the first visual row.
+    initial: Vec<StyledSpan>,
     spans: Vec<StyledSpan>,
-    continuation_indent: usize,
+    /// Prefix re-applied to every wrapped continuation row (quote bars,
+    /// list indent, marker gap, code indent).
+    continuation: Vec<StyledSpan>,
+    prefixed: bool,
+    verbatim: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,13 +153,42 @@ struct ListState {
     next: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct ItemState {
+    marker: String,
+    marker_used: bool,
+    task_marker: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TableCell {
+    spans: Vec<StyledSpan>,
+}
+
+impl TableCell {
+    fn is_empty(&self) -> bool {
+        self.spans.iter().all(|span| span.text.is_empty())
+    }
+
+    fn width(&self) -> usize {
+        styled_width(&self.spans)
+    }
+}
+
 #[derive(Default)]
 struct TableState {
-    header: Option<Vec<String>>,
-    rows: Vec<Vec<String>>,
-    row: Vec<String>,
-    cell: String,
+    alignments: Vec<Alignment>,
+    header: Option<Vec<TableCell>>,
+    rows: Vec<Vec<TableCell>>,
+    row: Vec<TableCell>,
+    cell: TableCell,
     in_head: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LinkState {
+    destination: String,
+    label: String,
 }
 
 struct MarkdownWriter {
@@ -153,10 +200,8 @@ struct MarkdownWriter {
     blockquote_depth: usize,
     code_block: bool,
     lists: Vec<ListState>,
-    list_needs_blank_before_next_item: Vec<bool>,
-    list_item_start_line_counts: Vec<usize>,
-    item_marker: Option<String>,
-    item_marker_used: bool,
+    items: Vec<ItemState>,
+    links: Vec<LinkState>,
     table: Option<TableState>,
 }
 
@@ -171,10 +216,8 @@ impl MarkdownWriter {
             blockquote_depth: 0,
             code_block: false,
             lists: Vec::new(),
-            list_needs_blank_before_next_item: Vec::new(),
-            list_item_start_line_counts: Vec::new(),
-            item_marker: None,
-            item_marker_used: false,
+            items: Vec::new(),
+            links: Vec::new(),
             table: None,
         }
     }
@@ -194,54 +237,86 @@ impl MarkdownWriter {
     }
 
     fn ensure_prefix(&mut self) {
-        if !self.current.spans.is_empty() {
+        if self.current.prefixed {
             return;
         }
+        self.current.prefixed = true;
 
         let quote_prefix = "│ ".repeat(self.blockquote_depth);
         if !quote_prefix.is_empty() {
-            self.current.spans.push(StyledSpan {
+            let style = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM);
+            self.current.initial.push(StyledSpan {
+                text: quote_prefix.clone(),
+                style,
+            });
+            self.current.continuation.push(StyledSpan {
                 text: quote_prefix,
-                style: Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::DIM),
+                style,
             });
         }
 
         let list_indent = "  ".repeat(self.lists.len().saturating_sub(1));
         if !list_indent.is_empty() {
-            self.current.spans.push(StyledSpan {
+            self.current.initial.push(StyledSpan {
                 text: list_indent.clone(),
+                style: Style::default(),
+            });
+            self.current.continuation.push(StyledSpan {
+                text: list_indent,
                 style: Style::default(),
             });
         }
 
-        if let Some(marker) = self.item_marker.clone() {
-            let prefix = if self.item_marker_used {
-                " ".repeat(UnicodeWidthStr::width(marker.as_str()))
+        // The item marker plus any task checkbox (`- [x] `); continuation
+        // rows repeat the marker width as spaces so wrapped text stays
+        // aligned with the first line's content.
+        if let Some(item) = self.items.last_mut() {
+            let marker_text = item.task_marker.map_or_else(
+                || item.marker.clone(),
+                |task| format!("{}{task}", item.marker),
+            );
+            let marker_width = UnicodeWidthStr::width(marker_text.as_str());
+            let prefix = if item.marker_used {
+                " ".repeat(marker_width)
             } else {
-                self.item_marker_used = true;
-                marker
+                item.marker_used = true;
+                marker_text
             };
-            self.current.continuation_indent = UnicodeWidthStr::width(prefix.as_str())
-                + UnicodeWidthStr::width(list_indent.as_str())
-                + UnicodeWidthStr::width("│ ") * self.blockquote_depth;
-            self.current.spans.push(StyledSpan {
+            let style = Style::default().fg(Color::Blue);
+            self.current.continuation.push(StyledSpan {
+                text: " ".repeat(marker_width),
+                style,
+            });
+            self.current.initial.push(StyledSpan {
                 text: prefix,
-                style: Style::default().fg(Color::Blue),
+                style,
             });
         }
 
         if self.code_block {
-            self.current.spans.push(StyledSpan {
+            let style = Style::default().add_modifier(Modifier::DIM);
+            self.current.initial.push(StyledSpan {
                 text: "  ".to_string(),
-                style: Style::default().add_modifier(Modifier::DIM),
+                style,
             });
-            self.current.continuation_indent = self.current.continuation_indent.max(2);
+            self.current.continuation.push(StyledSpan {
+                text: "  ".to_string(),
+                style,
+            });
+            self.current.verbatim = true;
         }
     }
 
     fn push_text(&mut self, text: &str) {
+        if let Some(link) = self.links.last_mut() {
+            link.label.push_str(text);
+        }
+        self.push_text_untracked(text);
+    }
+
+    fn push_text_untracked(&mut self, text: &str) {
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
                 self.force_line_break();
@@ -250,15 +325,13 @@ impl MarkdownWriter {
                 continue;
             }
             self.ensure_prefix();
-            self.current.spans.push(StyledSpan {
-                text: part.to_string(),
-                style: self.current_style(),
-            });
+            let style = self.current_style();
+            push_styled_text(&mut self.current.spans, part, style);
         }
     }
 
     fn finish_line(&mut self) {
-        if !self.current.spans.is_empty() {
+        if !logical_line_is_empty(&self.current) {
             self.lines.push(std::mem::take(&mut self.current));
         }
     }
@@ -296,85 +369,174 @@ impl MarkdownWriter {
         self.inline_styles.pop();
     }
 
+    fn start_link(&mut self, destination: &str) {
+        self.links.push(LinkState {
+            destination: destination.to_string(),
+            label: String::new(),
+        });
+        self.push_style(link_style());
+    }
+
+    fn finish_link(&mut self) -> Option<String> {
+        self.pop_style();
+        let link = self.links.pop()?;
+        let label = link.label.trim();
+        let destination = link.destination.trim();
+        (!destination.is_empty() && label != destination).then(|| format!(" ({destination})"))
+    }
+
+    fn push_link_suffix(&mut self, suffix: &str) {
+        self.push_style(link_destination_style());
+        self.push_text_untracked(suffix);
+        self.pop_style();
+    }
+
     fn start_item(&mut self) {
-        if self
-            .list_needs_blank_before_next_item
-            .last_mut()
-            .map(std::mem::take)
-            .unwrap_or(false)
-        {
+        self.finish_line();
+        if self.needs_block_gap {
             self.push_blank_line();
         }
-        self.finish_line();
-        self.list_item_start_line_counts.push(self.lines.len());
         let marker = self.lists.last_mut().map_or_else(
             || "- ".to_string(),
-            |list| match list.next.as_mut() {
-                Some(next) => {
-                    let marker = format!("{next}. ");
-                    *next += 1;
-                    marker
-                }
-                None => "- ".to_string(),
+            |list| {
+                list.next.as_mut().map_or_else(
+                    || "- ".to_string(),
+                    |next| {
+                        let marker = format!("{next}. ");
+                        *next += 1;
+                        marker
+                    },
+                )
             },
         );
-        self.item_marker = Some(marker);
-        self.item_marker_used = false;
+        self.items.push(ItemState {
+            marker,
+            marker_used: false,
+            task_marker: None,
+        });
         self.needs_block_gap = false;
     }
 
     fn finish_item(&mut self) {
         self.finish_line();
-        let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
-        if self.lines.len().saturating_sub(start_line_count) > 1 {
-            if let Some(needs_blank) = self.list_needs_blank_before_next_item.last_mut() {
-                *needs_blank = true;
-            }
+        self.items.pop();
+    }
+
+    fn push_table_text(&mut self, text: &str) {
+        if let Some(link) = self.links.last_mut() {
+            link.label.push_str(text);
         }
-        self.item_marker = None;
-        self.item_marker_used = false;
+        self.push_table_text_untracked(text);
+    }
+
+    fn push_table_text_untracked(&mut self, text: &str) {
+        let style = self.current_style();
+        if let Some(table) = self.table.as_mut() {
+            push_styled_text(&mut table.cell.spans, text, style);
+        }
+    }
+
+    fn finish_table_cell(&mut self) {
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+        trim_styled_spans(&mut table.cell.spans);
+        table.row.push(std::mem::take(&mut table.cell));
+    }
+
+    fn finish_table_row(&mut self) {
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+        let row = std::mem::take(&mut table.row);
+        if table.in_head {
+            table.header = Some(row);
+        } else {
+            table.rows.push(row);
+        }
     }
 
     fn handle_table_event(&mut self, event: MarkdownEvent<'_>) -> bool {
-        let Some(table) = self.table.as_mut() else {
+        if self.table.is_none() {
             return false;
-        };
+        }
         match event {
             MarkdownEvent::Start(Tag::TableHead) => {
-                table.in_head = true;
-                table.row.clear();
+                if let Some(table) = self.table.as_mut() {
+                    table.in_head = true;
+                    table.row.clear();
+                }
             }
             MarkdownEvent::End(TagEnd::TableHead) => {
-                if !table.cell.is_empty() {
-                    table.row.push(std::mem::take(&mut table.cell));
+                if self
+                    .table
+                    .as_ref()
+                    .is_some_and(|table| !table.cell.is_empty())
+                {
+                    self.finish_table_cell();
                 }
-                table.header = Some(std::mem::take(&mut table.row));
-                table.in_head = false;
+                if self
+                    .table
+                    .as_ref()
+                    .is_some_and(|table| !table.row.is_empty())
+                {
+                    self.finish_table_row();
+                }
+                if let Some(table) = self.table.as_mut() {
+                    table.in_head = false;
+                }
             }
-            MarkdownEvent::Start(Tag::TableRow) => table.row.clear(),
+            MarkdownEvent::Start(Tag::TableRow) => {
+                if let Some(table) = self.table.as_mut() {
+                    table.row.clear();
+                }
+            }
             MarkdownEvent::End(TagEnd::TableRow) => {
-                if !table.cell.is_empty() {
-                    table.row.push(std::mem::take(&mut table.cell));
+                if self
+                    .table
+                    .as_ref()
+                    .is_some_and(|table| !table.cell.is_empty())
+                {
+                    self.finish_table_cell();
                 }
-                let row = std::mem::take(&mut table.row);
-                if table.in_head {
-                    table.header = Some(row);
-                } else {
-                    table.rows.push(row);
+                self.finish_table_row();
+            }
+            MarkdownEvent::Start(Tag::TableCell) => {
+                if let Some(table) = self.table.as_mut() {
+                    table.cell = TableCell::default();
                 }
             }
-            MarkdownEvent::Start(Tag::TableCell) => table.cell.clear(),
-            MarkdownEvent::End(TagEnd::TableCell) => {
-                table.row.push(table.cell.trim().to_string());
-                table.cell.clear();
+            MarkdownEvent::End(TagEnd::TableCell) => self.finish_table_cell(),
+            MarkdownEvent::Start(Tag::Emphasis) => {
+                self.push_style(Style::default().add_modifier(Modifier::ITALIC));
             }
-            MarkdownEvent::Text(text) | MarkdownEvent::Code(text) | MarkdownEvent::Html(text) => {
-                if !table.cell.is_empty() {
-                    table.cell.push(' ');
+            MarkdownEvent::Start(Tag::Strong) => {
+                self.push_style(Style::default().add_modifier(Modifier::BOLD));
+            }
+            MarkdownEvent::Start(Tag::Strikethrough) => {
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+            }
+            MarkdownEvent::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
+                self.pop_style();
+            }
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => self.start_link(&dest_url),
+            MarkdownEvent::End(TagEnd::Link) => {
+                if let Some(suffix) = self.finish_link() {
+                    let style = link_destination_style();
+                    if let Some(table) = self.table.as_mut() {
+                        push_styled_text(&mut table.cell.spans, &suffix, style);
+                    }
                 }
-                table.cell.push_str(text.trim());
             }
-            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => table.cell.push(' '),
+            MarkdownEvent::Text(text)
+            | MarkdownEvent::Html(text)
+            | MarkdownEvent::InlineHtml(text) => self.push_table_text(&text),
+            MarkdownEvent::Code(text) => {
+                self.push_style(Style::default().fg(Color::Cyan));
+                self.push_table_text(&text);
+                self.pop_style();
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => self.push_table_text(" "),
             MarkdownEvent::End(TagEnd::Table) => return true,
             _ => {}
         }
@@ -385,69 +547,138 @@ impl MarkdownWriter {
         let Some(table) = self.table.take() else {
             return;
         };
-        let mut all_rows = Vec::new();
-        if let Some(header) = table.header.clone() {
-            all_rows.push(header);
-        }
-        all_rows.extend(table.rows.clone());
-        let columns = all_rows.iter().map(Vec::len).max().unwrap_or(0);
+        let columns = table
+            .header
+            .iter()
+            .chain(table.rows.iter())
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
         if columns == 0 {
             return;
         }
 
         let gap_width = 2 * columns.saturating_sub(1);
-        let available = self.width.saturating_sub(gap_width).max(columns);
-        let equal_cap = (available / columns).max(3);
-        let mut widths = vec![1usize; columns];
-        for row in &all_rows {
-            for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index]
-                    .max(UnicodeWidthStr::width(cell.as_str()))
-                    .min(equal_cap);
-            }
+        let content_width = self
+            .width
+            .saturating_sub(self.structural_prefix_width())
+            .max(1);
+        let grid_minimum = gap_width.saturating_add(columns.saturating_mul(3));
+        if table.header.is_some() && content_width < grid_minimum {
+            self.render_table_records(&table, content_width);
+            self.needs_block_gap = true;
+            return;
         }
 
-        let push_row = |writer: &mut Self, row: &[String], style: Style| {
-            let mut line = LogicalLine::default();
-            for (column, column_width) in widths.iter().copied().enumerate().take(columns) {
-                if column > 0 {
-                    line.spans.push(StyledSpan {
-                        text: "  ".to_string(),
-                        style: Style::default().add_modifier(Modifier::DIM),
-                    });
-                }
-                let value = row.get(column).map(String::as_str).unwrap_or("");
-                let value = truncate_end(value, column_width);
-                let padding = column_width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
-                line.spans.push(StyledSpan {
-                    text: format!("{value}{}", " ".repeat(padding)),
-                    style,
-                });
+        let column_budget = content_width.saturating_sub(gap_width).max(columns);
+        let mut widths = vec![1usize; columns];
+        for row in table.header.iter().chain(table.rows.iter()) {
+            for (index, cell) in row.iter().enumerate() {
+                widths[index] = widths[index].max(cell.width()).min(column_budget);
             }
-            writer.lines.push(line);
-        };
+        }
+        shrink_column_widths(&mut widths, column_budget, 1);
 
-        if let Some(header) = table.header {
-            push_row(self, &header, Style::default().add_modifier(Modifier::BOLD));
+        if let Some(header) = table.header.as_deref() {
+            let spans = table_row_spans(
+                header,
+                &widths,
+                &table.alignments,
+                Style::default().add_modifier(Modifier::BOLD),
+            );
+            self.push_spans_line(spans, true);
             let separator = widths
                 .iter()
                 .map(|width| "─".repeat(*width))
                 .collect::<Vec<_>>()
                 .join("  ");
-            self.lines.push(LogicalLine {
-                spans: vec![StyledSpan {
+            self.push_spans_line(
+                vec![StyledSpan {
                     text: separator,
                     style: Style::default().add_modifier(Modifier::DIM),
                 }],
-                continuation_indent: 0,
-            });
+                true,
+            );
         }
-        for row in table.rows {
-            push_row(self, &row, Style::default());
+        for row in &table.rows {
+            let spans = table_row_spans(row, &widths, &table.alignments, Style::default());
+            self.push_spans_line(spans, true);
         }
         self.needs_block_gap = true;
     }
 
+    fn structural_prefix_width(&self) -> usize {
+        let quote_width = UnicodeWidthStr::width("│ ") * self.blockquote_depth;
+        let list_width = UnicodeWidthStr::width("  ") * self.lists.len().saturating_sub(1);
+        let item_width = self.items.last().map_or(0, |item| {
+            UnicodeWidthStr::width(item.marker.as_str())
+                + item.task_marker.map_or(0, UnicodeWidthStr::width)
+        });
+        let code_width = usize::from(self.code_block) * UnicodeWidthStr::width("  ");
+        quote_width + list_width + item_width + code_width
+    }
+
+    fn push_spans_line(&mut self, spans: Vec<StyledSpan>, verbatim: bool) {
+        self.ensure_prefix();
+        for span in spans {
+            push_styled_text(&mut self.current.spans, &span.text, span.style);
+        }
+        self.current.verbatim |= verbatim;
+        self.finish_line();
+    }
+
+    fn render_table_records(&mut self, table: &TableState, content_width: usize) {
+        let Some(header) = table.header.as_deref() else {
+            return;
+        };
+        if table.rows.is_empty() {
+            for label in header {
+                let mut spans = label.spans.clone();
+                for span in &mut spans {
+                    span.style = span
+                        .style
+                        .patch(Style::default().add_modifier(Modifier::BOLD));
+                }
+                self.push_spans_line(truncate_styled_spans(&spans, content_width), true);
+            }
+            return;
+        }
+        for (row_index, row) in table.rows.iter().enumerate() {
+            if row_index > 0 {
+                self.push_blank_line();
+            }
+            for (column, value) in row.iter().enumerate() {
+                let Some(label) = header.get(column) else {
+                    continue;
+                };
+                let mut label_spans = label.spans.clone();
+                for span in &mut label_spans {
+                    span.style = span
+                        .style
+                        .patch(Style::default().add_modifier(Modifier::BOLD));
+                }
+                if label.width().saturating_add(2) >= content_width {
+                    self.push_spans_line(truncate_styled_spans(&label_spans, content_width), true);
+                    self.push_spans_line(value.spans.clone(), false);
+                    continue;
+                }
+                push_styled_text(
+                    &mut label_spans,
+                    ": ",
+                    Style::default().add_modifier(Modifier::DIM),
+                );
+                for span in &value.spans {
+                    push_styled_text(&mut label_spans, &span.text, span.style);
+                }
+                self.push_spans_line(label_spans, false);
+            }
+        }
+    }
+
+    /// Render one source string into styled lines. This is the parser event
+    /// loop: one match arm per markdown construct, all sharing the same
+    /// incremental renderer state.
+    #[allow(clippy::too_many_lines)]
     fn run(mut self, source: &str) -> Vec<RenderedLine> {
         for event in Parser::new_ext(source, markdown_options()) {
             if self.table.is_some() {
@@ -505,36 +736,37 @@ impl MarkdownWriter {
                         self.block_gap();
                     }
                     self.lists.push(ListState { next: start });
-                    self.list_needs_blank_before_next_item.push(false);
                 }
                 MarkdownEvent::End(TagEnd::List(_)) => {
                     self.lists.pop();
-                    self.list_needs_blank_before_next_item.pop();
                     self.needs_block_gap = true;
                 }
                 MarkdownEvent::Start(Tag::Item) => self.start_item(),
                 MarkdownEvent::End(TagEnd::Item) => self.finish_item(),
                 MarkdownEvent::Start(Tag::Emphasis) => {
-                    self.push_style(Style::default().add_modifier(Modifier::ITALIC))
+                    self.push_style(Style::default().add_modifier(Modifier::ITALIC));
                 }
-                MarkdownEvent::End(TagEnd::Emphasis) => self.pop_style(),
                 MarkdownEvent::Start(Tag::Strong) => {
-                    self.push_style(Style::default().add_modifier(Modifier::BOLD))
+                    self.push_style(Style::default().add_modifier(Modifier::BOLD));
                 }
-                MarkdownEvent::End(TagEnd::Strong) => self.pop_style(),
                 MarkdownEvent::Start(Tag::Strikethrough) => {
-                    self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
+                    self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
                 }
-                MarkdownEvent::End(TagEnd::Strikethrough) => self.pop_style(),
-                MarkdownEvent::Start(Tag::Link { .. }) => self.push_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-                MarkdownEvent::End(TagEnd::Link) => self.pop_style(),
-                MarkdownEvent::Start(Tag::Table(_)) => {
+                MarkdownEvent::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
+                    self.pop_style();
+                }
+                MarkdownEvent::Start(Tag::Link { dest_url, .. }) => self.start_link(&dest_url),
+                MarkdownEvent::End(TagEnd::Link) => {
+                    if let Some(suffix) = self.finish_link() {
+                        self.push_link_suffix(&suffix);
+                    }
+                }
+                MarkdownEvent::Start(Tag::Table(alignments)) => {
                     self.block_gap();
-                    self.table = Some(TableState::default());
+                    self.table = Some(TableState {
+                        alignments,
+                        ..TableState::default()
+                    });
                 }
                 MarkdownEvent::Text(text) | MarkdownEvent::Html(text) => self.push_text(&text),
                 MarkdownEvent::Code(code) => {
@@ -546,17 +778,24 @@ impl MarkdownWriter {
                 MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => self.force_line_break(),
                 MarkdownEvent::Rule => {
                     self.block_gap();
-                    self.lines.push(LogicalLine {
-                        spans: vec![StyledSpan {
-                            text: "─".repeat(self.width.min(24)),
+                    let rule_width = self
+                        .width
+                        .saturating_sub(self.structural_prefix_width())
+                        .clamp(1, 24);
+                    self.push_spans_line(
+                        vec![StyledSpan {
+                            text: "─".repeat(rule_width),
                             style: Style::default().add_modifier(Modifier::DIM),
                         }],
-                        continuation_indent: 0,
-                    });
+                        true,
+                    );
                     self.needs_block_gap = true;
                 }
                 MarkdownEvent::TaskListMarker(checked) => {
-                    self.push_text(if checked { "[x] " } else { "[ ] " });
+                    if let Some(item) = self.items.last_mut() {
+                        item.task_marker = Some(if checked { "[x] " } else { "[ ] " });
+                    }
+                    self.ensure_prefix();
                 }
                 MarkdownEvent::FootnoteReference(reference) => {
                     self.push_text(&format!("[{reference}]"));
@@ -574,6 +813,174 @@ impl MarkdownWriter {
             .collect::<Vec<_>>();
         trim_and_collapse_blank_lines(rendered)
     }
+}
+
+fn push_styled_text(spans: &mut Vec<StyledSpan>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
+        last.text.push_str(text);
+    } else {
+        spans.push(StyledSpan {
+            text: text.to_string(),
+            style,
+        });
+    }
+}
+
+fn styled_width(spans: &[StyledSpan]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum()
+}
+
+fn trim_styled_spans(spans: &mut Vec<StyledSpan>) {
+    while let Some(first) = spans.first_mut() {
+        first.text = first.text.trim_start().to_string();
+        if first.text.is_empty() {
+            spans.remove(0);
+        } else {
+            break;
+        }
+    }
+    while let Some(last) = spans.last_mut() {
+        last.text = last.text.trim_end().to_string();
+        if last.text.is_empty() {
+            spans.pop();
+        } else {
+            break;
+        }
+    }
+
+    let mut merged: Vec<StyledSpan> = Vec::with_capacity(spans.len());
+    for span in spans.drain(..) {
+        push_styled_text(&mut merged, &span.text, span.style);
+    }
+    *spans = merged;
+}
+
+fn link_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn link_destination_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+}
+
+fn shrink_column_widths(widths: &mut [usize], budget: usize, minimum: usize) {
+    for width in widths.iter_mut() {
+        *width = (*width).min(budget).max(minimum);
+    }
+    let minimum_total = minimum.saturating_mul(widths.len());
+    if budget < minimum_total {
+        let equal_width = budget / widths.len().max(1);
+        let remainder = budget % widths.len().max(1);
+        for (index, width) in widths.iter_mut().enumerate() {
+            *width = equal_width + usize::from(index < remainder);
+        }
+        return;
+    }
+
+    let total = widths.iter().sum::<usize>();
+    if total <= budget {
+        return;
+    }
+
+    let extra_budget = budget - minimum_total;
+    let total_requested = total - minimum_total;
+    let mut remainders = Vec::with_capacity(widths.len());
+    let mut allocated = minimum_total;
+    for (index, width) in widths.iter_mut().enumerate() {
+        let requested = *width - minimum;
+        let scaled = requested.saturating_mul(extra_budget);
+        let granted = scaled / total_requested;
+        *width = minimum + granted;
+        allocated += granted;
+        remainders.push((scaled % total_requested, index, requested - granted));
+    }
+
+    remainders.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, index, capacity) in remainders {
+        if allocated == budget {
+            break;
+        }
+        if capacity > 0 {
+            widths[index] += 1;
+            allocated += 1;
+        }
+    }
+}
+
+fn table_row_spans(
+    row: &[TableCell],
+    widths: &[usize],
+    alignments: &[Alignment],
+    row_style: Style,
+) -> Vec<StyledSpan> {
+    let mut output = Vec::new();
+    for (column, column_width) in widths.iter().copied().enumerate() {
+        if column > 0 {
+            push_styled_text(
+                &mut output,
+                "  ",
+                Style::default().add_modifier(Modifier::DIM),
+            );
+        }
+
+        let mut cell = row
+            .get(column)
+            .map(|cell| cell.spans.clone())
+            .unwrap_or_default();
+        for span in &mut cell {
+            span.style = span.style.patch(row_style);
+        }
+        let cell = truncate_styled_spans(&cell, column_width);
+        let padding = column_width.saturating_sub(styled_width(&cell));
+        let (left_padding, right_padding) = match alignments.get(column) {
+            Some(Alignment::Right) => (padding, 0),
+            Some(Alignment::Center) => (padding / 2, padding.saturating_sub(padding / 2)),
+            _ => (0, padding),
+        };
+        push_styled_text(&mut output, &" ".repeat(left_padding), Style::default());
+        for span in cell {
+            push_styled_text(&mut output, &span.text, span.style);
+        }
+        if column + 1 < widths.len() {
+            push_styled_text(&mut output, &" ".repeat(right_padding), Style::default());
+        }
+    }
+    output
+}
+
+fn truncate_styled_spans(spans: &[StyledSpan], maximum_width: usize) -> Vec<StyledSpan> {
+    if styled_width(spans) <= maximum_width {
+        return spans.to_vec();
+    }
+    if maximum_width == 0 {
+        return Vec::new();
+    }
+
+    let content_width = maximum_width.saturating_sub(1);
+    let mut output = Vec::new();
+    let mut width = 0usize;
+    let mut ellipsis_style = Style::default();
+    'spans: for span in spans {
+        ellipsis_style = span.style;
+        for grapheme in UnicodeSegmentation::graphemes(span.text.as_str(), true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if width.saturating_add(grapheme_width) > content_width {
+                break 'spans;
+            }
+            push_styled_text(&mut output, grapheme, span.style);
+            width += grapheme_width;
+        }
+    }
+    push_styled_text(&mut output, "…", ellipsis_style);
+    output
 }
 
 fn trim_and_collapse_blank_lines(lines: Vec<RenderedLine>) -> Vec<RenderedLine> {
@@ -608,55 +1015,203 @@ fn heading_style(level: HeadingLevel) -> Style {
     }
 }
 
+const fn logical_line_is_empty(line: &LogicalLine) -> bool {
+    line.initial.is_empty() && line.spans.is_empty()
+}
+
 fn logical_line_is_blank(line: &LogicalLine) -> bool {
-    line.spans.iter().all(|span| span.text.trim().is_empty())
+    line.initial
+        .iter()
+        .chain(line.spans.iter())
+        .all(|span| span.text.trim().is_empty())
 }
 
 fn wrap_line(line: LogicalLine, width: usize) -> Vec<RenderedLine> {
-    if line.spans.is_empty() {
+    if logical_line_is_empty(&line) {
         return vec![RenderedLine::default()];
     }
 
+    let prefix_limit = if line.spans.is_empty() {
+        width
+    } else {
+        width.saturating_sub(1)
+    };
+    let initial = clip_styled_spans(&line.initial, prefix_limit);
+    let continuation = clip_styled_spans(&line.continuation, prefix_limit);
+    if line.verbatim {
+        wrap_verbatim(line.spans, &initial, &continuation, width)
+    } else {
+        wrap_words(line.spans, &initial, &continuation, width)
+    }
+}
+
+fn clip_styled_spans(spans: &[StyledSpan], maximum_width: usize) -> Vec<StyledSpan> {
     let mut output = Vec::new();
-    let mut current = RenderedLine::default();
-    let mut current_width = 0usize;
-    for span in line.spans {
-        for character in span.text.chars() {
-            let character_width = character.width().unwrap_or(0);
-            if current_width > 0 && current_width + character_width > width {
-                output.push(std::mem::take(&mut current));
-                current_width = 0;
-                if line.continuation_indent > 0 {
-                    let indent = " ".repeat(line.continuation_indent.min(width.saturating_sub(1)));
-                    current.spans.push(StyledSpan {
-                        text: indent.clone(),
-                        style: Style::default(),
-                    });
-                    current_width = UnicodeWidthStr::width(indent.as_str());
-                }
+    let mut width = 0usize;
+    'spans: for span in spans {
+        for grapheme in UnicodeSegmentation::graphemes(span.text.as_str(), true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if width.saturating_add(grapheme_width) > maximum_width {
+                break 'spans;
             }
-            if current
-                .spans
-                .last()
-                .is_some_and(|last| last.style == span.style)
-            {
-                if let Some(last) = current.spans.last_mut() {
-                    last.text.push(character);
-                }
-            } else {
-                current.spans.push(StyledSpan {
-                    text: character.to_string(),
-                    style: span.style,
-                });
-            }
-            current_width += character_width;
+            push_styled_text(&mut output, grapheme, span.style);
+            width += grapheme_width;
         }
+    }
+    output
+}
+
+#[derive(Clone, Debug)]
+struct StyledGrapheme {
+    range: std::ops::Range<usize>,
+    style: Style,
+    width: usize,
+    whitespace: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StyledText {
+    text: String,
+    graphemes: Vec<StyledGrapheme>,
+}
+
+fn styled_graphemes(spans: Vec<StyledSpan>) -> StyledText {
+    let mut output = StyledText::default();
+    for span in spans {
+        for grapheme in UnicodeSegmentation::graphemes(span.text.as_str(), true) {
+            let start = output.text.len();
+            output.text.push_str(grapheme);
+            output.graphemes.push(StyledGrapheme {
+                range: start..output.text.len(),
+                style: span.style,
+                width: UnicodeWidthStr::width(grapheme),
+                whitespace: grapheme.chars().all(char::is_whitespace),
+            });
+        }
+    }
+    output
+}
+
+fn prefixed_line(prefix: &[StyledSpan]) -> (RenderedLine, usize) {
+    let mut line = RenderedLine::default();
+    for span in prefix {
+        push_styled_text(&mut line.spans, &span.text, span.style);
+    }
+    (line, styled_width(prefix))
+}
+
+fn append_grapheme(line: &mut RenderedLine, source: &str, grapheme: &StyledGrapheme) {
+    push_styled_text(
+        &mut line.spans,
+        &source[grapheme.range.clone()],
+        grapheme.style,
+    );
+}
+
+fn wrap_verbatim(
+    spans: Vec<StyledSpan>,
+    initial: &[StyledSpan],
+    continuation: &[StyledSpan],
+    width: usize,
+) -> Vec<RenderedLine> {
+    let styled = styled_graphemes(spans);
+    let (mut current, mut current_width) = prefixed_line(initial);
+    let mut content_width = 0usize;
+    let mut output = Vec::new();
+
+    for grapheme in &styled.graphemes {
+        if content_width > 0 && current_width.saturating_add(grapheme.width) > width {
+            output.push(std::mem::take(&mut current));
+            let prefixed = prefixed_line(continuation);
+            current = prefixed.0;
+            current_width = prefixed.1;
+            content_width = 0;
+        }
+        append_grapheme(&mut current, &styled.text, grapheme);
+        current_width += grapheme.width;
+        content_width += grapheme.width;
     }
     output.push(current);
     output
 }
 
-pub(crate) fn render_markdown(source: &str, width: u16) -> Vec<RenderedLine> {
+// `pending_whitespace` is refilled on later iterations, so draining keeps
+// the allocation while `into_iter` would move the buffer out of the loop.
+#[allow(clippy::iter_with_drain)]
+fn wrap_words(
+    spans: Vec<StyledSpan>,
+    initial: &[StyledSpan],
+    continuation: &[StyledSpan],
+    width: usize,
+) -> Vec<RenderedLine> {
+    let styled = styled_graphemes(spans);
+    let graphemes = &styled.graphemes;
+    let (mut current, mut current_width) = prefixed_line(initial);
+    let mut content_width = 0usize;
+    let mut output = Vec::new();
+    let mut pending_whitespace = Vec::new();
+    let mut index = 0usize;
+
+    while index < graphemes.len() {
+        if graphemes[index].whitespace {
+            pending_whitespace.push(graphemes[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let word_start = index;
+        while index < graphemes.len() && !graphemes[index].whitespace {
+            index += 1;
+        }
+        let word = &graphemes[word_start..index];
+        let word_width = word.iter().map(|grapheme| grapheme.width).sum::<usize>();
+        let whitespace_width = pending_whitespace
+            .iter()
+            .map(|grapheme| grapheme.width)
+            .sum::<usize>();
+
+        if content_width > 0
+            && current_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                > width
+        {
+            output.push(std::mem::take(&mut current));
+            let prefixed = prefixed_line(continuation);
+            current = prefixed.0;
+            current_width = prefixed.1;
+            content_width = 0;
+        }
+
+        if content_width > 0 {
+            for grapheme in pending_whitespace.drain(..) {
+                append_grapheme(&mut current, &styled.text, &grapheme);
+                current_width += grapheme.width;
+                content_width += grapheme.width;
+            }
+        } else {
+            pending_whitespace.clear();
+        }
+
+        for grapheme in word {
+            if content_width > 0 && current_width.saturating_add(grapheme.width) > width {
+                output.push(std::mem::take(&mut current));
+                let prefixed = prefixed_line(continuation);
+                current = prefixed.0;
+                current_width = prefixed.1;
+                content_width = 0;
+            }
+            append_grapheme(&mut current, &styled.text, grapheme);
+            current_width += grapheme.width;
+            content_width += grapheme.width;
+        }
+    }
+
+    output.push(current);
+    output
+}
+
+pub fn render_markdown(source: &str, width: u16) -> Vec<RenderedLine> {
     MarkdownWriter::new(usize::from(width.max(1))).run(source)
 }
 
@@ -703,6 +1258,27 @@ fn stable_markdown_split(source: &str) -> Option<usize> {
         .find(|start| follows_blank_line(source, *start))
 }
 
+fn reference_link_count_before(source: &str, end: usize) -> usize {
+    Parser::new_ext(source, markdown_options())
+        .into_offset_iter()
+        .filter(|(event, range)| {
+            range.start < end
+                && matches!(
+                    event,
+                    MarkdownEvent::Start(Tag::Link {
+                        link_type: LinkType::Reference
+                            | LinkType::ReferenceUnknown
+                            | LinkType::Collapsed
+                            | LinkType::CollapsedUnknown
+                            | LinkType::Shortcut
+                            | LinkType::ShortcutUnknown,
+                        ..
+                    })
+                )
+        })
+        .count()
+}
+
 fn follows_blank_line(source: &str, start: usize) -> bool {
     let Some(before) = source.get(..start) else {
         return false;
@@ -715,7 +1291,7 @@ fn follows_blank_line(source: &str, start: usize) -> bool {
         .is_empty()
 }
 
-fn is_block_tag(tag: &Tag<'_>) -> bool {
+const fn is_block_tag(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
         Tag::Paragraph
@@ -737,7 +1313,7 @@ fn is_block_tag(tag: &Tag<'_>) -> bool {
     )
 }
 
-fn is_block_end(tag: TagEnd) -> bool {
+const fn is_block_end(tag: TagEnd) -> bool {
     matches!(
         tag,
         TagEnd::Paragraph
@@ -783,6 +1359,143 @@ mod tests {
             actual.extend(tail);
             assert_eq!(actual, render_markdown(prefix, width), "prefix: {prefix:?}");
         }
+    }
+
+    #[test]
+    fn wrapped_quote_rows_keep_the_quote_bar() {
+        let lines = render_markdown(
+            "> a very long quoted line that will definitely wrap at a narrow width",
+            20,
+        );
+        assert_eq!(
+            text(&lines),
+            vec![
+                "│ a very long quoted",
+                "│ line that will",
+                "│ definitely wrap at",
+                "│ a narrow width",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_list_rows_keep_a_consistent_continuation_indent() {
+        let plain = render_markdown("- plain item with a long description that wraps", 16);
+        assert_eq!(
+            text(&plain),
+            vec![
+                "- plain item",
+                "  with a long",
+                "  description",
+                "  that wraps"
+            ]
+        );
+        let numbered = render_markdown("10. item with marker width four and a long line", 12);
+        assert_eq!(
+            text(&numbered),
+            vec![
+                "10. item",
+                "    with",
+                "    marker",
+                "    width",
+                "    four and",
+                "    a long",
+                "    line",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_task_items_align_under_the_item_text() {
+        let lines = render_markdown(
+            "- [x] a checked task item with a long description that wraps",
+            16,
+        );
+        let rendered = text(&lines);
+        assert_eq!(rendered[0], "- [x] a checked");
+        // The checkbox is part of the marker, so continuation rows indent by
+        // the full `- [x] ` width instead of just the bullet width.
+        assert!(rendered[1..]
+            .iter()
+            .all(|line| line.starts_with("      ") && UnicodeWidthStr::width(line.as_str()) <= 16));
+    }
+
+    #[test]
+    fn narrow_tables_stay_within_the_content_width() {
+        let lines = render_markdown("| Name | State |\n|---|---|\n| ash | ready |", 4);
+        assert_eq!(text(&lines), vec!["Name", "ash", "Sta…", "read", "y"]);
+        assert!(lines
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.plain_text().as_str()) <= 4));
+    }
+
+    #[test]
+    fn keeps_parent_item_context_after_a_nested_list() {
+        let lines = render_markdown("- outer\n  - inner\n\n  tail\n- next", 80);
+        assert_eq!(
+            text(&lines),
+            vec!["- outer", "", "  - inner", "", "  tail", "", "- next",]
+        );
+    }
+
+    #[test]
+    fn tight_multiline_items_do_not_gain_a_blank_row() {
+        let lines = render_markdown("- first line\n  continuation\n- second", 80);
+        assert_eq!(
+            text(&lines),
+            vec!["- first line", "  continuation", "- second"]
+        );
+    }
+
+    #[test]
+    fn wrapping_keeps_unicode_graphemes_intact() {
+        assert_eq!(text(&render_markdown("- 👩‍💻👩‍💻", 4)), vec!["- 👩‍💻", "  👩‍💻"]);
+        assert_eq!(
+            text(&render_markdown("- 中文中文", 6)),
+            vec!["- 中文", "  中文"]
+        );
+    }
+
+    #[test]
+    fn links_include_non_redundant_destinations() {
+        let lines = render_markdown(
+            "Read [the docs](https://example.com/docs) or <https://example.com>.",
+            80,
+        );
+        assert_eq!(
+            text(&lines),
+            vec!["Read the docs (https://example.com/docs) or https://example.com."]
+        );
+        assert!(lines[0].spans.iter().any(|span| {
+            span.text.contains("(https://example.com/docs)")
+                && span.style.add_modifier.contains(Modifier::DIM)
+        }));
+    }
+
+    #[test]
+    fn table_cells_keep_inline_style_and_text_adjacency() {
+        let lines = render_markdown("| Value |\n|---|\n| foo**bar**baz |", 40);
+        assert_eq!(text(&lines), vec!["Value", "─────────", "foobarbaz"]);
+        assert!(lines[2].spans.iter().any(|span| {
+            span.text == "bar" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn tables_honor_column_alignment() {
+        let lines = render_markdown(
+            "| Left | Center | Right |\n|:---|:---:|---:|\n| a | b | c |",
+            40,
+        );
+        assert_eq!(text(&lines)[2], "a       b         c");
+    }
+
+    #[test]
+    fn streaming_recomputes_links_when_a_reference_definition_arrives() {
+        assert_streaming_matches_full(
+            "Read [the docs][docs].\n\n[docs]: https://example.com/docs\n\nAfter",
+            80,
+        );
     }
 
     #[test]

@@ -247,6 +247,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

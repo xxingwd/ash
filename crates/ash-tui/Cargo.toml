@@ -10,6 +10,7 @@ futures = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 pulldown-cmark = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

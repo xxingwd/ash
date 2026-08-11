@@ -1,6 +1,5 @@
 /target/
-/codex/
-/opencode/
+/tmp/
 /.env
 /.env.*
 /test

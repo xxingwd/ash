@@ -52,6 +52,7 @@ ratatui = { version = "0.30.2", default-features = false, features = [
 owo-colors = "4.3.0"
 rustyline = "18.0.1"
 unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
 pulldown-cmark = "0.13.4"
 
 # Type system
