@@ -93,6 +93,13 @@ pub struct FnTool<Args, F, Fut, Output> {
     _phantom: std::marker::PhantomData<fn(Args) -> (Fut, Output)>,
 }
 
+/// Build a tool from a function. The function must be `Send + Sync + 'static`
+/// and take one `Args` argument (see [`FnTool`]).
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when `name` or `description` are empty or the
+/// function's signature cannot be turned into a JSON schema.
 pub fn define_tool<Args, F, Fut, Output>(
     name: &str,
     description: &str,

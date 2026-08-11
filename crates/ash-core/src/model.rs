@@ -14,6 +14,7 @@ impl ModelId {
         Self(id.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -30,7 +31,7 @@ pub struct ModelRequest {
 
 /// Provider-neutral streaming event. Incremental by nature; only a terminal
 /// `Stop` is a reliable boundary across reconnects.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
     Text(String),
     Reasoning(String),
@@ -48,5 +49,11 @@ pub type ModelStream =
 
 /// Provider-neutral streaming model interface used by the agent runtime.
 pub trait ModelClient: Send + Sync {
+    /// Start a model stream for the given request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] when the request cannot be started (invalid
+    /// request shape, transport failure, or provider rejection).
     fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProtocolError>;
 }

@@ -21,7 +21,8 @@ pub enum SubagentState {
 }
 
 impl SubagentState {
-    pub fn is_active(self) -> bool {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
         matches!(self, Self::Pending | Self::Running)
     }
 }

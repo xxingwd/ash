@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub struct MessageId(Uuid);
 
 impl MessageId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -23,6 +24,7 @@ impl Default for MessageId {
 pub struct ToolCallId(String);
 
 impl ToolCallId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
@@ -31,6 +33,7 @@ impl ToolCallId {
         Self(id.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,6 +49,7 @@ impl Default for ToolCallId {
 pub struct TurnId(Uuid);
 
 impl TurnId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -73,6 +77,7 @@ impl Default for TurnId {
 pub struct ThreadId(Uuid);
 
 impl ThreadId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -96,6 +101,7 @@ impl std::str::FromStr for ThreadId {
 pub struct TreeId(Uuid);
 
 impl TreeId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -122,7 +128,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_serialized(self) -> &'static str {
+    const fn as_serialized(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
@@ -163,13 +169,15 @@ impl<'de> Deserialize<'de> for Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
     Image { media_type: String, data: Vec<u8> },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
+// `EnumAsInner` generates unsafe accessor methods; serde itself is safe here.
+#[allow(clippy::unsafe_derive_deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
 pub enum ContentBlock {
     Text(String),
     Thought {
@@ -183,7 +191,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageContent {
     User(Vec<Content>),
     Assistant(Vec<ContentBlock>),
@@ -194,7 +202,7 @@ pub enum MessageContent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
     pub role: Role,
@@ -202,10 +210,12 @@ pub struct Message {
 }
 
 impl Message {
+    #[must_use]
     pub fn user(text: &str) -> Self {
         Self::user_content(vec![Content::Text(text.to_string())])
     }
 
+    #[must_use]
     pub fn user_content(content: Vec<Content>) -> Self {
         Self {
             id: MessageId::new(),
@@ -214,6 +224,7 @@ impl Message {
         }
     }
 
+    #[must_use]
     pub fn assistant_text(text: &str) -> Self {
         Self {
             id: MessageId::new(),
@@ -222,6 +233,7 @@ impl Message {
         }
     }
 
+    #[must_use]
     pub fn system(text: &str) -> Self {
         Self {
             id: MessageId::new(),
@@ -230,10 +242,12 @@ impl Message {
         }
     }
 
+    #[must_use]
     pub fn is_user_turn(&self) -> bool {
         self.role == Role::User && matches!(self.content, MessageContent::User(_))
     }
 
+    #[must_use]
     pub fn user_turn_text(&self) -> Option<String> {
         if self.is_user_turn() {
             self.content_text()
@@ -257,6 +271,7 @@ impl Message {
 }
 
 impl Content {
+    #[must_use]
     pub fn display_text(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),

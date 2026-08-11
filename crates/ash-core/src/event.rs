@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::message::{Message, MessageId, ThreadId, ToolCallId, TurnId};
 
 /// A routed event emitted by a thread. `sequence` is monotonic within one thread.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub thread_id: ThreadId,
     pub turn_id: Option<TurnId>,
@@ -13,12 +13,14 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// Provider-neutral usage accounting. `estimated` marks locally estimated
-/// values (no API usage was reported); `generation_ms` measures the wall-clock
-/// time from the first output token of any kind (reasoning, text, or tool
-/// call) to the end of the stream. Provider-reported `output_tokens` includes
-/// reasoning/thinking tokens, so the clock must start at the first reasoning
-/// delta for the rate (output_tokens / generation_ms) to be honest.
+/// Provider-neutral usage accounting.
+///
+/// `estimated` marks locally estimated values (no API usage was reported);
+/// `generation_ms` measures the wall-clock time from the first output token
+/// of any kind (reasoning, text, or tool call) to the end of the stream.
+/// Provider-reported `output_tokens` includes reasoning/thinking tokens, so
+/// the clock must start at the first reasoning delta for the rate
+/// (`output_tokens` / `generation_ms`) to be honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -40,7 +42,7 @@ pub enum TurnResult {
 
 /// Completed-turn snapshot: the durable boundary for scrollback, replay, and
 /// resume. `messages` is the canonical set of messages produced by the turn.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnView {
     pub id: TurnId,
     pub result: TurnResult,
@@ -55,7 +57,7 @@ pub struct TurnView {
 
 /// Full projected state of a thread, derived from its durable log. Never
 /// mutated directly; rebuilt from `LogEntry` records.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadView {
     pub messages: Vec<Message>,
     pub context: Vec<Message>,
@@ -69,7 +71,7 @@ pub struct ThreadView {
 
 /// Ephemeral streaming deltas for the current turn. Never persisted and never
 /// replayed; the UI draws them as a live preview only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiveEvent {
     TextDelta(String),
     ReasoningDelta(String),
@@ -100,7 +102,7 @@ pub struct ForkPoint {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A turn started executing; its input was already accepted.
     TurnStart,
