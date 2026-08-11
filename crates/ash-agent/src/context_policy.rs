@@ -8,7 +8,7 @@ use crate::context::{
     summary_output_tokens,
 };
 
-pub(crate) const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding threads. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
+pub const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding threads. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
 
 #[derive(Clone)]
 pub struct ContextRequest {
@@ -54,7 +54,7 @@ pub struct ContextUpdate {
     pub dropped_messages: usize,
 }
 
-pub(crate) struct CompactedContext {
+pub struct CompactedContext {
     pub messages: Vec<Message>,
     pub update: ContextUpdate,
 }
@@ -97,7 +97,7 @@ impl DefaultContextPolicy {
         let mut stop_reason = None;
         loop {
             let next = tokio::select! {
-                _ = cancel.cancelled() => return Err(ash_core::AshError::Cancelled),
+                () = cancel.cancelled() => return Err(ash_core::AshError::Cancelled),
                 next = stream.next() => next,
             };
             let Some(item) = next else {

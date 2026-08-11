@@ -32,7 +32,7 @@ impl Default for ThreadOptions {
     fn default() -> Self {
         Self {
             working_dir: PathBuf::from("."),
-            tool_timeout: Duration::from_secs(120),
+            tool_timeout: Duration::from_mins(2),
             path: default_agent_path(),
             tree_id: None,
             kind: ThreadKind::Root,
@@ -44,9 +44,10 @@ impl Default for ThreadOptions {
 /// the relative `working_dir` default. Falls back to `/root` only when the
 /// directory cannot be resolved (for example because it was removed).
 fn default_agent_path() -> String {
-    std::env::current_dir()
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_else(|_| "/root".to_string())
+    std::env::current_dir().map_or_else(
+        |_| "/root".to_string(),
+        |directory| directory.display().to_string(),
+    )
 }
 
 /// Exponential retry backoff for safe model-call retries.
@@ -68,7 +69,7 @@ impl Default for RetryBackoff {
 
 /// Private composition consumed by the model/tool execution engine.
 #[derive(Clone)]
-pub(crate) struct RunConfig {
+pub struct RunConfig {
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub model: ModelId,

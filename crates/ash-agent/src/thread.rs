@@ -86,7 +86,7 @@ impl Thread {
             {
                 tracing::error!(
                     %id,
-                    message = %panic_payload(&panic),
+                    message = %panic_payload(panic.as_ref()),
                     "thread actor panicked"
                 );
             }
@@ -98,14 +98,22 @@ impl Thread {
         }
     }
 
-    pub fn id(&self) -> ThreadId {
+    #[must_use]
+    pub const fn id(&self) -> ThreadId {
         self.id
     }
 
+    #[must_use]
     pub fn events(&self) -> BroadcastStream<Event> {
         BroadcastStream::new(self.events.subscribe())
     }
 
+    /// Submit a new turn and return a handle to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// stopped.
     pub async fn submit(&self, input: impl Into<Input>) -> Result<Turn, ash_core::AshError> {
         let input = input.into();
         ensure_nonempty(&input)?;
@@ -127,6 +135,11 @@ impl Thread {
     }
 
     /// Enqueue a standalone turn without retaining a turn handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// stopped.
     pub async fn enqueue(&self, input: impl Into<Input>) -> Result<TurnId, ash_core::AshError> {
         let input = input.into();
         ensure_nonempty(&input)?;
@@ -140,6 +153,11 @@ impl Thread {
     }
 
     /// Attach input when the next queued turn starts, without starting work by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// stopped.
     pub async fn notify(&self, input: impl Into<Input>) -> Result<(), ash_core::AshError> {
         let input = input.into();
         ensure_nonempty(&input)?;
@@ -149,27 +167,56 @@ impl Thread {
             .map_err(|_| thread_closed())
     }
 
+    /// Durable messages of this thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn messages(&self) -> Result<Vec<Message>, ash_core::AshError> {
         self.ask(Command::Messages).await
     }
 
     /// Full projected state: history, model context, and turn views.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn view(&self) -> Result<ThreadView, ash_core::AshError> {
         self.ask(Command::View).await
     }
 
+    /// Forkable submission points in this thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn fork_points(&self) -> Result<Vec<ForkPoint>, ash_core::AshError> {
         self.ask(Command::ForkPoints).await
     }
 
+    /// Roll back the latest settled turn and return its prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn rollback(&self) -> Result<Option<String>, ash_core::AshError> {
         self.ask(Command::Rollback).await
     }
 
+    /// Fork the thread from the message with the given id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn fork_at(&self, message_id: MessageId) -> Result<Option<Fork>, ash_core::AshError> {
         self.ask(|reply| Command::Fork { message_id, reply }).await
     }
 
+    /// Compact model context, keeping full history durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread runtime has stopped.
     pub async fn compact(&self) -> Result<ContextCompaction, ash_core::AshError> {
         self.ask(Command::Compact).await
     }
@@ -188,18 +235,27 @@ impl Thread {
 }
 
 impl Turn {
-    pub fn thread_id(&self) -> ThreadId {
+    #[must_use]
+    pub const fn thread_id(&self) -> ThreadId {
         self.thread_id
     }
 
-    pub fn id(&self) -> TurnId {
+    #[must_use]
+    pub const fn id(&self) -> TurnId {
         self.id
     }
 
+    #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }
 
+    /// Send steering input to the active turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// stopped.
     pub async fn steer(&self, input: impl Into<Input>) -> Result<(), ash_core::AshError> {
         let input = input.into();
         ensure_nonempty(&input)?;
@@ -215,6 +271,11 @@ impl Turn {
         result.await.map_err(|_| thread_closed())?
     }
 
+    /// Wait for this turn to settle and return its stop reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the turn ends without a completion signal.
     pub async fn wait(self) -> Result<StopReason, ash_core::AshError> {
         self.completion.await.map_err(|_| thread_closed())?
     }
@@ -424,8 +485,9 @@ fn publish(
     // regardless of whether any UI is attached. Streaming deltas are too
     // chatty for info level; everything else is a stable boundary event.
     match &event.kind {
-        EventKind::Live(ash_core::LiveEvent::TextDelta(_))
-        | EventKind::Live(ash_core::LiveEvent::ReasoningDelta(_)) => {
+        EventKind::Live(
+            ash_core::LiveEvent::TextDelta(_) | ash_core::LiveEvent::ReasoningDelta(_),
+        ) => {
             tracing::debug!(%thread_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
         }
         _ => {
@@ -441,13 +503,11 @@ fn thread_closed() -> ash_core::AshError {
 
 /// Extract a human-readable message from a panic payload for logging.
 fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| panic.downcast_ref::<String>().map(ToString::to_string))
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 fn inactive_turn() -> ash_core::AshError {
@@ -522,7 +582,7 @@ impl ThreadState {
         }
     }
 
-    pub fn id(&self) -> ThreadId {
+    pub const fn id(&self) -> ThreadId {
         self.id
     }
 
@@ -570,9 +630,9 @@ impl ThreadState {
     }
 
     async fn fork_at(
-        &mut self,
+        &self,
         message_id: MessageId,
-    ) -> Result<Option<(ThreadState, ForkData)>, ash_core::AshError> {
+    ) -> Result<Option<(Self, ForkData)>, ash_core::AshError> {
         let Some((turn_start, prompt)) =
             self.log
                 .messages()
@@ -593,7 +653,7 @@ impl ThreadState {
         let protocol = runtime.model_backend().to_string();
         let working_dir = config.working_dir.clone();
 
-        let mut state = ThreadState::new(config, runtime);
+        let mut state = Self::new(config, runtime);
         state.seed(messages.clone()).await?;
 
         let details = ForkData {
@@ -825,7 +885,7 @@ struct ForkData {
     prompt: String,
 }
 
-fn thread_metadata(config: &RunConfig, thread_id: ThreadId) -> ThreadMetadata {
+const fn thread_metadata(config: &RunConfig, thread_id: ThreadId) -> ThreadMetadata {
     ThreadMetadata {
         thread_id,
         kind: config.kind,
@@ -1035,7 +1095,7 @@ mod tests {
         let selected = Message::user("try another direction");
         let later = Message::assistant_text("second answer");
         let messages = vec![first.clone(), answer.clone(), selected.clone(), later];
-        let mut state = thread_with_messages(config, runtime.clone(), &messages).await;
+        let state = thread_with_messages(config, runtime.clone(), &messages).await;
         let original_id = state.id();
 
         let (fork_state, forked) = state.fork_at(selected.id).await.unwrap().unwrap();
@@ -1192,6 +1252,7 @@ mod tests {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].tools.is_empty());
+            drop(requests);
         }
         let stored = state.store.load(state.id()).await.unwrap().unwrap();
         assert_eq!(stored.log.messages().len(), 6);
@@ -1456,6 +1517,7 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.user_turn_text().as_deref() == Some("updated direction")));
+        drop(requests);
     }
 
     #[tokio::test]

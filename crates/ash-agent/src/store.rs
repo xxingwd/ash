@@ -81,7 +81,7 @@ pub trait ThreadStore: Send + Sync {
 
 pub type SharedThreadStore = Arc<dyn ThreadStore>;
 
-pub(crate) struct ThreadPersistence {
+pub struct ThreadPersistence {
     writer: Arc<tokio::sync::Mutex<Box<dyn ThreadAppender>>>,
     /// Entries buffered in memory and not yet written to disk. Flushed at
     /// commit points (`TurnEnd`, rollback, checkpoint) so one turn costs two
@@ -110,7 +110,7 @@ impl ThreadPersistence {
 
     /// Number of buffered entries. Used to snapshot the buffer before a model
     /// call so a retry can discard partial output without touching the disk.
-    pub(crate) fn pending_len(&self) -> usize {
+    pub(crate) const fn pending_len(&self) -> usize {
         self.pending.len()
     }
 

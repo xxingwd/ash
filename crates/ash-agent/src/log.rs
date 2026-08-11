@@ -17,6 +17,11 @@ pub struct AcceptedInput {
 }
 
 impl ContextCheckpoint {
+    /// Build a checkpoint from a model-context snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the context has no summary message.
     pub fn from_model_context(messages: &[Message]) -> Result<Self, ash_core::AshError> {
         let summary = messages.first().cloned().ok_or_else(|| {
             ash_core::AshError::Config("compacted context has no summary message".to_string())
@@ -113,6 +118,7 @@ impl<'de> Deserialize<'de> for ThreadLog {
 }
 
 impl ThreadLog {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -132,10 +138,12 @@ impl ThreadLog {
         }
     }
 
+    #[must_use]
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
     }
 
+    #[must_use]
     pub fn contains_idempotency_key(&self, key: &str) -> bool {
         self.entries.iter().any(|entry| {
             matches!(
@@ -155,6 +163,7 @@ impl ThreadLog {
     /// partial messages from a turn that never settled (e.g. after a crash):
     /// its accepted inputs stay visible, but half-streamed assistant and tool
     /// messages are not exposed as normal history.
+    #[must_use]
     pub fn messages(&self) -> Vec<Message> {
         self.projection.history.clone()
     }
@@ -162,6 +171,7 @@ impl ThreadLog {
     /// The model context for the next request, honoring checkpoints. Messages
     /// of a turn that never settled are excluded (except its accepted inputs)
     /// so the model never resumes from a half-streamed fact.
+    #[must_use]
     pub fn model_context(&self) -> Vec<Message> {
         self.projection.context.clone()
     }
@@ -169,12 +179,14 @@ impl ThreadLog {
     /// Completed turn snapshots in log order. A turn left open when the
     /// session ended (no `TurnEnd`, e.g. after a crash) is projected as
     /// `Interrupted` so partial turns never masquerade as normal history.
+    #[must_use]
     pub fn turns(&self) -> Vec<TurnView> {
         self.projection.turns()
     }
 
     /// Messages belonging to one turn: accepted inputs plus model and tool
     /// messages recorded under that turn id.
+    #[must_use]
     pub fn turn_messages(&self, turn_id: TurnId) -> Vec<Message> {
         self.turn_view(turn_id)
             .map(|turn| turn.messages)
@@ -186,6 +198,7 @@ impl ThreadLog {
     }
 
     /// Full projected state: history, model context, and turn views.
+    #[must_use]
     pub fn view(&self) -> ThreadView {
         ThreadView {
             messages: self.projection.history.clone(),
@@ -524,7 +537,7 @@ mod tests {
         let mut log = ThreadLog::new();
         log.push(LogEntry::TurnStart(TurnId::new()));
         log.push(LogEntry::Message(first.clone()));
-        log.push(LogEntry::Message(answer.clone()));
+        log.push(LogEntry::Message(answer));
         log.push(LogEntry::TurnStart(TurnId::new()));
         log.push(LogEntry::Message(second));
         log.push(LogEntry::Message(Message::assistant_text("second answer")));

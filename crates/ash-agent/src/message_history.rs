@@ -54,14 +54,20 @@ pub struct MessageHistoryStore {
 impl Default for MessageHistoryStore {
     fn default() -> Self {
         Self {
-            path: directories::ProjectDirs::from("", "", "ash")
-                .map(|dirs| dirs.data_dir().join("history.jsonl"))
-                .unwrap_or_else(|| PathBuf::from(".ash/history.jsonl")),
+            path: directories::ProjectDirs::from("", "", "ash").map_or_else(
+                || PathBuf::from(".ash/history.jsonl"),
+                |dirs| dirs.data_dir().join("history.jsonl"),
+            ),
         }
     }
 }
 
 impl MessageHistoryStore {
+    /// Record a submitted prompt for the thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the history file cannot be written.
     pub async fn append(&self, thread_id: ThreadId, text: &str) -> Result<(), ash_core::AshError> {
         if text.trim().is_empty() {
             return Ok(());
@@ -73,6 +79,11 @@ impl MessageHistoryStore {
         self.append_entry(&entry).await
     }
 
+    /// Record an undone prompt for the thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the history file cannot be written.
     pub async fn undo(&self, thread_id: ThreadId, text: &str) -> Result<(), ash_core::AshError> {
         let entry = MessageHistoryRecord::Undone {
             thread_id,
@@ -98,6 +109,11 @@ impl MessageHistoryStore {
         Ok(())
     }
 
+    /// Load the recorded history lines for all threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the history file exists but cannot be read.
     pub async fn load(&self) -> Result<Vec<String>, ash_core::AshError> {
         let file = match tokio::fs::File::open(&self.path).await {
             Ok(file) => file,

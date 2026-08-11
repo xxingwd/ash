@@ -24,18 +24,25 @@ impl Runtime {
         }
     }
 
+    #[must_use]
     pub fn with_thread_store(mut self, threads: Arc<dyn ThreadStore>) -> Self {
         self.threads = threads;
         self
     }
 
-    pub fn start(&self, agent: Agent, options: ThreadOptions) -> Thread {
+    #[must_use]
+    pub fn start(&self, agent: &Agent, options: &ThreadOptions) -> Thread {
         Thread::spawn(ThreadState::new(
-            RunConfig::new(&agent, &options),
+            RunConfig::new(agent, options),
             self.clone(),
         ))
     }
 
+    /// Start a thread seeded with the given history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when seeding the history fails.
     pub async fn start_with_history(
         &self,
         agent: Agent,
@@ -47,6 +54,12 @@ impl Runtime {
         Ok(Thread::spawn(state))
     }
 
+    /// Resume an existing thread by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread store cannot be read or the stored
+    /// thread cannot be replayed.
     pub async fn resume(
         &self,
         agent: Agent,
@@ -60,6 +73,11 @@ impl Runtime {
         Ok(Some(Thread::spawn(state)))
     }
 
+    /// List thread summaries, optionally excluding one thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the thread store cannot be read.
     pub async fn threads(
         &self,
         excluded: Option<ThreadId>,
@@ -67,10 +85,12 @@ impl Runtime {
         self.threads.list(excluded).await
     }
 
+    #[must_use]
     pub fn model_client(&self) -> Arc<dyn ModelClient> {
         Arc::clone(&self.model)
     }
 
+    #[must_use]
     pub fn model_backend(&self) -> &str {
         &self.model_backend
     }

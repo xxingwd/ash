@@ -67,7 +67,7 @@ enum OpenResponseBlock {
     Text,
 }
 
-pub(crate) struct CompactedHistory {
+pub struct CompactedHistory {
     pub(crate) messages: Vec<Message>,
     pub(crate) before_tokens: usize,
     pub(crate) after_tokens: usize,
@@ -94,12 +94,12 @@ struct AgentTurnRunner<'config, 'store> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ExecutionIds {
+pub struct ExecutionIds {
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
 }
 
-pub(crate) struct TurnExecution {
+pub struct TurnExecution {
     ids: ExecutionIds,
     tx: mpsc::Sender<EventKind>,
     cancel: CancellationToken,
@@ -108,13 +108,13 @@ pub(crate) struct TurnExecution {
 }
 
 impl ExecutionIds {
-    fn new(thread_id: ThreadId, turn_id: TurnId) -> Self {
+    const fn new(thread_id: ThreadId, turn_id: TurnId) -> Self {
         Self { thread_id, turn_id }
     }
 }
 
 impl TurnExecution {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         thread_id: ThreadId,
         turn_id: TurnId,
         tx: mpsc::Sender<EventKind>,
@@ -160,7 +160,7 @@ impl UsageAccumulator {
     }
 }
 
-pub(crate) async fn compact_with_adapter(
+pub async fn compact_with_adapter(
     config: &RunConfig,
     messages: &[Message],
     model: &dyn ModelClient,
@@ -189,7 +189,7 @@ pub(crate) async fn compact_with_adapter(
     }))
 }
 
-pub(crate) async fn run_agent_turn_persisted(
+pub async fn run_agent_turn_persisted(
     model: &dyn ModelClient,
     config: &RunConfig,
     messages: &mut Vec<Message>,
@@ -325,7 +325,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             );
             merge_turn_usage(turn_usage, call_usage);
             if let Some(message) = message {
-                self.persist_message(&message).await?;
+                self.persist_message(&message)?;
                 messages.push(message);
             }
 
@@ -355,8 +355,8 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             "retrying model call after retryable failure"
         );
         tokio::select! {
-            _ = self.cancel.cancelled() => return Some(RetryAction::Abort),
-            _ = tokio::time::sleep(delay) => {}
+            () = self.cancel.cancelled() => return Some(RetryAction::Abort),
+            () = tokio::time::sleep(delay) => {}
         }
         *retries += 1;
         if let (Some(base), Some(persistence)) = (pending_base, self.persistence.as_deref_mut()) {
@@ -376,7 +376,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             ResponseOutcome::Failed(error) => Err(error.into()),
             ResponseOutcome::Cancelled => {
                 // Drain steering so queued input is not lost, then abort.
-                let _ = self.apply_steering(messages).await?;
+                let _ = self.apply_steering(messages);
                 Ok(Step::Done(StopReason::Aborted))
             }
             ResponseOutcome::ToolCalls(calls) => {
@@ -384,11 +384,11 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 if self.cancel.is_cancelled() {
                     return Ok(Step::Done(StopReason::Aborted));
                 }
-                let _ = self.apply_steering(messages).await?;
+                let _ = self.apply_steering(messages);
                 Ok(Step::More)
             }
             ResponseOutcome::Finished(reason) => {
-                if self.apply_steering(messages).await? {
+                if self.apply_steering(messages) {
                     return Ok(Step::More);
                 }
                 Ok(Step::Done(reason))
@@ -442,20 +442,16 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         Ok(estimated_input_tokens)
     }
 
-    async fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
-        match self.persistence.as_deref_mut() {
-            Some(persistence) => {
+    fn persist_message(&mut self, message: &Message) -> Result<(), ash_core::AshError> {
+        self.persistence
+            .as_deref_mut()
+            .map_or(Ok(()), |persistence| {
                 persistence.stage(&[LogEntry::Message(message.clone())]);
                 Ok(())
-            }
-            None => Ok(()),
-        }
+            })
     }
 
-    async fn apply_steering(
-        &mut self,
-        messages: &mut Vec<Message>,
-    ) -> Result<bool, ash_core::AshError> {
+    fn apply_steering(&mut self, messages: &mut Vec<Message>) -> bool {
         let mut accepted = Vec::new();
         while let Ok(input) = self.steering.try_recv() {
             if input.is_empty() {
@@ -465,7 +461,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             accepted.push((input, message));
         }
         if accepted.is_empty() {
-            return Ok(false);
+            return false;
         }
         if let Some(persistence) = self.persistence.as_deref_mut() {
             let records = accepted
@@ -481,7 +477,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             persistence.stage(&records);
         }
         messages.extend(accepted.into_iter().map(|(_, message)| message));
-        Ok(true)
+        true
     }
 
     async fn execute_tool_calls(
@@ -533,14 +529,14 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     attachments,
                 },
             };
-            self.persist_message(&message).await?;
+            self.persist_message(&message)?;
             messages.push(message);
         }
         Ok(())
     }
 
     async fn execute_tool(
-        &mut self,
+        &self,
         messages: &[Message],
         name: &str,
         arguments: serde_json::Value,
@@ -564,7 +560,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         };
 
         tokio::select! {
-            _ = self.cancel.cancelled() => Err(ToolError::Cancelled),
+            () = self.cancel.cancelled() => Err(ToolError::Cancelled),
             result = tokio::time::timeout(
                 self.config.max_tool_duration,
                 tool.execute(context, arguments),
@@ -599,7 +595,7 @@ async fn collect_response(
     let mut accumulator = ResponseAccumulator::new();
     let stream_exit = loop {
         let next = tokio::select! {
-            _ = cancel.cancelled() => break StreamExit::Cancelled,
+            () = cancel.cancelled() => break StreamExit::Cancelled,
             next = stream.next() => next,
         };
         let Some(item) = next else {
@@ -653,15 +649,14 @@ impl ResponseAccumulator {
             }
             ModelEvent::Reasoning(delta) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
-                match self.blocks.last_mut() {
-                    Some(ContentBlock::Thought { text, .. }) => text.push_str(&delta),
-                    _ => {
-                        self.thought_started_at = Some(Instant::now());
-                        self.blocks.push(ContentBlock::Thought {
-                            text: delta.clone(),
-                            elapsed_seconds: 0,
-                        });
-                    }
+                if let Some(ContentBlock::Thought { text, .. }) = self.blocks.last_mut() {
+                    text.push_str(&delta);
+                } else {
+                    self.thought_started_at = Some(Instant::now());
+                    self.blocks.push(ContentBlock::Thought {
+                        text: delta.clone(),
+                        elapsed_seconds: 0,
+                    });
                 }
                 self.open_block = Some(OpenResponseBlock::Thought);
                 send_live(tx, EventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
@@ -787,7 +782,7 @@ fn response_action(
 /// retried: request/network errors, upstream 5xx, and rate limits. Auth,
 /// request-shaping, and response-shaping errors are never retried because
 /// re-issuing them cannot succeed.
-fn retryable(error: &ash_core::ProtocolError) -> bool {
+const fn retryable(error: &ash_core::ProtocolError) -> bool {
     matches!(
         error,
         ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited
@@ -812,15 +807,12 @@ fn retry_delay(attempt: u32, backoff: RetryBackoff) -> std::time::Duration {
 /// latest snapshot instead of summing deltas. Output tokens are per-call
 /// increments and do accumulate across the turn.
 fn merge_turn_usage(turn_usage: &mut Option<Usage>, call_usage: Usage) {
-    *turn_usage = Some(match *turn_usage {
-        Some(acc) => Usage {
-            input_tokens: acc.input_tokens.max(call_usage.input_tokens),
-            output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
-            generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
-            estimated: acc.estimated || call_usage.estimated,
-        },
-        None => call_usage,
-    });
+    *turn_usage = Some(turn_usage.map_or(call_usage, |acc| Usage {
+        input_tokens: acc.input_tokens.max(call_usage.input_tokens),
+        output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
+        generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
+        estimated: acc.estimated || call_usage.estimated,
+    }));
 }
 
 fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
@@ -843,9 +835,7 @@ fn discard_open_block(
     let matches_open = match (open_block, blocks.last()) {
         (Some(OpenResponseBlock::Thought), Some(ContentBlock::Thought { .. }))
         | (Some(OpenResponseBlock::Text), Some(ContentBlock::Text(_))) => true,
-        (None, _) | (Some(OpenResponseBlock::Thought), _) | (Some(OpenResponseBlock::Text), _) => {
-            false
-        }
+        (None | Some(OpenResponseBlock::Thought | OpenResponseBlock::Text), _) => false,
     };
     if matches_open {
         blocks.pop();
@@ -978,11 +968,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "echo"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "echo"
         }
 
@@ -1011,11 +1001,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for BlockingTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "blocking"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "blocking"
         }
 
@@ -1181,6 +1171,7 @@ mod tests {
                 MessageContent::Assistant(blocks)
                     if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.contains("<context-summary>"))
             ));
+            drop(requests);
         }
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
@@ -1343,6 +1334,7 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.id == ephemeral_id));
+            drop(requests);
         }
         let stored = load_thread(&store, thread_id).await;
         assert!(!stored
@@ -1477,6 +1469,7 @@ mod tests {
                 .count(),
             3
         );
+        drop(requests);
     }
 
     #[tokio::test]
@@ -1843,10 +1836,10 @@ mod tests {
                 result = &mut response => panic!("response ended before cancellation: {}", result.message.is_some()),
             };
             assert!(matches!(
-                event,
-                Some(EventKind::Live(LiveEvent::ReasoningDelta(text)))
-                    | Some(EventKind::Live(LiveEvent::TextDelta(text))) if text == expected
-            ));
+                            event,
+                            Some(EventKind::Live(LiveEvent::ReasoningDelta(text) |
+            LiveEvent::TextDelta(text))) if text == expected
+                        ));
         }
         cancel.cancel();
         let collected = response.await;
@@ -2221,7 +2214,7 @@ mod tests {
         ));
         // Stream failure beats everything, even pending tool calls.
         assert!(matches!(
-            response_action(failed(), vec![call.clone()], stop.clone()),
+            response_action(failed(), vec![call], stop.clone()),
             ResponseOutcome::Failed(_)
         ));
         assert!(matches!(
@@ -2314,7 +2307,7 @@ mod tests {
             }
         };
         tokio::select! {
-            _ = wait_for_first_call => {}
+            () = wait_for_first_call => {}
             result = &mut turn => panic!("turn ended before the first call: {result:?}"),
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

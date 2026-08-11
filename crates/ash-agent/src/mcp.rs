@@ -24,7 +24,7 @@ struct McpToolAdapter {
 }
 
 impl McpToolAdapter {
-    fn new(
+    const fn new(
         name: String,
         description: String,
         schema: serde_json::Value,
@@ -115,12 +115,19 @@ impl Default for McpManager {
 }
 
 impl McpManager {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             connections: Vec::new(),
         }
     }
 
+    /// Connect to an MCP server and keep the connection in this pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the server process cannot be started or the
+    /// handshake fails.
     pub async fn connect(&mut self, config: McpServerConfig) -> Result<(), ash_core::AshError> {
         let mut cmd = tokio::process::Command::new(&config.command);
         cmd.args(&config.args);

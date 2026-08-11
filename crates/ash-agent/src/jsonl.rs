@@ -114,7 +114,7 @@ impl FileRecord {
         }
     }
 
-    fn user_message(&self) -> Option<&Message> {
+    const fn user_message(&self) -> Option<&Message> {
         match self {
             Self::InputAccepted(input) => Some(&input.message),
             Self::UserMessage(message) => Some(message),
@@ -222,7 +222,7 @@ impl ThreadWriter {
         }
     }
 
-    fn existing(path: PathBuf, file: tokio::fs::File) -> Self {
+    const fn existing(path: PathBuf, file: tokio::fs::File) -> Self {
         Self {
             path,
             state: WriterState::Open { file },
@@ -288,7 +288,7 @@ impl ThreadWriter {
 #[async_trait::async_trait]
 impl ThreadAppender for ThreadWriter {
     async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
-        ThreadWriter::append(self, entries).await
+        Self::append(self, entries).await
     }
 }
 
@@ -441,9 +441,10 @@ fn default_thread_dir() -> PathBuf {
 /// the relative `.ash/threads` fallback when no platform data dir is
 /// available. Pure so both branches are covered by regression tests.
 fn thread_dir_from_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
-    data_dir
-        .map(|dir| dir.join("threads"))
-        .unwrap_or_else(|| PathBuf::from(".ash").join("threads"))
+    data_dir.map_or_else(
+        || PathBuf::from(".ash").join("threads"),
+        |dir| dir.join("threads"),
+    )
 }
 
 fn thread_filename(thread_id: ThreadId) -> String {
@@ -657,13 +658,13 @@ fn message_title(message: &Message) -> Option<String> {
         .join(" ");
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(shorten_title(if title.is_empty() {
-        UNTITLED_CHAT.to_string()
+        UNTITLED_CHAT
     } else {
-        title
+        title.as_str()
     }))
 }
 
-fn shorten_title(title: String) -> String {
+fn shorten_title(title: &str) -> String {
     let mut chars = title.chars();
     let prefix = chars
         .by_ref()

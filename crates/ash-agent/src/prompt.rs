@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::Path;
 
 use chrono::Local;
@@ -14,6 +15,10 @@ const MAX_AGENTS_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 /// discovery). Callers in an async context must wrap it in
 /// `tokio::task::spawn_blocking` so the blocking IO stays off the async
 /// worker threads.
+/// # Errors
+///
+/// Returns `AshError` when the working directory cannot be canonicalized
+/// or an AGENTS.md file cannot be read.
 pub fn build_system_prompt(
     working_dir: &Path,
     skills: &[Skill],
@@ -91,16 +96,17 @@ fn skills_context(skills: &[Skill], active_skill: Option<&Skill>) -> Option<Stri
         output.push_str("- None discovered.\n");
     } else {
         for skill in skills {
-            output.push_str(&format!("- `{}`: {}\n", skill.name, skill.description));
+            let _ = writeln!(output, "- `{}`: {}", skill.name, skill.description);
         }
     }
 
     if let Some(skill) = active_skill {
-        output.push_str(&format!(
-            "\n## Active skill: {}\n\n{}\n",
+        let _ = writeln!(
+            output,
+            "\n## Active skill: {}\n\n{}",
             skill.name,
             skill.instructions()
-        ));
+        );
     }
     output.push_str("</skills>");
     Some(output)

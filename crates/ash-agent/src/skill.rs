@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 const SKILL_FILE_LIMIT: usize = 10;
-pub(crate) const SKILL_TOOL_NAME: &str = "skill";
+pub const SKILL_TOOL_NAME: &str = "skill";
 
 #[derive(Deserialize, JsonSchema)]
 struct SkillArgs {
@@ -38,7 +38,13 @@ pub struct Skill {
 }
 
 impl Skill {
-    pub fn discover(working_dir: &Path) -> Result<Vec<Skill>, ash_core::AshError> {
+    /// Discover skills from the working directory and the user skill
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when a skill directory cannot be read.
+    pub fn discover(working_dir: &Path) -> Result<Vec<Self>, ash_core::AshError> {
         let user_skills = directories::BaseDirs::new()
             .map(|directories| directories.home_dir().join(".agents/skills"));
         Self::discover_from(working_dir, user_skills.as_deref())
@@ -47,7 +53,7 @@ impl Skill {
     fn discover_from(
         working_dir: &Path,
         user_skills: Option<&Path>,
-    ) -> Result<Vec<Skill>, ash_core::AshError> {
+    ) -> Result<Vec<Self>, ash_core::AshError> {
         let mut skills = BTreeMap::new();
         let mut load = |directory: &Path| -> Result<(), ash_core::AshError> {
             for skill in Self::load_from_dir(directory)? {
@@ -65,7 +71,7 @@ impl Skill {
         Ok(skills.into_values().collect())
     }
 
-    fn load_from_dir(dir: &Path) -> Result<Vec<Skill>, ash_core::AshError> {
+    fn load_from_dir(dir: &Path) -> Result<Vec<Self>, ash_core::AshError> {
         let mut skills = Vec::new();
 
         if !dir.exists() {
@@ -99,7 +105,7 @@ impl Skill {
         Ok(skills)
     }
 
-    fn load_file(path: &Path) -> Result<Skill, ash_core::AshError> {
+    fn load_file(path: &Path) -> Result<Self, ash_core::AshError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             ash_core::AshError::Config(format!("cannot read {}: {e}", path.display()))
         })?;
@@ -107,7 +113,7 @@ impl Skill {
         let (frontmatter, body) = parse_frontmatter(&content)?;
         let metadata: SkillFrontmatter = serde_yaml::from_str(&frontmatter)
             .map_err(|e| ash_core::AshError::Config(format!("invalid skill frontmatter: {e}")))?;
-        Ok(Skill {
+        Ok(Self {
             name: metadata.name,
             description: metadata.description,
             tools: metadata.tools,
@@ -130,11 +136,17 @@ impl Skill {
         }
     }
 
+    #[must_use]
     pub fn instructions(&self) -> &str {
         &self.instructions
     }
 }
 
+/// Build the skill-loading tool.
+///
+/// # Errors
+///
+/// Returns `ToolError` when the tool cannot be defined.
 pub fn tool(skills: Vec<Skill>) -> Result<Arc<dyn Tool>, ToolError> {
     let skills = Arc::new(skills);
     define_tool(

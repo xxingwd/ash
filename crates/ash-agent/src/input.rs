@@ -42,6 +42,7 @@ impl Input {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
             || self.content.iter().all(|content| match content {

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) fn directories(working_dir: &Path) -> Vec<PathBuf> {
+pub fn directories(working_dir: &Path) -> Vec<PathBuf> {
     let root = working_dir
         .ancestors()
         .find(|directory| directory.join(".git").exists())
