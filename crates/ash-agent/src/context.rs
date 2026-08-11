@@ -13,7 +13,7 @@ const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 const PRUNE_MINIMUM_TOKENS: usize = 20_000;
 const PRUNE_PROTECT_TOKENS: usize = 40_000;
 const PRUNED_TOOL_OUTPUT: &str = "[Old tool output cleared to reduce context]";
-pub(crate) const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 4_096;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const SUMMARY_PREFIX: &str = "<context-summary>\n";
 const SUMMARY_SUFFIX: &str = "\n</context-summary>";
 const OMITTED_HISTORY_MARKER: &str = "\n\n[older serialized history omitted]\n\n";
@@ -51,14 +51,8 @@ enum TextSerialization {
     Truncated,
 }
 
-#[derive(Clone, Copy)]
-enum ThoughtAccounting {
-    Exclude,
-    Include,
-}
-
 #[derive(Debug)]
-pub(crate) struct CompactionPlan {
+pub struct CompactionPlan {
     pub(crate) summary_prompt: String,
     pub(crate) tail: Vec<Message>,
     pub(crate) compacted_messages: usize,
@@ -70,11 +64,11 @@ struct CompactionHistory {
     messages: Vec<Message>,
 }
 
-pub(crate) fn estimate_tokens(input: &str) -> usize {
+pub fn estimate_tokens(input: &str) -> usize {
     estimate_character_count(character_units(input))
 }
 
-fn estimate_character_count(characters: usize) -> usize {
+const fn estimate_character_count(characters: usize) -> usize {
     characters.saturating_add(CHARS_PER_TOKEN / 2) / CHARS_PER_TOKEN
 }
 
@@ -82,10 +76,10 @@ fn character_units(input: &str) -> usize {
     input.encode_utf16().count()
 }
 
-pub(crate) fn count_tokens(messages: &[Message]) -> usize {
+pub fn count_tokens(messages: &[Message]) -> usize {
     let content = messages
         .iter()
-        .map(|message| message_characters(message, ThoughtAccounting::Exclude))
+        .map(message_characters)
         .fold(0usize, usize::saturating_add);
     estimate_character_count(content)
         .saturating_add(messages.len().saturating_mul(TOKENS_PER_MESSAGE_OVERHEAD))
@@ -93,7 +87,7 @@ pub(crate) fn count_tokens(messages: &[Message]) -> usize {
 }
 
 pub fn count_output_tokens(message: &Message) -> usize {
-    estimate_character_count(message_characters(message, ThoughtAccounting::Include))
+    estimate_character_count(message_characters(message))
 }
 
 /// Estimate the token count of a full request: system prompt + tools + messages.
@@ -101,7 +95,7 @@ pub fn count_output_tokens(message: &Message) -> usize {
 /// This is the single estimation entry point used both at runtime (when the
 /// API does not report usage) and when recomputing the current context size
 /// after restore, rollback, or fork.
-pub(crate) fn estimate_request_tokens(
+pub fn estimate_request_tokens(
     system_prompt: Option<&str>,
     messages: &[Message],
     tools: &[ToolDefinition],
@@ -115,20 +109,20 @@ pub(crate) fn estimate_request_tokens(
         .saturating_add(tool_tokens)
 }
 
-pub(crate) fn compaction_threshold(max_context_tokens: usize) -> usize {
+pub const fn compaction_threshold(max_context_tokens: usize) -> usize {
     max_context_tokens.saturating_mul(COMPACTION_TRIGGER_PERCENT) / 100
 }
 
-pub(crate) fn summary_output_tokens(max_context_tokens: usize) -> u32 {
+pub fn summary_output_tokens(max_context_tokens: usize) -> u32 {
     let input_fraction = u32::try_from(max_context_tokens / 5).unwrap_or(u32::MAX);
     SUMMARY_MAX_OUTPUT_TOKENS.min(input_fraction.max(1))
 }
 
-pub(crate) fn needs_compaction(estimated_tokens: usize, max_context_tokens: usize) -> bool {
+pub const fn needs_compaction(estimated_tokens: usize, max_context_tokens: usize) -> bool {
     estimated_tokens >= compaction_threshold(max_context_tokens)
 }
 
-pub(crate) fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
+pub fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
     let protected = protected_tool_calls(messages);
     let mut turns = 0usize;
     let mut retained_tokens = 0usize;
@@ -196,10 +190,7 @@ fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
         .collect()
 }
 
-pub(crate) fn plan_compaction(
-    messages: &[Message],
-    max_context_tokens: usize,
-) -> Option<CompactionPlan> {
+pub fn plan_compaction(messages: &[Message], max_context_tokens: usize) -> Option<CompactionPlan> {
     let CompactionHistory {
         previous_summary,
         messages: history,
@@ -255,7 +246,7 @@ fn recent_tail_start(messages: &[Message], max_context_tokens: usize) -> usize {
     tail_start
 }
 
-pub(crate) fn apply_summary(summary: &str, tail: Vec<Message>) -> Vec<Message> {
+pub fn apply_summary(summary: &str, tail: Vec<Message>) -> Vec<Message> {
     let mut messages = Vec::with_capacity(tail.len() + 1);
     messages.push(Message::assistant_text(&format!(
         "{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}",
@@ -434,19 +425,15 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{prefix}{OMITTED_HISTORY_MARKER}{suffix}")
 }
 
-fn message_characters(message: &Message, thoughts: ThoughtAccounting) -> usize {
+fn message_characters(message: &Message) -> usize {
     match &message.content {
         MessageContent::User(contents) => content_characters(contents),
         MessageContent::Assistant(blocks) => blocks
             .iter()
             .map(|block| match block {
-                ContentBlock::Text(text) => character_units(text),
-                ContentBlock::Thought { text, .. }
-                    if matches!(thoughts, ThoughtAccounting::Include) =>
-                {
+                ContentBlock::Text(text) | ContentBlock::Thought { text, .. } => {
                     character_units(text)
                 }
-                ContentBlock::Thought { .. } => 0,
                 ContentBlock::ToolCall {
                     name, arguments, ..
                 } => character_units(name).saturating_add(character_units(&arguments.to_string())),
@@ -671,5 +658,32 @@ mod tests {
         };
 
         assert!(count_output_tokens(&message) >= 3);
+    }
+
+    #[test]
+    fn request_estimate_counts_persisted_thoughts() {
+        let text_only = Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: MessageContent::Assistant(vec![ContentBlock::Text("x".repeat(400))]),
+        };
+        let with_thought = Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: MessageContent::Assistant(vec![
+                ContentBlock::Thought {
+                    text: "x".repeat(400),
+                    elapsed_seconds: 0,
+                },
+                ContentBlock::Text("x".repeat(400)),
+            ]),
+        };
+
+        let plain = count_tokens(std::slice::from_ref(&text_only));
+        let reasoned = count_tokens(std::slice::from_ref(&with_thought));
+        // The persisted thought is sent back to the model, so it must count
+        // toward the request estimate (not just the output estimate).
+        assert!(reasoned > plain);
+        assert!(reasoned >= plain.saturating_add(90));
     }
 }
