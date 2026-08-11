@@ -102,31 +102,31 @@ trait PickerNavigation {
 
 impl PickerNavigation for SessionPickerState {
     fn move_up(&mut self) {
-        SessionPickerState::move_up(self);
+        Self::move_up(self);
     }
 
     fn move_down(&mut self) {
-        SessionPickerState::move_down(self);
+        Self::move_down(self);
     }
 }
 
 impl PickerNavigation for ForkPickerState {
     fn move_up(&mut self) {
-        ForkPickerState::move_up(self);
+        Self::move_up(self);
     }
 
     fn move_down(&mut self) {
-        ForkPickerState::move_down(self);
+        Self::move_down(self);
     }
 }
 
 impl PickerNavigation for CommandCompletionState {
     fn move_up(&mut self) {
-        CommandCompletionState::move_up(self);
+        Self::move_up(self);
     }
 
     fn move_down(&mut self) {
-        CommandCompletionState::move_down(self);
+        Self::move_down(self);
     }
 }
 
@@ -147,7 +147,7 @@ impl AppState {
         };
         match receiver.has_changed() {
             Ok(true) => {
-                self.subagents = receiver.borrow_and_update().clone();
+                self.subagents.clone_from(&receiver.borrow_and_update());
             }
             Ok(false) => {}
             // The monitor channel closed: no further snapshots will arrive, so
@@ -198,7 +198,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(protocol: String, model: String, working_dir: PathBuf) -> Self {
+    #[must_use]
+    pub const fn new(protocol: String, model: String, working_dir: PathBuf) -> Self {
         Self {
             protocol,
             model,
@@ -209,16 +210,19 @@ impl App {
         }
     }
 
-    pub fn with_context_limit(mut self, context_limit: Option<u64>) -> Self {
+    #[must_use]
+    pub const fn with_context_limit(mut self, context_limit: Option<u64>) -> Self {
         self.context_limit = context_limit;
         self
     }
 
+    #[must_use]
     pub fn with_input_history(mut self, input_history: Vec<String>) -> Self {
         self.input_history = input_history;
         self
     }
 
+    #[must_use]
     pub fn with_subagent_monitor(
         mut self,
         subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
@@ -227,6 +231,13 @@ impl App {
         self
     }
 
+    /// Run the TUI loop until the terminal closes or an unrecoverable I/O
+    /// error occurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when terminal I/O (render, key input, or the
+    /// alternate screen) fails and cannot be recovered.
     pub async fn run(
         mut self,
         mut events: impl futures::Stream<Item = EventKind> + Unpin,
@@ -287,6 +298,11 @@ impl App {
     }
 }
 
+// One branch per `EventKind`: an exhaustive match over the whole event
+// vocabulary, where each branch only touches the few structures it needs.
+// Splitting this into per-event handlers would thread `state`, `terminal`,
+// and `commands` through every call for no readability gain.
+#[allow(clippy::too_many_lines)]
 async fn handle_agent_event(
     state: &mut AppState,
     terminal: &mut TerminalUi,
@@ -528,12 +544,12 @@ async fn handle_key(
         KeyCode::Home => state.input.move_home(),
         KeyCode::End => state.input.move_end(),
         KeyCode::Up => {
-            if !state.input.move_up(terminal.composer_text_width()?) {
+            if !state.input.move_up(TerminalUi::composer_text_width()?) {
                 state.input.history_previous();
             }
         }
         KeyCode::Down => {
-            if !state.input.move_down(terminal.composer_text_width()?) {
+            if !state.input.move_down(TerminalUi::composer_text_width()?) {
                 state.input.history_next();
             }
         }
@@ -639,11 +655,7 @@ where
             picker.move_down();
             Some(PickerAction::KeepOpen)
         }
-        KeyCode::Enter => Some(
-            selected(picker)
-                .map(PickerAction::Confirm)
-                .unwrap_or(PickerAction::Close),
-        ),
+        KeyCode::Enter => Some(selected(picker).map_or(PickerAction::Close, PickerAction::Confirm)),
         _ => None,
     }
 }
@@ -662,7 +674,7 @@ fn handle_completion_key(
         KeyCode::Down => completion.move_down(),
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => completion.move_up(),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            completion.move_down()
+            completion.move_down();
         }
         KeyCode::Tab => {
             if let Some(selected) = completion.selected() {
@@ -699,7 +711,7 @@ enum CtrlCAction {
     Exit,
 }
 
-fn ctrl_c_action(input_is_empty: bool, busy: bool) -> CtrlCAction {
+const fn ctrl_c_action(input_is_empty: bool, busy: bool) -> CtrlCAction {
     if !input_is_empty {
         CtrlCAction::ClearInput
     } else if busy {
@@ -890,7 +902,7 @@ async fn run_command(
     Ok(LoopAction::Continue)
 }
 
-fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
+const fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
     matches!(
         (policy, input),
         (

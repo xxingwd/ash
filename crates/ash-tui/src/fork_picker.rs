@@ -3,18 +3,18 @@ use ash_core::{ForkPoint, MessageId};
 use crate::picker::PickerState;
 
 #[derive(Debug, Default)]
-pub(crate) struct ForkPickerState {
+pub struct ForkPickerState {
     inner: PickerState<ForkPoint>,
 }
 
 impl ForkPickerState {
-    pub(crate) fn with_items(points: Vec<ForkPoint>) -> Self {
+    pub(crate) const fn with_items(points: Vec<ForkPoint>) -> Self {
         Self {
             inner: PickerState::with_items(points),
         }
     }
 
-    pub(crate) fn is_visible(&self) -> bool {
+    pub(crate) const fn is_visible(&self) -> bool {
         self.inner.is_visible()
     }
 
@@ -22,7 +22,7 @@ impl ForkPickerState {
         self.inner.items()
     }
 
-    pub(crate) fn selected_index(&self) -> usize {
+    pub(crate) const fn selected_index(&self) -> usize {
         self.inner.selected_index()
     }
 
@@ -33,11 +33,11 @@ impl ForkPickerState {
             .map(|point| point.message_id)
     }
 
-    pub(crate) fn move_up(&mut self) {
+    pub(crate) const fn move_up(&mut self) {
         self.inner.move_up();
     }
 
-    pub(crate) fn move_down(&mut self) {
+    pub(crate) const fn move_down(&mut self) {
         self.inner.move_down();
     }
 }

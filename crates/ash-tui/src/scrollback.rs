@@ -4,7 +4,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-pub(crate) fn sanitize_terminal_text(text: &str) -> String {
+pub fn sanitize_terminal_text(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
@@ -39,14 +39,14 @@ pub(crate) fn sanitize_terminal_text(text: &str) -> String {
     sanitized
 }
 
-pub(crate) fn sanitize_single_line(text: &str) -> String {
+pub fn sanitize_single_line(text: &str) -> String {
     sanitize_terminal_text(text).replace(['\r', '\n'], " ")
 }
 
 /// Content-row prefix spans: a bullet marker on the first row and an
 /// indentation gap on continuation rows. Shared by the markdown renderers so
 /// the `• /  ` prefix stays identical across blocks.
-pub(crate) fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
+pub fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
     if first {
         vec![Span::styled(
             "• ",
@@ -57,7 +57,7 @@ pub(crate) fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
     }
 }
 
-pub(crate) fn wrap_text(text: &str, width: u16) -> Vec<String> {
+pub fn wrap_text(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width.max(1));
     let mut lines = Vec::new();
     for source_line in text.split('\n') {

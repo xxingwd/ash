@@ -8,7 +8,7 @@ use crate::{
 };
 
 #[derive(Debug, Default)]
-pub(crate) struct StreamState {
+pub struct StreamState {
     mode: StreamMode,
 }
 
@@ -27,7 +27,7 @@ enum StreamMode {
 /// Summary of a reasoning phase that just finished, produced by
 /// `StreamState::finish` when there was any thought content.
 #[derive(Debug)]
-pub(crate) struct FinishedThought {
+pub struct FinishedThought {
     pub(crate) source: String,
     pub(crate) elapsed_seconds: u64,
 }
@@ -78,20 +78,19 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn is_reasoning(&self) -> bool {
+    pub(crate) const fn is_reasoning(&self) -> bool {
         matches!(self.mode, StreamMode::Reasoning { .. })
     }
 
     pub(crate) fn finish(&mut self) -> Option<FinishedThought> {
         match std::mem::take(&mut self.mode) {
-            StreamMode::Idle => None,
             StreamMode::Reasoning {
                 source, started_at, ..
             } if !source.trim().is_empty() => Some(FinishedThought {
                 source,
                 elapsed_seconds: started_at.elapsed().as_secs(),
             }),
-            StreamMode::Reasoning { .. } => None,
+            StreamMode::Idle | StreamMode::Reasoning { .. } => None,
         }
     }
 
@@ -100,7 +99,7 @@ impl StreamState {
     }
 }
 
-pub(crate) fn format_elapsed(elapsed_seconds: u64) -> String {
+pub fn format_elapsed(elapsed_seconds: u64) -> String {
     if elapsed_seconds < 60 {
         return format!("{elapsed_seconds}s");
     }

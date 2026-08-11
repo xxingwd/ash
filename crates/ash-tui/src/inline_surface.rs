@@ -22,7 +22,7 @@ struct FrameWriter {
 }
 
 impl FrameWriter {
-    fn new(stdout: Stdout) -> Self {
+    const fn new(stdout: Stdout) -> Self {
         Self {
             stdout,
             frame: None,
@@ -70,7 +70,7 @@ impl Write for FrameWriter {
 type InlineTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 
 /// Owns an inline viewport while preserving the terminal's native scrollback.
-pub(crate) struct InlineScreen {
+pub struct InlineScreen {
     terminal: InlineTerminal,
     viewport_area: Rect,
     guard: TerminalGuard,
@@ -680,7 +680,7 @@ mod tests {
         (0..buffer.area.width)
             .filter_map(|x| buffer.cell((x, y)))
             .filter(|cell| !crate::buffer::cell_is_skipped(cell))
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
             .trim_end()
             .to_string()

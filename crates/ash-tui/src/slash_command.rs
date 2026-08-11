@@ -1,7 +1,7 @@
 use crate::picker::PickerState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SlashCommand {
+pub enum SlashCommand {
     New,
     Clear,
     Undo,
@@ -13,7 +13,7 @@ pub(crate) enum SlashCommand {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ParsedInput {
+pub enum ParsedInput {
     Message,
     Command(SlashCommand),
     Invalid(String),
@@ -28,13 +28,13 @@ struct CommandSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CommandCompletion {
+pub struct CommandCompletion {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct CommandCompletionState {
+pub struct CommandCompletionState {
     filter: Option<String>,
     dismissed_filter: Option<String>,
     picker: PickerState<CommandCompletion>,
@@ -92,7 +92,7 @@ const COMMANDS: &[CommandSpec] = &[
 ];
 
 impl SlashCommand {
-    pub(crate) fn requires_idle(self) -> bool {
+    pub(crate) const fn requires_idle(self) -> bool {
         matches!(
             self,
             Self::New | Self::Clear | Self::Undo | Self::Fork | Self::Compact | Self::Resume
@@ -100,7 +100,7 @@ impl SlashCommand {
     }
 }
 
-pub(crate) fn parse(input: &str) -> ParsedInput {
+pub fn parse(input: &str) -> ParsedInput {
     let input = input.trim();
     let Some(command_line) = input.strip_prefix('/') else {
         return ParsedInput::Message;
@@ -122,14 +122,14 @@ pub(crate) fn parse(input: &str) -> ParsedInput {
         )
 }
 
-pub(crate) fn is_bare_exit(input: &str) -> bool {
+pub fn is_bare_exit(input: &str) -> bool {
     let input = input.trim();
     COMMANDS.iter().any(|spec| {
         spec.command == SlashCommand::Exit && (spec.name == input || spec.aliases.contains(&input))
     })
 }
 
-pub(crate) fn completion_filter(input: &str, cursor: usize) -> Option<String> {
+pub fn completion_filter(input: &str, cursor: usize) -> Option<String> {
     if !input.starts_with('/') || cursor > input.len() || !input.is_char_boundary(cursor) {
         return None;
     }
@@ -183,7 +183,7 @@ impl CommandCompletionState {
         self.picker.items()
     }
 
-    pub(crate) fn selected_index(&self) -> usize {
+    pub(crate) const fn selected_index(&self) -> usize {
         self.picker.selected_index()
     }
 
@@ -192,11 +192,11 @@ impl CommandCompletionState {
         self.picker.items().get(index).copied()
     }
 
-    pub(crate) fn move_up(&mut self) {
+    pub(crate) const fn move_up(&mut self) {
         self.picker.move_up();
     }
 
-    pub(crate) fn move_down(&mut self) {
+    pub(crate) const fn move_down(&mut self) {
         self.picker.move_down();
     }
 
@@ -205,7 +205,7 @@ impl CommandCompletionState {
         self.picker.clear();
     }
 
-    pub(crate) fn is_visible(&self) -> bool {
+    pub(crate) const fn is_visible(&self) -> bool {
         self.picker.is_visible()
     }
 }

@@ -22,7 +22,7 @@ const FULL_WORDMARK: [&str; 6] = [
 const COMPACT_WORDMARK: [&str; 2] = ["▄▀█  █▀  █ █", "█▀█  ▄█  █▀█"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WelcomeStyle {
+pub enum WelcomeStyle {
     Frame,
     Logo,
     Title,
@@ -30,12 +30,12 @@ pub(crate) enum WelcomeStyle {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct WelcomeLine {
+pub struct WelcomeLine {
     pub(crate) text: String,
     pub(crate) style: WelcomeStyle,
 }
 
-pub(crate) fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<WelcomeLine> {
+pub fn welcome_card(available_width: u16, working_dir: &Path) -> Vec<WelcomeLine> {
     let outer_width = available_width;
     let inner_width = outer_width.saturating_sub(FRAME_BORDER_COLUMNS);
     if outer_width < MIN_CARD_WIDTH {

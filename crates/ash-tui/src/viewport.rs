@@ -34,15 +34,15 @@ const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
 const MENU_COLUMN_GAP: usize = 2;
 const MENU_PREFIX_COLUMNS: usize = 2;
 const SESSION_CREATED_MIN_LEFT_COLUMNS: usize = 8;
-pub(crate) const COMPOSER_TEXT_COLUMN: u16 = 2;
+pub const COMPOSER_TEXT_COLUMN: u16 = 2;
 
-pub(crate) fn drawable_width(terminal_width: u16) -> u16 {
+pub fn drawable_width(terminal_width: u16) -> u16 {
     // Keep the final column free because writing into it can trigger an automatic wrap.
     terminal_width.saturating_sub(1).max(1)
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ViewportInput<'a> {
+pub struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
     pub(crate) transcript: &'a [LiveBlock],
@@ -65,7 +65,7 @@ pub(crate) struct ViewportInput<'a> {
     pub(crate) subagents: &'a [SubagentSnapshot],
 }
 
-pub(crate) struct ViewportFrame {
+pub struct ViewportFrame {
     pub(crate) buffer: Buffer,
     pub(crate) viewport_height: u16,
     pub(crate) cursor_row: u16,
@@ -91,7 +91,7 @@ impl ViewportFrame {
     }
 }
 
-pub(crate) fn render(input: ViewportInput<'_>) -> ViewportFrame {
+pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let terminal_width = input.terminal_width.max(1);
     let terminal_height = input.terminal_height.max(1);
     let width = drawable_width(input.terminal_width);
@@ -240,7 +240,7 @@ const REMOVE_ORDER: [ScreenPart; 5] = [
 ];
 
 impl ScreenRows {
-    fn rows_mut(&mut self, part: ScreenPart) -> &mut u16 {
+    const fn rows_mut(&mut self, part: ScreenPart) -> &mut u16 {
         match part {
             ScreenPart::Transcript => &mut self.transcript,
             ScreenPart::Status => &mut self.status,
@@ -532,7 +532,7 @@ fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Bu
     }
 }
 
-fn subagent_state_symbol(state: ash_core::SubagentState) -> &'static str {
+const fn subagent_state_symbol(state: ash_core::SubagentState) -> &'static str {
     match state {
         ash_core::SubagentState::Pending => "○",
         ash_core::SubagentState::Running => "●",
@@ -542,7 +542,7 @@ fn subagent_state_symbol(state: ash_core::SubagentState) -> &'static str {
     }
 }
 
-fn subagent_state_label(state: ash_core::SubagentState) -> &'static str {
+const fn subagent_state_label(state: ash_core::SubagentState) -> &'static str {
     match state {
         ash_core::SubagentState::Pending => "pending",
         ash_core::SubagentState::Running => "running",
@@ -552,12 +552,11 @@ fn subagent_state_label(state: ash_core::SubagentState) -> &'static str {
     }
 }
 
-fn subagent_state_color(state: ash_core::SubagentState) -> Color {
+const fn subagent_state_color(state: ash_core::SubagentState) -> Color {
     match state {
-        ash_core::SubagentState::Pending => Color::Yellow,
+        ash_core::SubagentState::Pending | ash_core::SubagentState::Interrupted => Color::Yellow,
         ash_core::SubagentState::Running => Color::Cyan,
         ash_core::SubagentState::Completed => Color::Green,
-        ash_core::SubagentState::Interrupted => Color::Yellow,
         ash_core::SubagentState::Errored => Color::Red,
     }
 }
@@ -769,14 +768,12 @@ fn footer_right_fits(area: Rect, context: Option<&ContextDisplay>, protocol: Opt
 }
 
 fn footer_right_width(context: Option<&ContextDisplay>, protocol: Option<&str>) -> u16 {
-    let context_width = context
-        .map(|context| {
-            u16::try_from(UnicodeWidthStr::width(context.text.as_str())).unwrap_or(u16::MAX)
-        })
-        .unwrap_or(0);
-    let protocol_width = protocol
-        .map(|protocol| u16::try_from(UnicodeWidthStr::width(protocol)).unwrap_or(u16::MAX))
-        .unwrap_or(0);
+    let context_width = context.map_or(0, |context| {
+        u16::try_from(UnicodeWidthStr::width(context.text.as_str())).unwrap_or(u16::MAX)
+    });
+    let protocol_width = protocol.map_or(0, |protocol| {
+        u16::try_from(UnicodeWidthStr::width(protocol)).unwrap_or(u16::MAX)
+    });
     context_width
         .saturating_add(protocol_width)
         .saturating_add(u16::from(context_width > 0 && protocol_width > 0) * 3)
@@ -918,7 +915,7 @@ struct MenuWindow {
 }
 
 impl MenuWindow {
-    fn end(&self) -> usize {
+    const fn end(&self) -> usize {
         self.start + self.visible
     }
 }

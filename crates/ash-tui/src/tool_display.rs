@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -43,19 +45,19 @@ impl ToolKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChangePreviewSource {
+pub enum ChangePreviewSource {
     EditOutput,
     WriteContent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ToolRenderer {
+pub enum ToolRenderer {
     Bash,
     ChangePreview(ChangePreviewSource),
     Generic { show_output: bool },
 }
 
-pub(crate) fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
+pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
     let kind = ToolKind::from_name(name);
     match (kind, is_error) {
         (ToolKind::Bash, _) => ToolRenderer::Bash,
@@ -68,11 +70,11 @@ pub(crate) fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
     }
 }
 
-pub(crate) fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
+pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
     (ToolKind::from_name(name) == ToolKind::Read).then(|| path_argument(arguments))
 }
 
-pub(crate) fn tool_call_summary(
+pub fn tool_call_summary(
     name: &str,
     arguments: &Value,
     is_error: bool,
@@ -87,7 +89,7 @@ pub(crate) fn tool_call_summary(
     fit_action_and_detail(action, &detail, usize::from(max_width.max(1)))
 }
 
-pub(crate) fn read_group_summary(details: &[String], max_width: u16) -> (String, String) {
+pub fn read_group_summary(details: &[String], max_width: u16) -> (String, String) {
     let mut unique = details.iter().filter(|detail| !detail.is_empty()).fold(
         Vec::new(),
         |mut unique, detail| {
@@ -101,7 +103,7 @@ pub(crate) fn read_group_summary(details: &[String], max_width: u16) -> (String,
     unique.truncate(GROUP_DETAIL_LIMIT);
     let mut detail = unique.join(", ");
     if hidden > 0 {
-        detail.push_str(&format!(" +{hidden}"));
+        let _ = write!(detail, " +{hidden}");
     }
     fit_action_and_detail("Read", &detail, usize::from(max_width.max(1)))
 }
@@ -164,7 +166,7 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     }
 }
 
-fn phrase(completed: &'static str, failed: &'static str, detail: String) -> ToolPhrase {
+const fn phrase(completed: &'static str, failed: &'static str, detail: String) -> ToolPhrase {
     ToolPhrase {
         completed,
         failed,

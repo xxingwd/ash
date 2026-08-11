@@ -7,7 +7,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) enum MenuView<'a> {
+pub enum MenuView<'a> {
     #[default]
     None,
     Commands {
@@ -25,7 +25,7 @@ pub(crate) enum MenuView<'a> {
 }
 
 impl MenuView<'_> {
-    pub(crate) fn item_count(self) -> usize {
+    pub(crate) const fn item_count(self) -> usize {
         match self {
             Self::None => 0,
             Self::Commands { items, .. } => items.len(),
@@ -36,7 +36,7 @@ impl MenuView<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) enum ComposerMenuState {
+pub enum ComposerMenuState {
     Commands(CommandCompletionState),
     Sessions(SessionPickerState),
     ForkPoints(ForkPickerState),
@@ -73,36 +73,36 @@ impl ComposerMenuState {
         }
     }
 
-    pub(crate) fn visible_completion_mut(&mut self) -> Option<&mut CommandCompletionState> {
+    pub(crate) const fn visible_completion_mut(&mut self) -> Option<&mut CommandCompletionState> {
         match self {
             Self::Commands(completion) if completion.is_visible() => Some(completion),
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => None,
         }
     }
 
-    pub(crate) fn visible_session_picker_mut(&mut self) -> Option<&mut SessionPickerState> {
+    pub(crate) const fn visible_session_picker_mut(&mut self) -> Option<&mut SessionPickerState> {
         match self {
             Self::Sessions(picker) if picker.is_visible() => Some(picker),
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => None,
         }
     }
 
-    pub(crate) fn visible_fork_picker_mut(&mut self) -> Option<&mut ForkPickerState> {
+    pub(crate) const fn visible_fork_picker_mut(&mut self) -> Option<&mut ForkPickerState> {
         match self {
             Self::ForkPoints(picker) if picker.is_visible() => Some(picker),
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => None,
         }
     }
 
-    pub(crate) fn session_picker_is_visible(&self) -> bool {
+    pub(crate) const fn session_picker_is_visible(&self) -> bool {
         matches!(self, Self::Sessions(picker) if picker.is_visible())
     }
 
-    pub(crate) fn fork_picker_is_visible(&self) -> bool {
+    pub(crate) const fn fork_picker_is_visible(&self) -> bool {
         matches!(self, Self::ForkPoints(picker) if picker.is_visible())
     }
 
-    pub(crate) fn picker_is_visible(&self) -> bool {
+    pub(crate) const fn picker_is_visible(&self) -> bool {
         self.session_picker_is_visible() || self.fork_picker_is_visible()
     }
 

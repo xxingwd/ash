@@ -14,9 +14,9 @@ use ratatui::text::{Line, Span};
 
 /// Display budget for a collapsed block: tool output, bash command
 /// continuations, and live reasoning all preview at this many lines.
-pub(crate) const COLLAPSED_MAX_LINES: usize = 5;
+pub const COLLAPSED_MAX_LINES: usize = 5;
 /// Display budget when tool blocks are expanded (`Ctrl+o`).
-pub(crate) const EXPANDED_MAX_LINES: usize = 50;
+pub const EXPANDED_MAX_LINES: usize = 50;
 
 /// Bash highlighting palette. Uses the same base ratatui colors as the
 /// markdown renderer (Green for quotes, Cyan for code, Blue for markers) so
@@ -50,7 +50,7 @@ const BASH_KEYWORDS: &[&str] = &[
 /// or `|`) is the command and gets the command color. A keyword in that
 /// position keeps the keyword color and does not consume the boundary, so
 /// `if cd /tmp` still colors `cd` as a command.
-fn is_command_boundary(ch: char) -> bool {
+const fn is_command_boundary(ch: char) -> bool {
     matches!(ch, '&' | '|' | ';')
 }
 
@@ -60,7 +60,7 @@ fn is_command_boundary(ch: char) -> bool {
 /// colors everything else with the default foreground. This covers the
 /// simple commands agents actually run; exotic constructs just fall back to
 /// plain text.
-pub(crate) fn highlight_bash_command(command: &str) -> Vec<Line<'static>> {
+pub fn highlight_bash_command(command: &str) -> Vec<Line<'static>> {
     command.lines().map(highlight_bash_line).collect()
 }
 
@@ -244,7 +244,7 @@ fn styled_span(content: String, color: ratatui::style::Color) -> Span<'static> {
 
 /// Parse one line of text that may contain ANSI escape sequences into a
 /// ratatui `Line` with styled spans. Falls back to plain text on parse error.
-pub(crate) fn parse_ansi_line(line: &str) -> Line<'static> {
+pub fn parse_ansi_line(line: &str) -> Line<'static> {
     let expanded = expand_tabs(line);
     match expanded.as_ref().into_text() {
         Ok(text) => text.lines.into_iter().next().unwrap_or_default(),
@@ -255,7 +255,7 @@ pub(crate) fn parse_ansi_line(line: &str) -> Line<'static> {
 /// Wrap a highlighted `Line` to a display width, splitting at the last space
 /// that fits on each row so long tokens stay intact. Styles are preserved per
 /// character, so syntax colors survive the wrap.
-pub(crate) fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     // Flatten the line into (style, char) pairs.
     let mut chars: Vec<(Style, String)> = Vec::new();
@@ -321,7 +321,7 @@ pub(crate) fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<L
 /// line is parsed for ANSI colors and dimmed to visually recede behind the
 /// tool title. The first line uses `first_prefix` (e.g. `└ `) and all later
 /// lines use `subsequent_prefix` (e.g. four spaces).
-pub(crate) fn split_output(
+pub fn split_output(
     output: &str,
     head: usize,
     tail: usize,
@@ -361,12 +361,7 @@ pub(crate) fn split_output(
 /// Keep the first `head` and last `tail` items of `items`, inserting
 /// `ellipsis` between them when anything was omitted. Shared by tool output
 /// and multi-line bash command truncation.
-pub(crate) fn split_with_ellipsis<T>(
-    mut items: Vec<T>,
-    head: usize,
-    tail: usize,
-    ellipsis: T,
-) -> Vec<T> {
+pub fn split_with_ellipsis<T>(mut items: Vec<T>, head: usize, tail: usize, ellipsis: T) -> Vec<T> {
     let total = items.len();
     if total <= head + tail {
         return items;

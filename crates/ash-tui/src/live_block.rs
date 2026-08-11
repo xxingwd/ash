@@ -25,7 +25,7 @@ const CHANGE_PREVIEW_MAX_LINES: usize = 12;
 
 /// A complete transcript entry retained by Ash and re-rendered after updates.
 #[derive(Clone, Debug)]
-pub(crate) struct LiveBlock {
+pub struct LiveBlock {
     id: u64,
     turn_id: Option<u64>,
     kind: LiveBlockKind,
@@ -63,15 +63,15 @@ enum LiveBlockKind {
 }
 
 impl LiveBlock {
-    pub(crate) fn welcome(id: u64, working_dir: PathBuf) -> Self {
+    pub(crate) const fn welcome(id: u64, working_dir: PathBuf) -> Self {
         Self::new(id, LiveBlockKind::Welcome(working_dir))
     }
 
-    pub(crate) fn history(id: u64, block: HistoryBlock) -> Self {
+    pub(crate) const fn history(id: u64, block: HistoryBlock) -> Self {
         Self::new(id, LiveBlockKind::History(block))
     }
 
-    pub(crate) fn assistant(id: u64, source: String) -> Self {
+    pub(crate) const fn assistant(id: u64, source: String) -> Self {
         Self::new(
             id,
             LiveBlockKind::Assistant {
@@ -81,7 +81,7 @@ impl LiveBlock {
         )
     }
 
-    pub(crate) fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
+    pub(crate) const fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
         Self::new(
             id,
             LiveBlockKind::Thought {
@@ -114,7 +114,7 @@ impl LiveBlock {
         )
     }
 
-    fn new(id: u64, kind: LiveBlockKind) -> Self {
+    const fn new(id: u64, kind: LiveBlockKind) -> Self {
         Self {
             id,
             turn_id: None,
@@ -123,7 +123,7 @@ impl LiveBlock {
         }
     }
 
-    pub(crate) fn with_turn(mut self, turn_id: Option<u64>) -> Self {
+    pub(crate) const fn with_turn(mut self, turn_id: Option<u64>) -> Self {
         self.turn_id = turn_id;
         self
     }
@@ -310,7 +310,7 @@ impl LiveBlock {
         self.cache.get_mut().take();
     }
 
-    fn source_len(&self) -> Option<usize> {
+    const fn source_len(&self) -> Option<usize> {
         match &self.kind {
             LiveBlockKind::Assistant { source, .. } => Some(source.len()),
             _ => None,
@@ -449,13 +449,13 @@ fn update_markdown_buffer(
     let height = u16::try_from(markdown_line_count(stable, tail))
         .unwrap_or(u16::MAX)
         .max(1);
-    let (mut buffer, dirty_from) = match previous
+    let (mut buffer, dirty_from) = previous
         .and_then(|buffer| Arc::try_unwrap(buffer).ok())
         .filter(|buffer| buffer.area.width == width)
-    {
-        Some(buffer) => (buffer, dirty_from),
-        None => (Buffer::empty(Rect::new(0, 0, width, height)), 0),
-    };
+        .map_or_else(
+            || (Buffer::empty(Rect::new(0, 0, width, height)), 0),
+            |buffer| (buffer, dirty_from),
+        );
     buffer.area = Rect::new(0, 0, width, height);
     buffer
         .content
@@ -649,12 +649,13 @@ fn render_bash_command_line(
         .max(1);
     let wrapped_first = crate::ansi::wrap_highlighted_line(&first, header_content_width);
     let mut iter = wrapped_first.into_iter();
-    let mut first_spans: Vec<Span<'static>> = Vec::new();
-    if let Some(first_row) = iter.next() {
+    let first_spans: Vec<Span<'static>> = if let Some(first_row) = iter.next() {
         let mut spans = header_spans.clone();
         spans.extend(first_row.spans);
-        first_spans = spans;
-    }
+        spans
+    } else {
+        Vec::new()
+    };
     // Any remaining wrapped rows become continuation lines, in order.
     let mut wrapped_tail: Vec<Line<'static>> = iter.collect();
     wrapped_tail.extend(highlighted);
@@ -679,7 +680,7 @@ fn render_bash_command_line(
             width.max(1),
             u16::try_from(shown).unwrap_or(u16::MAX),
         ));
-        for (offset, line) in highlighted.drain(..).enumerate() {
+        for (offset, line) in highlighted.into_iter().enumerate() {
             // Dim the pipe prefix so it matches the `└` output corner; the
             // command text itself keeps its syntax colors.
             let mut spans = vec![Span::styled(
@@ -1046,7 +1047,7 @@ mod tests {
         let buffer = block.render(80, false);
         let rendered = (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, 0)))
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("• Read inline.rs, viewport.rs"));
     }
@@ -1202,7 +1203,7 @@ mod tests {
             .find(|&row| {
                 (0..buffer.area.width)
                     .filter_map(|column| buffer.cell((column, row)))
-                    .map(|cell| cell.symbol())
+                    .map(ratatui::buffer::Cell::symbol)
                     .collect::<String>()
                     .contains("TERMINAL CODING AGENT")
             })
@@ -1230,7 +1231,7 @@ mod tests {
         (0..buffer.area.width)
             .filter_map(|x| buffer.cell((x, y)))
             .filter(|cell| !crate::buffer::cell_is_skipped(cell))
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
             .trim_end()
             .to_string()
@@ -1244,7 +1245,7 @@ mod generic_output_tests {
     fn row_text(buffer: &Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, row)))
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect()
     }
 

@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -14,7 +16,7 @@ use crate::{
 const USER_HORIZONTAL_INSET: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HistoryBlock {
+pub enum HistoryBlock {
     User(String),
     Info(String),
     Interrupted,
@@ -23,7 +25,7 @@ pub(crate) enum HistoryBlock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Worked {
+pub struct Worked {
     elapsed: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -47,7 +49,7 @@ impl HistoryBlock {
         Self::Interrupted
     }
 
-    pub(crate) fn worked(
+    pub(crate) const fn worked(
         elapsed: String,
         input_tokens: u64,
         output_tokens: u64,
@@ -205,13 +207,14 @@ fn render_worked(worked: &Worked, width: u16) -> Buffer {
 fn worked_separator(worked: &Worked, width: u16) -> String {
     let mut label = format!("─ Worked for {}", worked.elapsed);
     if worked.input_tokens > 0 || worked.output_tokens > 0 {
-        label.push_str(&format!(
+        let _ = write!(
+            label,
             " · {} in / {} out",
             format_token_count(worked.input_tokens),
             format_token_count(worked.output_tokens),
-        ));
+        );
         if let Some(rate) = format_token_rate(worked.output_tokens, worked.generation_ms) {
-            label.push_str(&format!(" · {rate}"));
+            let _ = write!(label, " · {rate}");
         }
     }
     label.push_str(" ─");
@@ -230,7 +233,7 @@ mod tests {
     fn row_text(buffer: &Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, row)))
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
             .trim_end()
             .to_string()

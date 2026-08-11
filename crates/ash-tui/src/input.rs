@@ -3,7 +3,7 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Default)]
-pub(crate) struct InputState {
+pub struct InputState {
     buffer: String,
     cursor: usize,
     goal_column: Option<usize>,
@@ -12,14 +12,14 @@ pub(crate) struct InputState {
     history_draft: Option<String>,
 }
 
-pub(crate) struct InputView {
+pub struct InputView {
     pub lines: Vec<String>,
     pub cursor_row: u16,
     pub cursor_column: u16,
 }
 
 impl InputState {
-    pub fn with_history(history: Vec<String>) -> Self {
+    pub const fn with_history(history: Vec<String>) -> Self {
         let history_index = history.len();
         Self {
             buffer: String::new(),
@@ -35,11 +35,11 @@ impl InputState {
         &self.buffer
     }
 
-    pub fn cursor(&self) -> usize {
+    pub const fn cursor(&self) -> usize {
         self.cursor
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 

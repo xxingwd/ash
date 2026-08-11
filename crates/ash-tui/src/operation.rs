@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackgroundAction {
+pub enum BackgroundAction {
     ListSessions,
     ListForkPoints,
     Resume,
@@ -9,37 +9,37 @@ pub(crate) enum BackgroundAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubmissionPolicy {
+pub enum SubmissionPolicy {
     Start,
     Steer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CancellationMode {
+pub enum CancellationMode {
     Interrupt,
     Rollback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TurnCompletion {
+pub enum TurnCompletion {
     Commit,
     AwaitRollback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentStart {
+pub enum AgentStart {
     StartedTurn,
     TurnAlreadyTracked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FailureCompletion {
+pub enum FailureCompletion {
     FinishedOperation,
     OperationUnchanged,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct OperationState {
+pub struct OperationState {
     current: Operation,
 }
 
@@ -58,18 +58,18 @@ enum TurnOperation {
 }
 
 impl OperationState {
-    pub(crate) fn is_busy(&self) -> bool {
+    pub(crate) const fn is_busy(&self) -> bool {
         !matches!(self.current, Operation::Idle)
     }
 
-    pub(crate) fn shows_activity(&self) -> bool {
+    pub(crate) const fn shows_activity(&self) -> bool {
         matches!(
             self.current,
             Operation::Turn(_) | Operation::Background(BackgroundAction::Compact)
         )
     }
 
-    pub(crate) fn submission_policy(&self) -> Option<SubmissionPolicy> {
+    pub(crate) const fn submission_policy(&self) -> Option<SubmissionPolicy> {
         match self.current {
             Operation::Idle => Some(SubmissionPolicy::Start),
             Operation::Turn(TurnOperation::Running) => Some(SubmissionPolicy::Steer),
@@ -77,19 +77,19 @@ impl OperationState {
         }
     }
 
-    pub(crate) fn can_cancel(&self) -> bool {
+    pub(crate) const fn can_cancel(&self) -> bool {
         matches!(self.current, Operation::Turn(TurnOperation::Running))
     }
 
-    pub(crate) fn accepts_live_output(&self) -> bool {
+    pub(crate) const fn accepts_live_output(&self) -> bool {
         matches!(self.current, Operation::Turn(TurnOperation::Running))
     }
 
-    pub(crate) fn start_turn(&mut self) {
+    pub(crate) const fn start_turn(&mut self) {
         self.current = Operation::Turn(TurnOperation::Running);
     }
 
-    pub(crate) fn agent_started(&mut self) -> AgentStart {
+    pub(crate) const fn agent_started(&mut self) -> AgentStart {
         if self.is_busy() {
             AgentStart::TurnAlreadyTracked
         } else {
@@ -98,11 +98,11 @@ impl OperationState {
         }
     }
 
-    pub(crate) fn start_background(&mut self, action: BackgroundAction) {
+    pub(crate) const fn start_background(&mut self, action: BackgroundAction) {
         self.current = Operation::Background(action);
     }
 
-    pub(crate) fn begin_cancellation(&mut self, mode: CancellationMode) -> bool {
+    pub(crate) const fn begin_cancellation(&mut self, mode: CancellationMode) -> bool {
         if !matches!(self.current, Operation::Turn(TurnOperation::Running)) {
             return false;
         }
@@ -122,14 +122,13 @@ impl OperationState {
                 TurnCompletion::Commit
             }
             Operation::Idle
-            | Operation::Turn(TurnOperation::Running)
-            | Operation::Turn(TurnOperation::Cancelling(CancellationMode::Interrupt)) => {
-                TurnCompletion::Commit
-            }
+            | Operation::Turn(
+                TurnOperation::Running | TurnOperation::Cancelling(CancellationMode::Interrupt),
+            ) => TurnCompletion::Commit,
         }
     }
 
-    pub(crate) fn complete_failed_action(&mut self) -> FailureCompletion {
+    pub(crate) const fn complete_failed_action(&mut self) -> FailureCompletion {
         if matches!(self.current, Operation::Background(_)) {
             self.finish();
             FailureCompletion::FinishedOperation
@@ -144,7 +143,7 @@ impl OperationState {
         }
     }
 
-    pub(crate) fn finish(&mut self) {
+    pub(crate) const fn finish(&mut self) {
         self.current = Operation::Idle;
     }
 }

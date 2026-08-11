@@ -1,6 +1,6 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub(crate) fn truncate_end(value: &str, width: usize) -> String {
+pub fn truncate_end(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_string();
     }
@@ -23,7 +23,7 @@ pub(crate) fn truncate_end(value: &str, width: usize) -> String {
     output
 }
 
-pub(crate) fn truncate_start(value: &str, width: usize) -> String {
+pub fn truncate_start(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_string();
     }

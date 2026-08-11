@@ -4,24 +4,26 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::text_width::truncate_end;
 
-pub(crate) fn compact_path(path: &Path) -> String {
+pub fn compact_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     compact_path_with_home(path, home.as_deref())
 }
 
 fn compact_path_with_home(path: &Path, home: Option<&Path>) -> String {
-    if let Some(relative) = home.and_then(|home| path.strip_prefix(home).ok()) {
-        if relative.as_os_str().is_empty() {
-            "~".into()
-        } else {
-            format!("~/{}", relative.display())
-        }
-    } else {
-        path.display().to_string()
-    }
+    home.and_then(|home| path.strip_prefix(home).ok())
+        .map_or_else(
+            || path.display().to_string(),
+            |relative| {
+                if relative.as_os_str().is_empty() {
+                    "~".into()
+                } else {
+                    format!("~/{}", relative.display())
+                }
+            },
+        )
 }
 
-pub(crate) fn format_token_count(tokens: u64) -> String {
+pub fn format_token_count(tokens: u64) -> String {
     match tokens {
         0..=999 => tokens.to_string(),
         1_000..=999_999 => format_compact(tokens, 1_000, "k"),
@@ -29,7 +31,7 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
     }
 }
 
-pub(crate) fn format_token_rate(tokens: u64, duration_ms: u64) -> Option<String> {
+pub fn format_token_rate(tokens: u64, duration_ms: u64) -> Option<String> {
     (tokens > 0 && duration_ms > 0).then(|| {
         let tenths = tokens.saturating_mul(10_000) / duration_ms;
         if tenths.is_multiple_of(10) {
@@ -45,7 +47,7 @@ fn format_compact(value: u64, scale: u64, suffix: &str) -> String {
     format!("{}.{:01}{suffix}", tenths / 10, tenths % 10)
 }
 
-pub(crate) fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
+pub fn fit_status_left(model: &str, path: &str, width: u16) -> (String, Option<String>) {
     let model_width = u16::try_from(UnicodeWidthStr::width(model)).unwrap_or(u16::MAX);
     let path_width = width.saturating_sub(model_width.saturating_add(3));
     if model_width >= width || path.is_empty() || path_width == 0 {

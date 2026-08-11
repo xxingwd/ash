@@ -4,7 +4,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-pub(crate) fn copy_rows(source: &Buffer, destination: &mut Buffer, source_y: u16, target: Rect) {
+pub fn copy_rows(source: &Buffer, destination: &mut Buffer, source_y: u16, target: Rect) {
     let height = target
         .height
         .min(source.area.height.saturating_sub(source_y))
@@ -31,7 +31,7 @@ pub(crate) fn copy_rows(source: &Buffer, destination: &mut Buffer, source_y: u16
 
 /// Copies rows for Ratatui's direct-draw history path, where every cell is emitted without diffing.
 /// Wide-character continuation cells must be empty or they become visible spaces.
-pub(crate) fn copy_rows_for_direct_draw(
+pub fn copy_rows_for_direct_draw(
     source: &Buffer,
     destination: &mut Buffer,
     source_y: u16,
@@ -56,7 +56,7 @@ pub(crate) fn copy_rows_for_direct_draw(
     }
 }
 
-pub(crate) fn cell_is_skipped(cell: &Cell) -> bool {
+pub const fn cell_is_skipped(cell: &Cell) -> bool {
     matches!(cell.diff_option, CellDiffOption::Skip)
 }
 
@@ -76,7 +76,7 @@ mod tests {
 
         let symbols = destination.content[..5]
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<Vec<_>>();
         assert_eq!(symbols, ["中", "", "文", "", "a"]);
         assert_eq!(symbols.concat(), "中文a");

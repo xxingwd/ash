@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 const BLOCK_SPACING: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StackItem {
+pub struct StackItem {
     pub(crate) height: u16,
 }
 
@@ -14,12 +14,12 @@ impl StackItem {
 }
 
 #[derive(Debug)]
-pub(crate) struct StackLayout {
+pub struct StackLayout {
     pub(crate) height: u16,
     pub(crate) areas: Vec<Rect>,
 }
 
-pub(crate) fn layout_stack(width: u16, items: &[StackItem]) -> StackLayout {
+pub fn layout_stack(width: u16, items: &[StackItem]) -> StackLayout {
     if items.is_empty() {
         return StackLayout {
             height: 0,

@@ -3,7 +3,7 @@
 /// navigation for both, so the concrete pickers only add their typed
 /// accessors.
 #[derive(Debug)]
-pub(crate) struct PickerState<T> {
+pub struct PickerState<T> {
     items: Vec<T>,
     selected: usize,
 }
@@ -18,11 +18,11 @@ impl<T> Default for PickerState<T> {
 }
 
 impl<T> PickerState<T> {
-    pub(crate) fn with_items(items: Vec<T>) -> Self {
+    pub(crate) const fn with_items(items: Vec<T>) -> Self {
         Self { items, selected: 0 }
     }
 
-    pub(crate) fn is_visible(&self) -> bool {
+    pub(crate) const fn is_visible(&self) -> bool {
         !self.items.is_empty()
     }
 
@@ -30,11 +30,11 @@ impl<T> PickerState<T> {
         &self.items
     }
 
-    pub(crate) fn selected_index(&self) -> usize {
+    pub(crate) const fn selected_index(&self) -> usize {
         self.selected
     }
 
-    pub(crate) fn move_up(&mut self) {
+    pub(crate) const fn move_up(&mut self) {
         if self.items.is_empty() {
             return;
         }
@@ -45,7 +45,7 @@ impl<T> PickerState<T> {
         };
     }
 
-    pub(crate) fn move_down(&mut self) {
+    pub(crate) const fn move_down(&mut self) {
         if !self.items.is_empty() {
             self.selected = (self.selected + 1) % self.items.len();
         }
