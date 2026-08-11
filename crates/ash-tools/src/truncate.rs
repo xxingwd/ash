@@ -1,21 +1,21 @@
-pub(crate) const DEFAULT_MAX_LINES: usize = 2_000;
-pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+pub const DEFAULT_MAX_LINES: usize = 2_000;
+pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LimitKind {
+pub enum LimitKind {
     Lines,
     Bytes,
 }
 
 #[derive(Debug)]
-pub(crate) struct Truncation {
+pub struct Truncation {
     pub(crate) content: String,
     pub(crate) truncated: bool,
     pub(crate) limited_by: Option<LimitKind>,
     pub(crate) partial_line: bool,
 }
 
-pub(crate) fn tail(content: &str) -> Truncation {
+pub fn tail(content: &str) -> Truncation {
     let lines = split_lines(content);
     if lines.len() <= DEFAULT_MAX_LINES && content.len() <= DEFAULT_MAX_BYTES {
         return complete(content);
@@ -49,13 +49,19 @@ pub(crate) fn tail(content: &str) -> Truncation {
     }
 }
 
-pub(crate) fn format_size(bytes: usize) -> String {
+pub fn format_size(bytes: usize) -> String {
+    // Display-only rounding; the u64 -> f64 precision loss is irrelevant here.
+    #[allow(clippy::cast_precision_loss)]
+    const fn to_f64(bytes: usize) -> f64 {
+        bytes as f64
+    }
+
     if bytes < 1024 {
         format!("{bytes}B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
+        format!("{:.1}KB", to_f64(bytes) / 1024.0)
     } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{:.1}MB", to_f64(bytes) / (1024.0 * 1024.0))
     }
 }
 
@@ -79,7 +85,7 @@ fn split_lines(content: &str) -> Vec<&str> {
     lines
 }
 
-fn suffix_boundary(text: &str, max_bytes: usize) -> usize {
+const fn suffix_boundary(text: &str, max_bytes: usize) -> usize {
     let mut start = text.len().saturating_sub(max_bytes);
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;

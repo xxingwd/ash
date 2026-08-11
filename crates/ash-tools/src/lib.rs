@@ -12,11 +12,17 @@ mod write;
 use ash_core::{Tool, ToolError};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
+/// Build the default tool set for the given working directory.
+///
+/// # Errors
+///
+/// Returns `ToolError` when a built-in tool cannot be constructed (for
+/// example, an unknown tool name in `enabled`).
 pub fn tools(
     working_dir: impl Into<PathBuf>,
     enabled: Option<&[String]>,
 ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
-    let tools = all_tools(Arc::new(working_dir.into()))?;
+    let tools = all_tools(&Arc::new(working_dir.into()))?;
     let Some(names) = enabled else {
         return Ok(tools);
     };
@@ -44,14 +50,14 @@ pub fn tools(
         .collect())
 }
 
-fn all_tools(working_dir: Arc<PathBuf>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+fn all_tools(working_dir: &Arc<PathBuf>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
     let tools = vec![
-        read::tool(Arc::clone(&working_dir))?,
-        glob::tool(Arc::clone(&working_dir))?,
-        grep::tool(Arc::clone(&working_dir))?,
-        bash::tool(Arc::clone(&working_dir))?,
-        edit::tool(Arc::clone(&working_dir))?,
-        write::tool(Arc::clone(&working_dir))?,
+        read::tool(Arc::clone(working_dir))?,
+        glob::tool(Arc::clone(working_dir))?,
+        grep::tool(Arc::clone(working_dir))?,
+        bash::tool(Arc::clone(working_dir))?,
+        edit::tool(Arc::clone(working_dir))?,
+        write::tool(Arc::clone(working_dir))?,
         webfetch::tool()?,
     ];
     Ok(tools)

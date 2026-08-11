@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
@@ -62,7 +63,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
                         args.path.as_deref().unwrap_or("."),
                         &args.pattern,
                         args.include.as_deref(),
-                        cancellation,
+                        &cancellation,
                         deadline,
                     )
                 })
@@ -77,10 +78,10 @@ fn search(
     requested: &str,
     pattern: &str,
     include: Option<&str>,
-    cancellation: CancellationToken,
+    cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<String, ToolError> {
-    crate::path::ensure_running(&cancellation, deadline)?;
+    crate::path::ensure_running(cancellation, deadline)?;
     if pattern.is_empty() {
         return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
@@ -93,10 +94,10 @@ fn search(
         &regex,
         include,
         &mut matches,
-        &cancellation,
+        cancellation,
         deadline,
     )?;
-    render_matches(matches, progress, &cancellation, deadline)
+    render_matches(matches, progress, cancellation, deadline)
 }
 
 /// Collects up to `MAX_MATCHES` matching lines from a single file or a whole
@@ -190,15 +191,16 @@ fn render_matches(
         .as_slice()
         .chunk_by(|left, right| left.path == right.path)
     {
-        output.push_str(&format!("\n\n{}:", chunk[0].path.display()));
+        let _ = write!(output, "\n\n{}:", chunk[0].path.display());
         for found in chunk {
-            output.push_str(&format!("\n  Line {}: {}", found.line, found.text));
+            let _ = write!(output, "\n  Line {}: {}", found.line, found.text);
         }
     }
     if progress == SearchProgress::MatchLimitReached {
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "\n\n[Results truncated at {MAX_MATCHES} matching lines. Use a narrower path, pattern, or include glob.]"
-        ));
+        );
     }
     Ok(output)
 }
@@ -329,8 +331,8 @@ mod tests {
             "src",
             r"needle \d",
             Some("*.rs"),
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -350,8 +352,8 @@ mod tests {
             "notes.txt",
             "two",
             None,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -362,8 +364,8 @@ mod tests {
             ".",
             "[",
             None,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .is_err());
     }
@@ -382,8 +384,8 @@ mod tests {
             ".",
             "match",
             None,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -401,7 +403,7 @@ mod tests {
         let mut reader = BufReader::new(input.as_bytes());
         let mut buffer = Vec::new();
         let cancellation = CancellationToken::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
 
         assert_eq!(
             read_line(
@@ -453,8 +455,8 @@ mod tests {
             ".",
             "needle",
             None,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -485,8 +487,8 @@ mod tests {
             ".",
             "needle",
             None,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
         assert_eq!(output, "No matches found");
@@ -504,8 +506,8 @@ mod tests {
             ".",
             "needle",
             None,
-            cancellation,
-            Instant::now() + Duration::from_secs(60),
+            &cancellation,
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap_err();
 

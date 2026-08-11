@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const ASH_USER_AGENT: &str = concat!("ash/", env!("CARGO_PKG_VERSION"));
 const ACCEPT: &str =
@@ -40,7 +40,7 @@ pub fn tool() -> Result<Arc<dyn Tool>, ToolError> {
                     result = tokio::time::timeout(timeout, request) => {
                         result.map_err(|_| ToolError::Timeout(timeout))?
                     }
-                    _ = cancellation.cancelled() => Err(ToolError::Cancelled),
+                    () = cancellation.cancelled() => Err(ToolError::Cancelled),
                 }
             }
         },
@@ -223,6 +223,8 @@ fn nonempty(content: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -235,8 +237,8 @@ mod tests {
     fn validates_urls_and_timeouts() {
         assert!(parse_url("https://example.com").is_ok());
         assert!(parse_url("file:///etc/passwd").is_err());
-        assert!(parse_timeout(Some(0.0), Duration::from_secs(120)).is_err());
-        assert!(parse_timeout(Some(121.0), Duration::from_secs(120)).is_err());
+        assert!(parse_timeout(Some(0.0), Duration::from_mins(2)).is_err());
+        assert!(parse_timeout(Some(121.0), Duration::from_mins(2)).is_err());
         assert_eq!(
             parse_timeout(Some(20.0), Duration::from_secs(10)).unwrap(),
             Duration::from_secs(10)
@@ -295,12 +297,12 @@ mod tests {
     }
 
     fn response(status: &str, content_type: &str, headers: &[(&str, &str)], body: &str) -> String {
-        let headers = headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect::<String>();
+        let mut rendered_headers = String::new();
+        for (name, value) in headers {
+            let _ = write!(rendered_headers, "{name}: {value}\r\n");
+        }
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{rendered_headers}Connection: close\r\n\r\n{body}",
             body.len()
         )
     }

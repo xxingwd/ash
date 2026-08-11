@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -91,7 +92,7 @@ async fn run_command(
     } else {
         Err(ToolError::Execution(format!(
             "{rendered}\n\nCommand exited with {}",
-            exit_description(&output)
+            exit_description(output)
         )))
     }
 }
@@ -106,18 +107,18 @@ async fn wait_for_child(
         status = wait => status.map_err(|error| {
             ToolError::Execution(format!("failed to execute bash: {error}"))
         }),
-        _ = tokio::time::sleep(timeout) => {
+        () = tokio::time::sleep(timeout) => {
             child.terminate().await;
             Err(ToolError::Timeout(timeout))
         }
-        _ = cancellation.cancelled() => {
+        () = cancellation.cancelled() => {
             child.terminate().await;
             Err(ToolError::Cancelled)
         }
     }
 }
 
-fn exit_description(status: &std::process::ExitStatus) -> String {
+fn exit_description(status: std::process::ExitStatus) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -172,7 +173,7 @@ impl ManagedChild {
         let _ = self.child.start_kill();
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         #[cfg(unix)]
         {
             self.process_group = None;
@@ -267,29 +268,31 @@ fn render_output(mut output: tempfile::NamedTempFile) -> Result<String, ToolErro
         .map_err(|error| ToolError::Execution(format!("cannot keep output file: {error}")))?;
 
     if let Some(line_length) = oversized_line {
-        rendered.push_str(&format!(
+        let _ = write!(
+            rendered,
             "\n\n[Showing the last {} of an oversized line of {}. Full output: {}]",
             truncate::format_size(rendered.len()),
             truncate::format_size(line_length),
             path.display()
-        ));
+        );
         return Ok(rendered);
     }
 
     let shown_lines = line_count(rendered.as_bytes());
     let first_line = total_lines.saturating_sub(shown_lines).saturating_add(1);
     let reason = match limited_by {
-        Some(LimitKind::Lines) => format!("{} line limit", DEFAULT_MAX_LINES),
+        Some(LimitKind::Lines) => format!("{DEFAULT_MAX_LINES} line limit"),
         Some(LimitKind::Bytes) | None => {
             format!("{} limit", truncate::format_size(DEFAULT_MAX_BYTES))
         }
     };
-    rendered.push_str(&format!(
+    let _ = write!(
+        rendered,
         "\n\n[Showing lines {first_line}-{} of {} ({reason}). Full output: {}]",
         total_lines,
         total_lines,
         path.display()
-    ));
+    );
     Ok(rendered)
 }
 
@@ -299,7 +302,7 @@ fn read_entire_output(output: &mut tempfile::NamedTempFile) -> Result<String, To
         .as_file_mut()
         .seek(SeekFrom::Start(0))
         .map_err(output_error)?;
-    let mut bytes = Vec::with_capacity(length as usize);
+    let mut bytes = Vec::with_capacity(output_length_usize(length)?);
     output
         .as_file_mut()
         .read_to_end(&mut bytes)
@@ -319,7 +322,7 @@ fn render_tail_window(
         .as_file_mut()
         .seek(SeekFrom::Start(start))
         .map_err(output_error)?;
-    let mut bytes = Vec::with_capacity((length - start) as usize);
+    let mut bytes = Vec::with_capacity(output_length_usize(length - start)?);
     output
         .as_file_mut()
         .read_to_end(&mut bytes)
@@ -352,7 +355,7 @@ fn oversized_line_length(
 ) -> Result<usize, ToolError> {
     let line_start = previous_newline_offset(output, start)?;
     let line_end = next_newline_offset(output, start, file_length)?;
-    Ok((line_end - line_start) as usize)
+    output_length_usize(line_end - line_start)
 }
 
 /// Offset just after the last newline strictly before `offset` (or 0).
@@ -364,6 +367,8 @@ fn previous_newline_offset(
     let mut buffer = [0_u8; 8 * 1024];
     loop {
         let window_start = position.saturating_sub(buffer.len() as u64);
+        // The window is at most `buffer.len()` bytes, so this cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
         let window_len = (position - window_start) as usize;
         if window_len == 0 {
             return Ok(0);
@@ -413,6 +418,9 @@ fn next_newline_offset(
     }
 }
 
+// Counting newlines via `filter` is fine for command output sizes; adding a
+// `memchr`/`bytecount` dependency is not worth it here.
+#[allow(clippy::naive_bytecount)]
 fn count_lines(file: &mut std::fs::File) -> Result<usize, ToolError> {
     file.seek(SeekFrom::Start(0)).map_err(output_error)?;
     let mut buffer = [0_u8; 8 * 1024];
@@ -423,6 +431,8 @@ fn count_lines(file: &mut std::fs::File) -> Result<usize, ToolError> {
         if count == 0 {
             break;
         }
+        // Counting newlines via `filter` is fine for command output sizes;
+        // adding a `memchr`/`bytecount` dependency is not worth it here.
         newlines += buffer[..count]
             .iter()
             .filter(|byte| **byte == b'\n')
@@ -432,6 +442,9 @@ fn count_lines(file: &mut std::fs::File) -> Result<usize, ToolError> {
     Ok(newlines + usize::from(last.is_some_and(|byte| byte != b'\n')))
 }
 
+// Counting newlines via `filter` is fine for command output sizes; adding a
+// `memchr`/`bytecount` dependency is not worth it here.
+#[allow(clippy::naive_bytecount)]
 fn line_count(content: &[u8]) -> usize {
     if content.is_empty() {
         return 0;
@@ -440,8 +453,19 @@ fn line_count(content: &[u8]) -> usize {
         + usize::from(content.last() != Some(&b'\n'))
 }
 
+// Takes the error by value so it can be passed directly to `map_err`.
+#[allow(clippy::needless_pass_by_value)]
 fn output_error(error: std::io::Error) -> ToolError {
     ToolError::Execution(format!("cannot process command output: {error}"))
+}
+
+/// Convert a file-derived `u64` length to `usize`. Files too large to address
+/// on a 32-bit target cannot be read into memory anyway, so reject them
+/// explicitly instead of silently truncating.
+fn output_length_usize(length: u64) -> Result<usize, ToolError> {
+    usize::try_from(length).map_err(|_| {
+        ToolError::Execution("command output is too large for this platform".to_string())
+    })
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -35,7 +36,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
                         &root,
                         args.path.as_deref().unwrap_or("."),
                         &args.pattern,
-                        cancellation,
+                        &cancellation,
                         deadline,
                     )
                 })
@@ -49,10 +50,10 @@ fn find_files(
     root: &Path,
     requested: &str,
     pattern: &str,
-    cancellation: CancellationToken,
+    cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<String, ToolError> {
-    crate::path::ensure_running(&cancellation, deadline)?;
+    crate::path::ensure_running(cancellation, deadline)?;
     if pattern.is_empty() {
         return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
@@ -75,7 +76,7 @@ fn find_files(
 
     let mut files = Vec::new();
     for entry in builder.build() {
-        crate::path::ensure_running(&cancellation, deadline)?;
+        crate::path::ensure_running(cancellation, deadline)?;
         let entry =
             entry.map_err(|error| ToolError::Execution(format!("cannot search files: {error}")))?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -96,7 +97,7 @@ fn find_files(
     files.sort();
     let truncated = files.len() > MAX_RESULTS;
     files.truncate(MAX_RESULTS);
-    crate::path::ensure_running(&cancellation, deadline)?;
+    crate::path::ensure_running(cancellation, deadline)?;
 
     if files.is_empty() {
         return Ok("No files found".into());
@@ -107,9 +108,10 @@ fn find_files(
         .collect::<Vec<_>>()
         .join("\n");
     if truncated {
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "\n\n[Results truncated at {MAX_RESULTS} files. Use a narrower path or pattern.]"
-        ));
+        );
     }
     Ok(output)
 }
@@ -132,8 +134,8 @@ mod tests {
             root.path(),
             ".",
             "*.rs",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -151,8 +153,8 @@ mod tests {
             root.path(),
             "file.rs",
             "*.rs",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .is_err());
     }
@@ -168,13 +170,18 @@ mod tests {
             root.path(),
             ".",
             "*.rs",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
         assert_eq!(
-            output.lines().filter(|line| line.ends_with(".rs")).count(),
+            output
+                .lines()
+                .filter(|line| std::path::Path::new(line)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
+                .count(),
             MAX_RESULTS
         );
         assert!(output.contains("Results truncated at 100 files"));
@@ -192,8 +199,8 @@ mod tests {
             root.path(),
             ".",
             "*.rs",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
 
@@ -211,8 +218,8 @@ mod tests {
             root.path(),
             ".",
             "*.rs",
-            cancellation,
-            Instant::now() + Duration::from_secs(60),
+            &cancellation,
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap_err();
 

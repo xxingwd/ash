@@ -70,7 +70,7 @@ mod tests {
             "src/new.rs",
             "first",
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -79,7 +79,7 @@ mod tests {
             "src/new.rs",
             "second",
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -111,7 +111,7 @@ mod tests {
             "existing.txt",
             "changed",
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -136,7 +136,7 @@ mod tests {
             "link.txt",
             "changed",
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .is_err());
@@ -154,7 +154,7 @@ mod tests {
             "new.txt",
             "content",
             cancellation,
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap_err();

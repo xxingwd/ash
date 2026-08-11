@@ -13,28 +13,28 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 const IO_BUFFER_BYTES: usize = 8 * 1024;
 
-pub(crate) struct WorkspacePath {
+pub struct WorkspacePath {
     dir: Dir,
     relative: PathBuf,
     full_path: PathBuf,
 }
 
-pub(crate) struct SearchPath {
+pub struct SearchPath {
     dir: Dir,
     workspace: PathBuf,
     full_path: PathBuf,
 }
 
-pub(crate) fn file_walker(root: &Path) -> WalkBuilder {
+pub fn file_walker(root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .follow_links(false)
         .require_git(false)
-        .sort_by_file_path(|left, right| left.cmp(right));
+        .sort_by_file_path(std::cmp::Ord::cmp);
     builder
 }
 
-pub(crate) fn ensure_running(
+pub fn ensure_running(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<(), ToolError> {
@@ -47,7 +47,7 @@ pub(crate) fn ensure_running(
     Ok(())
 }
 
-pub(crate) fn read_all(
+pub fn read_all(
     reader: &mut impl Read,
     path: &Path,
     cancellation: &CancellationToken,
@@ -206,7 +206,7 @@ impl WorkspacePath {
         let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
         self.dir
             .create_dir_all(parent)
-            .map_err(|error| self.write_error(error))?;
+            .map_err(|error| self.write_error(&error))?;
         ensure_running(cancellation, deadline)?;
 
         let permissions = self.prepare_permissions(permissions)?;
@@ -227,7 +227,7 @@ impl WorkspacePath {
             let file = match self.dir.open_with(&temp, &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(self.write_error(error)),
+                Err(error) => return Err(self.write_error(&error)),
             };
             let result = self.commit_temp_file(
                 file,
@@ -269,7 +269,7 @@ impl WorkspacePath {
             }
             Ok(metadata) => Ok(Some(metadata.permissions())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(self.write_error(error)),
+            Err(error) => Err(self.write_error(&error)),
         }
     }
 
@@ -287,19 +287,19 @@ impl WorkspacePath {
     ) -> Result<(), ToolError> {
         if let Some(permissions) = permissions {
             file.set_permissions(permissions.clone())
-                .map_err(|error| self.write_error(error))?;
+                .map_err(|error| self.write_error(&error))?;
         }
         write_all(&mut file, content, &self.full_path, cancellation, deadline)?;
         ensure_running(cancellation, deadline)?;
-        file.sync_all().map_err(|error| self.write_error(error))?;
+        file.sync_all().map_err(|error| self.write_error(&error))?;
         drop(file);
         ensure_running(cancellation, deadline)?;
         self.dir
             .rename(temp, &self.dir, &self.relative)
-            .map_err(|error| self.write_error(error))
+            .map_err(|error| self.write_error(&error))
     }
 
-    fn write_error(&self, error: std::io::Error) -> ToolError {
+    fn write_error(&self, error: &std::io::Error) -> ToolError {
         ToolError::Execution(format!(
             "cannot write {}: {error}",
             self.full_path.display()
@@ -307,7 +307,7 @@ impl WorkspacePath {
     }
 }
 
-pub(crate) async fn run_blocking<T>(
+pub async fn run_blocking<T>(
     operation: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
 ) -> Result<T, ToolError>
 where
@@ -318,7 +318,7 @@ where
         .map_err(|error| ToolError::Execution(format!("filesystem task failed: {error}")))?
 }
 
-pub(crate) async fn run_tool_blocking<T>(
+pub async fn run_tool_blocking<T>(
     cancellation: CancellationToken,
     deadline: Instant,
     operation: impl FnOnce(CancellationToken, Instant) -> Result<T, ToolError> + Send + 'static,
@@ -417,7 +417,7 @@ mod tests {
         cancellation.cancel();
 
         assert!(matches!(
-            ensure_running(&cancellation, Instant::now() + Duration::from_secs(60)),
+            ensure_running(&cancellation, Instant::now() + Duration::from_mins(1)),
             Err(ToolError::Cancelled)
         ));
     }
@@ -442,7 +442,7 @@ mod tests {
             &mut reader,
             Path::new("file"),
             &cancellation,
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap_err();
 
@@ -462,7 +462,7 @@ mod tests {
             &vec![b'x'; IO_BUFFER_BYTES + 1],
             Path::new("file"),
             &cancellation,
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .unwrap_err();
 

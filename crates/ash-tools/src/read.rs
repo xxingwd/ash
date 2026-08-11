@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -49,7 +50,7 @@ impl TextReadState {
         }
     }
 
-    fn accepts_current_line(&self) -> bool {
+    const fn accepts_current_line(&self) -> bool {
         self.line >= self.offset && self.line < self.end && self.limited_by.is_none()
     }
 
@@ -188,7 +189,7 @@ fn render_text(
         offset,
         limit,
         &CancellationToken::new(),
-        Instant::now() + std::time::Duration::from_secs(60),
+        Instant::now() + std::time::Duration::from_mins(1),
     )
 }
 
@@ -243,8 +244,7 @@ fn render_reader(
     let total_lines = state.line;
     if offset > total_lines {
         return Err(ToolError::Execution(format!(
-            "offset {offset} is beyond end of file ({} lines total)",
-            total_lines
+            "offset {offset} is beyond end of file ({total_lines} lines total)"
         )));
     }
     if state.limited_by.is_none()
@@ -265,19 +265,20 @@ fn render_reader(
     if let Some(limited_by) = state.limited_by {
         let next_offset = last_line + 1;
         let reason = match limited_by {
-            LimitKind::Lines => format!("{} line limit", DEFAULT_MAX_LINES),
+            LimitKind::Lines => format!("{DEFAULT_MAX_LINES} line limit"),
             LimitKind::Bytes => format!("{} limit", truncate::format_size(DEFAULT_MAX_BYTES)),
         };
-        output.push_str(&format!(
-            "\n\n[Showing lines {offset}-{last_line} of {} ({reason}). Use offset={next_offset} to continue.]",
-            total_lines
-        ));
+        let _ = write!(
+            output,
+            "\n\n[Showing lines {offset}-{last_line} of {total_lines} ({reason}). Use offset={next_offset} to continue.]"
+        );
     } else if last_line < total_lines {
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "\n\n[{} more lines in file. Use offset={} to continue.]",
             total_lines - last_line,
             last_line + 1
-        ));
+        );
     }
     Ok(output)
 }
@@ -348,7 +349,7 @@ mod tests {
             None,
             None,
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -376,7 +377,7 @@ mod tests {
             None,
             None,
             cancellation,
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap_err();

@@ -227,7 +227,7 @@ mod tests {
             "input.txt",
             vec![replacement("one\ntwo", "three")],
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -253,7 +253,7 @@ mod tests {
             "script.sh",
             vec![replacement("old", "new")],
             CancellationToken::new(),
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap();
@@ -276,7 +276,7 @@ mod tests {
             "input.txt",
             vec![replacement("old", "new")],
             cancellation,
-            Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_mins(1),
         )
         .await
         .unwrap_err();
