@@ -76,3 +76,30 @@ impl<T> PickerState<T> {
         self.selected = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_items_clamps_the_existing_selection() {
+        let mut picker = PickerState::with_items(vec!["first", "second", "third"]);
+        picker.set_selected(2);
+
+        picker.replace_items(vec!["first", "second"]);
+
+        assert_eq!(picker.selected_index(), 1);
+        assert_eq!(picker.items()[picker.selected_index()], "second");
+    }
+
+    #[test]
+    fn replacing_items_with_an_empty_list_resets_the_selection() {
+        let mut picker = PickerState::with_items(vec!["first", "second"]);
+        picker.set_selected(1);
+
+        picker.replace_items(Vec::new());
+
+        assert_eq!(picker.selected_index(), 0);
+        assert!(!picker.is_visible());
+    }
+}

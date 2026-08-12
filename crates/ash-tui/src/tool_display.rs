@@ -45,15 +45,8 @@ impl ToolKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChangePreviewSource {
-    EditOutput,
-    WriteContent,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolRenderer {
     Bash,
-    ChangePreview(ChangePreviewSource),
     Generic { show_output: bool },
 }
 
@@ -61,8 +54,6 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
     let kind = ToolKind::from_name(name);
     match (kind, is_error) {
         (ToolKind::Bash, _) => ToolRenderer::Bash,
-        (ToolKind::Edit, false) => ToolRenderer::ChangePreview(ChangePreviewSource::EditOutput),
-        (ToolKind::Write, false) => ToolRenderer::ChangePreview(ChangePreviewSource::WriteContent),
         (ToolKind::Read | ToolKind::Edit | ToolKind::Write, _) => {
             ToolRenderer::Generic { show_output: false }
         }
@@ -373,7 +364,11 @@ mod tests {
         assert_eq!(tool_renderer("bash", false), ToolRenderer::Bash);
         assert_eq!(
             tool_renderer("edit", false),
-            ToolRenderer::ChangePreview(ChangePreviewSource::EditOutput)
+            ToolRenderer::Generic { show_output: false }
+        );
+        assert_eq!(
+            tool_renderer("write", false),
+            ToolRenderer::Generic { show_output: false }
         );
         assert_eq!(
             tool_renderer("read", true),

@@ -85,6 +85,7 @@ htmd = "0.5.5"
 cap-std = "4.0.2"
 ignore = "0.4.31"
 regex = "1.13.1"
+similar = "2.7.0"
 
 # MCP
 rmcp = { version = "3.0.1", features = ["client", "transport-io", "transport-child-process"] }

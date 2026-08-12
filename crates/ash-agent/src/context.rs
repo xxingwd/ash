@@ -492,6 +492,7 @@ mod tests {
                 id,
                 result: Ok(output),
                 attachments,
+                file_change: None,
             },
         }
     }

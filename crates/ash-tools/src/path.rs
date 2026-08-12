@@ -188,6 +188,10 @@ impl WorkspacePath {
         &self.full_path
     }
 
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative
+    }
+
     pub(crate) fn open_with(
         &self,
         options: &cap_std::fs::OpenOptions,

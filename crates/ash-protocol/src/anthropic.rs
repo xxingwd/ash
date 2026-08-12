@@ -88,6 +88,7 @@ impl AnthropicAdapter {
                     id,
                     result,
                     attachments,
+                    ..
                 } => {
                     let (text, is_error) = match result {
                         Ok(output) => (output, false),
@@ -475,6 +476,7 @@ mod tests {
                         media_type: "image/png".into(),
                         data: vec![1, 2, 3],
                     }],
+                    file_change: None,
                 },
             }],
             tools: Vec::new(),

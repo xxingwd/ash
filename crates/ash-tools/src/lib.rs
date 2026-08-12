@@ -1,4 +1,5 @@
 mod bash;
+mod change;
 mod edit;
 mod glob;
 mod grep;

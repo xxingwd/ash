@@ -46,6 +46,7 @@ fn serializes_tool_result_message_with_the_stable_contract() {
             id: ToolCallId::new(),
             result: Ok("file1.txt\nfile2.txt".to_string()),
             attachments: Vec::new(),
+            file_change: None,
         },
     };
     assert_json_snapshot!("tool_result_message", msg, {
@@ -63,6 +64,7 @@ fn serializes_tool_result_error_with_the_stable_contract() {
             id: ToolCallId::new(),
             result: Err("command not found".to_string()),
             attachments: Vec::new(),
+            file_change: None,
         },
     };
     assert_json_snapshot!("tool_result_error", msg, {

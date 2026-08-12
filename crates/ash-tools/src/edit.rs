@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use ash_core::{define_tool, CancellationToken, Tool, ToolError};
+use ash_core::{define_tool, CancellationToken, FileChange, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -25,6 +25,12 @@ struct EditArgs {
     edits: Vec<Replacement>,
 }
 
+#[derive(Debug)]
+struct EditResult {
+    path: PathBuf,
+    change: FileChange,
+}
+
 pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "edit",
@@ -35,13 +41,14 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
             let deadline = ctx.deadline;
             async move {
                 let count = args.edits.len();
-                let path =
+                let result =
                     edit_file(&working_dir, &args.path, args.edits, cancellation, deadline).await?;
-                Ok(format!(
+                let text = format!(
                     "Successfully replaced {} block(s) in {}.",
                     count,
-                    path.display()
-                ))
+                    result.path.display()
+                );
+                Ok(ToolOutput::with_file_change(text, result.change))
             }
         },
     )
@@ -53,7 +60,7 @@ async fn edit_file(
     edits: Vec<Replacement>,
     cancellation: CancellationToken,
     deadline: Instant,
-) -> Result<std::path::PathBuf, ToolError> {
+) -> Result<EditResult, ToolError> {
     let root = root.to_path_buf();
     let requested = requested.to_string();
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
@@ -79,16 +86,16 @@ async fn edit_file(
             })?
             .permissions();
         let raw = crate::path::read_all(&mut file, path.full_path(), &cancellation, deadline)?;
-        let raw = String::from_utf8(raw).map_err(|error| {
+        let original = String::from_utf8(raw).map_err(|error| {
             ToolError::Execution(format!(
                 "cannot read {}: {}",
                 path.full_path().display(),
                 error.utf8_error()
             ))
         })?;
-        let (bom, content) = raw
+        let (bom, content) = original
             .strip_prefix('\u{feff}')
-            .map_or(("", raw.as_str()), |content| ("\u{feff}", content));
+            .map_or(("", original.as_str()), |content| ("\u{feff}", content));
         let line_ending = if content.contains("\r\n") {
             "\r\n"
         } else {
@@ -110,14 +117,23 @@ async fn edit_file(
         };
         let content = format!("{bom}{edited}");
 
+        let Some(change) =
+            crate::change::updated(path.relative_path().to_path_buf(), &original, &content)
+        else {
+            return Err(ToolError::Execution(
+                "edits did not change the resulting file".to_string(),
+            ));
+        };
         path.atomic_write(
             content.as_bytes(),
             Some(permissions),
             &cancellation,
             deadline,
         )?;
-
-        Ok(path.full_path().to_path_buf())
+        Ok(EditResult {
+            path: path.full_path().to_path_buf(),
+            change,
+        })
     })
     .await
 }
@@ -222,7 +238,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("input.txt"), "one\r\ntwo\r\n").unwrap();
 
-        edit_file(
+        let result = edit_file(
             root.path(),
             "input.txt",
             vec![replacement("one\ntwo", "three")],
@@ -232,10 +248,42 @@ mod tests {
         .await
         .unwrap();
 
+        let FileChange::Update { path, unified_diff } = result.change else {
+            panic!("edit must report an update");
+        };
+        assert_eq!(path, Path::new("input.txt"));
+        assert!(unified_diff.contains("-one\r"));
+        assert!(unified_diff.contains("+three\r"));
         assert_eq!(
             std::fs::read_to_string(root.path().join("input.txt")).unwrap(),
             "three\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn large_edits_report_the_complete_change() {
+        let root = tempfile::tempdir().unwrap();
+        let content = format!("needle\n{}", "x".repeat(64 * 1024));
+        std::fs::write(root.path().join("large.txt"), content).unwrap();
+
+        let result = edit_file(
+            root.path(),
+            "large.txt",
+            vec![replacement("needle", "changed")],
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        let FileChange::Update { unified_diff, .. } = result.change else {
+            panic!("edit must report an update");
+        };
+        assert!(unified_diff.contains("-needle"));
+        assert!(unified_diff.contains("+changed"));
+        assert!(std::fs::read_to_string(root.path().join("large.txt"))
+            .unwrap()
+            .starts_with("changed\n"));
     }
 
     #[cfg(unix)]

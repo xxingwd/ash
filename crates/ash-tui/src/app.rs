@@ -337,9 +337,10 @@ async fn handle_agent_event(
             arguments,
             output,
             is_error,
+            file_change,
             ..
         }) => {
-            terminal.tool_end(&name, &arguments, &output, is_error)?;
+            terminal.tool_end(&name, &arguments, &output, is_error, file_change)?;
             Ok(LoopAction::Continue)
         }
         EventKind::Error(error) => {

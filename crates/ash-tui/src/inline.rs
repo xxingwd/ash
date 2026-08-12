@@ -6,7 +6,7 @@ use std::{
 };
 
 use ash_core::{
-    Content, ContentBlock, ForkPoint, Message, MessageContent, MessageId, StopReason,
+    Content, ContentBlock, FileChange, ForkPoint, Message, MessageContent, MessageId, StopReason,
     SubagentSnapshot, ThreadSummary, ThreadView, ToolCallId, TurnResult, TurnView, Usage,
 };
 use crossterm::terminal;
@@ -514,12 +514,14 @@ impl TerminalUi {
         arguments: &Value,
         output: &str,
         is_error: bool,
+        file_change: Option<FileChange>,
     ) -> io::Result<()> {
         self.push_tool_block(
             name.to_string(),
             arguments.clone(),
             output.to_string(),
             is_error,
+            file_change,
         );
         self.redraw()
     }
@@ -858,7 +860,14 @@ impl TerminalUi {
         self.push_block(LiveBlock::thought(id, source, elapsed_seconds));
     }
 
-    fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
+    fn push_tool_block(
+        &mut self,
+        name: String,
+        arguments: Value,
+        output: String,
+        is_error: bool,
+        file_change: Option<FileChange>,
+    ) {
         if self
             .transcript
             .last_mut()
@@ -867,7 +876,14 @@ impl TerminalUi {
             return;
         }
         let id = self.allocate_block_id();
-        self.push_block(LiveBlock::tool(id, name, arguments, output, is_error));
+        self.push_block(LiveBlock::tool(
+            id,
+            name,
+            arguments,
+            output,
+            is_error,
+            file_change,
+        ));
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
@@ -930,7 +946,7 @@ impl TerminalUi {
     fn push_turn_message(
         &mut self,
         message: &Message,
-        tool_results: &HashMap<ToolCallId, (bool, &str)>,
+        tool_results: &HashMap<ToolCallId, ToolResultView<'_>>,
         render_user: bool,
     ) {
         match &message.content {
@@ -955,7 +971,7 @@ impl TerminalUi {
     fn push_assistant_blocks(
         &mut self,
         blocks: &[ContentBlock],
-        tool_results: &HashMap<ToolCallId, (bool, &str)>,
+        tool_results: &HashMap<ToolCallId, ToolResultView<'_>>,
     ) {
         for block in blocks {
             match block {
@@ -973,15 +989,17 @@ impl TerminalUi {
                     name,
                     arguments,
                 } => {
-                    let (is_error, output) = tool_results
-                        .get(id)
-                        .copied()
-                        .unwrap_or((true, "tool result unavailable"));
+                    let result = tool_results.get(id).copied().unwrap_or(ToolResultView {
+                        is_error: true,
+                        output: "tool result unavailable",
+                        file_change: None,
+                    });
                     self.push_tool_block(
                         name.clone(),
                         arguments.clone(),
-                        output.to_string(),
-                        is_error,
+                        result.output.to_string(),
+                        result.is_error,
+                        result.file_change.cloned(),
                     );
                 }
                 ContentBlock::Text(_) | ContentBlock::Thought { .. } => {}
@@ -1103,15 +1121,35 @@ fn composer_text_width(terminal_width: u16) -> u16 {
         .max(1)
 }
 
-fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, (bool, &str)> {
+#[derive(Clone, Copy)]
+struct ToolResultView<'a> {
+    is_error: bool,
+    output: &'a str,
+    file_change: Option<&'a FileChange>,
+}
+
+fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, ToolResultView<'_>> {
     let mut results = HashMap::new();
     for message in messages {
-        if let MessageContent::ToolResult { id, result, .. } = &message.content {
+        if let MessageContent::ToolResult {
+            id,
+            result,
+            file_change,
+            ..
+        } = &message.content
+        {
             let (is_error, output) = match result {
                 Ok(output) => (false, output.as_str()),
                 Err(error) => (true, error.as_str()),
             };
-            results.insert(id.clone(), (is_error, output));
+            results.insert(
+                id.clone(),
+                ToolResultView {
+                    is_error,
+                    output,
+                    file_change: file_change.as_ref(),
+                },
+            );
         }
     }
     results
@@ -1331,6 +1369,34 @@ mod tests {
         assert_eq!(
             restored_turn_footer(&TurnResult::Interrupted("session closed".into())),
             Some(HistoryBlock::error("session closed"))
+        );
+    }
+
+    #[test]
+    fn durable_tool_results_retain_file_changes_for_replay() {
+        let id = ToolCallId::from_provider("call-1");
+        let messages = [Message {
+            id: MessageId::new(),
+            role: ash_core::Role::User,
+            content: MessageContent::ToolResult {
+                id: id.clone(),
+                result: Ok("updated".to_string()),
+                attachments: Vec::new(),
+                file_change: Some(FileChange::Update {
+                    path: PathBuf::from("src/main.rs"),
+                    unified_diff: "-old\n+new\n".to_string(),
+                }),
+            },
+        }];
+
+        let results = tool_results_map(&messages);
+        let result = results.get(&id).expect("tool result");
+
+        assert!(!result.is_error);
+        assert_eq!(result.output, "updated");
+        assert_eq!(
+            result.file_change.map(FileChange::path),
+            Some(Path::new("src/main.rs"))
         );
     }
 }

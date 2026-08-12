@@ -499,14 +499,18 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 self.execute_tool(messages, &call.name, call.arguments.clone())
                     .await,
             );
-            let (output, is_error, result, attachments) = match result {
+            let (output, is_error, result, attachments, file_change) = match result {
                 Ok(output) => {
-                    let text = output.text;
-                    (text.clone(), false, Ok(text), output.attachments)
+                    let ToolOutput {
+                        text,
+                        attachments,
+                        file_change,
+                    } = output;
+                    (text.clone(), false, Ok(text), attachments, file_change)
                 }
                 Err(error) => {
                     let text = error.to_string();
-                    (text.clone(), true, Err(text), Vec::new())
+                    (text.clone(), true, Err(text), Vec::new(), None)
                 }
             };
             send_live(
@@ -517,6 +521,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     arguments: call.arguments,
                     output,
                     is_error,
+                    file_change: file_change.clone(),
                 }),
             )
             .await;
@@ -527,6 +532,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     id: call.id,
                     result,
                     attachments,
+                    file_change,
                 },
             };
             self.persist_message(&message)?;
@@ -888,8 +894,8 @@ mod tests {
     };
 
     use ash_core::{
-        Content, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool, ToolCallId,
-        ToolContext, ToolError,
+        Content, FileChange, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool,
+        ToolCallId, ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
@@ -1434,6 +1440,7 @@ mod tests {
                     id: call,
                     result: Ok("x".repeat(64_000)),
                     attachments: Vec::new(),
+                    file_change: None,
                 },
             });
             messages.push(Message::assistant_text(&format!("answer {turn}")));
@@ -2231,6 +2238,21 @@ mod tests {
         assert!(truncated.len() <= MAX_AGENT_OUTPUT_BYTES);
         assert!(truncated.contains("tool output truncated"));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn preserves_file_changes_while_limiting_tool_text() {
+        let change = FileChange::Add {
+            path: PathBuf::from("large.txt"),
+            content: "x".repeat(MAX_AGENT_OUTPUT_BYTES + 1),
+        };
+        let output =
+            ToolOutput::with_file_change("x".repeat(MAX_AGENT_OUTPUT_BYTES + 1), change.clone());
+
+        let limited = limit_tool_result(Ok(output)).unwrap();
+
+        assert!(limited.text.contains("tool output truncated"));
+        assert_eq!(limited.file_change, Some(change));
     }
 
     #[test]

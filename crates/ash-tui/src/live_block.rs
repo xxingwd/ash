@@ -9,19 +9,20 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
+use ash_core::FileChange;
+
 use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
-    scrollback::{sanitize_terminal_text, wrap_text},
+    scrollback::{sanitize_single_line, sanitize_terminal_text, wrap_text},
     tool_display::{
-        read_group_detail, read_group_summary, tool_call_summary, tool_renderer,
-        ChangePreviewSource, ToolRenderer,
+        read_group_detail, read_group_summary, tool_call_summary, tool_renderer, ToolRenderer,
     },
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
-const CHANGE_PREVIEW_MAX_LINES: usize = 12;
+const COLLAPSED_CHANGE_MAX_LINES: usize = 12;
 
 /// A complete transcript entry retained by Ash and re-rendered after updates.
 #[derive(Clone, Debug)]
@@ -59,6 +60,7 @@ enum LiveBlockKind {
         arguments: Value,
         output: String,
         is_error: bool,
+        file_change: Option<FileChange>,
     },
 }
 
@@ -97,6 +99,7 @@ impl LiveBlock {
         arguments: Value,
         output: String,
         is_error: bool,
+        file_change: Option<FileChange>,
     ) -> Self {
         if !is_error {
             if let Some(detail) = read_group_detail(&name, &arguments) {
@@ -110,6 +113,7 @@ impl LiveBlock {
                 arguments,
                 output,
                 is_error,
+                file_change,
             },
         )
     }
@@ -302,7 +306,16 @@ impl LiveBlock {
                 arguments,
                 output,
                 is_error,
-            } => render_tool(name, arguments, output, *is_error, width, expanded),
+                file_change,
+            } => render_tool(
+                name,
+                arguments,
+                output,
+                *is_error,
+                file_change.as_ref(),
+                width,
+                expanded,
+            ),
         }
     }
 
@@ -535,18 +548,18 @@ fn render_tool(
     arguments: &Value,
     output: &str,
     is_error: bool,
+    file_change: Option<&FileChange>,
     width: u16,
     expanded: bool,
 ) -> Buffer {
+    if !is_error {
+        if let Some(file_change) = file_change {
+            return render_file_change(file_change, width, expanded);
+        }
+    }
     let show_output = match tool_renderer(name, is_error) {
         ToolRenderer::Bash => {
             return render_bash_tool(name, arguments, output, is_error, width, expanded);
-        }
-        ToolRenderer::ChangePreview(source) => {
-            if let Some(preview) = change_preview(source, arguments, output) {
-                return render_change_preview(name, arguments, &preview, width);
-            }
-            false
         }
         ToolRenderer::Generic { show_output } => show_output,
     };
@@ -561,16 +574,6 @@ fn render_tool(
         rows.push(render_tool_output(output, width, expanded));
     }
     stack_rows(&rows, width)
-}
-
-fn change_preview(source: ChangePreviewSource, arguments: &Value, output: &str) -> Option<String> {
-    match source {
-        ChangePreviewSource::EditOutput => (!output.is_empty()).then(|| output.to_string()),
-        ChangePreviewSource::WriteContent => arguments
-            .get("content")
-            .and_then(Value::as_str)
-            .map(write_preview),
-    }
 }
 
 /// Render a bash tool call: the highlighted command (the "input") inline on
@@ -789,50 +792,31 @@ fn render_tool_title(action: String, detail: String, is_error: bool, width: u16)
     buffer
 }
 
-/// Prefix each line of a write-preview body with "+" so added content reads
-/// as a diff-style insertion when shown inside the tool block.
-fn write_preview(content: &str) -> String {
-    sanitize_terminal_text(content)
-        .lines()
-        .map(|line| format!("+{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_change_preview(name: &str, arguments: &Value, preview: &str, width: u16) -> Buffer {
-    let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let (action, detail) = tool_call_summary(name, arguments, false, detail_width);
-    let sanitized = sanitize_terminal_text(preview);
-    let source_lines = sanitized
-        .lines()
-        .filter(|line| !matches!(*line, "--- before" | "+++ after"))
-        .collect::<Vec<_>>();
-    let shown = source_lines.len().min(CHANGE_PREVIEW_MAX_LINES);
-    let content_x = if width > BULLET_PREFIX_COLUMNS {
-        BULLET_PREFIX_COLUMNS
-    } else {
-        0
-    };
-    let content_width = width.saturating_sub(content_x).max(1);
-    let mut rendered = Vec::new();
-    for line in source_lines.iter().take(shown) {
-        let style = change_line_style(line);
-        for row in wrap_text(line, content_width) {
-            rendered.push((row, style));
+fn render_file_change(change: &FileChange, width: u16, expanded: bool) -> Buffer {
+    let (action, path, added, removed, lines) = match change {
+        FileChange::Add { path, content } => {
+            let lines = sanitize_terminal_text(content)
+                .lines()
+                .map(|line| format!("+{line}"))
+                .collect::<Vec<_>>();
+            ("Added", path, lines.len(), 0, lines)
         }
-    }
-    if shown < source_lines.len() {
-        rendered.push((
-            format!("… {} more lines", source_lines.len() - shown),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-
-    let height = u16::try_from(rendered.len().saturating_add(1))
-        .unwrap_or(u16::MAX)
-        .max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
-    let mut title = vec![
+        FileChange::Update { path, unified_diff } => {
+            let lines = sanitize_terminal_text(unified_diff)
+                .lines()
+                .enumerate()
+                .filter(|(index, line)| {
+                    !(*index < 2 && matches!(*line, "--- before" | "+++ after"))
+                })
+                .map(|(_, line)| line)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let (added, removed) = changed_line_counts(&lines);
+            ("Edited", path, added, removed, lines)
+        }
+    };
+    let path = sanitize_single_line(&path.display().to_string());
+    let title = Line::from(vec![
         Span::styled(
             "•",
             Style::default()
@@ -841,19 +825,90 @@ fn render_change_preview(name: &str, arguments: &Value, preview: &str, width: u1
         ),
         Span::raw(" "),
         Span::styled(action, Style::default().add_modifier(Modifier::BOLD)),
-    ];
-    if !detail.is_empty() {
-        title.push(Span::raw(" "));
-        title.push(Span::raw(detail));
+        Span::raw(" "),
+        Span::raw(path),
+        Span::raw(" ("),
+        Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
+        Span::raw(")"),
+    ]);
+    render_change_block(title, lines, width, expanded)
+}
+
+fn changed_line_counts(lines: &[String]) -> (usize, usize) {
+    lines.iter().fold((0, 0), |(added, removed), line| {
+        if line.starts_with('+') {
+            (added + 1, removed)
+        } else if line.starts_with('-') {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
+}
+
+fn render_change_block(
+    title: Line<'static>,
+    lines: Vec<String>,
+    width: u16,
+    expanded: bool,
+) -> Buffer {
+    let title_rows = crate::ansi::wrap_highlighted_line(&title, usize::from(width.max(1)));
+    let lines = truncate_change_lines(lines, expanded);
+    let content_x = if width > BULLET_PREFIX_COLUMNS {
+        BULLET_PREFIX_COLUMNS
+    } else {
+        0
+    };
+    let content_width = width.saturating_sub(content_x).max(1);
+    let mut rendered = Vec::new();
+    for line in &lines {
+        let style = change_line_style(line);
+        for row in wrap_text(line, content_width) {
+            rendered.push((row, style));
+        }
     }
-    buffer.set_line(0, 0, &Line::from(title), width);
+
+    let height = u16::try_from(rendered.len().saturating_add(title_rows.len()))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
+    let title_height = title_rows.len();
+    for (index, row) in title_rows.into_iter().enumerate() {
+        let Ok(y) = u16::try_from(index) else {
+            break;
+        };
+        buffer.set_line(0, y, &row, width);
+    }
     for (index, (line, style)) in rendered.iter().enumerate() {
-        let Ok(y) = u16::try_from(index.saturating_add(1)) else {
+        let Ok(y) = u16::try_from(index.saturating_add(title_height)) else {
             break;
         };
         buffer.set_string(content_x, y, line, *style);
     }
     buffer
+}
+
+fn truncate_change_lines(mut lines: Vec<String>, expanded: bool) -> Vec<String> {
+    let limit = if expanded {
+        crate::ansi::EXPANDED_MAX_LINES
+    } else {
+        COLLAPSED_CHANGE_MAX_LINES
+    };
+    if lines.len() <= limit {
+        return lines;
+    }
+    let kept = limit.saturating_sub(1);
+    let head = kept / 2;
+    let tail = kept - head;
+    let omitted = lines.len() - kept;
+    crate::ansi::split_with_ellipsis(
+        std::mem::take(&mut lines),
+        head,
+        tail,
+        format!("… +{omitted} lines (truncated for display)"),
+    )
 }
 
 fn change_line_style(line: &str) -> Style {
@@ -1026,6 +1081,7 @@ mod tests {
             serde_json::json!({"path": "/workspace/src/inline.rs"}),
             String::new(),
             false,
+            None,
         );
 
         assert!(block.try_append_tool(
@@ -1060,6 +1116,7 @@ mod tests {
             serde_json::json!({"command": "cargo test"}),
             String::new(),
             false,
+            None,
         );
 
         assert!(!block.try_append_tool(
@@ -1081,6 +1138,7 @@ mod tests {
             serde_json::json!({"command": "seq 120"}),
             output,
             false,
+            None,
         );
         let rendered = block.render(40, false);
 
@@ -1105,6 +1163,7 @@ mod tests {
             serde_json::json!({"command": "seq 120"}),
             output,
             false,
+            None,
         );
         // Collapsed: 5 output lines (2 head + 1 ellipsis + 2 tail).
         assert_eq!(block.render(40, false).area.height, 6);
@@ -1126,6 +1185,7 @@ mod tests {
             serde_json::json!({"command": "ls --color"}),
             "\x1b[31mred.txt\x1b[0m\nplain".to_string(),
             false,
+            None,
         );
         let rendered = block.render(40, false);
         // Title row (command inline) + two output lines.
@@ -1151,6 +1211,7 @@ mod tests {
             serde_json::json!({"command": command}),
             "done".to_string(),
             false,
+            None,
         );
         let rendered = block.render(40, false);
         // Title (first line inline) + 2 head + 1 ellipsis + 2 tail continuations
@@ -1163,13 +1224,17 @@ mod tests {
     }
 
     #[test]
-    fn edit_and_write_render_different_change_previews() {
+    fn structured_file_changes_distinguish_adds_from_overwrites() {
         let edit = LiveBlock::tool(
             1,
-            "edit".to_string(),
+            "write".to_string(),
             serde_json::json!({"path": "/workspace/src/main.rs"}),
-            "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            "Wrote 4 bytes".to_string(),
             false,
+            Some(FileChange::Update {
+                path: PathBuf::from("src/main.rs"),
+                unified_diff: "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            }),
         )
         .render(60, false);
         let write = LiveBlock::tool(
@@ -1178,9 +1243,15 @@ mod tests {
             serde_json::json!({"path": "/workspace/src/new.rs", "content": "one\ntwo"}),
             String::new(),
             false,
+            Some(FileChange::Add {
+                path: PathBuf::from("src/new.rs"),
+                content: "one\ntwo".to_string(),
+            }),
         )
         .render(60, false);
 
+        assert_eq!(row_text(&edit, 0), "• Edited src/main.rs (+1 -1)");
+        assert_eq!(row_text(&write, 0), "• Added src/new.rs (+2 -0)");
         assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
         assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);
@@ -1191,9 +1262,80 @@ mod tests {
             serde_json::json!({"path": "new.rs", "content": "one"}),
             String::new(),
             false,
+            Some(FileChange::Add {
+                path: PathBuf::from("new.rs"),
+                content: "one".to_string(),
+            }),
         )
         .render(1, false);
         assert_eq!(tiny.area.width, 1);
+    }
+
+    #[test]
+    fn diff_content_that_resembles_headers_is_not_hidden() {
+        let block = LiveBlock::tool(
+            1,
+            "edit".to_string(),
+            serde_json::json!({"path": "markers.txt"}),
+            String::new(),
+            false,
+            Some(FileChange::Update {
+                path: PathBuf::from("markers.txt"),
+                unified_diff: "--- before\n+++ after\n@@ -1 +1 @@\n--- before\n+++ after\n"
+                    .to_string(),
+            }),
+        );
+
+        let rendered = block.render(60, false);
+
+        assert_eq!(row_text(&rendered, 0), "• Edited markers.txt (+1 -1)");
+        assert_eq!(row_text(&rendered, 2), "  --- before");
+        assert_eq!(row_text(&rendered, 3), "  +++ after");
+    }
+
+    #[test]
+    fn long_file_changes_keep_head_and_tail_and_expand() {
+        let content = (1..=30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = LiveBlock::tool(
+            1,
+            "write".to_string(),
+            serde_json::json!({"path": "long.txt"}),
+            String::new(),
+            false,
+            Some(FileChange::Add {
+                path: PathBuf::from("long.txt"),
+                content,
+            }),
+        );
+
+        let collapsed = block.render(80, false);
+        assert_eq!(collapsed.area.height, 13);
+        assert!(row_text(&collapsed, 6).contains("+19 lines"));
+        assert!(row_text(&collapsed, 12).contains("line 30"));
+
+        let expanded = block.render(80, true);
+        assert_eq!(expanded.area.height, 31);
+        assert!(row_text(&expanded, 30).contains("line 30"));
+    }
+
+    #[test]
+    fn writes_without_a_reported_change_do_not_invent_a_preview() {
+        let block = LiveBlock::tool(
+            1,
+            "write".to_string(),
+            serde_json::json!({"path": "same.txt", "content": "same\n"}),
+            "Wrote 5 bytes".to_string(),
+            false,
+            None,
+        );
+
+        let rendered = block.render(60, false);
+
+        assert_eq!(rendered.area.height, 1);
+        assert_eq!(row_text(&rendered, 0), "• Wrote same.txt");
     }
 
     #[test]
@@ -1276,6 +1418,7 @@ mod generic_output_tests {
             serde_json::json!({"command": "pwd"}),
             "/work/ash".to_string(),
             false,
+            None,
         )
         .with_turn(Some(7));
 
@@ -1292,6 +1435,7 @@ mod generic_output_tests {
             serde_json::json!({"pattern": pattern, "path": "src"}),
             "match".to_string(),
             false,
+            None,
         );
         // Non-bash titles are pre-truncated by fit_action_and_detail, so they
         // stay on one row (title + output).
@@ -1304,6 +1448,7 @@ mod generic_output_tests {
             serde_json::json!({"command": format!("cargo {}", "x".repeat(60))}),
             "ok".to_string(),
             false,
+            None,
         );
         assert!(bash_block.render(30, false).area.height > 2);
     }
@@ -1317,6 +1462,7 @@ mod generic_output_tests {
             serde_json::json!({"pattern": "[", "path": "src"}),
             "invalid regular expression".to_string(),
             true,
+            None,
         );
         let rendered = block.render(40, false);
         assert_eq!(rendered.area.height, 2);
@@ -1332,6 +1478,7 @@ mod generic_output_tests {
             serde_json::json!({"command": "false"}),
             "exit code 1".to_string(),
             true,
+            None,
         );
         let rendered = block.render(40, false);
         assert!(
@@ -1351,6 +1498,7 @@ mod generic_output_tests {
             serde_json::json!({"pattern": "let x", "path": "src"}),
             output.to_string(),
             false,
+            None,
         );
         let rendered = block.render(50, false);
         assert_eq!(rendered.area.height, 1 + 3);
@@ -1376,6 +1524,7 @@ mod toggle_tests {
             serde_json::json!({"command": "seq 30"}),
             output,
             false,
+            None,
         );
         // collapsed: 1 title + 5 output (2+1+2)
         assert_eq!(block.render(40, false).area.height, 6);

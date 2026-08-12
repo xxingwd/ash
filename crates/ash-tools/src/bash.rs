@@ -431,8 +431,6 @@ fn count_lines(file: &mut std::fs::File) -> Result<usize, ToolError> {
         if count == 0 {
             break;
         }
-        // Counting newlines via `filter` is fine for command output sizes;
-        // adding a `memchr`/`bytecount` dependency is not worth it here.
         newlines += buffer[..count]
             .iter()
             .filter(|byte| **byte == b'\n')

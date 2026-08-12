@@ -81,6 +81,28 @@ pub trait Decoder: Send + 'static {
     }
 }
 
+#[derive(Default)]
+struct StreamEventCounts {
+    frames: usize,
+    text_deltas: usize,
+    reasoning_deltas: usize,
+    tool_calls: usize,
+    usage_reports: usize,
+    stop_events: usize,
+}
+
+impl StreamEventCounts {
+    fn observe(&mut self, item: &ModelEvent) {
+        match item {
+            ModelEvent::Text(_) => self.text_deltas += 1,
+            ModelEvent::Reasoning(_) => self.reasoning_deltas += 1,
+            ModelEvent::ToolCall { .. } => self.tool_calls += 1,
+            ModelEvent::Usage(_) => self.usage_reports += 1,
+            ModelEvent::Stop(_) => self.stop_events += 1,
+        }
+    }
+}
+
 pub fn stream<D>(request: RequestBuilder, mut decoder: D) -> ModelStream
 where
     D: Decoder,
@@ -102,9 +124,12 @@ where
         // normal stop.
         let mut terminated = false;
         let mut saw_stop = false;
+        let mut wire_done = false;
+        let mut counts = StreamEventCounts::default();
         while let Some(event) = source.next().await {
             match event {
                 Ok(event) => {
+                    counts.frames += 1;
                     let result = decoder.decode(&event.data).map_err(|error| {
                         tracing::warn!(%error, data = %event.data, "sse decode failed");
                         error
@@ -120,9 +145,11 @@ where
                     for item in parts.items {
                         log_model_event(&item);
                         record_stop(&item, &mut saw_stop)?;
+                        counts.observe(&item);
                         yield item;
                     }
                     if parts.wire_done {
+                        wire_done = true;
                         break;
                     }
                 }
@@ -135,6 +162,7 @@ where
             tracing::debug!("sse stream terminated by provider marker");
             for item in decoder.finish()? {
                 record_stop(&item, &mut saw_stop)?;
+                counts.observe(&item);
                 yield item;
             }
             if !saw_stop {
@@ -146,8 +174,21 @@ where
             tracing::debug!("sse stream ended without provider terminal marker");
             // EOF (or a wire-only marker) without a provider terminal means
             // the response was truncated, even if partial output was emitted.
-            yield ModelEvent::Stop(StopReason::Truncated);
+            let stop = ModelEvent::Stop(StopReason::Truncated);
+            counts.observe(&stop);
+            yield stop;
         }
+        tracing::debug!(
+            frames = counts.frames,
+            text_deltas = counts.text_deltas,
+            reasoning_deltas = counts.reasoning_deltas,
+            tool_calls = counts.tool_calls,
+            usage_reports = counts.usage_reports,
+            stop_events = counts.stop_events,
+            provider_terminated = terminated,
+            wire_done,
+            "sse stream summary"
+        );
     })
 }
 

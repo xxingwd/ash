@@ -1775,6 +1775,7 @@ mod tests {
                     id: first_call,
                     result: Ok("done".to_string()),
                     attachments: Vec::new(),
+                    file_change: None,
                 },
             },
         ];
@@ -1792,6 +1793,7 @@ mod tests {
                 id: second_call,
                 result: Ok("spawned".to_string()),
                 attachments: Vec::new(),
+                file_change: None,
             },
         });
         assert_eq!(fork_messages(&complete, ForkMode::All).len(), 6);

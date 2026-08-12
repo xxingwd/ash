@@ -230,7 +230,7 @@ impl Thread {
             .send(make_command(reply))
             .await
             .map_err(|_| thread_closed())?;
-        result.await.map_err(|_| inactive_turn())?
+        result.await.map_err(|_| thread_closed())?
     }
 }
 
@@ -1039,6 +1039,7 @@ mod tests {
                     id: tool_id,
                     result: Ok("done".to_string()),
                     attachments: Vec::new(),
+                    file_change: None,
                 },
             },
         ];
@@ -1064,6 +1065,7 @@ mod tests {
                     id: tool_id,
                     result: Ok("result".to_string()),
                     attachments: Vec::new(),
+                    file_change: None,
                 },
             },
             second.clone(),

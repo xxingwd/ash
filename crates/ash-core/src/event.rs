@@ -1,7 +1,10 @@
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Message, MessageId, ThreadId, ToolCallId, TurnId};
+use crate::{
+    message::{Message, MessageId, ThreadId, ToolCallId, TurnId},
+    FileChange,
+};
 
 /// A routed event emitted by a thread. `sequence` is monotonic within one thread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +89,8 @@ pub enum LiveEvent {
         arguments: serde_json::Value,
         output: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_change: Option<FileChange>,
     },
 }
 

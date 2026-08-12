@@ -2,6 +2,8 @@ use derive_more::{Display, From, Into};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::FileChange;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into)]
 pub struct MessageId(Uuid);
 
@@ -199,6 +201,8 @@ pub enum MessageContent {
         id: ToolCallId,
         result: std::result::Result<String, String>,
         attachments: Vec<Content>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_change: Option<FileChange>,
     },
 }
 
@@ -303,5 +307,49 @@ mod tests {
         assert!(!system.is_user_turn());
         assert_eq!(system.user_turn_text(), None);
         assert_eq!(system.content_text().as_deref(), Some("rules"));
+    }
+
+    #[test]
+    fn file_changes_round_trip_with_tool_results() {
+        let message = Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: MessageContent::ToolResult {
+                id: ToolCallId::from_provider("call-1"),
+                result: Ok("updated".to_string()),
+                attachments: Vec::new(),
+                file_change: Some(FileChange::Update {
+                    path: "src/main.rs".into(),
+                    unified_diff: "--- before\n+++ after\n-old\n+new\n".to_string(),
+                }),
+            },
+        };
+
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded = serde_json::from_str::<Message>(&encoded).unwrap();
+
+        assert_eq!(decoded, message);
+        assert!(encoded.contains("\"file_change\""));
+        assert!(encoded.contains("\"type\":\"update\""));
+    }
+
+    #[test]
+    fn tool_results_without_file_changes_remain_compatible() {
+        let content = serde_json::from_value::<MessageContent>(serde_json::json!({
+            "ToolResult": {
+                "id": "call-1",
+                "result": { "Ok": "done" },
+                "attachments": []
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            content,
+            MessageContent::ToolResult {
+                file_change: None,
+                ..
+            }
+        ));
     }
 }

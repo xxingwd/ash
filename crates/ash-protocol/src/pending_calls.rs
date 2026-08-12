@@ -245,6 +245,64 @@ mod tests {
     }
 
     #[test]
+    fn item_placeholders_do_not_erase_accumulated_arguments() {
+        let mut call = PendingCall::new("call_1", "read");
+        call.set_arguments(r#"{"path":"Cargo.toml"}"#);
+
+        call.apply_item(&json!({"arguments": ""}), false);
+
+        assert_eq!(
+            call.finish("Responses").unwrap(),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_1"),
+                name: "read".to_string(),
+                arguments: json!({"path": "Cargo.toml"}),
+            }
+        );
+    }
+
+    #[test]
+    fn complete_items_replace_accumulated_arguments() {
+        let mut call = PendingCall::new("call_1", "read");
+        call.set_arguments(r#"{"path":"old"}"#);
+
+        call.apply_item(
+            &json!({
+                "call_id": "call_2",
+                "name": "write",
+                "arguments": ""
+            }),
+            true,
+        );
+
+        assert_eq!(
+            call.finish("Responses").unwrap(),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_2"),
+                name: "write".to_string(),
+                arguments: json!({}),
+            }
+        );
+    }
+
+    #[test]
+    fn nonempty_item_arguments_replace_accumulated_fragments() {
+        let mut call = PendingCall::new("call_1", "read");
+        call.append_arguments(r#"{"path":"old"}"#);
+
+        call.apply_item(&json!({"arguments": r#"{"path":"new"}"#}), false);
+
+        assert_eq!(
+            call.finish("Responses").unwrap(),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_1"),
+                name: "read".to_string(),
+                arguments: json!({"path": "new"}),
+            }
+        );
+    }
+
+    #[test]
     fn accumulator_drains_calls_in_key_order() {
         let mut accumulator = PendingCallAccumulator::default();
         accumulator.entry(1).set_name("second");

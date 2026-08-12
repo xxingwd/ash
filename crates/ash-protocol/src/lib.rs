@@ -216,6 +216,7 @@ fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolR
             id,
             result,
             attachments: result_attachments,
+            ..
         } = &message.content
         else {
             break;
@@ -290,6 +291,7 @@ pub(crate) mod test_support {
                 id: ToolCallId::new(),
                 result: Ok(text.into()),
                 attachments,
+                file_change: None,
             },
         }
     }

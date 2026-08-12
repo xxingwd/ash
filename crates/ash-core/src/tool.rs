@@ -1,8 +1,31 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 pub use tokio_util::sync::CancellationToken;
 
 use crate::{error::ToolError, Content, Message, ThreadId, TreeId, TurnId};
+
+/// A durable description of one file mutation produced by a tool.
+///
+/// The model receives the tool's short text result; products may render this
+/// richer change without parsing or exposing that text as a display protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileChange {
+    Add { path: PathBuf, content: String },
+    Update { path: PathBuf, unified_diff: String },
+}
+
+impl FileChange {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Add { path, .. } | Self::Update { path, .. } => path.as_path(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -37,6 +60,7 @@ pub struct AgentToolContext {
 pub struct ToolOutput {
     pub text: String,
     pub attachments: Vec<Content>,
+    pub file_change: Option<FileChange>,
 }
 
 impl ToolOutput {
@@ -44,6 +68,15 @@ impl ToolOutput {
         Self {
             text: text.into(),
             attachments,
+            file_change: None,
+        }
+    }
+
+    pub fn with_file_change(text: impl Into<String>, file_change: FileChange) -> Self {
+        Self {
+            text: text.into(),
+            attachments: Vec::new(),
+            file_change: Some(file_change),
         }
     }
 }
@@ -53,6 +86,7 @@ impl From<String> for ToolOutput {
         Self {
             text,
             attachments: Vec::new(),
+            file_change: None,
         }
     }
 }
@@ -62,6 +96,7 @@ impl From<&str> for ToolOutput {
         Self {
             text: text.to_string(),
             attachments: Vec::new(),
+            file_change: None,
         }
     }
 }
