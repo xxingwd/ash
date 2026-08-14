@@ -16,9 +16,11 @@ mod scrollback;
 mod session_picker;
 mod slash_command;
 mod status_line;
+mod subagent;
 mod text_width;
 mod tool_display;
 mod viewport;
 mod welcome_card;
 
-pub use app::{App, UiCommand, UiError};
+pub use app::{App, UiCommand, UiError, UiEvent};
+pub use subagent::{SubagentView, SubagentViewState};

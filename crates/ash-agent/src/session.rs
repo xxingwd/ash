@@ -5,8 +5,8 @@ use std::{
 };
 
 use ash_core::{
-    CancellationToken, Event, EventKind, ForkPoint, Message, MessageId, SessionId, SessionView,
-    TurnId, TurnResult, TurnView, Usage,
+    CancellationToken, ForkPoint, Message, MessageId, SessionEvent, SessionEventKind, SessionId,
+    SessionView, TurnId, TurnResult, TurnView, Usage,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -24,7 +24,7 @@ const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
 pub struct Session {
     id: SessionId,
     commands: mpsc::Sender<Command>,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<SessionEvent>,
 }
 
 pub struct Turn {
@@ -32,14 +32,14 @@ pub struct Turn {
     id: TurnId,
     commands: mpsc::Sender<Command>,
     cancellation: CancellationToken,
-    completion: oneshot::Receiver<Result<TurnResult, ash_core::AshError>>,
+    completion: oneshot::Receiver<Result<TurnView, ash_core::AshError>>,
 }
 
 struct QueuedTurn {
     id: TurnId,
     inputs: Vec<Input>,
     cancellation: CancellationToken,
-    completion: Option<oneshot::Sender<Result<TurnResult, ash_core::AshError>>>,
+    completion: Option<oneshot::Sender<Result<TurnView, ash_core::AshError>>>,
 }
 
 #[derive(Default)]
@@ -58,7 +58,6 @@ enum Command {
     },
     Rollback(oneshot::Sender<Result<Option<String>, ash_core::AshError>>),
     Compact(oneshot::Sender<Result<ContextCompaction, ash_core::AshError>>),
-    Messages(oneshot::Sender<Result<Vec<Message>, ash_core::AshError>>),
     View(oneshot::Sender<Result<SessionView, ash_core::AshError>>),
     ForkPoints(oneshot::Sender<Result<Vec<ForkPoint>, ash_core::AshError>>),
     Fork {
@@ -101,7 +100,7 @@ impl Session {
     }
 
     #[must_use]
-    pub fn events(&self) -> BroadcastStream<Event> {
+    pub fn events(&self) -> BroadcastStream<SessionEvent> {
         BroadcastStream::new(self.events.subscribe())
     }
 
@@ -162,15 +161,6 @@ impl Session {
             .send(Command::Notify(input))
             .await
             .map_err(|_| session_closed())
-    }
-
-    /// Durable messages of this session.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AshError` when the session runtime has stopped.
-    pub async fn messages(&self) -> Result<Vec<Message>, ash_core::AshError> {
-        self.ask(Command::Messages).await
     }
 
     /// Full projected state: history, model context, and turn views.
@@ -268,12 +258,12 @@ impl Turn {
         result.await.map_err(|_| session_closed())?
     }
 
-    /// Wait for this turn to settle and return its terminal result.
+    /// Wait for this turn to settle and return its canonical completed view.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the turn ends without a completion signal.
-    pub async fn wait(self) -> Result<TurnResult, ash_core::AshError> {
+    /// Returns `AshError` when the turn ends without a completion view.
+    pub async fn wait(self) -> Result<TurnView, ash_core::AshError> {
         self.completion.await.map_err(|_| session_closed())?
     }
 }
@@ -281,7 +271,7 @@ impl Turn {
 async fn run_session(
     mut state: SessionState,
     mut commands: mpsc::Receiver<Command>,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<SessionEvent>,
 ) {
     let mut queues = ActorQueues::default();
     let mut sequence = 0_u64;
@@ -310,7 +300,7 @@ async fn run_turn(
     turn: QueuedTurn,
     queues: &mut ActorQueues,
     commands: &mut mpsc::Receiver<Command>,
-    events: &broadcast::Sender<Event>,
+    events: &broadcast::Sender<SessionEvent>,
     sequence: &mut u64,
 ) {
     let QueuedTurn {
@@ -324,7 +314,13 @@ async fn run_turn(
         inputs = std::mem::take(&mut queues.inbox);
     }
     let session_id = state.id();
-    publish(events, session_id, Some(id), sequence, EventKind::TurnStart);
+    publish(
+        events,
+        session_id,
+        Some(id),
+        sequence,
+        SessionEventKind::TurnStarted,
+    );
     let (payload_tx, mut payload_rx) = mpsc::channel(64);
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let execution = state.submit_inputs(id, inputs, steer_rx, payload_tx, cancellation.clone());
@@ -368,15 +364,16 @@ async fn run_turn(
             })
         }
     };
+    let completed = view.clone();
     publish(
         events,
         session_id,
         Some(id),
         sequence,
-        EventKind::Turn(view),
+        SessionEventKind::TurnCompleted(view),
     );
     if let Some(completion) = completion {
-        let _ = completion.send(result.map(|view| view.result));
+        let _ = completion.send(Ok(completed));
     }
 }
 
@@ -402,7 +399,6 @@ fn dispatch_active_command(
         Command::Steer { reply, .. } => reject_steer(reply),
         Command::Rollback(reply) => reject_busy(reply),
         Command::Compact(reply) => reject_busy(reply),
-        Command::Messages(reply) => reject_busy(reply),
         Command::View(reply) => reject_busy(reply),
         Command::ForkPoints(reply) => reject_busy(reply),
         Command::Fork { reply, .. } => reject_busy(reply),
@@ -424,9 +420,6 @@ async fn dispatch_idle_command(
         }
         Command::Compact(reply) => {
             let _ = reply.send(state.compact().await);
-        }
-        Command::Messages(reply) => {
-            let _ = reply.send(Ok(state.messages()));
         }
         Command::View(reply) => {
             let _ = reply.send(Ok(state.view()));
@@ -459,14 +452,14 @@ fn reject_busy<T>(reply: oneshot::Sender<Result<T, ash_core::AshError>>) {
 }
 
 fn publish(
-    events: &broadcast::Sender<Event>,
+    events: &broadcast::Sender<SessionEvent>,
     session_id: SessionId,
     turn_id: Option<TurnId>,
     sequence: &mut u64,
-    kind: EventKind,
+    kind: SessionEventKind,
 ) {
     *sequence = sequence.saturating_add(1);
-    let event = Event {
+    let event = SessionEvent {
         session_id,
         turn_id,
         sequence: *sequence,
@@ -478,13 +471,13 @@ fn publish(
     // regardless of whether any UI is attached. Streaming deltas are too
     // chatty for info level; everything else is a stable boundary event.
     match &event.kind {
-        EventKind::Live(
+        SessionEventKind::Live(
             ash_core::LiveEvent::TextDelta(_) | ash_core::LiveEvent::ReasoningDelta(_),
         ) => {
-            tracing::debug!(%session_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+            tracing::debug!(%session_id, ?turn_id, sequence, kind = ?event.kind, "session event");
         }
         _ => {
-            tracing::info!(%session_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+            tracing::info!(%session_id, ?turn_id, sequence, kind = ?event.kind, "session event");
         }
     }
     let _ = events.send(event);
@@ -520,7 +513,7 @@ fn ensure_nonempty(input: &Input) -> Result<(), ash_core::AshError> {
 
 fn queued_turn(
     input: Input,
-    completion: Option<oneshot::Sender<Result<TurnResult, ash_core::AshError>>>,
+    completion: Option<oneshot::Sender<Result<TurnView, ash_core::AshError>>>,
 ) -> QueuedTurn {
     QueuedTurn {
         id: TurnId::new(),
@@ -577,10 +570,6 @@ impl SessionState {
 
     pub const fn id(&self) -> SessionId {
         self.id
-    }
-
-    pub fn messages(&self) -> Vec<Message> {
-        self.log.messages()
     }
 
     pub fn view(&self) -> SessionView {
@@ -674,7 +663,7 @@ impl SessionState {
         turn_id: TurnId,
         inputs: Vec<Input>,
         steering: mpsc::UnboundedReceiver<Input>,
-        events: mpsc::Sender<EventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         cancel: CancellationToken,
     ) -> Result<TurnView, ash_core::AshError> {
         if inputs.is_empty() {
@@ -932,6 +921,16 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct FailingAdapter;
+
+    impl ModelClient for FailingAdapter {
+        fn stream(&self, _: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+            Err(ash_core::ProtocolError::InvalidRequest(
+                "request rejected".to_string(),
+            ))
+        }
+    }
+
     impl ModelClient for BlockingAdapter {
         fn stream(&self, _: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
             let started = Arc::clone(&self.started);
@@ -1078,9 +1077,10 @@ mod tests {
 
         assert_eq!(state.id(), original_id);
         assert_ne!(fork_state.id(), original_id);
-        assert_eq!(fork_state.messages().len(), 2);
+        assert_eq!(fork_state.log.messages().len(), 2);
         assert_eq!(
             fork_state
+                .log
                 .messages()
                 .iter()
                 .map(|message| message.id)
@@ -1148,7 +1148,7 @@ mod tests {
             Some("current prompt")
         );
         assert_eq!(state.config.working_dir, current_dir);
-        assert_eq!(state.messages().len(), 1);
+        assert_eq!(state.log.messages().len(), 1);
     }
 
     #[tokio::test]
@@ -1259,7 +1259,7 @@ mod tests {
         first.wait().await.unwrap();
         second.wait().await.unwrap();
 
-        let messages = session.messages().await.unwrap();
+        let messages = session.view().await.unwrap().messages;
         let prompts = messages
             .iter()
             .filter_map(Message::user_turn_text)
@@ -1288,7 +1288,6 @@ mod tests {
         let errors = [
             session.rollback().await.unwrap_err(),
             session.compact().await.unwrap_err(),
-            session.messages().await.unwrap_err(),
             session.view().await.unwrap_err(),
             session.fork_points().await.unwrap_err(),
             session.fork_at(MessageId::new()).await.err().unwrap(),
@@ -1303,7 +1302,7 @@ mod tests {
 
         release.notify_one();
         turn.wait().await.unwrap();
-        assert_eq!(session.messages().await.unwrap().len(), 1);
+        assert_eq!(session.view().await.unwrap().messages.len(), 1);
     }
 
     #[tokio::test]
@@ -1336,6 +1335,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_and_turn_event_share_the_canonical_failed_result() {
+        let directory = TempDir::new().unwrap();
+        let runtime = Runtime::new(Arc::new(FailingAdapter), "test")
+            .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let mut events = session.events();
+
+        let waited = session.submit("work").await.unwrap().wait().await.unwrap();
+        let emitted = loop {
+            let event = events.next().await.unwrap().unwrap();
+            if let SessionEventKind::TurnCompleted(view) = event.kind {
+                break view;
+            }
+        };
+
+        assert_eq!(waited, emitted);
+        assert!(
+            matches!(waited.result, TurnResult::Failed(error) if error.contains("request rejected"))
+        );
+    }
+
+    #[tokio::test]
     async fn emitted_turn_messages_match_the_durable_projection() {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(
@@ -1355,7 +1376,7 @@ mod tests {
         session.submit("work").await.unwrap().wait().await.unwrap();
         let emitted = loop {
             let event = events.next().await.unwrap().unwrap();
-            if let EventKind::Turn(view) = event.kind {
+            if let SessionEventKind::TurnCompleted(view) = event.kind {
                 break view;
             }
         };
@@ -1388,13 +1409,14 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(session.messages().await.unwrap().is_empty());
+        assert!(session.view().await.unwrap().messages.is_empty());
         session.submit("task").await.unwrap().wait().await.unwrap();
 
         let prompts = session
-            .messages()
+            .view()
             .await
             .unwrap()
+            .messages
             .iter()
             .filter_map(Message::user_turn_text)
             .collect::<Vec<_>>();
@@ -1426,9 +1448,10 @@ mod tests {
         second.wait().await.unwrap();
 
         let prompts = session
-            .messages()
+            .view()
             .await
             .unwrap()
+            .messages
             .iter()
             .filter_map(Message::user_turn_text)
             .collect::<Vec<_>>();
@@ -1458,7 +1481,7 @@ mod tests {
         let completed = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let event = events.next().await.unwrap().unwrap();
-                if matches!(event.kind, EventKind::Turn(_)) {
+                if matches!(event.kind, SessionEventKind::TurnCompleted(_)) {
                     break event;
                 }
             }
@@ -1516,7 +1539,7 @@ mod tests {
 
         loop {
             let event = events.next().await.unwrap().unwrap();
-            if matches!(event.kind, EventKind::Turn(_)) {
+            if matches!(event.kind, SessionEventKind::TurnCompleted(_)) {
                 break;
             }
         }

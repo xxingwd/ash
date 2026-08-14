@@ -23,7 +23,7 @@ impl Agent {
     pub fn new(model: impl Into<ModelId>, tools: Vec<Arc<dyn Tool>>) -> Self {
         Self {
             system_prompt: None,
-            tools,
+            tools: deduplicate_tools(tools),
             model: model.into(),
             max_turns: 100,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
@@ -63,13 +63,25 @@ impl Agent {
 
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.tools = tools;
+        self.tools = deduplicate_tools(tools);
         self
     }
 
+    /// Add tools by name. A later tool replaces an existing tool with the same
+    /// name in place, so the model and executor always share one definition.
     #[must_use]
     pub fn pushing_tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        self.tools.extend(tools);
+        for tool in tools {
+            if let Some(existing) = self
+                .tools
+                .iter_mut()
+                .find(|existing| existing.name() == tool.name())
+            {
+                *existing = tool;
+            } else {
+                self.tools.push(tool);
+            }
+        }
         self
     }
 
@@ -103,11 +115,21 @@ impl Agent {
     pub const fn max_context_tokens(&self) -> usize {
         self.max_context_tokens
     }
+}
 
-    #[must_use]
-    pub fn context_policy(&self) -> &Arc<dyn ContextPolicy> {
-        &self.context_policy
+fn deduplicate_tools(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    let mut unique: Vec<Arc<dyn Tool>> = Vec::new();
+    for tool in tools {
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| existing.name() == tool.name())
+        {
+            *existing = tool;
+        } else {
+            unique.push(tool);
+        }
     }
+    unique
 }
 
 /// Per-session execution scope.
@@ -140,6 +162,31 @@ fn default_agent_path() -> String {
         |_| ".".to_string(),
         |directory| directory.display().to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use ash_core::define_tool;
+
+    use super::*;
+
+    fn named_tool(name: &str, description: &str) -> Arc<dyn Tool> {
+        define_tool(name, description, |_, _: ()| async { Ok("ok") }).unwrap()
+    }
+
+    #[test]
+    fn later_duplicate_tools_replace_the_existing_definition_in_place() {
+        let agent = Agent::new(
+            ModelId::new("model"),
+            vec![named_tool("read", "old"), named_tool("bash", "bash")],
+        )
+        .pushing_tools([named_tool("read", "new")]);
+
+        assert_eq!(agent.tools().len(), 2);
+        assert_eq!(agent.tools()[0].name(), "read");
+        assert_eq!(agent.tools()[0].description(), "new");
+        assert_eq!(agent.tools()[1].name(), "bash");
+    }
 }
 
 /// Exponential retry backoff for safe model-call retries.
@@ -192,7 +239,7 @@ impl RunConfig {
             max_turns: agent.max_turns(),
             working_dir: options.working_dir.clone(),
             max_context_tokens: agent.max_context_tokens(),
-            context_policy: Arc::clone(agent.context_policy()),
+            context_policy: Arc::clone(&agent.context_policy),
             max_tool_duration: options.tool_timeout,
             agent_path: options.path.clone(),
             tree_id: options.tree_id,

@@ -5,12 +5,12 @@ use crate::message::{Message, MessageId, SessionId, ToolCallId, TurnId};
 
 /// A routed event emitted by a session. `sequence` is monotonic within one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Event {
+pub struct SessionEvent {
     pub session_id: SessionId,
     pub turn_id: Option<TurnId>,
     pub sequence: u64,
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub kind: EventKind,
+    pub kind: SessionEventKind,
 }
 
 /// Provider-neutral usage accounting.
@@ -103,37 +103,19 @@ pub struct ForkPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventKind {
+pub enum SessionEventKind {
     /// A turn started executing; its input was already accepted.
-    TurnStart,
+    TurnStarted,
     /// Ephemeral streaming delta for the active turn's live preview.
     Live(LiveEvent),
     /// A turn settled: the canonical boundary for committing scrollback.
-    Turn(TurnView),
-    /// A persisted session was restored; `view` is its full projection.
-    Restored {
-        view: SessionView,
-    },
-    TurnRolledBack {
-        prompt: String,
-    },
-    Compacted {
+    TurnCompleted(TurnView),
+    /// The model context was compacted while a turn was executing.
+    ContextCompacted {
         before: u64,
         after: u64,
         dropped: u64,
-        automatic: bool,
     },
-    SessionsListed {
-        sessions: Vec<SessionSummary>,
-    },
-    ForkPointsListed {
-        points: Vec<ForkPoint>,
-    },
-    SessionForked {
-        view: SessionView,
-        prompt: String,
-    },
-    Error(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display)]
@@ -156,22 +138,25 @@ mod tests {
     #[test]
     fn serialized_events_require_complete_payloads() {
         let id = ToolCallId::new();
-        assert!(serde_json::from_value::<EventKind>(serde_json::json!({
-            "Live": {
-                "ToolStarted": {
-                    "id": id,
-                    "name": "read"
+        assert!(
+            serde_json::from_value::<SessionEventKind>(serde_json::json!({
+                "Live": {
+                    "ToolStarted": {
+                        "id": id,
+                        "name": "read"
+                    }
                 }
-            }
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<EventKind>(serde_json::json!({
-            "Compacted": {
-                "before": 100,
-                "after": 50,
-                "dropped": 4
-            }
-        }))
-        .is_err());
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SessionEventKind>(serde_json::json!({
+                "ContextCompacted": {
+                    "before": 100,
+                    "after": 50
+                }
+            }))
+            .is_err()
+        );
     }
 }

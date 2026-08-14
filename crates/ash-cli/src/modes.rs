@@ -6,12 +6,12 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, Runtime, Session, SessionOptions, Skill, Turn,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_collab::SubagentSnapshot;
+use ash_collab::{SubagentSnapshot, SubagentState};
 use ash_core::{
-    EventKind, LiveEvent, MessageId, ModelId, SessionId, SessionView, TurnId, TurnResult,
+    LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult, Usage,
 };
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
-use ash_tui::{UiCommand, UiError};
+use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiError, UiEvent};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
@@ -27,7 +27,7 @@ struct InteractiveController {
     agent: Agent,
     options: SessionOptions,
     runtime: Runtime,
-    event_tx: tokio::sync::mpsc::Sender<EventKind>,
+    event_tx: tokio::sync::mpsc::Sender<UiEvent>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
     history_store: MessageHistoryStore,
 }
@@ -35,6 +35,7 @@ struct InteractiveController {
 #[derive(Default)]
 struct TurnState {
     active: Option<Turn>,
+    cancelled: Option<TurnId>,
 }
 
 impl TurnState {
@@ -42,24 +43,35 @@ impl TurnState {
         self.active = Some(turn);
     }
 
-    fn finish(&mut self, id: Option<TurnId>) {
-        if self.active.as_ref().map(Turn::id) == id {
+    fn finish(&mut self, id: Option<TurnId>) -> bool {
+        let Some(id) = id else {
+            return false;
+        };
+        if self.active.as_ref().map(Turn::id) == Some(id) {
             self.active = None;
+        }
+        if self.cancelled == Some(id) {
+            self.cancelled = None;
+            true
+        } else {
+            false
         }
     }
 
-    fn cancel_active(&self) {
+    fn cancel_active(&mut self) {
         if let Some(turn) = &self.active {
+            self.cancelled = Some(turn.id());
             turn.cancellation_token().cancel();
         }
     }
 
     async fn steer_active(&self, input: String) -> Result<(), UiError> {
-        let turn = self.active.as_ref().ok_or_else(|| {
-            UiError::Agent(ash_core::AshError::Session(
+        let turn = self
+            .active
+            .as_ref()
+            .ok_or(UiError::Agent(ash_core::AshError::Session(
                 ash_core::SessionError::InactiveTurn,
-            ))
-        })?;
+            )))?;
         turn.steer(input).await.map_err(UiError::from)
     }
 
@@ -72,7 +84,7 @@ struct AgentSetup {
     agent: Agent,
     options: SessionOptions,
     runtime: Runtime,
-    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
+    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -134,7 +146,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         runtime.clone(),
         max_concurrent_agents,
     )?;
-    let subagent_monitor = control.map(|control| control.subscribe());
+    let subagent_monitor = control.map(|control| map_subagent_monitor(control.subscribe()));
 
     Ok(AgentSetup {
         agent,
@@ -142,6 +154,47 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         runtime,
         subagent_monitor,
     })
+}
+
+fn turn_has_completed_tool(view: &ash_core::TurnView) -> bool {
+    view.messages
+        .iter()
+        .any(|message| matches!(message.content, ash_core::MessageContent::ToolResult { .. }))
+}
+
+fn map_subagent_monitor(
+    mut source: tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>,
+) -> tokio::sync::watch::Receiver<Vec<SubagentView>> {
+    let (target, receiver) = tokio::sync::watch::channel(subagent_views(&source.borrow()));
+    tokio::spawn(async move {
+        while source.changed().await.is_ok() {
+            if target
+                .send(subagent_views(&source.borrow_and_update()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn subagent_views(snapshots: &[SubagentSnapshot]) -> Vec<SubagentView> {
+    snapshots
+        .iter()
+        .map(|snapshot| SubagentView {
+            task_name: snapshot.task_name.clone(),
+            agent_type: snapshot.agent_type.clone(),
+            state: match snapshot.state {
+                SubagentState::Pending => SubagentViewState::Pending,
+                SubagentState::Running => SubagentViewState::Running,
+                SubagentState::Completed => SubagentViewState::Completed,
+                SubagentState::Interrupted => SubagentViewState::Interrupted,
+                SubagentState::Errored => SubagentViewState::Errored,
+            },
+            last_task_message: snapshot.last_task_message.clone(),
+        })
+        .collect()
 }
 
 fn resolve_protocol(cli: &Cli) -> Result<Protocol> {
@@ -226,30 +279,25 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
             biased;
             event = events.next() => match event {
                 Some(Ok(event)) => print_event(event.kind),
-                Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
+                Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                 None => break,
             },
             result = &mut completion => {
-                result?;
-                break;
+                let completed = result?;
+                println!();
+                print_usage(completed.usage);
+                return Ok(());
             }
         }
     }
     println!();
-    print_usage(&session).await;
     Ok(())
 }
 
 /// Print the completed turn's token usage to stderr, mirroring the tool
 /// diagnostics already shown there. Useful when diagnosing a run.
-async fn print_usage(session: &Session) {
-    let Ok(view) = session.view().await else {
-        return;
-    };
-    let Some(turn) = view.turns.last() else {
-        return;
-    };
-    let Some(usage) = turn.usage else {
+fn print_usage(usage: Option<Usage>) {
+    let Some(usage) = usage else {
         return;
     };
     eprintln!(
@@ -261,24 +309,23 @@ async fn print_usage(session: &Session) {
     );
 }
 
-fn print_event(event: EventKind) {
+fn print_event(event: SessionEventKind) {
     match event {
-        EventKind::Live(LiveEvent::TextDelta(text)) => print!("{text}"),
-        EventKind::Live(LiveEvent::ToolStarted { name, .. }) => {
+        SessionEventKind::Live(LiveEvent::TextDelta(text)) => print!("{text}"),
+        SessionEventKind::Live(LiveEvent::ToolStarted { name, .. }) => {
             eprintln!("{}", format!("[tool: {name}]").cyan());
         }
-        EventKind::Live(LiveEvent::ToolFinished {
+        SessionEventKind::Live(LiveEvent::ToolFinished {
             is_error: true,
             output,
             ..
         }) => eprintln!("{}", format!("[error: {output}]").red()),
-        EventKind::Turn(view) => match view.result {
+        SessionEventKind::TurnCompleted(view) => match view.result {
             TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
                 eprintln!("{}", format!("[error: {error}]").red());
             }
             TurnResult::Completed(_) => {}
         },
-        EventKind::Error(error) => eprintln!("{}", format!("[error: {error}]").red()),
         _ => {}
     }
 }
@@ -330,18 +377,38 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
 
 impl InteractiveController {
     async fn run(mut self) {
+        let _ = self
+            .event_tx
+            .send(UiEvent::SessionChanged {
+                session_id: self.session.id(),
+            })
+            .await;
         let mut events = self.session.events();
         let mut turns = TurnState::default();
         loop {
             tokio::select! {
                 event = events.next() => match event {
                     Some(Ok(event)) => {
-                        if matches!(event.kind, EventKind::Turn(_)) {
-                            turns.finish(event.turn_id);
+                        let cancelled = if matches!(event.kind, SessionEventKind::TurnCompleted(_)) {
+                            turns.finish(event.turn_id)
+                        } else {
+                            false
+                        };
+                        if cancelled
+                            && matches!(&event.kind, SessionEventKind::TurnCompleted(view) if !turn_has_completed_tool(view))
+                        {
+                            let rollback = self.rollback_last_turn_event().await;
+                            if matches!(rollback, UiEvent::RollbackCompleted { .. }) {
+                                self.send_ui_event(rollback).await;
+                            } else {
+                                let _ = self.event_tx.send(UiEvent::Session(event)).await;
+                                self.send_ui_event(rollback).await;
+                            }
+                        } else {
+                            let _ = self.event_tx.send(UiEvent::Session(event)).await;
                         }
-                        let _ = self.event_tx.send(event.kind).await;
                     }
-                    Some(Err(error)) => tracing::warn!(%error, "agent event receiver lagged"),
+                    Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                     None => break,
                 },
                 command = self.command_rx.recv() => {
@@ -373,6 +440,12 @@ impl InteractiveController {
                         UiCommand::Compact => self.compact_session().await,
                         UiCommand::NewSession => {
                             self.session = self.runtime.start(&self.agent, &self.options);
+                            let _ = self
+                                .event_tx
+                                .send(UiEvent::SessionChanged {
+                                    session_id: self.session.id(),
+                                })
+                                .await;
                             events = self.session.events();
                             turns.reset();
                         }
@@ -404,47 +477,56 @@ impl InteractiveController {
         }
     }
 
+    async fn send_ui_event(&self, event: UiEvent) {
+        let _ = self.event_tx.send(event).await;
+    }
+
     async fn rollback_last_turn(&self) {
-        let event = match self.session.rollback().await {
+        let event = self.rollback_last_turn_event().await;
+        self.send_ui_event(event).await;
+    }
+
+    async fn rollback_last_turn_event(&self) -> UiEvent {
+        match self.session.rollback().await {
             Ok(Some(prompt)) => {
                 if let Err(error) = self.history_store.undo(self.session.id(), &prompt).await {
                     tracing::warn!(%error, "failed to undo input history entry");
                 }
-                EventKind::TurnRolledBack { prompt }
+                UiEvent::RollbackCompleted { prompt }
             }
-            Ok(None) => EventKind::Error("No submitted turn is available to undo.".to_string()),
-            Err(error) => EventKind::Error(format!("Failed to undo the last turn: {error}")),
-        };
-        let _ = self.event_tx.send(event).await;
+            Ok(None) => {
+                UiEvent::CommandFailed("No submitted turn is available to undo.".to_string())
+            }
+            Err(error) => UiEvent::CommandFailed(format!("Failed to undo the last turn: {error}")),
+        }
     }
 
     async fn compact_session(&self) {
         let event = match self.session.compact().await {
-            Ok(result) => EventKind::Compacted {
+            Ok(result) => UiEvent::CompactionCompleted {
                 before: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
                 after: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
                 dropped: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
-                automatic: false,
             },
-            Err(error) => EventKind::Error(format!("Failed to compact context: {error}")),
+            Err(error) => UiEvent::CommandFailed(format!("Failed to compact context: {error}")),
         };
-        let _ = self.event_tx.send(event).await;
+        self.send_ui_event(event).await;
     }
 
     async fn list_sessions(&self) {
         let event = match self.runtime.sessions(Some(self.session.id())).await {
-            Ok(sessions) => EventKind::SessionsListed { sessions },
-            Err(error) => EventKind::Error(format!("Failed to list saved chats: {error}")),
+            Ok(sessions) => UiEvent::SessionsListed { sessions },
+            Err(error) => UiEvent::CommandFailed(format!("Failed to list saved chats: {error}")),
         };
-        let _ = self.event_tx.send(event).await;
+        self.send_ui_event(event).await;
     }
 
     async fn list_fork_points(&self) {
         let event = match self.session.fork_points().await {
-            Ok(points) => EventKind::ForkPointsListed { points },
-            Err(error) => EventKind::Error(format!("Failed to list fork points: {error}")),
+            Ok(points) => UiEvent::ForkPointsListed { points },
+            Err(error) => UiEvent::CommandFailed(format!("Failed to list fork points: {error}")),
         };
-        let _ = self.event_tx.send(event).await;
+        self.send_ui_event(event).await;
     }
 
     /// Estimate the model-context size for a given message history, using the
@@ -455,47 +537,49 @@ impl InteractiveController {
             .resume(&self.agent, &self.options, session_id)
             .await
         {
-            Ok(Some(session)) => {
-                self.session = session;
-                self.with_current_view("restore chat", |view| EventKind::Restored { view })
-                    .await
+            Ok(Some(session)) => match session.view().await {
+                Ok(view) => {
+                    let session_id = session.id();
+                    self.session = session;
+                    UiEvent::SessionRestored { session_id, view }
+                }
+                Err(error) => UiEvent::CommandFailed(format!("Failed to restore chat: {error}")),
+            },
+            Ok(None) => {
+                UiEvent::CommandFailed("That saved chat is no longer available.".to_string())
             }
-            Ok(None) => EventKind::Error("That saved chat is no longer available.".to_string()),
-            Err(error) => EventKind::Error(format!("Failed to resume saved chat: {error}")),
+            Err(error) => UiEvent::CommandFailed(format!("Failed to resume saved chat: {error}")),
         };
-        let _ = self.event_tx.send(event).await;
+        self.send_ui_event(event).await;
     }
 
     async fn fork_session(&mut self, message_id: MessageId) {
         let event = match self.session.fork_at(message_id).await {
             Ok(Some(forked)) => {
-                let prompt = forked.prompt;
-                self.session = forked.session;
-                self.with_current_view("fork the current chat", |view| EventKind::SessionForked {
-                    view,
-                    prompt,
-                })
-                .await
+                let session = forked.session;
+                match session.view().await {
+                    Ok(view) => {
+                        let session_id = session.id();
+                        self.session = session;
+                        UiEvent::SessionForked {
+                            session_id,
+                            view,
+                            prompt: forked.prompt,
+                        }
+                    }
+                    Err(error) => {
+                        UiEvent::CommandFailed(format!("Failed to fork the current chat: {error}"))
+                    }
+                }
             }
-            Ok(None) => {
-                EventKind::Error("That prompt is no longer available to fork from.".to_string())
+            Ok(None) => UiEvent::CommandFailed(
+                "That prompt is no longer available to fork from.".to_string(),
+            ),
+            Err(error) => {
+                UiEvent::CommandFailed(format!("Failed to fork the current chat: {error}"))
             }
-            Err(error) => EventKind::Error(format!("Failed to fork the current chat: {error}")),
         };
-        let _ = self.event_tx.send(event).await;
-    }
-
-    /// Read the session's current view and map it to an event. Centralizes the
-    /// error event produced when the view cannot be read.
-    async fn with_current_view(
-        &self,
-        view_error_context: &str,
-        on_view: impl FnOnce(SessionView) -> EventKind,
-    ) -> EventKind {
-        match self.session.view().await {
-            Ok(view) => on_view(view),
-            Err(error) => EventKind::Error(format!("Failed to {view_error_context}: {error}")),
-        }
+        self.send_ui_event(event).await;
     }
 }
 

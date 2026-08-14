@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 ash-core = { workspace = true }
-ash-collab = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

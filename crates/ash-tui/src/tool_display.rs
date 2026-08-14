@@ -64,7 +64,7 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
 }
 
 pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
-    (ToolKind::from_name(name) == ToolKind::Read).then(|| path_argument(arguments))
+    (ToolKind::from_name(name) == ToolKind::Read).then(|| short_path_argument(arguments))
 }
 
 pub fn tool_call_summary(name: &str, arguments: &Value, is_error: bool) -> (String, String) {
@@ -109,9 +109,9 @@ struct ToolPhrase {
 
 fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     match ToolKind::from_name(name) {
-        ToolKind::Read => phrase("Read", "reading", path_argument(arguments)),
-        ToolKind::Write => phrase("Wrote", "writing", path_argument(arguments)),
-        ToolKind::Edit => phrase("Edited", "editing", path_argument(arguments)),
+        ToolKind::Read => phrase("Read", "reading", short_path_argument(arguments)),
+        ToolKind::Write => phrase("Wrote", "writing", raw_path_argument(arguments)),
+        ToolKind::Edit => phrase("Edited", "editing", raw_path_argument(arguments)),
         ToolKind::Glob => phrase("Found", "finding", string_argument(arguments, "pattern")),
         ToolKind::Grep => phrase(
             "Searched",
@@ -174,7 +174,15 @@ fn sentence_case(value: &str) -> String {
     })
 }
 
-fn path_argument(arguments: &Value) -> String {
+fn raw_path_argument(arguments: &Value) -> String {
+    arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(sanitize_single_line)
+        .unwrap_or_default()
+}
+
+fn short_path_argument(arguments: &Value) -> String {
     arguments
         .get("path")
         .and_then(Value::as_str)
@@ -295,8 +303,8 @@ mod tests {
     }
 
     #[test]
-    fn hides_edit_payloads_and_absolute_paths() {
-        let summary = tool_call_summary(
+    fn preserves_edit_and_write_paths_but_shortens_reads() {
+        let edit = tool_call_summary(
             "edit",
             &json!({
                 "path": "/home/user/work/ash/crates/ash-tui/src/inline.rs",
@@ -305,8 +313,29 @@ mod tests {
             }),
             false,
         );
+        let write = tool_call_summary(
+            "write",
+            &json!({"path": "crates/ash-tui/src/new.rs", "content": "content"}),
+            false,
+        );
+        let read = tool_call_summary(
+            "read",
+            &json!({"path": "/home/user/work/ash/crates/ash-tui/src/inline.rs"}),
+            false,
+        );
 
-        assert_eq!(summary, ("Edited".to_string(), "inline.rs".to_string()));
+        assert_eq!(
+            edit,
+            (
+                "Edited".to_string(),
+                "/home/user/work/ash/crates/ash-tui/src/inline.rs".to_string()
+            )
+        );
+        assert_eq!(
+            write,
+            ("Wrote".to_string(), "crates/ash-tui/src/new.rs".to_string())
+        );
+        assert_eq!(read, ("Read".to_string(), "inline.rs".to_string()));
     }
 
     #[test]
@@ -317,7 +346,7 @@ mod tests {
                 &json!({"path": "/tmp/report.md", "content": "one\ntwo"}),
                 true,
             ),
-            ("Failed".to_string(), "writing report.md".to_string())
+            ("Failed".to_string(), "writing /tmp/report.md".to_string())
         );
     }
 
@@ -347,7 +376,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn renderer_policy_is_centralized_by_tool_kind() {
         assert_eq!(tool_renderer("bash", false), ToolRenderer::Bash);

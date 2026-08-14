@@ -80,20 +80,20 @@ fn serializes_text_content_with_the_stable_contract() {
 
 #[test]
 fn serializes_event_text_delta_with_the_stable_contract() {
-    let event = EventKind::Live(LiveEvent::TextDelta("Hello".to_string()));
+    let event = SessionEventKind::Live(LiveEvent::TextDelta("Hello".to_string()));
     assert_json_snapshot!("event_text_delta", event);
 }
 
 #[test]
 fn serializes_event_envelope_with_the_stable_contract() {
-    let event = Event {
+    let event = SessionEvent {
         session_id: SessionId::new(),
         turn_id: Some(TurnId::new()),
         sequence: 3,
         timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-31T06:15:28Z")
             .unwrap()
             .with_timezone(&chrono::Utc),
-        kind: EventKind::Live(LiveEvent::TextDelta("Hello".to_string())),
+        kind: SessionEventKind::Live(LiveEvent::TextDelta("Hello".to_string())),
     };
     assert_json_snapshot!("event_envelope", event, {
         ".session_id" => "[uuid]",
@@ -103,7 +103,7 @@ fn serializes_event_envelope_with_the_stable_contract() {
 
 #[test]
 fn serializes_event_tool_call_start_with_the_stable_contract() {
-    let event = EventKind::Live(LiveEvent::ToolStarted {
+    let event = SessionEventKind::Live(LiveEvent::ToolStarted {
         id: ToolCallId::new(),
         name: "read".to_string(),
         arguments: serde_json::json!({"path": "README.md"}),
@@ -126,11 +126,10 @@ fn serializes_event_usage_with_the_stable_contract() {
 
 #[test]
 fn serializes_event_context_compacted_with_the_stable_contract() {
-    let event = EventKind::Compacted {
+    let event = SessionEventKind::ContextCompacted {
         before: 180_000,
         after: 12_000,
         dropped: 42,
-        automatic: false,
     };
     assert_json_snapshot!("event_context_compacted", event);
 }

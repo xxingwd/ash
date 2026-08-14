@@ -14,10 +14,10 @@ use ash_core::{ToolCallId, TurnId};
 use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
-    scrollback::{sanitize_single_line, sanitize_terminal_text, wrap_text},
+    scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{
-        display_path, read_group_detail, read_group_summary, running_tool_call_summary,
-        tool_call_summary, tool_renderer, ToolRenderer,
+        read_group_detail, read_group_summary, running_tool_call_summary, tool_call_summary,
+        tool_renderer, ToolRenderer,
     },
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
@@ -191,21 +191,6 @@ impl LiveBlock {
                     | LiveBlockKind::Reasoning { .. }
                     | LiveBlockKind::ReadGroup(_)
                     | LiveBlockKind::Tool { .. }
-            )
-    }
-
-    /// Whether this turn has a completed tool result. Tool completion is the
-    /// only reliable boundary while a streamed response is still active;
-    /// finalized text and reasoning do not keep an interrupted turn.
-    pub(crate) fn is_completed_tool_for_turn(&self, turn_id: TurnId) -> bool {
-        self.belongs_to_turn(turn_id)
-            && matches!(
-                &self.kind,
-                LiveBlockKind::ReadGroup(_)
-                    | LiveBlockKind::Tool {
-                        state: ToolState::Finished { .. },
-                        ..
-                    }
             )
     }
 
@@ -1039,7 +1024,6 @@ fn render_file_change(
     lines: Vec<String>,
     width: u16,
 ) -> Buffer {
-    let path = display_path(path);
     let title = Line::from(vec![
         Span::styled(
             "•",
@@ -1050,7 +1034,7 @@ fn render_file_change(
         Span::raw(" "),
         Span::styled(action, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" "),
-        Span::raw(path),
+        Span::raw(path.to_string()),
         Span::raw(" ("),
         Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
         Span::raw(" "),
@@ -1284,14 +1268,12 @@ mod tests {
         assert_eq!(row_text(&running, 0), "• Running cargo test");
         assert!(block.is_running_tool(&call_id));
         assert!(block.is_unfinished_response_for_turn(test_turn(7)));
-        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
 
         assert!(block.finish_tool(&call_id, "ok".to_string(), false));
         let finished = block.render(60, false);
         assert_eq!(row_text(&finished, 0), "• Ran cargo test");
         assert_eq!(row_text(&finished, 1), "  └ ok");
         assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
-        assert!(block.is_completed_tool_for_turn(test_turn(7)));
     }
 
     #[test]
@@ -1661,34 +1643,9 @@ mod generic_output_tests {
         let mut block = LiveBlock::assistant(1, String::new()).with_turn(Some(test_turn(7)));
         assert!(block.append_markdown_source("partial"));
         assert!(block.is_unfinished_response_for_turn(test_turn(7)));
-        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
 
         block.finalize_markdown();
         assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
-        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
-    }
-
-    #[test]
-    fn completed_thought_does_not_count_as_a_completed_tool() {
-        let block = LiveBlock::thought(1, "finished reasoning".to_string(), 3)
-            .with_turn(Some(test_turn(7)));
-
-        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
-    }
-
-    #[test]
-    fn completed_tool_result_keeps_the_interrupted_turn() {
-        let block = LiveBlock::tool(
-            1,
-            "bash".to_string(),
-            serde_json::json!({"command": "pwd"}),
-            "/work/ash".to_string(),
-            false,
-        )
-        .with_turn(Some(test_turn(7)));
-
-        assert!(block.is_completed_tool_for_turn(test_turn(7)));
-        assert!(!block.is_completed_tool_for_turn(test_turn(8)));
     }
 
     #[test]

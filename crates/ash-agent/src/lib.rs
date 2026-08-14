@@ -15,7 +15,7 @@ mod store;
 
 pub(crate) use agent::RunConfig;
 pub use agent::{Agent, SessionOptions, DEFAULT_MAX_CONTEXT_TOKENS};
-pub use ash_core::Event;
+pub use ash_core::SessionEvent;
 pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
 };

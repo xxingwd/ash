@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Instant};
 
 use ash_core::{Tool, ToolContext, ToolError, ToolOutput};
 use rmcp::model::{CallToolRequestParams, JsonObject};
@@ -66,11 +66,13 @@ impl Tool for McpToolAdapter {
             request = request.with_arguments(arguments);
         }
 
-        let result = tokio::select! {
-            () = ctx.cancellation.cancelled() => return Err(ToolError::Cancelled),
-            result = self.connection.peer.call_tool(request) => result
-                .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?,
-        };
+        let result = await_tool_call(
+            &ctx.cancellation,
+            ctx.deadline,
+            self.connection.peer.call_tool(request),
+        )
+        .await?
+        .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
 
         let mut output = String::new();
         for item in &result.content {
@@ -86,6 +88,21 @@ impl Tool for McpToolAdapter {
         } else {
             Ok(output.into())
         }
+    }
+}
+
+async fn await_tool_call<T>(
+    cancellation: &ash_core::CancellationToken,
+    deadline: Instant,
+    call: impl Future<Output = T>,
+) -> Result<T, ToolError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ToolError::Cancelled),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            Err(ToolError::DeadlineExceeded)
+        }
+        result = call => Ok(result),
     }
 }
 
@@ -250,6 +267,33 @@ mod tests {
                 messages: Vec::new(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_observe_cancellation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = await_tool_call(
+            &cancellation,
+            Instant::now() + std::time::Duration::from_secs(1),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_observe_deadlines() {
+        let result = await_tool_call(
+            &CancellationToken::new(),
+            Instant::now(),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ToolError::DeadlineExceeded)));
     }
 
     #[tokio::test]

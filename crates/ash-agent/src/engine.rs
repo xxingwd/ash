@@ -1,6 +1,6 @@
 use ash_core::{
-    AgentToolContext, CancellationToken, ContentBlock, EventKind, LiveEvent, Message, ModelClient,
-    ModelEvent, ModelRequest, ModelStream, SessionId, StopReason, ToolCallId, ToolContext,
+    AgentToolContext, CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent,
+    ModelRequest, ModelStream, SessionEventKind, SessionId, StopReason, ToolCallId, ToolContext,
     ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
 };
 use futures::StreamExt;
@@ -83,7 +83,7 @@ struct UsageAccumulator {
 
 struct AgentTurnRunner<'config, 'store> {
     config: &'config RunConfig,
-    tx: mpsc::Sender<EventKind>,
+    tx: mpsc::Sender<SessionEventKind>,
     cancel: CancellationToken,
     ids: ExecutionIds,
     model: &'config dyn ModelClient,
@@ -101,7 +101,7 @@ pub struct ExecutionIds {
 
 pub struct TurnExecution {
     ids: ExecutionIds,
-    tx: mpsc::Sender<EventKind>,
+    tx: mpsc::Sender<SessionEventKind>,
     cancel: CancellationToken,
     steering: mpsc::UnboundedReceiver<Input>,
     ephemeral_context: Vec<Message>,
@@ -120,7 +120,7 @@ impl TurnExecution {
     pub(crate) const fn new(
         session_id: SessionId,
         turn_id: TurnId,
-        tx: mpsc::Sender<EventKind>,
+        tx: mpsc::Sender<SessionEventKind>,
         cancel: CancellationToken,
         steering: mpsc::UnboundedReceiver<Input>,
         ephemeral_context: Vec<Message>,
@@ -435,11 +435,10 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         }
         let _ = self
             .tx
-            .send(EventKind::Compacted {
+            .send(SessionEventKind::ContextCompacted {
                 before: u64::try_from(update.before_tokens).unwrap_or(u64::MAX),
                 after: u64::try_from(update.after_tokens).unwrap_or(u64::MAX),
                 dropped: u64::try_from(update.dropped_messages).unwrap_or(u64::MAX),
-                automatic: true,
             })
             .await;
         Ok(estimated_input_tokens)
@@ -491,7 +490,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         for call in calls {
             send_live(
                 &self.tx,
-                EventKind::Live(LiveEvent::ToolStarted {
+                SessionEventKind::Live(LiveEvent::ToolStarted {
                     id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
@@ -514,7 +513,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             };
             send_live(
                 &self.tx,
-                EventKind::Live(LiveEvent::ToolFinished {
+                SessionEventKind::Live(LiveEvent::ToolFinished {
                     id: call.id.clone(),
                     name: call.name,
                     arguments: call.arguments,
@@ -575,15 +574,15 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
 /// session is shutting down (or already gone): the turn keeps running to a
 /// result, but its streaming preview has nowhere to go. Log instead of
 /// failing the turn silently.
-async fn send_live(tx: &mpsc::Sender<EventKind>, kind: EventKind) {
+async fn send_live(tx: &mpsc::Sender<SessionEventKind>, kind: SessionEventKind) {
     if let Err(error) = tx.send(kind).await {
-        tracing::warn!(%error, "dropping live event: agent event receiver closed");
+        tracing::warn!(%error, "dropping live event: session event receiver closed");
     }
 }
 
 async fn collect_response(
     stream: &mut ModelStream,
-    tx: &mpsc::Sender<EventKind>,
+    tx: &mpsc::Sender<SessionEventKind>,
     cancel: &CancellationToken,
     request_started: Instant,
 ) -> CollectedResponse {
@@ -630,7 +629,7 @@ impl ResponseAccumulator {
     }
 
     /// Fold one stream item into the accumulator, forwarding live deltas.
-    async fn apply(&mut self, tx: &mpsc::Sender<EventKind>, item: ModelEvent) {
+    async fn apply(&mut self, tx: &mpsc::Sender<SessionEventKind>, item: ModelEvent) {
         match item {
             ModelEvent::Text(delta) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
@@ -640,7 +639,7 @@ impl ResponseAccumulator {
                     _ => self.blocks.push(ContentBlock::Text(delta.clone())),
                 }
                 self.open_block = Some(OpenResponseBlock::Text);
-                send_live(tx, EventKind::Live(LiveEvent::TextDelta(delta))).await;
+                send_live(tx, SessionEventKind::Live(LiveEvent::TextDelta(delta))).await;
             }
             ModelEvent::Reasoning(delta) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
@@ -654,7 +653,7 @@ impl ResponseAccumulator {
                     });
                 }
                 self.open_block = Some(OpenResponseBlock::Thought);
-                send_live(tx, EventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
+                send_live(tx, SessionEventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
             }
             ModelEvent::ToolCall {
                 id,
@@ -891,7 +890,7 @@ mod tests {
     async fn run_with_adapter(
         config: &RunConfig,
         messages: &mut Vec<Message>,
-        tx: mpsc::Sender<EventKind>,
+        tx: mpsc::Sender<SessionEventKind>,
         cancel: CancellationToken,
         session_id: SessionId,
         model: &dyn ModelClient,
@@ -1164,16 +1163,8 @@ mod tests {
             ));
             drop(requests);
         }
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
-                event,
-                EventKind::Compacted {
-                    automatic: true,
-                    dropped: 2,
-                    ..
-                }
-            ))
-        );
+        assert!(std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, SessionEventKind::ContextCompacted { dropped: 2, .. })));
     }
 
     #[tokio::test]
@@ -1781,7 +1772,7 @@ mod tests {
                 result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
             };
             assert!(
-                matches!(event, Some(EventKind::Live(LiveEvent::TextDelta(text))) if text == "partial")
+                matches!(event, Some(SessionEventKind::Live(LiveEvent::TextDelta(text))) if text == "partial")
             );
             cancel.cancel();
             (&mut turn).await.unwrap().0
@@ -1817,7 +1808,7 @@ mod tests {
             };
             assert!(matches!(
                             event,
-                            Some(EventKind::Live(LiveEvent::ReasoningDelta(text) |
+                            Some(SessionEventKind::Live(LiveEvent::ReasoningDelta(text) |
             LiveEvent::TextDelta(text))) if text == expected
                         ));
         }
@@ -2146,7 +2137,10 @@ mod tests {
                     event = rx.recv() => event,
                     result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
                 };
-                if matches!(event, Some(EventKind::Live(LiveEvent::ToolStarted { .. }))) {
+                if matches!(
+                    event,
+                    Some(SessionEventKind::Live(LiveEvent::ToolStarted { .. }))
+                ) {
                     break;
                 }
             }
@@ -2162,7 +2156,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(EventKind::Live(LiveEvent::ToolFinished {
+            Some(SessionEventKind::Live(LiveEvent::ToolFinished {
                 is_error: true,
                 ..
             }))

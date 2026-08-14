@@ -26,6 +26,11 @@ const EXPOSED_COLLABORATION_TOOL_NAMES: [&str; 4] = [
 
 const LEGACY_COLLABORATION_TOOL_NAMES: [&str; 3] = ["send_message", "followup_task", "list_agents"];
 
+/// Tools whose public contracts are read-only. Explorer projection is an
+/// allowlist: unknown custom and MCP tools are excluded unless their behavior
+/// is represented by one of these canonical tool names.
+const EXPLORER_TOOL_NAMES: [&str; 5] = ["read", "glob", "grep", "webfetch", "skill"];
+
 /// Every collaboration tool name, derived from the exposed and legacy sets so
 /// that adding a new tool touches exactly one place.
 fn all_collaboration_tool_names() -> Vec<&'static str> {
@@ -272,10 +277,6 @@ impl AgentSpawner for InheritedAgentSpawner {
                 &request.parent_path,
                 &request.task_name,
             ));
-        let definition = match request.role {
-            AgentRole::Explorer => definition.without_tools(&["write", "edit", "bash"]),
-            AgentRole::Default | AgentRole::Worker => definition,
-        };
         let scope = SessionOptions {
             working_dir: self.scope.working_dir.clone(),
             tool_timeout: self.scope.tool_timeout,
@@ -834,13 +835,33 @@ impl AgentControl {
     /// touched, so the caller decides how to release the spawn reservation on
     /// failure.
     async fn prepare_child(&self, request: SpawnRequest) -> Result<Session, ToolError> {
+        let role = request.role;
         let child = self.inner.spawner.spawn(request)?;
-        let agent = child.agent.pushing_tools(self.tools()?);
+        let agent = Self::finalize_child_agent(child.agent, role, self.tools()?);
         child
             .runtime
             .start_with_history(&agent, &child.options, child.history)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+
+    fn finalize_child_agent(
+        agent: Agent,
+        role: AgentRole,
+        collaboration_tools: Vec<Arc<dyn Tool>>,
+    ) -> Agent {
+        match role {
+            AgentRole::Explorer => {
+                let tools = agent
+                    .tools()
+                    .iter()
+                    .filter(|tool| EXPLORER_TOOL_NAMES.contains(&tool.name()))
+                    .cloned()
+                    .collect();
+                agent.with_tools(tools)
+            }
+            AgentRole::Default | AgentRole::Worker => agent.pushing_tools(collaboration_tools),
+        }
     }
 
     /// Register the spawned session as a pending child agent in the shared
@@ -1100,11 +1121,13 @@ impl AgentControl {
         self.publish().await;
 
         let result = turn.wait().await;
-        let final_message = session
-            .messages()
-            .await
-            .ok()
-            .and_then(|messages| final_assistant_message(&messages));
+        let (result, final_message) = match result {
+            Ok(view) => {
+                let final_message = final_assistant_message(&view.messages);
+                (Ok(view.result), final_message)
+            }
+            Err(error) => (Err(error), None),
+        };
 
         let completed = match result {
             Ok(TurnResult::Completed(StopReason::Aborted) | TurnResult::Interrupted(_)) => {
@@ -1378,6 +1401,20 @@ mod tests {
         AgentControl::new(None, Arc::new(RejectingSpawner))
     }
 
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct NoToolArgs {}
+
+    fn named_tool(name: &str) -> Arc<dyn Tool> {
+        define_tool(name, "test tool", |_context, _args: NoToolArgs| async {
+            Ok::<_, ToolError>(String::new())
+        })
+        .unwrap()
+    }
+
+    fn tool_names(agent: &Agent) -> Vec<&str> {
+        agent.tools().iter().map(|tool| tool.name()).collect()
+    }
+
     fn make_agent() -> Agent {
         Agent::new(ModelId::new("test-model"), Vec::new())
             .with_system_prompt("base prompt")
@@ -1446,6 +1483,73 @@ mod tests {
         );
         assert_eq!(AgentRole::from_str("worker").unwrap(), AgentRole::Worker);
         assert!(AgentRole::from_str("awaiter").is_err());
+    }
+
+    #[test]
+    fn explorer_final_tools_are_an_explicit_read_only_allowlist() {
+        let inherited = [
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "skill",
+            "write",
+            "edit",
+            "bash",
+            "custom_mutator",
+        ]
+        .into_iter()
+        .map(named_tool)
+        .collect();
+        let collaboration = EXPOSED_COLLABORATION_TOOL_NAMES
+            .into_iter()
+            .map(named_tool)
+            .collect();
+        let agent = AgentControl::finalize_child_agent(
+            make_agent().with_tools(inherited),
+            AgentRole::Explorer,
+            collaboration,
+        );
+
+        assert_eq!(
+            tool_names(&agent),
+            ["read", "glob", "grep", "webfetch", "skill"]
+        );
+        assert!(!tool_names(&agent).contains(&"custom_mutator"));
+        assert!(!tool_names(&agent).contains(&"spawn_agent"));
+    }
+
+    #[test]
+    fn default_and_worker_keep_inherited_and_collaboration_tools() {
+        for role in [AgentRole::Default, AgentRole::Worker] {
+            let inherited = ["read", "write", "custom_tool"]
+                .into_iter()
+                .map(named_tool)
+                .collect();
+            let collaboration = EXPOSED_COLLABORATION_TOOL_NAMES
+                .into_iter()
+                .map(named_tool)
+                .collect();
+            let agent = AgentControl::finalize_child_agent(
+                make_agent().with_tools(inherited),
+                role,
+                collaboration,
+            );
+
+            assert_eq!(
+                tool_names(&agent),
+                [
+                    "read",
+                    "write",
+                    "custom_tool",
+                    "spawn_agent",
+                    "message_agent",
+                    "interrupt_agent",
+                    "wait_agent",
+                ],
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

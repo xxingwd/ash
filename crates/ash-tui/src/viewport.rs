@@ -1,6 +1,5 @@
 use std::{path::Path, sync::Arc};
 
-use ash_collab::{SubagentSnapshot, SubagentState};
 use ash_core::{ForkPoint, SessionSummary};
 use ratatui::{
     buffer::Buffer,
@@ -18,6 +17,7 @@ use crate::{
     slash_command::CommandCompletion,
     status_line::{compact_path, fit_status_left, format_token_count},
     text_width::truncate_end,
+    SubagentView, SubagentViewState,
 };
 
 const FOOTER_ROWS: u16 = 1;
@@ -62,7 +62,7 @@ pub struct ViewportInput<'a> {
     pub(crate) context_tokens: Option<u64>,
     pub(crate) context_limit: Option<u64>,
     pub(crate) tools_expanded: bool,
-    pub(crate) subagents: &'a [SubagentSnapshot],
+    pub(crate) subagents: &'a [SubagentView],
 }
 
 pub struct ViewportFrame {
@@ -405,7 +405,7 @@ fn render_transcript(
     }
 }
 
-fn subagent_rows(subagents: &[&SubagentSnapshot]) -> u16 {
+fn subagent_rows(subagents: &[&SubagentView]) -> u16 {
     if subagents.is_empty() {
         return 0;
     }
@@ -413,7 +413,7 @@ fn subagent_rows(subagents: &[&SubagentSnapshot]) -> u16 {
     rows.saturating_add(u16::from(subagents.len() > SUBAGENTS_MAX_ROWS))
 }
 
-fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Buffer) {
+fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -471,32 +471,32 @@ fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Bu
     }
 }
 
-const fn subagent_state_symbol(state: SubagentState) -> &'static str {
+const fn subagent_state_symbol(state: SubagentViewState) -> &'static str {
     match state {
-        SubagentState::Pending => "○",
-        SubagentState::Running => "●",
-        SubagentState::Completed => "✓",
-        SubagentState::Interrupted => "⏸",
-        SubagentState::Errored => "✗",
+        SubagentViewState::Pending => "○",
+        SubagentViewState::Running => "●",
+        SubagentViewState::Completed => "✓",
+        SubagentViewState::Interrupted => "⏸",
+        SubagentViewState::Errored => "✗",
     }
 }
 
-const fn subagent_state_label(state: SubagentState) -> &'static str {
+const fn subagent_state_label(state: SubagentViewState) -> &'static str {
     match state {
-        SubagentState::Pending => "pending",
-        SubagentState::Running => "running",
-        SubagentState::Completed => "done",
-        SubagentState::Interrupted => "interrupted",
-        SubagentState::Errored => "error",
+        SubagentViewState::Pending => "pending",
+        SubagentViewState::Running => "running",
+        SubagentViewState::Completed => "done",
+        SubagentViewState::Interrupted => "interrupted",
+        SubagentViewState::Errored => "error",
     }
 }
 
-const fn subagent_state_color(state: SubagentState) -> Color {
+const fn subagent_state_color(state: SubagentViewState) -> Color {
     match state {
-        SubagentState::Pending | SubagentState::Interrupted => Color::Yellow,
-        SubagentState::Running => Color::Cyan,
-        SubagentState::Completed => Color::Green,
-        SubagentState::Errored => Color::Red,
+        SubagentViewState::Pending | SubagentViewState::Interrupted => Color::Yellow,
+        SubagentViewState::Running => Color::Cyan,
+        SubagentViewState::Completed => Color::Green,
+        SubagentViewState::Errored => Color::Red,
     }
 }
 
@@ -989,16 +989,16 @@ mod tests {
     fn subagents_render_below_the_composer_and_above_the_footer() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [
-            SubagentSnapshot {
+            SubagentView {
                 task_name: "inspect_glob".to_string(),
                 agent_type: "explorer".to_string(),
-                state: SubagentState::Running,
+                state: SubagentViewState::Running,
                 last_task_message: "Inspect the glob API".to_string(),
             },
-            SubagentSnapshot {
+            SubagentView {
                 task_name: "fix_bash".to_string(),
                 agent_type: "worker".to_string(),
-                state: SubagentState::Pending,
+                state: SubagentViewState::Pending,
                 last_task_message: "Add cwd to bash".to_string(),
             },
         ];
@@ -1040,10 +1040,10 @@ mod tests {
     #[test]
     fn completed_subagents_do_not_occupy_a_row() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
-        let subagents = [SubagentSnapshot {
+        let subagents = [SubagentView {
             task_name: "inspect_glob".to_string(),
             agent_type: "explorer".to_string(),
-            state: SubagentState::Completed,
+            state: SubagentViewState::Completed,
             last_task_message: "Inspect the glob API".to_string(),
         }];
         let frame = render(ViewportInput {

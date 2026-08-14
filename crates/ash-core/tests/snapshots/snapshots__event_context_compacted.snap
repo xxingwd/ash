@@ -3,10 +3,9 @@ source: crates/ash-core/tests/snapshots.rs
 expression: event
 ---
 {
-  "Compacted": {
+  "ContextCompacted": {
     "before": 180000,
     "after": 12000,
-    "dropped": 42,
-    "automatic": false
+    "dropped": 42
   }
 }

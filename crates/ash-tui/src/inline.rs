@@ -5,7 +5,6 @@ use std::{
     time::Instant,
 };
 
-use ash_collab::SubagentSnapshot;
 use ash_core::{
     Content, ContentBlock, ForkPoint, Message, MessageContent, MessageId, SessionSummary,
     SessionView, StopReason, ToolCallId, TurnId, TurnResult, TurnView, Usage,
@@ -21,10 +20,12 @@ use crate::{
     input::InputState,
     live_block::LiveBlock,
     menu::MenuView,
+    operation::ActivityView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
     status_line::format_elapsed,
     viewport::{self, ViewportInput, COMPOSER_TEXT_COLUMN},
+    SubagentView,
 };
 
 const TERMINAL_SAFE_COLUMN: u16 = 1;
@@ -89,13 +90,64 @@ struct ComposerState {
     cursor_column: u16,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderPlan {
+    sync_view: bool,
+    redraw: bool,
+    commit: bool,
+    rebuild: bool,
+}
+
+impl RenderPlan {
+    pub(crate) const NONE: Self = Self {
+        sync_view: false,
+        redraw: false,
+        commit: false,
+        rebuild: false,
+    };
+    pub(crate) const REDRAW: Self = Self {
+        sync_view: true,
+        redraw: true,
+        commit: false,
+        rebuild: false,
+    };
+    pub(crate) const COMMIT: Self = Self {
+        sync_view: true,
+        redraw: false,
+        commit: true,
+        rebuild: false,
+    };
+    pub(crate) const REBUILD: Self = Self {
+        sync_view: true,
+        redraw: false,
+        commit: false,
+        rebuild: true,
+    };
+
+    #[must_use]
+    pub(crate) const fn merge(self, other: Self) -> Self {
+        Self {
+            sync_view: self.sync_view || other.sync_view,
+            redraw: self.redraw || other.redraw,
+            commit: self.commit || other.commit,
+            rebuild: self.rebuild || other.rebuild,
+        }
+    }
+
+    pub(crate) const fn should_sync_view(self) -> bool {
+        self.sync_view
+    }
+
+    const fn needs_io(self) -> bool {
+        self.redraw || self.commit || self.rebuild
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct TerminalView<'a> {
     pub(crate) input: &'a InputState,
     pub(crate) menu: MenuView<'a>,
-    pub(crate) busy: bool,
-    pub(crate) interruptible: bool,
-    pub(crate) status_header: Option<&'static str>,
+    pub(crate) activity: ActivityView,
 }
 
 impl ComposerState {
@@ -108,23 +160,20 @@ impl ComposerState {
 
 #[derive(Debug, Default)]
 struct StatusState {
-    header: String,
     started_at: Option<Instant>,
     frame: usize,
 }
 
 impl StatusState {
-    fn start(&mut self, header: &str) {
-        self.header.clear();
-        self.header.push_str(header);
-        self.started_at = Some(Instant::now());
-        self.frame = 0;
-    }
-
-    fn stop(&mut self) {
-        self.header.clear();
-        self.started_at = None;
-        self.frame = 0;
+    fn set_active(&mut self, active: bool) {
+        match (self.started_at.is_some(), active) {
+            (false, true) => {
+                self.started_at = Some(Instant::now());
+                self.frame = 0;
+            }
+            (true, false) => self.reset(),
+            _ => {}
+        }
     }
 
     fn reset(&mut self) {
@@ -201,22 +250,127 @@ impl RenderedMenu {
 struct ViewState {
     composer: ComposerState,
     menu: RenderedMenu,
-    busy: bool,
-    interruptible: bool,
+    activity: ActivityView,
+}
+
+#[derive(Debug, Default)]
+struct BlockStore {
+    blocks: Vec<LiveBlock>,
+    committed_len: usize,
+}
+
+impl BlockStore {
+    fn clear(&mut self) {
+        self.blocks.clear();
+        self.committed_len = 0;
+    }
+
+    const fn committed_is_empty(&self) -> bool {
+        self.committed_len == 0
+    }
+
+    fn pending(&self) -> &[LiveBlock] {
+        &self.blocks[self.committed_len..]
+    }
+
+    fn pending_mut(&mut self) -> &mut [LiveBlock] {
+        &mut self.blocks[self.committed_len..]
+    }
+
+    fn pending_is_empty(&self) -> bool {
+        self.committed_len == self.blocks.len()
+    }
+
+    fn push_pending(&mut self, block: LiveBlock) {
+        self.blocks.push(block);
+    }
+
+    fn pending_last_mut(&mut self) -> Option<&mut LiveBlock> {
+        (self.blocks.len() > self.committed_len)
+            .then(|| self.blocks.last_mut())
+            .flatten()
+    }
+
+    fn pending_position(&self, predicate: impl FnMut(&LiveBlock) -> bool) -> Option<usize> {
+        self.pending().iter().position(predicate)
+    }
+
+    fn remove_pending(&mut self, position: usize) {
+        self.blocks.remove(self.committed_len + position);
+    }
+
+    fn retain_pending(&mut self, predicate: impl FnMut(&LiveBlock) -> bool) {
+        let mut pending = self.blocks.split_off(self.committed_len);
+        pending.retain(predicate);
+        self.blocks.extend(pending);
+    }
+
+    fn remove_streamed_turn(&mut self, current: Option<TurnId>, canonical: TurnId) {
+        let Some(turn_id) = current.filter(|id| *id == canonical) else {
+            return;
+        };
+        self.retain_pending(|block| !block.is_streamed_for_turn(turn_id));
+    }
+
+    fn remove_turn(&mut self, turn_id: TurnId) {
+        let removed_committed = self.blocks[..self.committed_len]
+            .iter()
+            .filter(|block| block.belongs_to_turn(turn_id))
+            .count();
+        self.blocks.retain(|block| !block.belongs_to_turn(turn_id));
+        self.committed_len -= removed_committed;
+    }
+
+    fn latest_turn_id(&self, current: Option<TurnId>) -> Option<TurnId> {
+        current.or_else(|| self.blocks.iter().rev().find_map(LiveBlock::turn_id))
+    }
+
+    fn take_pending(&mut self) -> Vec<LiveBlock> {
+        self.blocks.split_off(self.committed_len)
+    }
+
+    fn finish_commit(&mut self, pending: Vec<LiveBlock>, inserted: usize) {
+        let inserted = inserted.min(pending.len());
+        self.blocks.extend(pending);
+        self.committed_len += inserted;
+    }
+
+    fn mark_all_committed(&mut self) {
+        self.committed_len = self.blocks.len();
+    }
+
+    fn take_committed(&mut self) -> Vec<LiveBlock> {
+        let pending = self.blocks.split_off(self.committed_len);
+        self.committed_len = 0;
+        std::mem::replace(&mut self.blocks, pending)
+    }
+
+    fn rebuild_succeeded(&mut self, mut committed: Vec<LiveBlock>) {
+        let committed_len = committed.len();
+        committed.append(&mut self.blocks);
+        self.blocks = committed;
+        self.committed_len = committed_len;
+    }
+
+    fn rebuild_failed(&mut self, committed: Vec<LiveBlock>, inserted: usize) {
+        let mut remaining = committed.into_iter().skip(inserted).collect::<Vec<_>>();
+        self.committed_len = remaining.len();
+        remaining.append(&mut self.blocks);
+        self.blocks = remaining;
+    }
 }
 
 pub struct TerminalUi {
     surface: InlineScreen,
     session: SessionUiInfo,
     view: ViewState,
-    history: Vec<LiveBlock>,
-    transcript: Vec<LiveBlock>,
+    blocks: BlockStore,
     /// Global display mode for tool output: true renders full output, false
     /// renders a short preview. Persists across session switches (`Ctrl+o`).
     tools_expanded: bool,
     /// Display-only snapshots of the session's sub-agents, refreshed by the
     /// app from the collaboration control's watch channel.
-    subagents: Vec<SubagentSnapshot>,
+    subagents: Vec<SubagentView>,
     scroll_top: Option<u16>,
     next_block_id: u64,
     status: StatusState,
@@ -247,8 +401,7 @@ impl TerminalUi {
             surface,
             session: SessionUiInfo::new(protocol, model, working_dir, context_limit),
             view: ViewState::default(),
-            history: Vec::new(),
-            transcript: Vec::new(),
+            blocks: BlockStore::default(),
             tools_expanded: false,
             subagents: Vec::new(),
             scroll_top: None,
@@ -261,9 +414,9 @@ impl TerminalUi {
         })
     }
 
-    pub fn welcome(&mut self) -> io::Result<()> {
+    pub fn welcome(&mut self) -> RenderPlan {
         self.enqueue_welcome();
-        self.commit_transcript_to_scrollback()
+        RenderPlan::COMMIT
     }
 
     fn enqueue_welcome(&mut self) {
@@ -271,14 +424,14 @@ impl TerminalUi {
         self.push_block(LiveBlock::welcome(id, self.session.working_dir.clone()));
     }
 
-    pub fn command_output(&mut self, message: &str) -> io::Result<()> {
+    pub fn command_output(&mut self, message: &str) -> RenderPlan {
         self.view.composer.clear();
         self.scroll_top = None;
         self.push_history_block(HistoryBlock::info(message));
-        self.commit_transcript_to_scrollback()
+        RenderPlan::COMMIT
     }
 
-    pub fn show_session_status(&mut self) -> io::Result<()> {
+    pub fn show_session_status(&mut self) -> RenderPlan {
         let status = format!(
             "Model: {}\nProtocol: {}\nDirectory: {}",
             self.session.model,
@@ -288,11 +441,11 @@ impl TerminalUi {
         self.command_output(&status)
     }
 
-    pub fn command_error(&mut self, message: &str) -> io::Result<()> {
+    pub fn command_error(&mut self, message: &str) -> RenderPlan {
         self.view.composer.clear();
         self.scroll_top = None;
         self.push_history_block(HistoryBlock::error(message));
-        self.commit_transcript_to_scrollback()
+        RenderPlan::COMMIT
     }
 
     pub fn finish_compaction(
@@ -300,8 +453,7 @@ impl TerminalUi {
         before_tokens: u64,
         after_tokens: u64,
         dropped_messages: u64,
-    ) -> io::Result<()> {
-        self.status.stop();
+    ) -> RenderPlan {
         self.usage.set_context_tokens(after_tokens);
         let message = if dropped_messages == 0 {
             "Model context is already compact; no new summary was created.".to_string()
@@ -313,42 +465,38 @@ impl TerminalUi {
         self.command_output(&message)
     }
 
-    pub fn record_automatic_compaction(&mut self, after_tokens: u64) -> io::Result<()> {
+    pub fn record_automatic_compaction(&mut self, after_tokens: u64) -> RenderPlan {
         self.usage.set_context_tokens(after_tokens);
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
-    pub fn start_new_session(&mut self) -> io::Result<()> {
-        self.begin_fresh_viewport()?;
+    pub fn start_new_session(&mut self) -> RenderPlan {
+        self.begin_fresh_viewport();
         self.enqueue_welcome();
-        self.commit_transcript_to_scrollback()
+        self.blocks.mark_all_committed();
+        RenderPlan::REBUILD
     }
 
-    fn begin_fresh_viewport(&mut self) -> io::Result<()> {
-        self.synchronized(|terminal| {
-            terminal.history.clear();
-            terminal.transcript.clear();
-            terminal.scroll_top = None;
-            terminal.reset_ui_state()?;
-            Ok(())
-        })
+    fn begin_fresh_viewport(&mut self) {
+        self.blocks.clear();
+        self.scroll_top = None;
+        self.view = ViewState::default();
+        self.usage = UsageState::default();
+        self.reset_turn_state();
     }
 
-    pub fn rollback_turn(&mut self) -> io::Result<()> {
-        let turn_id = latest_turn_id(self.current_turn_id, &self.transcript, &self.history);
-        let (width, height) = terminal_size()?;
+    pub fn rollback_turn(&mut self) -> RenderPlan {
+        let turn_id = self.blocks.latest_turn_id(self.current_turn_id);
         if let Some(turn_id) = turn_id {
-            self.history.retain(|block| !block.belongs_to_turn(turn_id));
-            self.transcript
-                .retain(|block| !block.belongs_to_turn(turn_id));
+            self.blocks.remove_turn(turn_id);
         }
         self.scroll_top = None;
         self.reset_turn_state();
-        self.rebuild_scrollback_at(width, height)
+        RenderPlan::REBUILD
     }
 
-    pub fn restore_session(&mut self, session: &SessionView) -> io::Result<()> {
-        self.begin_fresh_viewport()?;
+    pub fn restore_session(&mut self, session: &SessionView) -> RenderPlan {
+        self.begin_fresh_viewport();
         self.enqueue_welcome();
         if session.turns.is_empty() {
             self.push_restored_messages(&session.messages);
@@ -367,19 +515,34 @@ impl TerminalUi {
         if let Some(tokens) = session.context_tokens {
             self.usage.set_context_tokens(tokens);
         }
-        self.commit_transcript_to_scrollback()
+        self.blocks.mark_all_committed();
+        RenderPlan::REBUILD
     }
 
-    pub fn sync_view(&mut self, view: TerminalView<'_>) -> io::Result<()> {
+    pub(crate) fn apply_plan(
+        &mut self,
+        view: TerminalView<'_>,
+        plan: RenderPlan,
+    ) -> io::Result<()> {
+        if !plan.sync_view && !plan.needs_io() {
+            return Ok(());
+        }
         let (width, height) = terminal_size()?;
-        self.sync_view_at(view, width, height)
-    }
-
-    fn sync_view_at(&mut self, view: TerminalView<'_>, width: u16, height: u16) -> io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        self.apply_view(view, width);
-        self.redraw_at(width, height)
+        if plan.sync_view {
+            self.apply_view(view, width);
+        }
+        match (plan.rebuild, plan.commit, plan.redraw) {
+            (true, true, _) => {
+                self.blocks.mark_all_committed();
+                self.rebuild_scrollback_at(width, height)
+            }
+            (true, false, _) => self.rebuild_scrollback_at(width, height),
+            (false, true, _) => self.commit_transcript_to_scrollback_at(width, height),
+            (false, false, true) => self.redraw_at(width, height),
+            (false, false, false) => Ok(()),
+        }
     }
 
     fn apply_view(&mut self, view: TerminalView<'_>, width: u16) {
@@ -388,57 +551,49 @@ impl TerminalUi {
         self.view.composer.cursor_row = input.cursor_row;
         self.view.composer.cursor_column = input.cursor_column;
         self.view.menu.set(view.menu);
-        self.view.busy = view.busy;
-        self.view.interruptible = view.interruptible;
-        match view.status_header {
-            Some(header) if self.status.started_at.is_none() => self.status.start(header),
-            Some(header) => {
-                self.status.header.clear();
-                self.status.header.push_str(header);
-            }
-            None => self.status.stop(),
-        }
+        self.view.activity = view.activity;
+        self.status.set_active(view.activity.is_active());
     }
 
     pub fn composer_text_width() -> io::Result<u16> {
         Ok(composer_text_width(terminal_size()?.0))
     }
 
-    pub fn commit_input(&mut self, turn_id: TurnId, input: &str) -> io::Result<()> {
+    pub const fn current_turn_id(&self) -> Option<TurnId> {
+        self.current_turn_id
+    }
+
+    pub const fn track_turn(&mut self, turn_id: TurnId) {
+        self.current_turn_id = Some(turn_id);
+    }
+
+    pub fn commit_input(&mut self, turn_id: TurnId, input: &str) -> RenderPlan {
         self.current_turn_id = Some(turn_id);
         self.scroll_top = None;
-        self.status.start("Working");
         self.commit_user_message(input)
     }
 
-    pub fn commit_steer(&mut self, input: &str) -> io::Result<()> {
+    pub fn commit_steer(&mut self, input: &str) -> RenderPlan {
         self.finish_live_output();
         self.scroll_top = None;
         self.commit_user_message(input)
     }
 
-    pub fn commit_exit(&mut self, input: &str) -> io::Result<()> {
+    pub fn commit_exit(&mut self, input: &str) {
         self.finish_live_output();
         self.current_turn_id = None;
-        self.status.stop();
-        self.view.busy = false;
-        self.commit_user_message(input)?;
-        self.commit_transcript_to_scrollback()
+        let _ = self.commit_user_message(input);
     }
 
-    fn commit_user_message(&mut self, input: &str) -> io::Result<()> {
+    fn commit_user_message(&mut self, input: &str) -> RenderPlan {
         self.view.composer.clear();
         self.view.menu.clear();
         self.push_history_block(HistoryBlock::user(input));
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
-    pub fn agent_started(&mut self) -> io::Result<()> {
-        if self.status.started_at.is_none() {
-            self.status.start("Working");
-            self.redraw()?;
-        }
-        Ok(())
+    pub const fn agent_started(&self) -> RenderPlan {
+        RenderPlan::REDRAW
     }
 
     /// Append one text delta to the turn's streaming assistant block,
@@ -455,7 +610,12 @@ impl TerminalUi {
             self.assistant_block_id = Some(id);
             id
         });
-        if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+        if let Some(block) = self
+            .blocks
+            .pending_mut()
+            .iter_mut()
+            .find(|block| block.id() == id)
+        {
             block.append_markdown_source(source);
         }
     }
@@ -463,12 +623,13 @@ impl TerminalUi {
     /// Append one text delta and redraw immediately when it completes a line,
     /// so output reads line by line instead of character by character.
     /// Partial runs are picked up by the periodic status refresh.
-    pub fn text(&mut self, text: &str) -> io::Result<()> {
+    pub fn text(&mut self, text: &str) -> RenderPlan {
         self.append_assistant(text);
         if delta_completes_line(text) {
-            self.redraw()?;
+            RenderPlan::REDRAW
+        } else {
+            RenderPlan::NONE
         }
-        Ok(())
     }
 
     /// Append one reasoning delta to the scrolling preview. Newline-complete
@@ -477,35 +638,36 @@ impl TerminalUi {
     /// Reasoning always precedes the assistant text: the protocol emits
     /// thinking blocks before text output, so no late-reasoning handling is
     /// needed here.
-    pub fn thinking(&mut self, text: &str) -> io::Result<()> {
+    pub fn thinking(&mut self, text: &str) -> RenderPlan {
         let id = self.reasoning_block_id.unwrap_or_else(|| {
             let id = self.allocate_block_id();
             self.push_block(LiveBlock::reasoning(id));
             self.reasoning_block_id = Some(id);
             id
         });
-        if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+        if let Some(block) = self
+            .blocks
+            .pending_mut()
+            .iter_mut()
+            .find(|block| block.id() == id)
+        {
             block.append_reasoning_source(text);
         }
         if delta_completes_line(text) {
-            self.redraw()?;
+            RenderPlan::REDRAW
+        } else {
+            RenderPlan::NONE
         }
-        Ok(())
     }
 
-    pub fn tool_started(
-        &mut self,
-        id: ToolCallId,
-        name: String,
-        arguments: Value,
-    ) -> io::Result<()> {
+    pub fn tool_started(&mut self, id: ToolCallId, name: String, arguments: Value) -> RenderPlan {
         self.finish_live_output();
-        if absorbs_running_read(&self.transcript, &name, &arguments) {
-            return Ok(());
+        if absorbs_running_read(self.blocks.pending(), &name, &arguments) {
+            return RenderPlan::NONE;
         }
         let block_id = self.allocate_block_id();
         self.push_block(LiveBlock::running_tool(block_id, id, name, arguments));
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
     pub fn tool_finished(
@@ -515,17 +677,17 @@ impl TerminalUi {
         arguments: &Value,
         output: &str,
         is_error: bool,
-    ) -> io::Result<()> {
+    ) -> RenderPlan {
         if let Some(position) = self
-            .transcript
-            .iter()
-            .position(|block| block.is_running_tool(id))
+            .blocks
+            .pending_position(|block| block.is_running_tool(id))
         {
-            self.transcript[position].finish_tool(id, output.to_string(), is_error);
+            self.blocks.pending_mut()[position].finish_tool(id, output.to_string(), is_error);
             if position > 0
-                && self.transcript[position - 1].try_append_tool(name, arguments, is_error)
+                && self.blocks.pending_mut()[position - 1]
+                    .try_append_tool(name, arguments, is_error)
             {
-                self.transcript.remove(position);
+                self.blocks.remove_pending(position);
             }
         } else {
             self.push_tool_block(
@@ -535,7 +697,7 @@ impl TerminalUi {
                 is_error,
             );
         }
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
     /// Discard unfinished streamed output after the user cancels. Completed
@@ -544,25 +706,25 @@ impl TerminalUi {
     pub fn prepare_cancellation(&mut self) {
         self.reasoning_block_id = None;
         if let Some(turn_id) = self.current_turn_id {
-            self.transcript
-                .retain(|block| !block.is_unfinished_response_for_turn(turn_id));
+            self.blocks
+                .retain_pending(|block| !block.is_unfinished_response_for_turn(turn_id));
         }
         self.assistant_block_id = None;
     }
 
-    pub fn error(&mut self, error: &str) -> io::Result<()> {
+    pub fn error(&mut self, error: &str) -> RenderPlan {
         self.finish_live_output();
         self.push_history_block(HistoryBlock::error(error));
         if self.current_turn_id.is_some() {
-            self.redraw()
+            RenderPlan::REDRAW
         } else {
-            self.commit_transcript_to_scrollback()
+            RenderPlan::COMMIT
         }
     }
 
     /// Commit a settled turn: replace the streamed preview with the canonical
     /// projection of the turn's messages, then move it into the scrollback.
-    pub fn commit_turn(&mut self, view: &TurnView) -> io::Result<()> {
+    pub fn commit_turn(&mut self, view: &TurnView) -> RenderPlan {
         self.finish_live_output();
         let elapsed_seconds = self.status.elapsed_seconds();
         if let Some(tokens) = view.context_tokens {
@@ -570,17 +732,13 @@ impl TerminalUi {
         }
         let usage = UsageState::commit_turn_usage(view.usage.as_ref());
         let footer = turn_footer(&view.result, elapsed_seconds, usage);
-        if let Some(turn_id) = self.current_turn_id {
-            self.transcript
-                .retain(|block| !block.is_streamed_for_turn(turn_id));
-        }
+        self.blocks
+            .remove_streamed_turn(self.current_turn_id, view.id);
         self.assistant_block_id = None;
         self.push_turn_messages(&view.messages);
-        self.status.stop();
-        self.view.busy = false;
         self.push_history_block(footer);
         self.current_turn_id = None;
-        self.commit_transcript_to_scrollback()
+        RenderPlan::COMMIT
     }
 
     pub fn resize_view(
@@ -611,15 +769,15 @@ impl TerminalUi {
     /// Toggle the global tool-output display mode: full output vs short
     /// preview. Applies to every tool block and persists across session
     /// switches (`Ctrl+o`).
-    pub fn toggle_tool_expanded(&mut self) -> io::Result<()> {
+    pub fn toggle_tool_expanded(&mut self) -> RenderPlan {
         self.tools_expanded = !self.tools_expanded;
         // Committed blocks are baked into the scrollback surface; rebuilding
         // it re-renders them at their new height.
-        if !self.history.is_empty() {
-            let (width, height) = terminal_size()?;
-            self.rebuild_scrollback_at(width, height)?;
+        if self.blocks.committed_is_empty() {
+            RenderPlan::REDRAW
+        } else {
+            RenderPlan::REBUILD
         }
-        self.redraw()
     }
 
     pub fn scroll_to_top(&mut self) -> io::Result<()> {
@@ -632,30 +790,28 @@ impl TerminalUi {
         self.redraw()
     }
 
-    pub fn refresh_status(&mut self) -> io::Result<()> {
-        if !self.view.busy && self.subagents.is_empty() {
-            return Ok(());
+    pub fn refresh_status(&mut self) -> RenderPlan {
+        if !self.view.activity.is_active() && self.subagents.is_empty() {
+            return RenderPlan::NONE;
         }
         self.status.frame = self.status.frame.wrapping_add(1);
         // The periodic working refresh is the fallback flush point: it
         // redraws current state, so partial lines that never completed a
         // newline still appear here.
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
-    /// Replace the displayed sub-agent snapshots and redraw when they changed.
-    pub fn set_subagents(&mut self, subagents: Vec<SubagentSnapshot>) -> io::Result<()> {
+    /// Replace the displayed sub-agent snapshots.
+    pub fn set_subagents(&mut self, subagents: Vec<SubagentView>) -> RenderPlan {
         if self.subagents == subagents {
-            return Ok(());
+            return RenderPlan::NONE;
         }
         self.subagents = subagents;
-        self.redraw()
+        RenderPlan::REDRAW
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
         self.finish_live_output();
-        self.status.stop();
-        self.view.busy = false;
         self.current_turn_id = None;
         self.commit_transcript_to_scrollback()?;
         self.surface.leave_screen()
@@ -664,7 +820,12 @@ impl TerminalUi {
     fn finish_live_output(&mut self) {
         self.finish_reasoning();
         if let Some(id) = self.assistant_block_id.take() {
-            if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+            if let Some(block) = self
+                .blocks
+                .pending_mut()
+                .iter_mut()
+                .find(|block| block.id() == id)
+            {
                 block.finalize_markdown();
             }
         }
@@ -674,20 +835,12 @@ impl TerminalUi {
         let Some(id) = self.reasoning_block_id.take() else {
             return;
         };
-        let Some(position) = self.transcript.iter().position(|block| block.id() == id) else {
+        let Some(position) = self.blocks.pending_position(|block| block.id() == id) else {
             return;
         };
-        if !self.transcript[position].finish_reasoning() {
-            self.transcript.remove(position);
+        if !self.blocks.pending_mut()[position].finish_reasoning() {
+            self.blocks.remove_pending(position);
         }
-    }
-
-    fn reset_ui_state(&mut self) -> io::Result<()> {
-        self.surface.reset()?;
-        self.view = ViewState::default();
-        self.usage = UsageState::default();
-        self.reset_turn_state();
-        Ok(())
     }
 
     fn reset_turn_state(&mut self) {
@@ -707,19 +860,51 @@ impl TerminalUi {
     }
 
     fn commit_transcript_to_scrollback(&mut self) -> io::Result<()> {
-        if self.transcript.is_empty() {
-            return self.redraw();
+        let (width, height) = terminal_size()?;
+        self.commit_transcript_to_scrollback_at(width, height)
+    }
+
+    fn commit_transcript_to_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
+        if self.blocks.pending_is_empty() {
+            return self.redraw_at(width, height);
         }
 
-        let (width, height) = terminal_size()?;
         let render_width = viewport::drawable_width(width);
         let tools_expanded = self.tools_expanded;
-        let committed = std::mem::take(&mut self.transcript);
+        let pending = self.blocks.take_pending();
         let result = self.synchronized(|terminal| {
             terminal.scroll_top = None;
 
             // Shrink the live viewport before inserting history so committed rows remain visible
             // directly above the composer instead of disappearing above a full-screen viewport.
+            terminal.render_viewport(width, height)?;
+            let inserted = insert_history_blocks(
+                &mut terminal.surface,
+                &pending,
+                render_width,
+                tools_expanded,
+            )?;
+            terminal.render_viewport(width, height)?;
+            Ok(inserted)
+        });
+        match &result {
+            Ok(inserted) => self.blocks.finish_commit(pending, *inserted),
+            Err(error) => {
+                // Blocks written to the terminal before the failure stay
+                // committed; only the untouched remainder stays pending so a
+                // retry never re-renders them.
+                self.blocks.finish_commit(pending, inserted_blocks(error));
+            }
+        }
+        result.map(|_| ())
+    }
+
+    fn rebuild_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
+        let render_width = viewport::drawable_width(width);
+        let tools_expanded = self.tools_expanded;
+        let committed = self.blocks.take_committed();
+        let result = self.synchronized(|terminal| {
+            terminal.surface.reset()?;
             terminal.render_viewport(width, height)?;
             let inserted = insert_history_blocks(
                 &mut terminal.surface,
@@ -731,44 +916,13 @@ impl TerminalUi {
             Ok(inserted)
         });
         match &result {
-            Ok(inserted) => self.history.extend(committed.into_iter().take(*inserted)),
-            Err(error) => {
-                // Blocks written to the terminal before the failure stay
-                // committed; only the untouched remainder returns to the
-                // transcript so a retry never re-renders them.
-                let inserted = inserted_blocks(error);
-                self.history
-                    .extend(committed.iter().take(inserted).cloned());
-                self.transcript = committed.into_iter().skip(inserted).collect();
-            }
-        }
-        result.map(|_| ())
-    }
-
-    fn rebuild_scrollback_at(&mut self, width: u16, height: u16) -> io::Result<()> {
-        let render_width = viewport::drawable_width(width);
-        let tools_expanded = self.tools_expanded;
-        let history = std::mem::take(&mut self.history);
-        let result = self.synchronized(|terminal| {
-            terminal.surface.reset()?;
-            terminal.render_viewport(width, height)?;
-            let inserted = insert_history_blocks(
-                &mut terminal.surface,
-                &history,
-                render_width,
-                tools_expanded,
-            )?;
-            terminal.render_viewport(width, height)?;
-            Ok(inserted)
-        });
-        match &result {
-            Ok(_) => self.history = history,
+            Ok(_) => self.blocks.rebuild_succeeded(committed),
             Err(error) => {
                 // Blocks already written to the terminal before the failure are
                 // not restored, otherwise the next commit would render them a
                 // second time.
-                let inserted = inserted_blocks(error);
-                self.history = history.into_iter().skip(inserted).collect();
+                self.blocks
+                    .rebuild_failed(committed, inserted_blocks(error));
             }
         }
         result.map(|_| ())
@@ -816,7 +970,8 @@ impl TerminalUi {
     }
 
     fn push_block(&mut self, block: LiveBlock) {
-        self.transcript.push(block.with_turn(self.current_turn_id));
+        self.blocks
+            .push_pending(block.with_turn(self.current_turn_id));
     }
 
     fn push_history_block(&mut self, block: HistoryBlock) {
@@ -836,8 +991,8 @@ impl TerminalUi {
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
         if self
-            .transcript
-            .last_mut()
+            .blocks
+            .pending_last_mut()
             .is_some_and(|block| block.try_append_tool(&name, &arguments, is_error))
         {
             return;
@@ -965,16 +1120,23 @@ impl TerminalUi {
 
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
         let elapsed = format_elapsed(self.status.elapsed_seconds());
-        let status_header = sanitize_single_line(&self.status.header);
+        let (busy, interruptible, status_header) = match self.view.activity {
+            ActivityView::Idle => (false, false, ""),
+            ActivityView::Active {
+                header,
+                interruptible,
+            } => (true, interruptible, header),
+        };
+        let status_header = sanitize_single_line(status_header);
         let model = sanitize_single_line(&self.session.model);
         let protocol = sanitize_single_line(&self.session.protocol);
         viewport::render(ViewportInput {
             terminal_width: width,
             terminal_height: height,
-            transcript: &self.transcript,
+            transcript: self.blocks.pending(),
             scroll_top: self.scroll_top,
-            busy: self.view.busy,
-            interruptible: self.view.interruptible,
+            busy,
+            interruptible,
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
@@ -1097,20 +1259,6 @@ fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, ToolResultView<
     results
 }
 
-fn latest_turn_id(
-    current_turn_id: Option<TurnId>,
-    transcript: &[LiveBlock],
-    history: &[LiveBlock],
-) -> Option<TurnId> {
-    current_turn_id
-        .or_else(|| transcript.iter().rev().find_map(LiveBlock::turn_id))
-        .or_else(|| history.iter().rev().find_map(LiveBlock::turn_id))
-}
-
-fn keep_during_cancellation(block: &LiveBlock, turn_id: TurnId) -> bool {
-    !block.is_unfinished_response_for_turn(turn_id)
-}
-
 fn turn_footer(result: &TurnResult, elapsed_seconds: u64, usage: TurnUsage) -> HistoryBlock {
     match result {
         TurnResult::Completed(StopReason::Aborted) => HistoryBlock::interrupted(),
@@ -1146,6 +1294,90 @@ mod tests {
 
     fn test_turn(n: u128) -> TurnId {
         TurnId::from_u128(n)
+    }
+
+    #[test]
+    fn render_plan_preserves_orthogonal_terminal_operations() {
+        let plan = RenderPlan::COMMIT.merge(RenderPlan::REBUILD);
+        assert!(plan.commit);
+        assert!(plan.rebuild);
+        assert!(plan.should_sync_view());
+
+        let no_op = RenderPlan::NONE;
+        assert!(!no_op.should_sync_view());
+        assert!(!no_op.needs_io());
+    }
+
+    #[test]
+    fn block_store_preserves_the_unwritten_suffix_after_a_partial_commit() {
+        let mut blocks = BlockStore::default();
+        let first = LiveBlock::history(1, HistoryBlock::info("first"));
+        let second = LiveBlock::history(2, HistoryBlock::info("second"));
+        blocks.push_pending(first);
+        blocks.push_pending(second);
+
+        let pending = blocks.take_pending();
+        blocks.finish_commit(pending, 1);
+
+        assert_eq!(blocks.committed_len, 1);
+        assert_eq!(blocks.blocks.len(), 2);
+        assert_eq!(blocks.blocks[0].id(), 1);
+        assert_eq!(blocks.pending()[0].id(), 2);
+    }
+
+    #[test]
+    fn block_store_rebuild_success_preserves_pending_suffix() {
+        let mut blocks = BlockStore::default();
+        blocks.push_pending(LiveBlock::history(1, HistoryBlock::info("committed")));
+        let pending = blocks.take_pending();
+        blocks.finish_commit(pending, 1);
+        blocks.push_pending(LiveBlock::history(2, HistoryBlock::info("pending")));
+
+        let committed = blocks.take_committed();
+        blocks.rebuild_succeeded(committed);
+
+        assert_eq!(blocks.committed_len, 1);
+        assert_eq!(blocks.blocks.len(), 2);
+        assert_eq!(blocks.pending()[0].id(), 2);
+    }
+
+    #[test]
+    fn block_store_rebuild_failure_preserves_unwritten_suffix_and_pending() {
+        let mut blocks = BlockStore::default();
+        for id in [1, 2] {
+            blocks.push_pending(LiveBlock::history(id, HistoryBlock::info("committed")));
+        }
+        let pending = blocks.take_pending();
+        blocks.finish_commit(pending, 2);
+        blocks.push_pending(LiveBlock::history(3, HistoryBlock::info("pending")));
+
+        let committed = blocks.take_committed();
+        blocks.rebuild_failed(committed, 1);
+
+        assert_eq!(blocks.committed_len, 1);
+        assert!(blocks.committed_len <= blocks.blocks.len());
+        assert_eq!(blocks.blocks[0].id(), 2);
+        assert_eq!(blocks.pending()[0].id(), 3);
+    }
+
+    #[test]
+    fn block_store_removes_a_turn_from_committed_and_pending_blocks() {
+        let mut blocks = BlockStore::default();
+        blocks.push_pending(
+            LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(test_turn(7))),
+        );
+        let pending = blocks.take_pending();
+        blocks.finish_commit(pending, 1);
+        blocks.push_pending(
+            LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(test_turn(7))),
+        );
+        blocks.push_pending(LiveBlock::history(3, HistoryBlock::info("status")));
+
+        blocks.remove_turn(test_turn(7));
+
+        assert_eq!(blocks.committed_len, 0);
+        assert_eq!(blocks.pending().len(), 1);
+        assert_eq!(blocks.pending()[0].id(), 3);
     }
 
     #[test]
@@ -1220,13 +1452,18 @@ mod tests {
 
     #[test]
     fn rollback_finds_the_latest_committed_turn_behind_non_turn_history() {
-        let history = [
+        let mut blocks = BlockStore::default();
+        for block in [
             LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(test_turn(7))),
             LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(test_turn(7))),
             LiveBlock::history(3, HistoryBlock::info("status")),
-        ];
+        ] {
+            blocks.push_pending(block);
+        }
+        let pending = blocks.take_pending();
+        blocks.finish_commit(pending, 3);
 
-        assert_eq!(latest_turn_id(None, &[], &history), Some(test_turn(7)));
+        assert_eq!(blocks.latest_turn_id(None), Some(test_turn(7)));
     }
 
     #[test]
@@ -1235,11 +1472,11 @@ mod tests {
         assert!(text.append_markdown_source("Inspecting before the tool call."));
         text.finalize_markdown();
 
-        assert!(keep_during_cancellation(&text, test_turn(7)));
+        assert!(!text.is_unfinished_response_for_turn(test_turn(7)));
 
         let prompt =
             LiveBlock::history(2, HistoryBlock::user("inspect")).with_turn(Some(test_turn(7)));
-        assert!(keep_during_cancellation(&prompt, test_turn(7)));
+        assert!(!prompt.is_unfinished_response_for_turn(test_turn(7)));
     }
 
     #[test]
@@ -1253,9 +1490,9 @@ mod tests {
         )
         .with_turn(Some(test_turn(7)));
 
-        assert!(!keep_during_cancellation(&tool, test_turn(7)));
+        assert!(tool.is_unfinished_response_for_turn(test_turn(7)));
         assert!(tool.finish_tool(&call_id, "done".to_string(), false));
-        assert!(keep_during_cancellation(&tool, test_turn(7)));
+        assert!(!tool.is_unfinished_response_for_turn(test_turn(7)));
     }
 
     #[test]
@@ -1359,7 +1596,7 @@ mod tests {
         );
 
         assert!(absorbs_running_read(
-            &[first.clone()],
+            std::slice::from_ref(&first),
             "read",
             &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
         ));

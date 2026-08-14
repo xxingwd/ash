@@ -1,3 +1,19 @@
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActivityView {
+    #[default]
+    Idle,
+    Active {
+        header: &'static str,
+        interruptible: bool,
+    },
+}
+
+impl ActivityView {
+    pub(crate) const fn is_active(self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackgroundAction {
     ListSessions,
@@ -26,12 +42,6 @@ pub enum AgentStart {
     TurnAlreadyTracked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FailureCompletion {
-    FinishedOperation,
-    OperationUnchanged,
-}
-
 #[derive(Debug, Default)]
 pub struct OperationState {
     current: Operation,
@@ -57,10 +67,7 @@ impl OperationState {
     }
 
     pub(crate) const fn shows_activity(&self) -> bool {
-        matches!(
-            self.current,
-            Operation::Turn(_) | Operation::Background(BackgroundAction::Compact)
-        )
+        self.activity_view().is_active()
     }
 
     pub(crate) const fn submission_policy(&self) -> Option<SubmissionPolicy> {
@@ -72,15 +79,30 @@ impl OperationState {
     }
 
     pub(crate) const fn can_cancel(&self) -> bool {
-        matches!(self.current, Operation::Turn(TurnOperation::Running))
+        matches!(
+            self.activity_view(),
+            ActivityView::Active {
+                interruptible: true,
+                ..
+            }
+        )
     }
 
-    pub(crate) const fn status_header(&self) -> Option<&'static str> {
+    pub(crate) const fn activity_view(&self) -> ActivityView {
         match self.current {
-            Operation::Turn(TurnOperation::Running) => Some("Working"),
-            Operation::Turn(TurnOperation::Cancelling) => Some("Interrupting"),
-            Operation::Background(BackgroundAction::Compact) => Some("Compacting"),
-            Operation::Idle | Operation::Background(_) => None,
+            Operation::Turn(TurnOperation::Running) => ActivityView::Active {
+                header: "Working",
+                interruptible: true,
+            },
+            Operation::Turn(TurnOperation::Cancelling) => ActivityView::Active {
+                header: "Interrupting",
+                interruptible: false,
+            },
+            Operation::Background(BackgroundAction::Compact) => ActivityView::Active {
+                header: "Compacting",
+                interruptible: false,
+            },
+            Operation::Idle | Operation::Background(_) => ActivityView::Idle,
         }
     }
 
@@ -125,15 +147,6 @@ impl OperationState {
         }
     }
 
-    pub(crate) const fn complete_failed_action(&mut self) -> FailureCompletion {
-        if matches!(self.current, Operation::Background(_)) {
-            self.finish();
-            FailureCompletion::FinishedOperation
-        } else {
-            FailureCompletion::OperationUnchanged
-        }
-    }
-
     pub(crate) fn finish_background(&mut self, action: BackgroundAction) {
         if matches!(self.current, Operation::Background(current) if current == action) {
             self.finish();
@@ -152,19 +165,37 @@ mod tests {
     #[test]
     fn status_header_follows_the_active_operation() {
         let mut state = OperationState::default();
-        assert_eq!(state.status_header(), None);
+        assert_eq!(state.activity_view(), ActivityView::Idle);
 
         state.start_turn();
-        assert_eq!(state.status_header(), Some("Working"));
+        assert_eq!(
+            state.activity_view(),
+            ActivityView::Active {
+                header: "Working",
+                interruptible: true,
+            }
+        );
         assert!(state.can_cancel());
 
         assert!(state.begin_cancellation());
-        assert_eq!(state.status_header(), Some("Interrupting"));
+        assert_eq!(
+            state.activity_view(),
+            ActivityView::Active {
+                header: "Interrupting",
+                interruptible: false,
+            }
+        );
         assert!(!state.can_cancel());
 
         let mut state = OperationState::default();
         state.start_background(BackgroundAction::Compact);
-        assert_eq!(state.status_header(), Some("Compacting"));
+        assert_eq!(
+            state.activity_view(),
+            ActivityView::Active {
+                header: "Compacting",
+                interruptible: false,
+            }
+        );
         assert!(!state.can_cancel());
     }
 
@@ -174,18 +205,6 @@ mod tests {
 
         assert_eq!(state.agent_started(), AgentStart::StartedTurn);
         assert_eq!(state.agent_started(), AgentStart::TurnAlreadyTracked);
-    }
-
-    #[test]
-    fn turn_errors_do_not_finish_the_operation_before_agent_finished() {
-        let mut state = OperationState::default();
-        state.start_turn();
-
-        assert_eq!(
-            state.complete_failed_action(),
-            FailureCompletion::OperationUnchanged
-        );
-        assert!(state.is_busy());
     }
 
     #[test]
@@ -230,10 +249,8 @@ mod tests {
         assert!(!state.shows_activity());
         assert_eq!(state.complete_turn(), TurnCompletion::Commit);
         assert!(state.is_busy());
-        assert_eq!(
-            state.complete_failed_action(),
-            FailureCompletion::FinishedOperation
-        );
+        state.finish();
+        assert!(!state.is_busy());
     }
 
     #[test]

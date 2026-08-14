@@ -2,10 +2,12 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_collab::SubagentSnapshot;
 #[cfg(test)]
 use ash_core::SessionError;
-use ash_core::{AshError, EventKind, LiveEvent, Message, MessageId, SessionId, TurnId, TurnView};
+use ash_core::{
+    AshError, ForkPoint, LiveEvent, MessageId, SessionEvent, SessionEventKind, SessionId,
+    SessionSummary, SessionView, TurnId,
+};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -13,15 +15,13 @@ use futures::StreamExt;
 
 use crate::{
     fork_picker::ForkPickerState,
-    inline::{TerminalUi, TerminalView},
+    inline::{RenderPlan, TerminalUi, TerminalView},
     input::InputState,
     menu::ComposerMenuState,
-    operation::{
-        AgentStart, BackgroundAction, FailureCompletion, OperationState, SubmissionPolicy,
-        TurnCompletion,
-    },
+    operation::{AgentStart, BackgroundAction, OperationState, SubmissionPolicy},
     session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
+    SubagentView,
 };
 
 /// Pace complete assistant lines so streaming remains readable rather than
@@ -75,12 +75,46 @@ pub enum UiCommand {
     Exit,
 }
 
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    Session(SessionEvent),
+    SessionChanged {
+        session_id: SessionId,
+    },
+    SessionRestored {
+        session_id: SessionId,
+        view: SessionView,
+    },
+    RollbackCompleted {
+        prompt: String,
+    },
+    CompactionCompleted {
+        before: u64,
+        after: u64,
+        dropped: u64,
+    },
+    SessionsListed {
+        sessions: Vec<SessionSummary>,
+    },
+    ForkPointsListed {
+        points: Vec<ForkPoint>,
+    },
+    SessionForked {
+        session_id: SessionId,
+        view: SessionView,
+        prompt: String,
+    },
+    CommandFailed(String),
+}
+
 struct AppState {
     input: InputState,
     operation: OperationState,
     menu: ComposerMenuState,
-    subagent_rx: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
-    subagents: Vec<SubagentSnapshot>,
+    subagent_rx: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
+    subagents: Vec<SubagentView>,
+    session_id: Option<SessionId>,
+    last_sequence: u64,
 }
 
 enum LoopAction {
@@ -139,6 +173,8 @@ impl AppState {
             menu: ComposerMenuState::default(),
             subagent_rx: None,
             subagents: Vec::new(),
+            session_id: None,
+            last_sequence: 0,
         }
     }
 
@@ -166,6 +202,24 @@ impl AppState {
         }
     }
 
+    fn select_session(&mut self, session_id: SessionId) {
+        self.session_id = Some(session_id);
+        self.last_sequence = 0;
+    }
+
+    fn finish_command_failure(&mut self) {
+        self.operation.finish();
+        self.menu.close_picker();
+    }
+
+    fn accept_session_event(&mut self, session_id: SessionId, sequence: u64) -> bool {
+        if self.session_id != Some(session_id) || sequence <= self.last_sequence {
+            return false;
+        }
+        self.last_sequence = sequence;
+        true
+    }
+
     fn sync_menu(&mut self) {
         self.menu
             .sync_commands(self.input.text(), self.input.cursor());
@@ -175,15 +229,19 @@ impl AppState {
         TerminalView {
             input: &self.input,
             menu: self.menu.view(),
-            busy: self.operation.shows_activity(),
-            interruptible: self.operation.can_cancel(),
-            status_header: self.operation.status_header(),
+            activity: self.operation.activity_view(),
         }
     }
 
     fn render(&mut self, terminal: &mut TerminalUi) -> std::io::Result<()> {
-        self.sync_menu();
-        terminal.sync_view(self.view())
+        self.apply(terminal, RenderPlan::REDRAW)
+    }
+
+    fn apply(&mut self, terminal: &mut TerminalUi, plan: RenderPlan) -> std::io::Result<()> {
+        if plan.should_sync_view() {
+            self.sync_menu();
+        }
+        terminal.apply_plan(self.view(), plan)
     }
 
     fn resize(
@@ -203,7 +261,7 @@ pub struct App {
     working_dir: PathBuf,
     context_limit: Option<u64>,
     input_history: Vec<String>,
-    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
+    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
 }
 
 impl App {
@@ -234,7 +292,7 @@ impl App {
     #[must_use]
     pub fn with_subagent_monitor(
         mut self,
-        subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
+        subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
     ) -> Self {
         self.subagent_monitor = subagent_monitor;
         self
@@ -249,7 +307,7 @@ impl App {
     /// alternate screen) fails and cannot be recovered.
     pub async fn run(
         mut self,
-        mut events: impl futures::Stream<Item = EventKind> + Unpin,
+        mut events: impl futures::Stream<Item = UiEvent> + Unpin,
         commands: tokio::sync::mpsc::Sender<UiCommand>,
     ) -> anyhow::Result<()> {
         let mut terminal = TerminalUi::enter(
@@ -266,22 +324,24 @@ impl App {
             STATUS_INTERVAL,
         );
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        terminal.welcome()?;
-        state.render(&mut terminal)?;
+        let effect = terminal.welcome();
+        state.apply(&mut terminal, effect)?;
 
         loop {
             tokio::select! {
                 _ = status_tick.tick() => {
+                    let mut effect = RenderPlan::NONE;
                     if state.refresh_subagents() {
-                        terminal.set_subagents(state.subagents.clone())?;
+                        effect = effect.merge(terminal.set_subagents(state.subagents.clone()));
                     }
                     if state.operation.shows_activity() {
-                        terminal.refresh_status()?;
+                        effect = effect.merge(terminal.refresh_status());
                     }
+                    state.apply(&mut terminal, effect)?;
                 }
                 event = events.next() => {
                     let Some(event) = event else { break };
-                    match handle_agent_event(&mut state, &mut terminal, &commands, event).await? {
+                    match handle_ui_event(&mut state, &mut terminal, event)? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
                             status_tick.reset();
@@ -308,148 +368,177 @@ impl App {
     }
 }
 
-// One branch per `EventKind`: an exhaustive match over the whole event
-// vocabulary, where each branch only touches the few structures it needs.
-// Splitting this into per-event handlers would session `state`, `terminal`,
-// and `commands` through every call for no readability gain.
-#[allow(clippy::too_many_lines)]
-async fn handle_agent_event(
+fn handle_ui_event(
     state: &mut AppState,
     terminal: &mut TerminalUi,
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    event: EventKind,
+    event: UiEvent,
 ) -> anyhow::Result<LoopAction> {
     match event {
-        EventKind::TurnStart => {
+        UiEvent::Session(event) => {
+            if !state.accept_session_event(event.session_id, event.sequence) {
+                return Ok(LoopAction::Continue);
+            }
+            handle_session_event(state, terminal, event)
+        }
+        UiEvent::SessionChanged { session_id } => {
+            state.select_session(session_id);
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::CommandFailed(error) => {
+            state.finish_command_failure();
+            let plan = terminal.error(&error).merge(RenderPlan::REDRAW);
+            state.apply(terminal, plan)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::RollbackCompleted { prompt } => {
+            state.operation.finish();
+            if state.input.text() != prompt {
+                state.input.restore_submission(prompt);
+            }
+            let effect = terminal.rollback_turn();
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::CompactionCompleted {
+            before,
+            after,
+            dropped,
+        } => {
+            state.operation.finish();
+            let effect = terminal.finish_compaction(before, after, dropped);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::SessionRestored { session_id, view } => {
+            state.select_session(session_id);
+            state.menu.close_picker();
+            state.operation.finish();
+            let effect = terminal.restore_session(&view);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::SessionsListed { sessions } => {
+            state
+                .operation
+                .finish_background(BackgroundAction::ListSessions);
+            let effect = if sessions.is_empty() {
+                terminal.command_output("No saved chats are available to resume.")
+            } else {
+                state.menu.open_sessions(sessions);
+                RenderPlan::REDRAW
+            };
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::ForkPointsListed { points } => {
+            state
+                .operation
+                .finish_background(BackgroundAction::ListForkPoints);
+            let effect = if points.is_empty() {
+                terminal.command_output("No submitted prompts are available to fork from.")
+            } else {
+                state.menu.open_fork_points(points);
+                RenderPlan::REDRAW
+            };
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::SessionForked {
+            session_id,
+            view,
+            prompt,
+        } => {
+            state.select_session(session_id);
+            state.menu.close_picker();
+            state.operation.finish_background(BackgroundAction::Fork);
+            let effect = terminal.restore_session(&view);
+            state.input.set_text(prompt);
+            state.apply(terminal, effect.merge(RenderPlan::REDRAW))?;
+            Ok(LoopAction::Continue)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_session_event(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    event: SessionEvent,
+) -> anyhow::Result<LoopAction> {
+    let turn_id = event.turn_id;
+    match event.kind {
+        SessionEventKind::TurnStarted => {
+            let Some(turn_id) = turn_id else {
+                return Ok(LoopAction::Continue);
+            };
+            if terminal
+                .current_turn_id()
+                .is_some_and(|current| current != turn_id)
+            {
+                return Ok(LoopAction::Continue);
+            }
+            terminal.track_turn(turn_id);
             let start = state.operation.agent_started();
-            terminal.agent_started()?;
-            state.render(terminal)?;
+            let effect = terminal.agent_started();
+            state.apply(terminal, effect)?;
             Ok(match start {
                 AgentStart::StartedTurn => LoopAction::ResetTimers,
                 AgentStart::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
-        EventKind::Live(_) if !state.operation.accepts_live_output() => Ok(LoopAction::Continue),
-        EventKind::Live(LiveEvent::TextDelta(text)) => {
-            terminal.text(&text)?;
+        SessionEventKind::Live(_) if turn_id.is_none() || terminal.current_turn_id() != turn_id => {
             Ok(LoopAction::Continue)
         }
-        EventKind::Live(LiveEvent::ReasoningDelta(text)) => {
-            terminal.thinking(&text)?;
+        SessionEventKind::Live(_) if !state.operation.accepts_live_output() => {
             Ok(LoopAction::Continue)
         }
-        EventKind::Live(LiveEvent::ToolStarted {
+        SessionEventKind::Live(LiveEvent::TextDelta(text)) => {
+            let effect = terminal.text(&text);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        SessionEventKind::Live(LiveEvent::ReasoningDelta(text)) => {
+            let effect = terminal.thinking(&text);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        SessionEventKind::Live(LiveEvent::ToolStarted {
             id,
             name,
             arguments,
         }) => {
-            terminal.tool_started(id, name, arguments)?;
+            let effect = terminal.tool_started(id, name, arguments);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Live(LiveEvent::ToolFinished {
+        SessionEventKind::Live(LiveEvent::ToolFinished {
             id,
             name,
             arguments,
             output,
             is_error,
         }) => {
-            terminal.tool_finished(&id, &name, &arguments, &output, is_error)?;
+            let effect = terminal.tool_finished(&id, &name, &arguments, &output, is_error);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Error(error) => {
-            terminal.error(&error)?;
-            match state.operation.complete_failed_action() {
-                FailureCompletion::FinishedOperation => {
-                    state.menu.close_picker();
-                    state.render(terminal)?;
-                }
-                FailureCompletion::OperationUnchanged => {}
+        SessionEventKind::TurnCompleted(view) => {
+            if turn_id != Some(view.id)
+                || terminal
+                    .current_turn_id()
+                    .is_some_and(|current| current != view.id)
+            {
+                return Ok(LoopAction::Continue);
             }
+            terminal.track_turn(view.id);
+            let _ = state.operation.complete_turn();
+            let effect = terminal.commit_turn(&view);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Turn(view) => {
-            match state.operation.complete_turn() {
-                TurnCompletion::Commit => {
-                    terminal.commit_turn(&view)?;
-                    state.render(terminal)?;
-                }
-                TurnCompletion::Cancelled => {
-                    if turn_has_completed_tool(&view) {
-                        terminal.commit_turn(&view)?;
-                        state.render(terminal)?;
-                    } else {
-                        state.operation.start_background(BackgroundAction::Rollback);
-                        if commands.send(UiCommand::Rollback).await.is_err() {
-                            return Ok(LoopAction::Exit);
-                        }
-                    }
-                }
-            }
-            Ok(LoopAction::Continue)
-        }
-        EventKind::TurnRolledBack { prompt } => {
-            state
-                .operation
-                .finish_background(BackgroundAction::Rollback);
-            if state.input.text() != prompt {
-                state.input.restore_submission(prompt);
-            }
-            terminal.rollback_turn()?;
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::Compacted {
-            before,
-            after,
-            dropped,
-            automatic,
-        } => {
-            if automatic {
-                terminal.record_automatic_compaction(after)?;
-            } else {
-                state.operation.finish();
-                terminal.finish_compaction(before, after, dropped)?;
-            }
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::Restored { view } => {
-            state.menu.close_picker();
-            state.operation.finish();
-            terminal.restore_session(&view)?;
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::SessionsListed { sessions } => {
-            state
-                .operation
-                .finish_background(BackgroundAction::ListSessions);
-            if sessions.is_empty() {
-                terminal.command_output("No saved chats are available to resume.")?;
-            } else {
-                state.menu.open_sessions(sessions);
-            }
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::ForkPointsListed { points } => {
-            state
-                .operation
-                .finish_background(BackgroundAction::ListForkPoints);
-            if points.is_empty() {
-                terminal.command_output("No submitted prompts are available to fork from.")?;
-            } else {
-                state.menu.open_fork_points(points);
-            }
-            state.render(terminal)?;
-            Ok(LoopAction::Continue)
-        }
-        EventKind::SessionForked { view, prompt } => {
-            state.menu.close_picker();
-            state.operation.finish_background(BackgroundAction::Fork);
-            terminal.restore_session(&view)?;
-            state.input.set_text(prompt);
-            state.render(terminal)?;
+        SessionEventKind::ContextCompacted { after, .. } => {
+            let effect = terminal.record_automatic_compaction(after);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
     }
@@ -518,7 +607,8 @@ async fn handle_key(
             return Ok(LoopAction::Continue);
         }
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            terminal.toggle_tool_expanded()?;
+            let effect = terminal.toggle_tool_expanded();
+            state.apply(terminal, effect)?;
             return Ok(LoopAction::Continue);
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,
@@ -733,7 +823,7 @@ async fn cancel_turn(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    let _ = terminal.prepare_cancellation();
+    terminal.prepare_cancellation();
     if !state.operation.begin_cancellation() {
         return Ok(LoopAction::Continue);
     }
@@ -758,12 +848,12 @@ async fn submit_input(
         return Ok(LoopAction::Continue);
     }
     let input = state.input.submit();
-    state.render(terminal)?;
     if input.trim().is_empty() {
+        state.apply(terminal, RenderPlan::REDRAW)?;
         return Ok(LoopAction::Continue);
     }
     if slash_command::is_bare_exit(&input) {
-        terminal.commit_exit(&input)?;
+        terminal.commit_exit(&input);
         let _ = commands.send(UiCommand::Exit).await;
         return Ok(LoopAction::Exit);
     }
@@ -776,8 +866,8 @@ async fn submit_input(
             steer_message(state, terminal, commands, input).await
         }
         (_, ParsedInput::Invalid(error)) => {
-            terminal.command_error(&error)?;
-            state.render(terminal)?;
+            let effect = terminal.command_error(&error);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
         (_, ParsedInput::Command(command)) => {
@@ -800,9 +890,9 @@ async fn start_message(
     match send_confirmed(commands, command, result).await {
         Ok(turn_id) => {
             state.operation.start_turn();
-            terminal.commit_input(turn_id, &input)?;
+            let effect = terminal.commit_input(turn_id, &input);
             state.input.record_submission(&input);
-            state.render(terminal)?;
+            state.apply(terminal, effect)?;
             Ok(LoopAction::ResetTimers)
         }
         Err(error) => reject_input(state, terminal, input, "submit", &error),
@@ -822,9 +912,9 @@ async fn steer_message(
     };
     match send_confirmed(commands, command, result).await {
         Ok(()) => {
-            terminal.commit_steer(&input)?;
+            let effect = terminal.commit_steer(&input);
             state.input.record_submission(&input);
-            state.render(terminal)?;
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
         Err(error) => reject_input(state, terminal, input, "steer", &error),
@@ -851,8 +941,8 @@ fn reject_input(
     error: &UiError,
 ) -> anyhow::Result<LoopAction> {
     state.input.set_text(input);
-    terminal.error(&format!("Failed to {action} input: {error}"))?;
-    state.render(terminal)?;
+    let effect = terminal.error(&format!("Failed to {action} input: {error}"));
+    state.apply(terminal, effect)?;
     Ok(LoopAction::Continue)
 }
 
@@ -863,10 +953,11 @@ async fn run_command(
     command: SlashCommand,
     input: &str,
 ) -> anyhow::Result<LoopAction> {
+    let mut effect = RenderPlan::REDRAW;
     let outgoing = match command {
         SlashCommand::New | SlashCommand::Clear => {
             state.menu.close_picker();
-            terminal.start_new_session()?;
+            effect = effect.merge(terminal.start_new_session());
             Some(UiCommand::NewSession)
         }
         SlashCommand::Resume => {
@@ -890,16 +981,16 @@ async fn run_command(
             Some(UiCommand::Compact)
         }
         SlashCommand::Status => {
-            terminal.show_session_status()?;
+            effect = effect.merge(terminal.show_session_status());
             None
         }
         SlashCommand::Exit => {
-            terminal.commit_exit(input)?;
+            terminal.commit_exit(input);
             let _ = commands.send(UiCommand::Exit).await;
             return Ok(LoopAction::Exit);
         }
     };
-    state.render(terminal)?;
+    state.apply(terminal, effect)?;
     if let Some(command) = outgoing {
         if commands.send(command).await.is_err() {
             return Ok(LoopAction::Exit);
@@ -925,21 +1016,10 @@ fn inserts_newline(key: &KeyEvent) -> bool {
         || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn turn_has_completed_tool(view: &TurnView) -> bool {
-    view.messages.iter().any(message_has_completed_tool)
-}
-
-fn message_has_completed_tool(message: &Message) -> bool {
-    match &message.content {
-        ash_core::MessageContent::ToolResult { .. } => true,
-        ash_core::MessageContent::User(_)
-        | ash_core::MessageContent::Assistant(_)
-        | ash_core::MessageContent::System(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::operation::TurnCompletion;
+
     use super::*;
 
     #[test]
@@ -951,37 +1031,11 @@ mod tests {
         state.sync_menu();
         let view = state.view();
 
-        assert!(view.busy);
+        assert!(view.activity.is_active());
         let crate::menu::MenuView::Commands { items, .. } = view.menu else {
             panic!("expected command completions");
         };
         assert_eq!(items.len(), 8);
-    }
-
-    #[test]
-    fn cancelled_turns_keep_completed_tool_results() {
-        let call = ash_core::ToolCallId::from_provider("call-1");
-        let kept = TurnView {
-            id: ash_core::TurnId::new(),
-            result: ash_core::TurnResult::Completed(ash_core::StopReason::Aborted),
-            messages: vec![ash_core::Message::tool_result(
-                call,
-                Ok("done".into()),
-                Vec::new(),
-            )],
-            usage: None,
-            context_tokens: None,
-        };
-        let rolled_back = TurnView {
-            id: ash_core::TurnId::new(),
-            result: ash_core::TurnResult::Completed(ash_core::StopReason::Aborted),
-            messages: vec![ash_core::Message::assistant_text("partial")],
-            usage: None,
-            context_tokens: None,
-        };
-
-        assert!(turn_has_completed_tool(&kept));
-        assert!(!turn_has_completed_tool(&rolled_back));
     }
 
     #[test]
@@ -993,6 +1047,34 @@ mod tests {
         assert_eq!(state.operation.complete_turn(), TurnCompletion::Cancelled);
         assert!(!state.operation.is_busy());
         assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn command_failure_releases_a_cancelling_operation() {
+        let mut state = AppState::new(Vec::new());
+        state.operation.start_turn();
+        assert!(state.operation.begin_cancellation());
+
+        state.finish_command_failure();
+
+        assert!(!state.operation.is_busy());
+        assert_eq!(
+            state.operation.submission_policy(),
+            Some(SubmissionPolicy::Start)
+        );
+    }
+
+    #[test]
+    fn session_events_require_the_current_session_and_newer_sequence() {
+        let mut state = AppState::new(Vec::new());
+        let current = SessionId::new();
+        let other = SessionId::new();
+        state.select_session(current);
+
+        assert!(state.accept_session_event(current, 1));
+        assert!(!state.accept_session_event(current, 1));
+        assert!(!state.accept_session_event(other, 2));
+        assert!(state.accept_session_event(current, 2));
     }
 
     #[test]
