@@ -6,10 +6,10 @@ use std::{
 };
 
 use crate::snapshot::{SubagentSnapshot, SubagentState};
-use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionKind, SessionOptions};
+use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions};
 use ash_core::{
-    define_tool, CancellationToken, ContentBlock, Message, MessageContent, SessionId, StopReason,
-    Tool, ToolContext, ToolError, TreeId, TurnResult,
+    define_tool, CancellationToken, ContentBlock, Message, MessageContent, SessionId,
+    SessionIdentity, StopReason, Tool, ToolContext, ToolError, TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -182,25 +182,25 @@ struct ControlInner {
 
 struct SpawnReservation {
     inner: Arc<ControlInner>,
-    tree_id: TreeId,
+    root_id: SessionId,
     task_name: Option<String>,
 }
 
 /// Remove a pending spawn reservation from the shared state. Used by the
 /// reservation's release path, its `Drop` impl, and the successful spawn path
 /// once the child agent has been registered.
-async fn release_spawn(inner: &Arc<ControlInner>, tree_id: TreeId, task_name: &str) {
+async fn release_spawn(inner: &Arc<ControlInner>, root_id: SessionId, task_name: &str) {
     let mut state = inner.state.lock().await;
-    if let Some(tree) = state.trees.get_mut(&tree_id) {
+    if let Some(tree) = state.trees.get_mut(&root_id) {
         tree.pending_spawns.remove(task_name);
     }
 }
 
 impl SpawnReservation {
-    const fn new(inner: Arc<ControlInner>, tree_id: TreeId, task_name: String) -> Self {
+    const fn new(inner: Arc<ControlInner>, root_id: SessionId, task_name: String) -> Self {
         Self {
             inner,
-            tree_id,
+            root_id,
             task_name: Some(task_name),
         }
     }
@@ -209,7 +209,7 @@ impl SpawnReservation {
         let Some(task_name) = self.task_name.take() else {
             return;
         };
-        release_spawn(&self.inner, self.tree_id, &task_name).await;
+        release_spawn(&self.inner, self.root_id, &task_name).await;
     }
 
     fn commit(mut self) {
@@ -223,11 +223,11 @@ impl Drop for SpawnReservation {
             return;
         };
         let inner = Arc::clone(&self.inner);
-        let tree_id = self.tree_id;
+        let root_id = self.root_id;
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
-                    release_spawn(&inner, tree_id, &task_name).await;
+                    release_spawn(&inner, root_id, &task_name).await;
                 });
             }
             Err(_) => {
@@ -242,10 +242,11 @@ impl Drop for SpawnReservation {
 
 pub(crate) struct SpawnRequest {
     pub role: AgentRole,
-    pub parent_path: String,
-    pub task_name: String,
+    /// Identity of the parent session that spawns this child.
+    pub parent: SessionIdentity,
+    /// One validated path segment naming this child under the parent.
+    pub segment: String,
     pub messages: Vec<Message>,
-    pub tree_id: TreeId,
 }
 
 pub(crate) struct ChildAgent {
@@ -268,21 +269,23 @@ struct InheritedAgentSpawner {
 
 impl AgentSpawner for InheritedAgentSpawner {
     fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError> {
+        let task_path = request
+            .parent
+            .path
+            .join(&request.segment)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
         let definition = self
             .definition
             .clone()
             .with_system_prompt(subagent_system_prompt(
                 self.system_prompt.as_deref(),
                 request.role,
-                &request.parent_path,
-                &request.task_name,
+                request.parent.path.as_str(),
+                task_path.as_str(),
             ));
         let scope = SessionOptions {
             working_dir: self.scope.working_dir.clone(),
             tool_timeout: self.scope.tool_timeout,
-            path: request.task_name,
-            tree_id: Some(request.tree_id),
-            kind: SessionKind::Subagent,
         };
         Ok(ChildAgent {
             runtime: self.runtime.clone(),
@@ -295,7 +298,8 @@ impl AgentSpawner for InheritedAgentSpawner {
 
 #[derive(Default)]
 struct ControlState {
-    trees: HashMap<TreeId, AgentTreeState>,
+    /// One tree per root session, keyed by the root session id.
+    trees: HashMap<SessionId, AgentTreeState>,
 }
 
 #[derive(Default)]
@@ -444,16 +448,16 @@ fn sorted_snapshots<'a>(records: impl Iterator<Item = &'a ChildRecord>) -> Vec<A
 }
 
 impl ControlState {
-    fn active_count(&self, tree_id: TreeId) -> usize {
+    fn active_count(&self, root_id: SessionId) -> usize {
         self.trees
-            .get(&tree_id)
+            .get(&root_id)
             .map_or(0, AgentTreeState::active_count)
     }
 
-    fn snapshots(&self, tree_id: TreeId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
+    fn snapshots(&self, root_id: SessionId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
         sorted_snapshots(
             self.trees
-                .get(&tree_id)
+                .get(&root_id)
                 .into_iter()
                 .flat_map(|tree| tree.agents.values())
                 .filter(|record| agent_path_matches(record, path_prefix)),
@@ -462,12 +466,12 @@ impl ControlState {
 
     fn wait_snapshot(
         &mut self,
-        tree_id: TreeId,
+        root_id: SessionId,
         waiter: &str,
         path_prefix: Option<&str>,
     ) -> WaitSnapshot {
         self.trees
-            .get_mut(&tree_id)
+            .get_mut(&root_id)
             .map_or_else(WaitSnapshot::empty, |tree| {
                 tree.wait_snapshot(waiter, path_prefix)
             })
@@ -475,13 +479,13 @@ impl ControlState {
 
     fn finish_turn(
         &mut self,
-        tree_id: TreeId,
+        root_id: SessionId,
         agent_id: SessionId,
         completed: ChildState,
         was_followup: bool,
     ) -> bool {
         self.trees
-            .get_mut(&tree_id)
+            .get_mut(&root_id)
             .is_some_and(|tree| tree.finish_turn(agent_id, completed, was_followup))
     }
 }
@@ -764,21 +768,21 @@ impl AgentControl {
         }
         let role = args.agent_type.unwrap_or(AgentRole::Default);
         let fork_mode = ForkMode::from_arg(args.fork_turns)?;
-        let parent_path = normalized_agent_path(&context.agent.path);
-        let task_name = format!("{parent_path}/{}", args.task_name);
+        let parent = context.agent.identity.clone();
+        let task_path = parent
+            .path
+            .join(&args.task_name)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let task_name = task_path.to_string();
         let mut reservation = {
             let mut state = self.inner.state.lock().await;
             state
                 .trees
-                .entry(context.agent.tree_id)
+                .entry(parent.root_id)
                 .or_default()
                 .reserve_spawn(&task_name, self.inner.max_concurrent_children)?;
             drop(state);
-            SpawnReservation::new(
-                Arc::clone(&self.inner),
-                context.agent.tree_id,
-                task_name.clone(),
-            )
+            SpawnReservation::new(Arc::clone(&self.inner), parent.root_id, task_name.clone())
         };
         let (command_tx, command_rx) = mpsc::channel(32);
 
@@ -786,10 +790,9 @@ impl AgentControl {
         let session = match self
             .prepare_child(SpawnRequest {
                 role,
-                parent_path,
-                task_name: task_name.clone(),
+                parent: parent.clone(),
+                segment: args.task_name.clone(),
                 messages,
-                tree_id: context.agent.tree_id,
             })
             .await
         {
@@ -802,7 +805,7 @@ impl AgentControl {
         let id = session.id();
 
         self.register_child(
-            context.agent.tree_id,
+            parent.root_id,
             id,
             &task_name,
             role,
@@ -810,15 +813,15 @@ impl AgentControl {
             command_tx,
         )
         .await;
-        release_spawn(&self.inner, context.agent.tree_id, &task_name).await;
+        release_spawn(&self.inner, parent.root_id, &task_name).await;
         reservation.commit();
 
         let control = self.clone();
-        let tree_id = context.agent.tree_id;
+        let root_id = parent.root_id;
         let initial_input = args.message.clone();
         tokio::spawn(async move {
             control
-                .run_child(tree_id, id, session, initial_input, command_rx)
+                .run_child(root_id, id, session, initial_input, command_rx)
                 .await;
         });
         self.inner.updates.notify_waiters();
@@ -836,11 +839,13 @@ impl AgentControl {
     /// failure.
     async fn prepare_child(&self, request: SpawnRequest) -> Result<Session, ToolError> {
         let role = request.role;
+        let parent = request.parent.clone();
+        let segment = request.segment.clone();
         let child = self.inner.spawner.spawn(request)?;
         let agent = Self::finalize_child_agent(child.agent, role, self.tools()?);
         child
             .runtime
-            .start_with_history(&agent, &child.options, child.history)
+            .start_child(&agent, &child.options, &parent, &segment, child.history)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))
     }
@@ -868,7 +873,7 @@ impl AgentControl {
     /// state.
     async fn register_child(
         &self,
-        tree_id: TreeId,
+        root_id: SessionId,
         id: SessionId,
         task_name: &str,
         role: AgentRole,
@@ -876,7 +881,7 @@ impl AgentControl {
         command_tx: mpsc::Sender<ChildCommand>,
     ) {
         let mut state = self.inner.state.lock().await;
-        let tree = state.trees.entry(tree_id).or_default();
+        let tree = state.trees.entry(root_id).or_default();
         tree.agents.insert(
             id,
             ChildRecord {
@@ -910,8 +915,8 @@ impl AgentControl {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.tree_id,
-                &context.agent.path,
+                context.agent.identity.root_id,
+                context.agent.identity.path.as_str(),
                 &args.target,
             )?;
             let result = (record.task_name.clone(), record.command_tx.clone());
@@ -924,11 +929,11 @@ impl AgentControl {
             .map_err(|_| ToolError::Execution(format!("agent is no longer available: {target}")))?;
         {
             let mut state = self.inner.state.lock().await;
-            let active_count = state.active_count(context.agent.tree_id);
+            let active_count = state.active_count(context.agent.identity.root_id);
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.tree_id,
-                &context.agent.path,
+                context.agent.identity.root_id,
+                context.agent.identity.path.as_str(),
                 &target,
             )?;
             if let Some(max) = self.inner.max_concurrent_children {
@@ -960,8 +965,8 @@ impl AgentControl {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.tree_id,
-                &context.agent.path,
+                context.agent.identity.root_id,
+                context.agent.identity.path.as_str(),
                 &args.target,
             )?;
             let result = (
@@ -994,7 +999,7 @@ impl AgentControl {
             .min(max_timeout_ms);
         if timeout_ms == 0 {
             let agents = self
-                .snapshots(context.agent.tree_id, args.path_prefix.as_deref())
+                .snapshots(context.agent.identity.root_id, args.path_prefix.as_deref())
                 .await;
             return json_output(&serde_json::json!({
                 "agents": agents,
@@ -1007,8 +1012,8 @@ impl AgentControl {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let snapshot = self.inner.state.lock().await.wait_snapshot(
-                context.agent.tree_id,
-                &context.agent.path,
+                context.agent.identity.root_id,
+                context.agent.identity.path.as_str(),
                 args.path_prefix.as_deref(),
             );
             if snapshot.agents.is_empty() || snapshot.has_update {
@@ -1024,8 +1029,8 @@ impl AgentControl {
             };
             if timed_out {
                 let snapshot = self.inner.state.lock().await.wait_snapshot(
-                    context.agent.tree_id,
-                    &context.agent.path,
+                    context.agent.identity.root_id,
+                    context.agent.identity.path.as_str(),
                     args.path_prefix.as_deref(),
                 );
                 return json_output(&serde_json::json!({
@@ -1038,25 +1043,25 @@ impl AgentControl {
 
     pub(crate) async fn snapshots(
         &self,
-        tree_id: TreeId,
+        root_id: SessionId,
         path_prefix: Option<&str>,
     ) -> Vec<AgentSnapshot> {
         self.inner
             .state
             .lock()
             .await
-            .snapshots(tree_id, path_prefix)
+            .snapshots(root_id, path_prefix)
     }
 
     async fn run_child(
         &self,
-        tree_id: TreeId,
+        root_id: SessionId,
         agent_id: SessionId,
         session: Session,
         initial_input: String,
         mut command_rx: mpsc::Receiver<ChildCommand>,
     ) {
-        self.run_child_turn(tree_id, agent_id, &session, initial_input, false)
+        self.run_child_turn(root_id, agent_id, &session, initial_input, false)
             .await;
 
         while let Some(command) = command_rx.recv().await {
@@ -1067,7 +1072,7 @@ impl AgentControl {
                         .await;
                 }
                 ChildCommand::Followup(message) => {
-                    self.run_child_turn(tree_id, agent_id, &session, message, true)
+                    self.run_child_turn(root_id, agent_id, &session, message, true)
                         .await;
                 }
             }
@@ -1076,7 +1081,7 @@ impl AgentControl {
 
     async fn run_child_turn(
         &self,
-        tree_id: TreeId,
+        root_id: SessionId,
         agent_id: SessionId,
         session: &Session,
         input: String,
@@ -1090,7 +1095,7 @@ impl AgentControl {
             Err(error) => {
                 let mut state = self.inner.state.lock().await;
                 let _ = state.finish_turn(
-                    tree_id,
+                    root_id,
                     agent_id,
                     ChildState::Errored {
                         final_message: None,
@@ -1109,7 +1114,7 @@ impl AgentControl {
             let mut state = self.inner.state.lock().await;
             let Some(record) = state
                 .trees
-                .get_mut(&tree_id)
+                .get_mut(&root_id)
                 .and_then(|tree| tree.agents.get_mut(&agent_id))
             else {
                 return;
@@ -1144,7 +1149,7 @@ impl AgentControl {
             },
         };
         let mut state = self.inner.state.lock().await;
-        if !state.finish_turn(tree_id, agent_id, completed, is_followup) {
+        if !state.finish_turn(root_id, agent_id, completed, is_followup) {
             return;
         }
         drop(state);
@@ -1215,32 +1220,23 @@ fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
 }
 
 fn agent_path_matches(record: &ChildRecord, path_prefix: Option<&str>) -> bool {
-    path_prefix.is_none_or(|prefix| record.task_name.starts_with(prefix))
-}
-
-/// The canonical path of the root agent; every sub-agent path is derived from
-/// it. The value mirrors the CLI's default working directory, so a sub-agent
-/// spawned without an explicit parent path lives under `/root`.
-const ROOT_AGENT_PATH: &str = "/root";
-
-fn normalized_agent_path(agent_path: &str) -> String {
-    let path = agent_path.trim().trim_end_matches('/');
-    if path.is_empty() {
-        ROOT_AGENT_PATH.to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    }
+    path_prefix.is_none_or(|prefix| {
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            return true;
+        }
+        let prefix = format!("/{prefix}");
+        record.task_name == prefix || record.task_name.starts_with(&format!("{prefix}/"))
+    })
 }
 
 fn resolve_target_mut<'a>(
     state: &'a mut ControlState,
-    tree_id: TreeId,
+    root_id: SessionId,
     current_agent_path: &str,
     target: &str,
 ) -> Result<&'a mut ChildRecord, ToolError> {
-    let tree = state.trees.get_mut(&tree_id).ok_or_else(|| {
+    let tree = state.trees.get_mut(&root_id).ok_or_else(|| {
         ToolError::Execution("no sub-agents exist in the current session".to_string())
     })?;
     if let Ok(agent_id) = SessionId::from_str(target) {
@@ -1250,7 +1246,7 @@ fn resolve_target_mut<'a>(
             .ok_or_else(|| ToolError::Execution(format!("sub-agent not found: {target}")));
     }
 
-    let current_path = normalized_agent_path(current_agent_path);
+    let current_path = current_agent_path.trim_end_matches('/');
     let relative_path = format!("{current_path}/{}", target.trim_matches('/'));
     let mut matches = tree
         .agents
@@ -1426,19 +1422,21 @@ mod tests {
         SessionOptions {
             working_dir: PathBuf::from("."),
             tool_timeout: Duration::from_secs(5),
-            ..SessionOptions::default()
         }
     }
 
-    fn make_context(tree_id: TreeId) -> ToolContext {
+    fn root_identity() -> SessionIdentity {
+        SessionIdentity::root(SessionId::new())
+    }
+
+    fn make_context(identity: SessionIdentity) -> ToolContext {
         ToolContext {
-            session_id: SessionId::new(),
+            session_id: identity.id,
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                tree_id,
-                path: "/root".to_string(),
+                identity,
                 messages: Vec::new(),
             },
         }
@@ -1623,7 +1621,7 @@ mod tests {
     #[tokio::test]
     async fn failed_spawn_releases_the_task_name_reservation() {
         let control = state_only_control();
-        let context = make_context(TreeId::new());
+        let context = make_context(root_identity());
 
         for _ in 0..2 {
             let error = control
@@ -1647,7 +1645,7 @@ mod tests {
         let control = AgentControl::new(Some(0), Arc::new(RejectingSpawner));
         let error = control
             .spawn(
-                make_context(TreeId::new()),
+                make_context(root_identity()),
                 SpawnAgentArgs {
                     task_name: "inspect".to_string(),
                     message: "Inspect the parser.".to_string(),
@@ -1666,21 +1664,21 @@ mod tests {
     #[tokio::test]
     async fn duplicate_reservation_rejects_before_calling_the_spawner() {
         let control = state_only_control();
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         control
             .inner
             .state
             .lock()
             .await
             .trees
-            .entry(tree_id)
+            .entry(root_id)
             .or_default()
             .pending_spawns
             .insert("/root/inspect".to_string());
 
         let error = control
             .spawn(
-                make_context(tree_id),
+                make_context(SessionIdentity::root(root_id)),
                 SpawnAgentArgs {
                     task_name: "inspect".to_string(),
                     message: "Inspect the parser.".to_string(),
@@ -1752,7 +1750,7 @@ mod tests {
     #[tokio::test]
     async fn failed_delivery_does_not_change_the_agent_lifecycle() {
         let control = state_only_control();
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let agent_id = SessionId::new();
         let (command_tx, command_rx) = mpsc::channel(1);
         drop(command_rx);
@@ -1762,7 +1760,7 @@ mod tests {
             .lock()
             .await
             .trees
-            .entry(tree_id)
+            .entry(root_id)
             .or_default()
             .agents
             .insert(
@@ -1781,7 +1779,7 @@ mod tests {
 
         let result = control
             .message_agent(
-                &make_context(tree_id),
+                &make_context(SessionIdentity::root(root_id)),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "follow up".to_string(),
@@ -1791,7 +1789,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let agents = control.snapshots(tree_id, None).await;
+        let agents = control.snapshots(root_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
         assert_eq!(agents[0].last_task_message, "original");
     }
@@ -1799,7 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn message_agent_can_queue_guidance_without_starting_a_turn() {
         let control = state_only_control();
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let agent_id = SessionId::new();
         let (command_tx, mut command_rx) = mpsc::channel(1);
         control
@@ -1808,7 +1806,7 @@ mod tests {
             .lock()
             .await
             .trees
-            .entry(tree_id)
+            .entry(root_id)
             .or_default()
             .agents
             .insert(
@@ -1827,7 +1825,7 @@ mod tests {
 
         let result = control
             .message_agent(
-                &make_context(tree_id),
+                &make_context(SessionIdentity::root(root_id)),
                 MessageAgentArgs {
                     target: "/root/inspect".to_string(),
                     message: "keep this in mind".to_string(),
@@ -1843,7 +1841,7 @@ mod tests {
             command_rx.recv().await.unwrap(),
             ChildCommand::Queue(message) if message == "keep this in mind"
         ));
-        let agents = control.snapshots(tree_id, None).await;
+        let agents = control.snapshots(root_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
         assert_eq!(agents[0].last_task_message, "keep this in mind");
     }
@@ -1910,8 +1908,8 @@ mod tests {
     #[tokio::test]
     async fn isolates_agent_trees_by_root_session() {
         let control = state_only_control();
-        let root = TreeId::new();
-        let other_root = TreeId::new();
+        let root = SessionId::new();
+        let other_root = SessionId::new();
         let agent_id = SessionId::new();
         let (command_tx, _command_rx) = mpsc::channel(1);
         control
@@ -1944,14 +1942,14 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_each_completion_only_once() {
         let control = state_only_control();
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let completed_id = SessionId::new();
         let running_id = SessionId::new();
         let (completed_tx, _completed_rx) = mpsc::channel(1);
         let (running_tx, _running_rx) = mpsc::channel(1);
         {
             let mut state = control.inner.state.lock().await;
-            let tree = state.trees.entry(tree_id).or_default();
+            let tree = state.trees.entry(root_id).or_default();
             tree.next_completion_revision = 1;
             tree.agents.insert(
                 completed_id,
@@ -1982,7 +1980,7 @@ mod tests {
             drop(state);
         }
 
-        let context = make_context(tree_id);
+        let context = make_context(SessionIdentity::root(root_id));
         let first = control
             .wait(
                 &context,
@@ -2018,7 +2016,7 @@ mod tests {
         {
             let mut state = control.inner.state.lock().await;
             assert!(state.finish_turn(
-                tree_id,
+                root_id,
                 running_id,
                 ChildState::Completed(Some("second result".to_string())),
                 false,
@@ -2040,12 +2038,12 @@ mod tests {
     #[tokio::test]
     async fn zero_timeout_wait_lists_without_advancing_completion_cursor() {
         let control = state_only_control();
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let agent_id = SessionId::new();
         let (command_tx, _command_rx) = mpsc::channel(1);
         {
             let mut state = control.inner.state.lock().await;
-            let tree = state.trees.entry(tree_id).or_default();
+            let tree = state.trees.entry(root_id).or_default();
             tree.next_completion_revision = 1;
             tree.agents.insert(
                 agent_id,
@@ -2063,7 +2061,7 @@ mod tests {
             drop(state);
         }
 
-        let context = make_context(tree_id);
+        let context = make_context(SessionIdentity::root(root_id));
         let snapshot = control
             .wait(
                 &context,
@@ -2097,15 +2095,14 @@ mod tests {
     async fn runs_a_spawned_agent_and_captures_its_final_message() {
         let (base_url, server) = mock_model_server(&["child done", "followup done"]).await;
         let (control, _directory) = make_control(make_model(Some(base_url)), 2);
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let context = ToolContext {
-            session_id: SessionId::new(),
+            session_id: root_id,
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                tree_id,
-                path: "/root".to_string(),
+                identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },
         };
@@ -2125,7 +2122,7 @@ mod tests {
 
         let completed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let agents = control.snapshots(tree_id, None).await;
+                let agents = control.snapshots(root_id, None).await;
                 if agents
                     .first()
                     .is_some_and(|agent| agent.status == AgentStatus::Completed)
@@ -2152,7 +2149,7 @@ mod tests {
             .unwrap();
         let followed_up = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let agents = control.snapshots(tree_id, None).await;
+                let agents = control.snapshots(root_id, None).await;
                 if agents.first().is_some_and(|agent| {
                     agent.status == AgentStatus::Completed
                         && agent.final_message.as_deref() == Some("followup done")
@@ -2240,16 +2237,15 @@ mod tests {
     async fn subscribers_receive_subagent_snapshot_updates() {
         let (base_url, _server) = mock_model_server(&["child done"]).await;
         let (control, _directory) = make_control(make_model(Some(base_url)), 1);
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let mut snapshots = control.subscribe();
         let context = ToolContext {
-            session_id: SessionId::new(),
+            session_id: root_id,
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                tree_id,
-                path: "/root".to_string(),
+                identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },
         };
@@ -2289,15 +2285,14 @@ mod tests {
     async fn default_configuration_allows_more_than_three_concurrent_subagents() {
         let (base_url, _server) = mock_model_server(&["a", "b", "c", "d"]).await;
         let (control, _directory) = make_control(make_model(Some(base_url)), 1);
-        let tree_id = TreeId::new();
+        let root_id = SessionId::new();
         let context = ToolContext {
-            session_id: SessionId::new(),
+            session_id: root_id,
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             agent: AgentToolContext {
-                tree_id,
-                path: "/root".to_string(),
+                identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },
         };
@@ -2318,7 +2313,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let agents = control.snapshots(tree_id, None).await;
+                let agents = control.snapshots(root_id, None).await;
                 if agents.len() == 4
                     && agents
                         .iter()

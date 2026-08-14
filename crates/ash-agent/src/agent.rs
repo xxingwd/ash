@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use ash_core::{ModelId, Tool, ToolDefinition, TreeId};
+use ash_core::{ModelId, SessionId, SessionIdentity, Tool, ToolDefinition};
 
-use crate::{ContextPolicy, SessionKind};
+use crate::ContextPolicy;
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
@@ -132,14 +132,12 @@ fn deduplicate_tools(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
     unique
 }
 
-/// Per-session execution scope.
+/// Per-session execution scope. Identity and lineage live on the session
+/// itself; working coordinates stay here.
 #[derive(Clone)]
 pub struct SessionOptions {
     pub working_dir: PathBuf,
     pub tool_timeout: Duration,
-    pub path: String,
-    pub tree_id: Option<TreeId>,
-    pub kind: SessionKind,
 }
 
 impl Default for SessionOptions {
@@ -147,21 +145,8 @@ impl Default for SessionOptions {
         Self {
             working_dir: PathBuf::from("."),
             tool_timeout: Duration::from_mins(2),
-            path: default_agent_path(),
-            tree_id: None,
-            kind: SessionKind::Root,
         }
     }
-}
-
-/// The agent's root path defaults to the process working directory, matching
-/// the relative `working_dir` default. Falls back to `.` only when the
-/// directory cannot be resolved.
-fn default_agent_path() -> String {
-    std::env::current_dir().map_or_else(
-        |_| ".".to_string(),
-        |directory| directory.display().to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -217,9 +202,9 @@ pub struct RunConfig {
     pub max_context_tokens: usize,
     pub context_policy: Arc<dyn ContextPolicy>,
     pub max_tool_duration: Duration,
-    pub agent_path: String,
-    pub tree_id: Option<TreeId>,
-    pub kind: SessionKind,
+    /// Identity of the executing session. Set by the session state when the
+    /// session id exists; `RunConfig::new` fills a root placeholder.
+    pub identity: SessionIdentity,
     /// How many times a single model call may be retried after a safe,
     /// retryable failure (network error, upstream 5xx, rate limit, or a
     /// truncated stream). Retries only happen before any tool call has been
@@ -241,9 +226,7 @@ impl RunConfig {
             max_context_tokens: agent.max_context_tokens(),
             context_policy: Arc::clone(&agent.context_policy),
             max_tool_duration: options.tool_timeout,
-            agent_path: options.path.clone(),
-            tree_id: options.tree_id,
-            kind: options.kind,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 5,
             retry_backoff: RetryBackoff::default(),
         }

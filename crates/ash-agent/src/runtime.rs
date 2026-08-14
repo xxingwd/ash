@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash_core::{Message, ModelClient, SessionId, SessionSummary};
+use ash_core::{Message, ModelClient, SessionId, SessionIdentity, SessionSummary};
 
 use crate::{
     agent::RunConfig, Agent, JsonlSessionStore, Session, SessionOptions, SessionState,
@@ -38,18 +38,27 @@ impl Runtime {
         ))
     }
 
-    /// Start a session seeded with the given history.
+    /// Start a child session of `parent`, seeded with the given history. The
+    /// child derives its lineage and path from the parent plus one task name.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when seeding the history fails.
-    pub async fn start_with_history(
+    /// Returns `AshError` when the task name is invalid or seeding the
+    /// history fails.
+    pub async fn start_child(
         &self,
         agent: &Agent,
         options: &SessionOptions,
+        parent: &SessionIdentity,
+        task_name: &str,
         history: Vec<Message>,
     ) -> Result<Session, ash_core::AshError> {
-        let mut state = SessionState::new(RunConfig::new(agent, options), self.clone());
+        let mut state = SessionState::new_child(
+            RunConfig::new(agent, options),
+            self.clone(),
+            parent,
+            task_name,
+        )?;
         state.seed(history).await?;
         Ok(Session::spawn(state))
     }

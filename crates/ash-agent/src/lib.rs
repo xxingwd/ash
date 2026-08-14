@@ -28,7 +28,4 @@ pub use runtime::Runtime;
 pub(crate) use session::SessionState;
 pub use session::{ContextCompaction, Fork, Session, Turn};
 pub use skill::{tool as skill_tool, Skill};
-pub use store::{
-    OpenedSession, SessionAppender, SessionKind, SessionMetadata, SessionStore, SharedSessionStore,
-    StoredSession,
-};
+pub use store::{OpenedSession, SessionAppender, SessionStore, SharedSessionStore, StoredSession};

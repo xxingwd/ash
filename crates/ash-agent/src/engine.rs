@@ -544,11 +544,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             cancellation: self.cancel.clone(),
             deadline: Instant::now() + self.config.max_tool_duration,
             agent: AgentToolContext {
-                tree_id: self
-                    .config
-                    .tree_id
-                    .unwrap_or_else(|| self.ids.session_id.into()),
-                path: self.config.agent_path.clone(),
+                identity: self.config.identity.clone(),
                 messages: self.request_messages(messages),
             },
         };
@@ -885,7 +881,8 @@ mod tests {
 
     use super::*;
     use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
-    use crate::{JsonlSessionStore, SessionMetadata, SharedSessionStore, StoredSession};
+    use crate::{JsonlSessionStore, SharedSessionStore, StoredSession};
+    use ash_core::SessionIdentity;
 
     async fn run_with_adapter(
         config: &RunConfig,
@@ -902,11 +899,8 @@ mod tests {
         run_agent_turn_inner(model, config, messages, execution, persistence).await
     }
 
-    fn metadata(session_id: SessionId) -> SessionMetadata {
-        SessionMetadata {
-            session_id,
-            kind: crate::SessionKind::Root,
-        }
+    fn metadata(session_id: SessionId) -> SessionIdentity {
+        SessionIdentity::root(session_id)
     }
 
     async fn persisted_session(
@@ -1041,9 +1035,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1106,9 +1098,7 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1193,9 +1183,7 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1263,9 +1251,7 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1343,9 +1329,7 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1390,9 +1374,7 @@ mod tests {
             max_context_tokens: 120_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1476,9 +1458,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1544,9 +1524,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1634,9 +1612,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1686,9 +1662,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1746,9 +1720,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1848,9 +1820,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1911,9 +1881,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1978,9 +1946,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2047,9 +2013,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2111,9 +2075,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(30),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -2255,9 +2217,7 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 5,
             retry_backoff: RetryBackoff {
                 base: Duration::from_secs(1),

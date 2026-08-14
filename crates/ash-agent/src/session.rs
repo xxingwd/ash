@@ -6,7 +6,7 @@ use std::{
 
 use ash_core::{
     CancellationToken, ForkPoint, Message, MessageId, SessionEvent, SessionEventKind, SessionId,
-    SessionView, TurnId, TurnResult, TurnView, Usage,
+    SessionIdentity, SessionView, TurnId, TurnResult, TurnView, Usage,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -15,14 +15,14 @@ use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
     AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedSession, RunConfig, Runtime,
-    SessionAppender, SessionLog, SessionMetadata, SharedSessionStore,
+    SessionAppender, SessionLog, SharedSessionStore,
 };
 
 const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
 
 #[derive(Clone)]
 pub struct Session {
-    id: SessionId,
+    identity: SessionIdentity,
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<SessionEvent>,
 }
@@ -69,6 +69,7 @@ enum Command {
 impl Session {
     pub(crate) fn spawn(state: SessionState) -> Self {
         let id = state.id();
+        let identity = state.identity().clone();
         let (commands, command_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(256);
         let events_clone = events.clone();
@@ -88,7 +89,7 @@ impl Session {
             }
         });
         Self {
-            id,
+            identity,
             commands,
             events,
         }
@@ -96,7 +97,12 @@ impl Session {
 
     #[must_use]
     pub const fn id(&self) -> SessionId {
-        self.id
+        self.identity.id
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> SessionIdentity {
+        self.identity.clone()
     }
 
     #[must_use]
@@ -122,7 +128,7 @@ impl Session {
             .await
             .map_err(|_| session_closed())?;
         Ok(Turn {
-            session_id: self.id,
+            session_id: self.identity.id,
             id,
             commands: self.commands.clone(),
             cancellation,
@@ -540,11 +546,10 @@ pub struct ContextCompaction {
 }
 
 pub struct SessionState {
-    id: SessionId,
+    identity: SessionIdentity,
     config: RunConfig,
     runtime: Runtime,
     log: SessionLog,
-    metadata: SessionMetadata,
     store: SharedSessionStore,
     /// Open append-only handle to this session's file. Initialized lazily so
     /// `SessionState::new` stays synchronous; every write goes through it
@@ -553,23 +558,51 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub(crate) fn new(config: RunConfig, runtime: Runtime) -> Self {
-        let id = SessionId::new();
-        let metadata = session_metadata(&config, id);
+    pub(crate) fn new(mut config: RunConfig, runtime: Runtime) -> Self {
+        let identity = SessionIdentity::root(SessionId::new());
+        config.identity = identity.clone();
         let store = runtime.session_store_handle();
         Self {
-            id,
+            identity,
             config,
             runtime,
             log: SessionLog::new(),
-            metadata,
             store,
             writer: None,
         }
     }
 
+    /// Create a child session of `parent`, deriving its lineage and path from
+    /// the parent plus one task name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the task name is not a valid path segment.
+    pub(crate) fn new_child(
+        mut config: RunConfig,
+        runtime: Runtime,
+        parent: &SessionIdentity,
+        task_name: &str,
+    ) -> Result<Self, ash_core::AshError> {
+        let identity = parent.child(SessionId::new(), task_name)?;
+        config.identity = identity.clone();
+        let store = runtime.session_store_handle();
+        Ok(Self {
+            identity,
+            config,
+            runtime,
+            log: SessionLog::new(),
+            store,
+            writer: None,
+        })
+    }
+
     pub const fn id(&self) -> SessionId {
-        self.id
+        self.identity.id
+    }
+
+    pub const fn identity(&self) -> &SessionIdentity {
+        &self.identity
     }
 
     pub fn view(&self) -> SessionView {
@@ -585,7 +618,7 @@ impl SessionState {
         let Some(opened) = self.store.open(session_id).await? else {
             return Ok(false);
         };
-        if opened.session.metadata.kind == crate::SessionKind::Subagent {
+        if opened.session.identity.parent_id.is_some() {
             return Ok(false);
         }
         self.restore(opened);
@@ -652,8 +685,8 @@ impl SessionState {
     }
 
     fn restore(&mut self, opened: OpenedSession) {
-        self.id = opened.session.metadata.session_id;
-        self.metadata = opened.session.metadata;
+        self.identity = opened.session.identity;
+        self.config.identity = self.identity.clone();
         self.log = opened.session.log;
         self.writer = Some(Arc::new(tokio::sync::Mutex::new(opened.writer)));
     }
@@ -696,7 +729,7 @@ impl SessionState {
         let writer = self.writer().await?;
         let mut persistence = crate::store::SessionPersistence::new(writer);
         let execution = TurnExecution::new(
-            self.id,
+            self.identity.id,
             turn_id,
             events.clone(),
             cancel,
@@ -855,7 +888,7 @@ impl SessionState {
             return Ok(Arc::clone(writer));
         }
         let writer = Arc::new(tokio::sync::Mutex::new(
-            self.store.open_writer(self.metadata).await?,
+            self.store.open_writer(self.identity.clone()).await?,
         ));
         self.writer = Some(Arc::clone(&writer));
         Ok(writer)
@@ -868,13 +901,6 @@ struct ForkData {
     protocol: String,
     working_dir: PathBuf,
     prompt: String,
-}
-
-const fn session_metadata(config: &RunConfig, session_id: SessionId) -> SessionMetadata {
-    SessionMetadata {
-        session_id,
-        kind: config.kind,
-    }
 }
 
 fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
@@ -979,9 +1005,7 @@ mod tests {
             max_context_tokens: 1000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(5),
-            agent_path: "/root".to_string(),
-            tree_id: None,
-            kind: crate::SessionKind::Root,
+            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         }
@@ -1132,7 +1156,7 @@ mod tests {
         runtime
             .session_store_handle()
             .create(
-                session_metadata(&config(directory.path().join("old")), saved_id),
+                SessionIdentity::root(saved_id),
                 &[LogEntry::Message(saved_message)],
             )
             .await
@@ -1141,6 +1165,7 @@ mod tests {
         assert!(state.resume(saved_id).await.unwrap());
 
         assert_eq!(state.id(), saved_id);
+        assert_eq!(state.identity().path.as_str(), "/root");
         assert_eq!(state.config.model.as_str(), "current-model");
         assert_eq!(state.runtime.model_backend(), "test");
         assert_eq!(
@@ -1149,6 +1174,76 @@ mod tests {
         );
         assert_eq!(state.config.working_dir, current_dir);
         assert_eq!(state.log.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_child_sessions() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime_in(directory.path());
+        let mut state = SessionState::new(config(directory.path().to_path_buf()), runtime.clone());
+        let root_id = SessionId::new();
+        let root = SessionIdentity::root(root_id);
+        let child = root.child(SessionId::new(), "research").unwrap();
+        runtime
+            .session_store_handle()
+            .create(
+                child.clone(),
+                &[LogEntry::Message(Message::user("child work"))],
+            )
+            .await
+            .unwrap();
+
+        assert!(!state.resume(child.id).await.unwrap());
+        assert_ne!(state.id(), child.id);
+    }
+
+    #[tokio::test]
+    async fn child_sessions_derive_path_and_lineage_from_the_parent() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime_in(directory.path());
+        let parent = SessionIdentity::root(SessionId::new());
+        let state = SessionState::new_child(
+            config(directory.path().to_path_buf()),
+            runtime,
+            &parent,
+            "research",
+        )
+        .unwrap();
+
+        assert_ne!(state.id(), parent.id);
+        assert_eq!(state.identity().root_id, parent.id);
+        assert_eq!(state.identity().parent_id, Some(parent.id));
+        assert_eq!(state.identity().path.as_str(), "/root/research");
+        assert_eq!(state.config.identity.id, state.id());
+    }
+
+    #[tokio::test]
+    async fn runtime_start_child_persists_the_derived_lineage() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime_in(directory.path());
+        let parent = SessionIdentity::root(SessionId::new());
+        let agent = crate::Agent::new(ModelId::new("current-model"), Vec::new());
+        let session = runtime
+            .start_child(
+                &agent,
+                &crate::SessionOptions::default(),
+                &parent,
+                "research",
+                vec![Message::user("seed")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session.identity().root_id, parent.id);
+        assert_eq!(session.identity().parent_id, Some(parent.id));
+        assert_eq!(session.identity().path.as_str(), "/root/research");
+        let stored = runtime
+            .session_store_handle()
+            .load(session.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.identity, session.identity());
     }
 
     #[tokio::test]

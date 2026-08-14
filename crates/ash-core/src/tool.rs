@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 pub use tokio_util::sync::CancellationToken;
 
-use crate::{error::ToolError, Content, Message, SessionId, TreeId, TurnId};
+use crate::{error::ToolError, Content, Message, SessionId, SessionIdentity, TurnId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -17,7 +17,7 @@ pub struct ToolContext {
     pub turn_id: TurnId,
     pub cancellation: CancellationToken,
     pub deadline: std::time::Instant,
-    /// Context needed only by agent-aware extension tools.
+    /// Read-only snapshot of the calling session, for agent-aware tools.
     pub agent: AgentToolContext,
 }
 
@@ -28,8 +28,7 @@ pub struct ToolContext {
 /// capabilities when they are constructed.
 #[derive(Clone)]
 pub struct AgentToolContext {
-    pub tree_id: TreeId,
-    pub path: String,
+    pub identity: SessionIdentity,
     pub messages: Vec<Message>,
 }
 

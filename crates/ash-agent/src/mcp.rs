@@ -211,7 +211,9 @@ pub async fn load_mcp_tools(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{AgentToolContext, CancellationToken, SessionId, ToolContext, TreeId, TurnId};
+    use ash_core::{
+        AgentToolContext, CancellationToken, SessionId, SessionIdentity, ToolContext, TurnId,
+    };
     use rmcp::{
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
@@ -262,8 +264,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             agent: AgentToolContext {
-                tree_id: TreeId::new(),
-                path: "/root".to_string(),
+                identity: SessionIdentity::root(SessionId::new()),
                 messages: Vec::new(),
             },
         }

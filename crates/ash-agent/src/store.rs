@@ -1,30 +1,12 @@
 use std::sync::Arc;
 
-use ash_core::{SessionId, SessionSummary};
-use serde::{Deserialize, Serialize};
+use ash_core::{SessionId, SessionIdentity, SessionSummary};
 
 use crate::{LogEntry, SessionLog};
 
-/// Whether a session belongs to the interactive root session or to a spawned
-/// sub-agent. Sub-agent sessions are hidden from the session list and cannot
-/// be resumed as root sessions.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionKind {
-    #[default]
-    Root,
-    Subagent,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct SessionMetadata {
-    pub session_id: SessionId,
-    pub kind: SessionKind,
-}
-
 #[derive(Clone, Debug)]
 pub struct StoredSession {
-    pub metadata: SessionMetadata,
+    pub identity: SessionIdentity,
     pub log: SessionLog,
 }
 
@@ -57,7 +39,7 @@ pub trait SessionAppender: Send {
 pub trait SessionStore: Send + Sync {
     async fn create(
         &self,
-        metadata: SessionMetadata,
+        identity: SessionIdentity,
         entries: &[LogEntry],
     ) -> Result<(), ash_core::AshError>;
 
@@ -81,7 +63,7 @@ pub trait SessionStore: Send + Sync {
     /// holds one exclusively locked writer per active session.
     async fn open_writer(
         &self,
-        metadata: SessionMetadata,
+        identity: SessionIdentity,
     ) -> Result<Box<dyn SessionAppender>, ash_core::AshError>;
 }
 

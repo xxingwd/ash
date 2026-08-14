@@ -133,7 +133,6 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     let options = SessionOptions {
         working_dir,
         tool_timeout: DEFAULT_TOOL_TIMEOUT,
-        ..SessionOptions::default()
     };
     if let Some(skill) = active_skill {
         agent = skill.apply_overrides(agent);

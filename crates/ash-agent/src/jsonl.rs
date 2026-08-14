@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use ash_core::{
-    Content, Message, MessageContent, MessageId, SessionId, SessionSummary, TurnId, TurnResult,
-    Usage,
+    parse_agent_path, AgentPath, Content, Message, MessageContent, MessageId, SessionId,
+    SessionIdentity, SessionSummary, TurnId, TurnResult, Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,28 +10,51 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, Async
 use tracing::warn;
 
 use crate::{
-    AcceptedInput, ContextCheckpoint, LogEntry, OpenedSession, SessionAppender, SessionKind,
-    SessionLog, SessionMetadata, SessionStore, StoredSession,
+    AcceptedInput, ContextCheckpoint, LogEntry, OpenedSession, SessionAppender, SessionLog,
+    SessionStore, StoredSession,
 };
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
 /// Immutable data needed to discover and display a session without replaying it.
+/// Lineage fields are all required: a file without them cannot be placed in a
+/// session tree and is rejected instead of silently becoming a root session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionHeader {
     session_id: SessionId,
+    root_id: SessionId,
+    parent_id: Option<SessionId>,
+    path: AgentPath,
     title: Option<String>,
-    #[serde(default)]
-    kind: SessionKind,
+}
+
+impl SessionHeader {
+    fn new(identity: SessionIdentity, title: Option<String>) -> Self {
+        Self {
+            session_id: identity.id,
+            root_id: identity.root_id,
+            parent_id: identity.parent_id,
+            path: identity.path,
+            title,
+        }
+    }
+
+    fn identity(&self) -> SessionIdentity {
+        SessionIdentity {
+            id: self.session_id,
+            root_id: self.root_id,
+            parent_id: self.parent_id,
+            path: self.path.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct StoredHeader {
-    session_id: SessionId,
+    identity: SessionIdentity,
     created_at: String,
     title: Option<String>,
-    kind: SessionKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,10 +172,7 @@ struct StoredFile {
 impl StoredFile {
     fn into_stored(self) -> StoredSession {
         StoredSession {
-            metadata: SessionMetadata {
-                session_id: self.header.session_id,
-                kind: self.header.kind,
-            },
+            identity: self.header.identity,
             log: self.log,
         }
     }
@@ -185,6 +205,7 @@ impl Replay {
 
     fn finish(self, path: &Path) -> Result<StoredFile, ash_core::AshError> {
         let mut header = self.header.ok_or_else(|| missing_header(path))?;
+        ensure_canonical_path(&header, path)?;
         let log = SessionLog::from_entries(
             self.records
                 .into_iter()
@@ -196,6 +217,23 @@ impl Replay {
             .or_else(|| title_from_messages(&log.messages()));
         Ok(StoredFile { header, log })
     }
+}
+
+/// Validate one replayed header: the agent path must parse and already be in
+/// canonical form before the header is trusted.
+fn ensure_canonical_path(header: &StoredHeader, path: &Path) -> Result<(), ash_core::AshError> {
+    let invalid = || {
+        ash_core::AshError::Config(format!(
+            "invalid session header in {}: {}",
+            path.display(),
+            header.identity.path
+        ))
+    };
+    let parsed = parse_agent_path(header.identity.path.as_str()).map_err(|_| invalid())?;
+    if parsed != header.identity.path {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// An exclusively locked append handle. The lock follows the file descriptor
@@ -211,15 +249,15 @@ pub struct SessionWriter {
 /// are modelled as one enum instead of two optional fields.
 #[derive(Debug)]
 enum WriterState {
-    New { metadata: SessionMetadata },
+    New { identity: SessionIdentity },
     Open { file: tokio::fs::File },
 }
 
 impl SessionWriter {
-    fn new(directory: &Path, metadata: SessionMetadata) -> Self {
+    fn new(directory: &Path, identity: SessionIdentity) -> Self {
         Self {
-            path: directory.join(session_filename(metadata.session_id)),
-            state: WriterState::New { metadata },
+            path: directory.join(session_filename(identity.id)),
+            state: WriterState::New { identity },
         }
     }
 
@@ -247,7 +285,7 @@ impl SessionWriter {
 
         let mut data = String::new();
         if is_new {
-            let WriterState::New { metadata } = &self.state else {
+            let WriterState::New { identity } = &self.state else {
                 // `is_new` was captured before any mutation, so this is
                 // unreachable; fail closed rather than panic.
                 return Err(ash_core::AshError::Config(
@@ -256,11 +294,10 @@ impl SessionWriter {
             };
             push_line(
                 &mut data,
-                FileRecord::SessionHeader(SessionHeader {
-                    session_id: metadata.session_id,
-                    title: title_from_entries(entries),
-                    kind: metadata.kind,
-                }),
+                FileRecord::SessionHeader(SessionHeader::new(
+                    identity.clone(),
+                    title_from_entries(entries),
+                )),
             )?;
         }
         for entry in entries.iter().cloned() {
@@ -365,10 +402,10 @@ impl JsonlSessionStore {
 impl SessionStore for JsonlSessionStore {
     async fn create(
         &self,
-        metadata: SessionMetadata,
+        identity: SessionIdentity,
         entries: &[LogEntry],
     ) -> Result<(), ash_core::AshError> {
-        SessionWriter::new(&self.directory, metadata)
+        SessionWriter::new(&self.directory, identity)
             .append(entries)
             .await
     }
@@ -381,7 +418,7 @@ impl SessionStore for JsonlSessionStore {
             return Ok(None);
         };
         let stored = read_session(&path).await?;
-        ensure_session_id(stored.header.session_id, session_id, &path)?;
+        ensure_session_id(stored.header.identity.id, session_id, &path)?;
         Ok(Some(stored.into_stored()))
     }
 
@@ -395,7 +432,7 @@ impl SessionStore for JsonlSessionStore {
         let file = open_locked_session(&path).await?;
         let mut reader = tokio::io::BufReader::new(file);
         let stored = replay_session(&mut reader, &path).await?;
-        ensure_session_id(stored.header.session_id, session_id, &path)?;
+        ensure_session_id(stored.header.identity.id, session_id, &path)?;
         let mut file = reader.into_inner();
         ensure_newline_terminated(&mut file).await?;
         Ok(Some(OpenedSession {
@@ -425,9 +462,9 @@ impl SessionStore for JsonlSessionStore {
 
     async fn open_writer(
         &self,
-        metadata: SessionMetadata,
+        identity: SessionIdentity,
     ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
-        Ok(Box::new(SessionWriter::new(&self.directory, metadata)))
+        Ok(Box::new(SessionWriter::new(&self.directory, identity)))
     }
 }
 
@@ -528,17 +565,18 @@ async fn read_summary(path: &Path) -> Result<Option<SessionSummary>, ash_core::A
     };
     let mut header =
         stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
+    ensure_canonical_path(&header, path)?;
     if let Some(session_id) = canonical_session_id(path) {
-        ensure_session_id(header.session_id, session_id, path)?;
+        ensure_session_id(header.identity.id, session_id, path)?;
     }
-    if header.kind == SessionKind::Subagent {
+    if header.identity.parent_id.is_some() {
         return Ok(None);
     }
     if header.title.is_none() {
         header.title = read_first_user_title(&mut reader, path).await?;
     }
     Ok(header.title.map(|title| SessionSummary {
-        session_id: header.session_id,
+        session_id: header.identity.id,
         title,
         created_at: display_created_at(&header.created_at),
     }))
@@ -547,10 +585,9 @@ async fn read_summary(path: &Path) -> Result<Option<SessionSummary>, ash_core::A
 fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
     match record {
         FileRecord::SessionHeader(header) => Some(StoredHeader {
-            session_id: header.session_id,
+            identity: header.identity(),
             created_at: timestamp.to_string(),
             title: header.title.clone(),
-            kind: header.kind,
         }),
         _ => None,
     }
@@ -714,20 +751,29 @@ mod tests {
 
     use super::*;
 
-    fn metadata(session_id: SessionId, kind: SessionKind) -> SessionMetadata {
-        SessionMetadata { session_id, kind }
-    }
-
     async fn create_session(
         store: &JsonlSessionStore,
         session_id: SessionId,
-        kind: SessionKind,
         entries: &[LogEntry],
     ) {
         store
-            .create(metadata(session_id, kind), entries)
+            .create(SessionIdentity::root(session_id), entries)
             .await
             .unwrap();
+    }
+
+    async fn create_child_session(
+        store: &JsonlSessionStore,
+        parent: SessionIdentity,
+        task_name: &str,
+        entries: &[LogEntry],
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .create(parent.child(session_id, task_name).unwrap(), entries)
+            .await
+            .unwrap();
+        session_id
     }
 
     #[test]
@@ -743,7 +789,7 @@ mod tests {
         let session_id = SessionId::new();
         let store = JsonlSessionStore::new(directory.path());
         let writer = store
-            .open_writer(metadata(session_id, SessionKind::Root))
+            .open_writer(SessionIdentity::root(session_id))
             .await
             .unwrap();
 
@@ -757,7 +803,7 @@ mod tests {
         let session_id = SessionId::new();
         let store = JsonlSessionStore::new(directory.path());
 
-        create_session(&store, session_id, SessionKind::Root, &[]).await;
+        create_session(&store, session_id, &[]).await;
 
         assert!(!directory.path().join(session_filename(session_id)).exists());
         assert!(store.load(session_id).await.unwrap().is_none());
@@ -771,7 +817,6 @@ mod tests {
         create_session(
             &store,
             session_id,
-            SessionKind::Root,
             &[LogEntry::Message(Message::user(
                 "  First session title\nwith details  ",
             ))],
@@ -791,7 +836,7 @@ mod tests {
         assert!(contents.contains(r#""session_id""#));
 
         let loaded = read_session(&path).await.unwrap();
-        assert_eq!(loaded.header.session_id, session_id);
+        assert_eq!(loaded.header.identity.id, session_id);
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.model_context().len(), 1);
     }
@@ -804,7 +849,6 @@ mod tests {
         create_session(
             &store,
             session_id,
-            SessionKind::Root,
             &[LogEntry::Message(Message::user("question"))],
         )
         .await;
@@ -828,7 +872,6 @@ mod tests {
         create_session(
             &store,
             session_id,
-            SessionKind::Root,
             &[
                 LogEntry::TurnStart(TurnId::new()),
                 LogEntry::Message(first),
@@ -860,7 +903,6 @@ mod tests {
         create_session(
             &store,
             session_id,
-            SessionKind::Root,
             &[
                 LogEntry::Message(Message::user("old request")),
                 LogEntry::Message(Message::assistant_text("old answer")),
@@ -898,7 +940,6 @@ mod tests {
         create_session(
             &store,
             session_id,
-            SessionKind::Root,
             &[LogEntry::Message(Message::user("session title"))],
         )
         .await;
@@ -922,11 +963,10 @@ mod tests {
         let mut contents = String::new();
         push_line(
             &mut contents,
-            FileRecord::SessionHeader(SessionHeader {
-                session_id,
-                title: Some("recoverable".to_string()),
-                kind: SessionKind::Root,
-            }),
+            FileRecord::SessionHeader(SessionHeader::new(
+                SessionIdentity::root(session_id),
+                Some("recoverable".to_string()),
+            )),
         )
         .unwrap();
         push_line(
@@ -962,11 +1002,10 @@ mod tests {
         let mut contents = String::new();
         push_line(
             &mut contents,
-            FileRecord::SessionHeader(SessionHeader {
-                session_id: header_id,
-                title: Some("mismatched".to_string()),
-                kind: SessionKind::Root,
-            }),
+            FileRecord::SessionHeader(SessionHeader::new(
+                SessionIdentity::root(header_id),
+                Some("mismatched".to_string()),
+            )),
         )
         .unwrap();
         tokio::fs::write(path, contents).await.unwrap();
@@ -978,31 +1017,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hides_subagent_sessions_from_the_session_list() {
+    async fn hides_child_sessions_from_the_session_list() {
         let directory = TempDir::new().unwrap();
         let root_id = SessionId::new();
-        let subagent_id = SessionId::new();
         let store = JsonlSessionStore::new(directory.path());
-        create_session(
+        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
+        let child_id = create_child_session(
             &store,
-            root_id,
-            SessionKind::Root,
-            &[LogEntry::Message(Message::user("root"))],
-        )
-        .await;
-        create_session(
-            &store,
-            subagent_id,
-            SessionKind::Subagent,
+            SessionIdentity::root(root_id),
+            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
 
         let listed = store.list(None).await.unwrap();
         assert!(listed.iter().any(|summary| summary.session_id == root_id));
-        assert!(!listed
-            .iter()
-            .any(|summary| summary.session_id == subagent_id));
+        assert!(!listed.iter().any(|summary| summary.session_id == child_id));
+    }
+
+    #[tokio::test]
+    async fn child_sessions_persist_and_restore_their_lineage() {
+        let directory = TempDir::new().unwrap();
+        let root_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        let child_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id),
+            "research",
+            &[LogEntry::Message(Message::user("child work"))],
+        )
+        .await;
+
+        let loaded = store.load(child_id).await.unwrap().unwrap();
+        assert_eq!(loaded.identity.id, child_id);
+        assert_eq!(loaded.identity.root_id, root_id);
+        assert_eq!(loaded.identity.parent_id, Some(root_id));
+        assert_eq!(loaded.identity.path.as_str(), "/root/research");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_header_without_lineage_fields() {
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let path = directory.path().join(session_filename(session_id));
+        tokio::fs::write(
+            &path,
+            format!("{{\"type\":\"session_header\",\"session_id\":\"{session_id}\"}}\n"),
+        )
+        .await
+        .unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+
+        let error = store.load(session_id).await.unwrap_err();
+        assert!(error.to_string().contains("missing its header"));
     }
 
     #[tokio::test]
@@ -1011,7 +1078,7 @@ mod tests {
         let store = JsonlSessionStore::new(directory.path());
         let session_id = SessionId::new();
         let mut writer = store
-            .open_writer(metadata(session_id, SessionKind::Root))
+            .open_writer(SessionIdentity::root(session_id))
             .await
             .unwrap();
         let turn_id = TurnId::new();

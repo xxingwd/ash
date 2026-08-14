@@ -102,28 +102,6 @@ impl std::str::FromStr for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
-pub struct TreeId(Uuid);
-
-impl TreeId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for TreeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl From<SessionId> for TreeId {
-    fn from(value: SessionId) -> Self {
-        Self(value.0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::EnumIter)]
 #[strum(serialize_all = "lowercase")]
 pub enum Role {
