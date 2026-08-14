@@ -212,7 +212,7 @@ pub async fn load_mcp_tools(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use ash_core::{
-        AgentToolContext, CancellationToken, SessionId, SessionIdentity, ToolContext, TurnId,
+        CancellationToken, SessionId, SessionIdentity, SessionToolContext, ToolContext, TurnId,
     };
     use rmcp::{
         model::{
@@ -263,7 +263,7 @@ mod tests {
             turn_id: TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: SessionIdentity::root(SessionId::new()),
                 messages: Vec::new(),
             },

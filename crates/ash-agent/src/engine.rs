@@ -1,7 +1,7 @@
 use ash_core::{
-    AgentToolContext, CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent,
-    ModelRequest, ModelStream, SessionEventKind, SessionId, StopReason, ToolCallId, ToolContext,
-    ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
+    CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent, ModelRequest,
+    ModelStream, SessionEventKind, SessionId, SessionToolContext, StopReason, ToolCallId,
+    ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
 };
 use futures::StreamExt;
 use std::time::Instant;
@@ -543,7 +543,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             turn_id: self.ids.turn_id,
             cancellation: self.cancel.clone(),
             deadline: Instant::now() + self.config.max_tool_duration,
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: self.config.identity.clone(),
                 messages: self.request_messages(messages),
             },

@@ -17,17 +17,17 @@ pub struct ToolContext {
     pub turn_id: TurnId,
     pub cancellation: CancellationToken,
     pub deadline: std::time::Instant,
-    /// Read-only snapshot of the calling session, for agent-aware tools.
-    pub agent: AgentToolContext,
+    /// Read-only snapshot of the calling session, for session-aware tools.
+    pub session: SessionToolContext,
 }
 
-/// Read-only invocation state used by agent-aware tools.
+/// Read-only invocation state used by session-aware tools.
 ///
 /// Model credentials, model clients, prompts, and the complete tool registry are
 /// intentionally not exposed here. Product-specific tools must capture those
 /// capabilities when they are constructed.
 #[derive(Clone)]
-pub struct AgentToolContext {
+pub struct SessionToolContext {
     pub identity: SessionIdentity,
     pub messages: Vec<Message>,
 }

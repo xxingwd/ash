@@ -801,7 +801,7 @@ impl AgentControl {
         }
         let profile = AgentProfile::for_name(args.agent_type.unwrap_or(ProfileName::Default));
         let fork_mode = ForkMode::from_arg(args.fork_turns)?;
-        let parent = context.agent.identity.clone();
+        let parent = context.session.identity.clone();
         let task_path = parent
             .path
             .join(&args.task_name)
@@ -817,7 +817,7 @@ impl AgentControl {
             drop(state);
             SpawnReservation::new(Arc::clone(&self.inner), parent.root_id, task_name.clone())
         };
-        let messages = fork_messages(&context.agent.messages, fork_mode);
+        let messages = fork_messages(&context.session.messages, fork_mode);
         let session = match self
             .prepare_child(ChildSessionRequest {
                 profile,
@@ -919,11 +919,11 @@ impl AgentControl {
         };
         let (target, session) = {
             let mut state = self.inner.state.lock().await;
-            let active_count = state.active_count(context.agent.identity.root_id);
+            let active_count = state.active_count(context.session.identity.root_id);
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.identity.root_id,
-                context.agent.identity.path.as_str(),
+                context.session.identity.root_id,
+                context.session.identity.path.as_str(),
                 &args.target,
             )?;
             if let Some(max) = self.inner.max_concurrent_children {
@@ -939,7 +939,7 @@ impl AgentControl {
         if delivery.triggers_turn() {
             self.submit_and_watch(
                 &session,
-                context.agent.identity.root_id,
+                context.session.identity.root_id,
                 &target,
                 args.message.clone(),
             )
@@ -968,8 +968,8 @@ impl AgentControl {
             let mut state = self.inner.state.lock().await;
             let record = resolve_target_mut(
                 &mut state,
-                context.agent.identity.root_id,
-                context.agent.identity.path.as_str(),
+                context.session.identity.root_id,
+                context.session.identity.path.as_str(),
                 &args.target,
             )?;
             let result = (
@@ -1002,7 +1002,10 @@ impl AgentControl {
             .min(max_timeout_ms);
         if timeout_ms == 0 {
             let agents = self
-                .snapshots(context.agent.identity.root_id, args.path_prefix.as_deref())
+                .snapshots(
+                    context.session.identity.root_id,
+                    args.path_prefix.as_deref(),
+                )
                 .await;
             return json_output(&serde_json::json!({
                 "agents": agents,
@@ -1015,8 +1018,8 @@ impl AgentControl {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let snapshot = self.inner.state.lock().await.wait_snapshot(
-                context.agent.identity.root_id,
-                context.agent.identity.path.as_str(),
+                context.session.identity.root_id,
+                context.session.identity.path.as_str(),
                 args.path_prefix.as_deref(),
             );
             if snapshot.agents.is_empty() || snapshot.has_update {
@@ -1032,8 +1035,8 @@ impl AgentControl {
             };
             if timed_out {
                 let snapshot = self.inner.state.lock().await.wait_snapshot(
-                    context.agent.identity.root_id,
-                    context.agent.identity.path.as_str(),
+                    context.session.identity.root_id,
+                    context.session.identity.path.as_str(),
                     args.path_prefix.as_deref(),
                 );
                 return json_output(&serde_json::json!({
@@ -1369,7 +1372,7 @@ fn json_output(value: &serde_json::Value) -> Result<String, ToolError> {
 mod tests {
     use std::path::PathBuf;
 
-    use ash_core::{AgentToolContext, ModelClient, ModelId};
+    use ash_core::{ModelClient, ModelId, SessionToolContext};
     use ash_protocol::{create_adapter, Protocol, ProviderConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1427,7 +1430,7 @@ mod tests {
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity,
                 messages: Vec::new(),
             },
@@ -2131,7 +2134,7 @@ mod tests {
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },
@@ -2274,7 +2277,7 @@ mod tests {
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },
@@ -2321,7 +2324,7 @@ mod tests {
             turn_id: ash_core::TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + Duration::from_secs(5),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: SessionIdentity::root(root_id),
                 messages: vec![Message::user("delegate this")],
             },

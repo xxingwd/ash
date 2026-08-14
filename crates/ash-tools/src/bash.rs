@@ -470,7 +470,7 @@ fn output_length_usize(length: u64) -> Result<usize, ToolError> {
 mod tests {
     use super::*;
     use ash_core::{
-        AgentToolContext, CancellationToken, SessionId, SessionIdentity, ToolContext, TurnId,
+        CancellationToken, SessionId, SessionIdentity, SessionToolContext, ToolContext, TurnId,
     };
 
     fn test_context() -> ToolContext {
@@ -483,7 +483,7 @@ mod tests {
             turn_id: TurnId::new(),
             cancellation,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
-            agent: AgentToolContext {
+            session: SessionToolContext {
                 identity: SessionIdentity::root(SessionId::new()),
                 messages: Vec::new(),
             },
