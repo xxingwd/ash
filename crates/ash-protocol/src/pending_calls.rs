@@ -48,14 +48,14 @@ pub struct PendingCall {
 impl PendingCall {
     pub(crate) fn new(id: &str, name: &str) -> Self {
         Self {
-            id: nonempty(id),
+            id: opaque_nonempty(id),
             name: nonempty(name),
             arguments: String::new(),
         }
     }
 
     pub(crate) fn set_id(&mut self, id: &str) {
-        if let Some(id) = nonempty(id) {
+        if let Some(id) = opaque_nonempty(id) {
             self.id = Some(id);
         }
     }
@@ -126,16 +126,17 @@ impl PendingCall {
                 ))
             })?
         };
-        let id = self
-            .id
-            .map(ToolCallId::from_provider)
-            .unwrap_or_else(ToolCallId::new);
+        let id = self.id.map(ToolCallId::from_provider).unwrap_or_default();
         Ok(ModelEvent::ToolCall {
             id,
             name,
             arguments,
         })
     }
+}
+
+fn opaque_nonempty(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -204,6 +205,19 @@ mod tests {
             }
             _ => panic!("expected a tool call event"),
         }
+    }
+
+    #[test]
+    fn finish_preserves_opaque_provider_id_exactly() {
+        let event = PendingCall::new("  toolu_123  ", "read")
+            .finish("Anthropic")
+            .unwrap();
+
+        assert!(matches!(
+            event,
+            ModelEvent::ToolCall { id, .. }
+                if id == ToolCallId::from_provider("  toolu_123  ")
+        ));
     }
 
     #[test]

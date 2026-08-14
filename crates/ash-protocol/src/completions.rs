@@ -81,17 +81,19 @@ impl CompletionsAdapter {
                     }
                 }
                 MessageGroup::ToolResults(group) => {
-                    for result in group.results {
+                    for result in &group.results {
+                        let output = text_tool_result(result.output, result.is_error);
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": result.id.as_str(),
-                            "content": result.output,
+                            "content": output,
                         }));
                     }
-                    if !group.attachments.is_empty() {
+                    let attachments = group.attachments().collect::<Vec<_>>();
+                    if !attachments.is_empty() {
                         messages.push(json!({
                             "role": "user",
-                            "content": chat_content(&group.attachments),
+                            "content": chat_attachments(&attachments),
                         }));
                     }
                 }
@@ -127,6 +129,31 @@ impl CompletionsAdapter {
         }
         model_config::apply_from_env(&mut body)?;
         Ok(body)
+    }
+}
+
+fn chat_attachments(contents: &[&ash_core::Content]) -> Value {
+    Value::Array(
+        contents
+            .iter()
+            .map(|content| match content {
+                ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
+                ash_core::Content::Image { media_type, data } => json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_url(media_type, data),
+                    }
+                }),
+            })
+            .collect(),
+    )
+}
+
+fn text_tool_result(output: &str, is_error: bool) -> std::borrow::Cow<'_, str> {
+    if is_error {
+        format!("Error: {output}").into()
+    } else {
+        output.into()
     }
 }
 
@@ -410,6 +437,25 @@ mod tests {
         assert_eq!(message["reasoning_content"], "step reasoning");
         assert_eq!(message["tool_calls"][0]["id"], "call_1");
         assert_eq!(message["tool_calls"][0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn preserves_text_only_tool_error_wire_format() {
+        let request = ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message::tool_result(
+                ToolCallId::from_provider("call"),
+                Err("permission denied".into()),
+                Vec::new(),
+            )],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = CompletionsAdapter::build_request(&request).unwrap();
+
+        assert_eq!(body["messages"][0]["content"], "Error: permission denied");
     }
 
     #[test]

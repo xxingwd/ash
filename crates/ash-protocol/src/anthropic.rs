@@ -92,8 +92,7 @@ impl AnthropicAdapter {
                         .results
                         .into_iter()
                         .map(|result| {
-                            let mut content =
-                                vec![json!({"type": "text", "text": result.output.as_ref()})];
+                            let mut content = vec![json!({"type": "text", "text": result.output})];
                             content.extend(result.attachments.iter().map(|attachment| {
                                 match attachment {
                                     ash_core::Content::Text(text) => {
@@ -279,9 +278,12 @@ impl AnthropicDecoder {
                 usage["output_tokens"].as_u64().unwrap_or(0),
             )));
         }
-        self.stop = Some(stop_reason(
-            event["delta"]["stop_reason"].as_str().unwrap_or(""),
-        ));
+        if let Some(reason) = event["delta"]["stop_reason"]
+            .as_str()
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            self.stop = Some(stop_reason(reason));
+        }
     }
 
     fn message_stop(
@@ -293,9 +295,12 @@ impl AnthropicDecoder {
                 "Anthropic message stopped with an unfinished tool call".to_string(),
             ));
         }
-        items.push(ModelEvent::Stop(
-            self.stop.take().unwrap_or(StopReason::EndTurn),
-        ));
+        let stop = self.stop.take().ok_or_else(|| {
+            ProtocolError::InvalidResponse(
+                "Anthropic message stopped without a stop reason".to_string(),
+            )
+        })?;
+        items.push(ModelEvent::Stop(stop));
         Ok(sse::DecodeResult::finished(std::mem::take(items)))
     }
 
@@ -350,12 +355,29 @@ mod tests {
     }
 
     #[test]
-    fn message_stop_finishes_the_decoder() {
+    fn rejects_message_stop_without_a_semantic_stop_reason() {
         let mut decoder = AnthropicDecoder::default();
+
+        let result = decoder.decode(r#"{"type":"message_stop"}"#);
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn message_stop_finishes_after_a_semantic_stop_reason() {
+        let mut decoder = AnthropicDecoder::default();
+        decoder
+            .decode(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            )
+            .unwrap();
 
         let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
-        assert!(matches!(result, sse::DecodeResult::Finished(_)));
+        assert_eq!(
+            result.into_items(),
+            vec![ModelEvent::Stop(StopReason::EndTurn)]
+        );
     }
 
     #[test]
@@ -451,6 +473,57 @@ mod tests {
         assert_eq!(content[0]["thinking"], "private reasoning");
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "visible answer");
+    }
+
+    #[test]
+    fn groups_consecutive_tool_results_into_one_user_message() {
+        let request = ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![
+                Message::tool_result(
+                    ToolCallId::from_provider("call_1"),
+                    Ok("first".into()),
+                    Vec::new(),
+                ),
+                Message::tool_result(
+                    ToolCallId::from_provider("call_2"),
+                    Ok("second".into()),
+                    Vec::new(),
+                ),
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = AnthropicAdapter::build_request(&request).unwrap();
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][0]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(body["messages"][0]["content"][1]["tool_use_id"], "call_2");
+    }
+
+    #[test]
+    fn sends_raw_tool_error_with_is_error() {
+        let request = ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message::tool_result(
+                ToolCallId::from_provider("call"),
+                Err("permission denied".into()),
+                Vec::new(),
+            )],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = AnthropicAdapter::build_request(&request).unwrap();
+        let result = &body["messages"][0]["content"][0];
+
+        assert_eq!(result["content"][0]["text"], "permission denied");
+        assert_eq!(result["is_error"], true);
     }
 
     #[test]

@@ -5,7 +5,7 @@ mod pending_calls;
 mod responses;
 mod sse;
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, ToolCallId};
 use base64::Engine;
@@ -184,19 +184,25 @@ fn project_request_messages(
 /// request, so providers that key results to calls can emit them as a block.
 pub(crate) struct ToolResultGroup<'a> {
     pub(crate) results: Vec<ToolResultRef<'a>>,
-    pub(crate) attachments: Vec<Content>,
+}
+
+impl<'a> ToolResultGroup<'a> {
+    pub(crate) fn attachments(&self) -> impl Iterator<Item = &'a Content> + '_ {
+        self.results
+            .iter()
+            .flat_map(|result| result.attachments.iter())
+    }
 }
 
 pub(crate) struct ToolResultRef<'a> {
     pub(crate) id: &'a ToolCallId,
-    pub(crate) output: Cow<'a, str>,
+    pub(crate) output: &'a str,
     pub(crate) is_error: bool,
     pub(crate) attachments: &'a [Content],
 }
 
 fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolResultGroup<'a> {
     let mut results = Vec::new();
-    let mut attachments = Vec::new();
     let mut index = start;
     while let Some(message) = messages.get(index) {
         let MessageContent::ToolResult {
@@ -209,8 +215,8 @@ fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolR
             break;
         };
         let (output, is_error) = match result {
-            Ok(output) => (Cow::Borrowed(output.as_str()), false),
-            Err(error) => (Cow::Owned(format!("Error: {error}")), true),
+            Ok(output) => (output.as_str(), false),
+            Err(error) => (error.as_str(), true),
         };
         results.push(ToolResultRef {
             id,
@@ -218,13 +224,9 @@ fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolR
             is_error,
             attachments: result_attachments,
         });
-        attachments.extend(result_attachments.iter().cloned());
         index += 1;
     }
-    ToolResultGroup {
-        results,
-        attachments,
-    }
+    ToolResultGroup { results }
 }
 
 /// One request-building step over the projected history: a user turn, an

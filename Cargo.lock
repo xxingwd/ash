@@ -249,7 +249,6 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
- "ash-collab",
  "ash-core",
  "crossterm",
  "futures",

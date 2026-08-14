@@ -71,17 +71,19 @@ impl ResponsesAdapter {
                     }));
                 }
                 MessageGroup::ToolResults(group) => {
-                    for result in group.results {
+                    for result in &group.results {
+                        let output = text_tool_result(result.output, result.is_error);
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": result.id.as_str(),
-                            "output": result.output,
+                            "output": output,
                         }));
                     }
-                    if !group.attachments.is_empty() {
+                    let attachments = group.attachments().collect::<Vec<_>>();
+                    if !attachments.is_empty() {
                         input.push(json!({
                             "role": "user",
-                            "content": responses_content(&group.attachments),
+                            "content": responses_attachments(&attachments),
                         }));
                     }
                 }
@@ -116,6 +118,31 @@ impl ResponsesAdapter {
         }
         model_config::apply_from_env(&mut body)?;
         Ok(body)
+    }
+}
+
+fn responses_attachments(contents: &[&ash_core::Content]) -> Value {
+    Value::Array(
+        contents
+            .iter()
+            .map(|content| match content {
+                ash_core::Content::Text(text) => {
+                    json!({"type": "input_text", "text": text})
+                }
+                ash_core::Content::Image { media_type, data } => json!({
+                    "type": "input_image",
+                    "image_url": image_data_url(media_type, data),
+                }),
+            })
+            .collect(),
+    )
+}
+
+fn text_tool_result(output: &str, is_error: bool) -> std::borrow::Cow<'_, str> {
+    if is_error {
+        format!("Error: {output}").into()
+    } else {
+        output.into()
     }
 }
 
@@ -579,6 +606,25 @@ mod tests {
         assert_eq!(body["input"][0]["content"], "visible answer");
         assert_eq!(body["input"][1]["type"], "reasoning");
         assert_eq!(body["input"][1]["summary"][0]["text"], "private reasoning");
+    }
+
+    #[test]
+    fn preserves_text_only_tool_error_wire_format() {
+        let request = ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            messages: vec![Message::tool_result(
+                ToolCallId::from_provider("call"),
+                Err("permission denied".into()),
+                Vec::new(),
+            )],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        let body = ResponsesAdapter::build_request(&request).unwrap();
+
+        assert_eq!(body["input"][0]["output"], "Error: permission denied");
     }
 
     #[test]
