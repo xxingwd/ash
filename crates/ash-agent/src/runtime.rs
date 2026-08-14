@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use ash_core::{Message, ModelClient, SessionId, SessionIdentity, SessionSummary};
 
-use crate::{
-    agent::RunConfig, Agent, JsonlSessionStore, Session, SessionOptions, SessionState,
-    SessionStore, SharedSessionStore,
-};
+use crate::agent::RunConfig;
+use crate::store::SharedSessionStore;
+use crate::{Agent, JsonlSessionStore, Session, SessionOptions, SessionState, SessionStore};
 
 /// Provider-neutral dependencies and the only entry point for creating sessions.
 #[derive(Clone)]
@@ -91,7 +90,11 @@ impl Runtime {
         &self,
         excluded: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.sessions.list(excluded).await
+        let mut sessions = self.sessions.list_roots().await?;
+        if let Some(excluded) = excluded {
+            sessions.retain(|summary| summary.session_id != excluded);
+        }
+        Ok(sessions)
     }
 
     /// List every session in one collaboration tree, root included.

@@ -20,7 +20,7 @@ pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
 };
 pub use input::{Input, InputSource};
-pub use jsonl::{JsonlSessionStore, SessionWriter};
+pub use jsonl::JsonlSessionStore;
 pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, SessionLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use prompt::build_system_prompt;
@@ -28,4 +28,4 @@ pub use runtime::Runtime;
 pub(crate) use session::SessionState;
 pub use session::{ContextCompaction, Fork, Session, Turn};
 pub use skill::{tool as skill_tool, Skill};
-pub use store::{OpenedSession, SessionAppender, SessionStore, SharedSessionStore, StoredSession};
+pub use store::{OpenedSession, SessionAppender, SessionStore, StoredSession};

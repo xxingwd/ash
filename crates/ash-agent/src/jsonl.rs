@@ -9,10 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use crate::{
-    AcceptedInput, ContextCheckpoint, LogEntry, OpenedSession, SessionAppender, SessionLog,
-    SessionStore, StoredSession,
-};
+use crate::store::{OpenedSession, SessionStore, StoredSession};
+use crate::{AcceptedInput, ContextCheckpoint, LogEntry, SessionAppender, SessionLog};
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
@@ -400,14 +398,11 @@ impl JsonlSessionStore {
     async fn read_summaries(
         &self,
         scope: SummaryScope,
-        excluded_session: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         let mut summaries = Vec::new();
         for path in self.session_paths().await? {
             match read_summary(&path, scope).await {
-                Ok(Some(summary)) if Some(summary.session_id) != excluded_session => {
-                    summaries.push(summary);
-                }
+                Ok(Some(summary)) => summaries.push(summary),
                 Ok(_) => {}
                 Err(error) => {
                     warn!(path = %path.display(), %error, "skipping unreadable session");
@@ -419,26 +414,11 @@ impl JsonlSessionStore {
 }
 #[async_trait::async_trait]
 impl SessionStore for JsonlSessionStore {
-    async fn create(
+    async fn open_new(
         &self,
         identity: SessionIdentity,
-        entries: &[LogEntry],
-    ) -> Result<(), ash_core::AshError> {
-        SessionWriter::new(&self.directory, identity)
-            .append(entries)
-            .await
-    }
-
-    async fn load(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<StoredSession>, ash_core::AshError> {
-        let Some(path) = self.find_session(session_id).await? else {
-            return Ok(None);
-        };
-        let stored = read_session(&path).await?;
-        ensure_session_id(stored.header.identity.id, session_id, &path)?;
-        Ok(Some(stored.into_stored()))
+    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
+        Ok(Box::new(SessionWriter::new(&self.directory, identity)))
     }
 
     async fn open(
@@ -460,23 +440,24 @@ impl SessionStore for JsonlSessionStore {
         }))
     }
 
-    async fn list(
+    async fn load(
         &self,
-        excluded_session: Option<SessionId>,
-    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.read_summaries(SummaryScope::Roots, excluded_session)
-            .await
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, ash_core::AshError> {
+        let Some(path) = self.find_session(session_id).await? else {
+            return Ok(None);
+        };
+        let stored = read_session(&path).await?;
+        ensure_session_id(stored.header.identity.id, session_id, &path)?;
+        Ok(Some(stored.into_stored()))
+    }
+
+    async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        self.read_summaries(SummaryScope::Roots).await
     }
 
     async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.read_summaries(SummaryScope::Tree(root_id), None).await
-    }
-
-    async fn open_writer(
-        &self,
-        identity: SessionIdentity,
-    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
-        Ok(Box::new(SessionWriter::new(&self.directory, identity)))
+        self.read_summaries(SummaryScope::Tree(root_id)).await
     }
 }
 
@@ -789,10 +770,11 @@ mod tests {
         session_id: SessionId,
         entries: &[LogEntry],
     ) {
-        store
-            .create(SessionIdentity::root(session_id), entries)
+        let mut writer = store
+            .open_new(SessionIdentity::root(session_id))
             .await
             .unwrap();
+        writer.append(entries).await.unwrap();
     }
 
     async fn create_child_session(
@@ -802,11 +784,14 @@ mod tests {
         entries: &[LogEntry],
     ) -> SessionId {
         let session_id = SessionId::new();
-        store
-            .create(parent.child(session_id, task_name).unwrap(), entries)
-            .await
-            .unwrap();
+        let identity = parent.child(session_id, task_name).unwrap();
+        let mut writer = store.open_new(identity).await.unwrap();
+        writer.append(entries).await.unwrap();
         session_id
+    }
+
+    async fn stored_log(store: &JsonlSessionStore, session_id: SessionId) -> SessionLog {
+        store.load(session_id).await.unwrap().unwrap().log
     }
 
     #[test]
@@ -822,7 +807,7 @@ mod tests {
         let session_id = SessionId::new();
         let store = JsonlSessionStore::new(directory.path());
         let writer = store
-            .open_writer(SessionIdentity::root(session_id))
+            .open_new(SessionIdentity::root(session_id))
             .await
             .unwrap();
 
@@ -919,8 +904,8 @@ mod tests {
         opened.writer.append(&[LogEntry::Rollback]).await.unwrap();
         drop(opened);
 
-        let loaded = store.load(session_id).await.unwrap().unwrap();
-        let messages = loaded.log.messages();
+        let loaded = stored_log(&store, session_id).await;
+        let messages = loaded.messages();
         // history keeps only user messages; the second turn is rolled back.
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0].content, MessageContent::User(_)));
@@ -959,10 +944,10 @@ mod tests {
             .unwrap();
         drop(opened);
 
-        let loaded = store.load(session_id).await.unwrap().unwrap();
-        assert_eq!(loaded.log.messages().len(), 4);
-        assert_eq!(loaded.log.model_context().len(), 3);
-        assert_eq!(session_title(&loaded.log.messages()), "old request");
+        let loaded = stored_log(&store, session_id).await;
+        assert_eq!(loaded.messages().len(), 4);
+        assert_eq!(loaded.model_context().len(), 3);
+        assert_eq!(session_title(&loaded.messages()), "old request");
     }
 
     #[tokio::test]
@@ -981,7 +966,7 @@ mod tests {
         contents.push_str("malformed tail that list must not read\n");
         tokio::fs::write(&path, contents).await.unwrap();
 
-        let listed = store.list(None).await.unwrap();
+        let listed = store.list_roots().await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, session_id);
         assert_eq!(listed[0].title, "session title");
@@ -1016,9 +1001,8 @@ mod tests {
         tokio::fs::write(path, contents).await.unwrap();
 
         let store = JsonlSessionStore::new(directory.path());
-        let loaded = store.load(session_id).await.unwrap().unwrap();
+        let loaded = stored_log(&store, session_id).await;
         let prompts = loaded
-            .log
             .messages()
             .iter()
             .filter_map(Message::user_turn_text)
@@ -1044,9 +1028,9 @@ mod tests {
         tokio::fs::write(path, contents).await.unwrap();
         let store = JsonlSessionStore::new(directory.path());
 
-        let error = store.load(filename_id).await.unwrap_err();
+        let error = store.open(filename_id).await.unwrap_err();
         assert!(error.to_string().contains("does not match filename"));
-        assert!(store.list(None).await.unwrap().is_empty());
+        assert!(store.list_roots().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1063,7 +1047,7 @@ mod tests {
         )
         .await;
 
-        let listed = store.list(None).await.unwrap();
+        let listed = store.list_roots().await.unwrap();
         assert!(listed.iter().any(|summary| summary.session_id == root_id));
         assert!(!listed.iter().any(|summary| summary.session_id == child_id));
     }
@@ -1142,7 +1126,7 @@ mod tests {
         .unwrap();
         let store = JsonlSessionStore::new(directory.path());
 
-        let error = store.load(session_id).await.unwrap_err();
+        let error = store.open(session_id).await.unwrap_err();
         assert!(error.to_string().contains("missing its header"));
     }
 
@@ -1152,7 +1136,7 @@ mod tests {
         let store = JsonlSessionStore::new(directory.path());
         let session_id = SessionId::new();
         let mut writer = store
-            .open_writer(SessionIdentity::root(session_id))
+            .open_new(SessionIdentity::root(session_id))
             .await
             .unwrap();
         let turn_id = TurnId::new();
@@ -1177,8 +1161,8 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store.load(session_id).await.unwrap().unwrap();
-        assert_eq!(loaded.log.messages().len(), 2);
+        let loaded = stored_log(&store, session_id).await;
+        assert_eq!(loaded.messages().len(), 2);
     }
 
     #[test]

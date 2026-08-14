@@ -13,9 +13,10 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
+use crate::store::{OpenedSession, SharedSessionStore};
 use crate::{
-    AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedSession, RunConfig, Runtime,
-    SessionAppender, SessionLog, SharedSessionStore,
+    AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime, SessionAppender,
+    SessionLog,
 };
 
 const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
@@ -888,7 +889,7 @@ impl SessionState {
             return Ok(Arc::clone(writer));
         }
         let writer = Arc::new(tokio::sync::Mutex::new(
-            self.store.open_writer(self.identity.clone()).await?,
+            self.store.open_new(self.identity.clone()).await?,
         ));
         self.writer = Some(Arc::clone(&writer));
         Ok(writer)
@@ -1025,6 +1026,22 @@ mod tests {
         runtime().with_session_store(Arc::new(crate::JsonlSessionStore::new(directory)))
     }
 
+    async fn create_session(
+        store: &SharedSessionStore,
+        identity: SessionIdentity,
+        entries: &[LogEntry],
+    ) {
+        let mut writer = store.open_new(identity).await.unwrap();
+        writer.append(entries).await.unwrap();
+    }
+
+    async fn stored_session(
+        store: &SharedSessionStore,
+        session_id: SessionId,
+    ) -> crate::StoredSession {
+        store.load(session_id).await.unwrap().unwrap()
+    }
+
     async fn session_with_messages(
         config: RunConfig,
         runtime: Runtime,
@@ -1120,19 +1137,9 @@ mod tests {
             expected_ids
         );
         assert_eq!(forked.prompt, "try another direction");
-        let original = runtime
-            .session_store_handle()
-            .load(original_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let original = stored_session(&runtime.session_store_handle(), original_id).await;
         assert_eq!(original.log.messages().len(), 4);
-        let stored_fork = fork_state
-            .store
-            .load(fork_state.id())
-            .await
-            .unwrap()
-            .unwrap();
+        let stored_fork = stored_session(&fork_state.store, fork_state.id()).await;
         assert_eq!(
             stored_fork
                 .log
@@ -1153,14 +1160,12 @@ mod tests {
         let mut state = SessionState::new(config(current_dir.clone()), runtime.clone());
         let saved_id = SessionId::new();
         let saved_message = Message::user("saved question");
-        runtime
-            .session_store_handle()
-            .create(
-                SessionIdentity::root(saved_id),
-                &[LogEntry::Message(saved_message)],
-            )
-            .await
-            .unwrap();
+        create_session(
+            &runtime.session_store_handle(),
+            SessionIdentity::root(saved_id),
+            &[LogEntry::Message(saved_message)],
+        )
+        .await;
 
         assert!(state.resume(saved_id).await.unwrap());
 
@@ -1184,14 +1189,12 @@ mod tests {
         let root_id = SessionId::new();
         let root = SessionIdentity::root(root_id);
         let child = root.child(SessionId::new(), "research").unwrap();
-        runtime
-            .session_store_handle()
-            .create(
-                child.clone(),
-                &[LogEntry::Message(Message::user("child work"))],
-            )
-            .await
-            .unwrap();
+        create_session(
+            &runtime.session_store_handle(),
+            child.clone(),
+            &[LogEntry::Message(Message::user("child work"))],
+        )
+        .await;
 
         assert!(!state.resume(child.id).await.unwrap());
         assert_ne!(state.id(), child.id);
@@ -1237,12 +1240,7 @@ mod tests {
         assert_eq!(session.identity().root_id, parent.id);
         assert_eq!(session.identity().parent_id, Some(parent.id));
         assert_eq!(session.identity().path.as_str(), "/root/research");
-        let stored = runtime
-            .session_store_handle()
-            .load(session.id())
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = stored_session(&runtime.session_store_handle(), session.id()).await;
         assert_eq!(stored.identity, session.identity());
     }
 
@@ -1325,7 +1323,7 @@ mod tests {
             assert!(requests[0].tools.is_empty());
             drop(requests);
         }
-        let stored = state.store.load(state.id()).await.unwrap().unwrap();
+        let stored = stored_session(&state.store, state.id()).await;
         assert_eq!(stored.log.messages().len(), 6);
         assert_eq!(stored.log.model_context().len(), 5);
         assert!(matches!(
@@ -1672,6 +1670,6 @@ mod tests {
 
         assert!(error.to_string().contains("duplicate agent input"));
         assert!(state.log.entries().is_empty());
-        assert!(state.store.load(state.id()).await.unwrap().is_none());
+        assert!(state.store.open(state.id()).await.unwrap().is_none());
     }
 }

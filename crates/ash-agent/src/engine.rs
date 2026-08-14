@@ -881,7 +881,8 @@ mod tests {
 
     use super::*;
     use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
-    use crate::{JsonlSessionStore, SharedSessionStore, StoredSession};
+    use crate::store::{SharedSessionStore, StoredSession};
+    use crate::JsonlSessionStore;
     use ash_core::SessionIdentity;
 
     async fn run_with_adapter(
@@ -914,7 +915,10 @@ mod tests {
             .cloned()
             .map(LogEntry::Message)
             .collect::<Vec<_>>();
-        store.create(metadata(session_id), &records).await.unwrap();
+        {
+            let mut writer = store.open_new(metadata(session_id)).await.unwrap();
+            writer.append(&records).await.unwrap();
+        }
         let opened = store.open(session_id).await.unwrap().unwrap();
         let writer = Arc::new(tokio::sync::Mutex::new(opened.writer));
         let persistence = SessionPersistence::new(writer);

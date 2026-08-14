@@ -37,16 +37,12 @@ pub trait SessionAppender: Send {
 /// Durable, storage-neutral boundary for session state.
 #[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
-    async fn create(
+    /// Open a brand-new session and keep its exclusively locked append handle
+    /// open. The runtime's hot write path holds one writer per active session.
+    async fn open_new(
         &self,
         identity: SessionIdentity,
-        entries: &[LogEntry],
-    ) -> Result<(), ash_core::AshError>;
-
-    async fn load(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<StoredSession>, ash_core::AshError>;
+    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError>;
 
     /// Load one session and keep its exclusively locked append handle open.
     async fn open(
@@ -54,25 +50,23 @@ pub trait SessionStore: Send + Sync {
         session_id: SessionId,
     ) -> Result<Option<OpenedSession>, ash_core::AshError>;
 
-    async fn list(
+    /// Non-locking read of one session. Used for introspection and tests when
+    /// another live writer already holds the exclusive lock.
+    async fn load(
         &self,
-        excluded_session: Option<SessionId>,
-    ) -> Result<Vec<SessionSummary>, ash_core::AshError>;
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, ash_core::AshError>;
+
+    /// List root sessions, newest first.
+    async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError>;
 
     /// List every session in one collaboration tree, root included, newest
     /// first. Children are durable history: they are discoverable here but
     /// never resumable as root sessions.
     async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError>;
-
-    /// Open an append-only writer for a session. The runtime's hot write path
-    /// holds one exclusively locked writer per active session.
-    async fn open_writer(
-        &self,
-        identity: SessionIdentity,
-    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError>;
 }
 
-pub type SharedSessionStore = Arc<dyn SessionStore>;
+pub(crate) type SharedSessionStore = Arc<dyn SessionStore>;
 
 pub struct SessionPersistence {
     writer: Arc<tokio::sync::Mutex<Box<dyn SessionAppender>>>,
