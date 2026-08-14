@@ -15,21 +15,79 @@ use crate::{AcceptedInput, ContextCheckpoint, LogEntry, SessionAppender, Session
 const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
+/// Current on-disk session file format. Bumped on incompatible changes; old
+/// formats are rejected outright rather than guessed at.
+const SESSION_FORMAT_VERSION: u32 = 1;
+
 /// Immutable data needed to discover and display a session without replaying it.
 /// Lineage fields are all required: a file without them cannot be placed in a
 /// session tree and is rejected instead of silently becoming a root session.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 struct SessionHeader {
+    format_version: u32,
     session_id: SessionId,
     root_id: SessionId,
+    /// Explicitly `null` for a root session; a missing field is rejected so
+    /// corrupt files never silently degrade to a root session.
     parent_id: Option<SessionId>,
     path: AgentPath,
     title: Option<String>,
 }
 
+impl<'de> Deserialize<'de> for SessionHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        use std::collections::BTreeMap;
+
+        let mut map = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        let parent_present = map.contains_key("parent_id");
+        let parent_id = map
+            .remove("parent_id")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .flatten();
+        if !parent_present {
+            return Err(D::Error::custom("missing required field `parent_id`"));
+        }
+        fn take<T, E>(map: &mut BTreeMap<String, serde_json::Value>, name: &str) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            let value = map
+                .remove(name)
+                .ok_or_else(|| E::custom(format!("missing required field `{name}`")))?;
+            serde_json::from_value(value).map_err(E::custom)
+        }
+        let format_version: u32 = take(&mut map, "format_version")?;
+        let session_id: SessionId = take(&mut map, "session_id")?;
+        let root_id: SessionId = take(&mut map, "root_id")?;
+        let path: AgentPath = take(&mut map, "path")?;
+        let title: Option<String> = map
+            .remove("title")
+            .map(serde_json::from_value::<Option<String>>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .flatten();
+        Ok(Self {
+            format_version,
+            session_id,
+            root_id,
+            parent_id,
+            path,
+            title,
+        })
+    }
+}
+
 impl SessionHeader {
     fn new(identity: SessionIdentity, title: Option<String>) -> Self {
         Self {
+            format_version: SESSION_FORMAT_VERSION,
             session_id: identity.id,
             root_id: identity.root_id,
             parent_id: identity.parent_id,
@@ -50,6 +108,7 @@ impl SessionHeader {
 
 #[derive(Clone, Debug)]
 struct StoredHeader {
+    format_version: u32,
     identity: SessionIdentity,
     created_at: String,
     title: Option<String>,
@@ -217,9 +276,17 @@ impl Replay {
     }
 }
 
-/// Validate one replayed header: the agent path must parse and already be in
-/// canonical form before the header is trusted.
+/// Validate one replayed header: the format version must match and the agent
+/// path must parse and already be in canonical form before the header is
+/// trusted.
 fn ensure_canonical_path(header: &StoredHeader, path: &Path) -> Result<(), ash_core::AshError> {
+    if header.format_version != SESSION_FORMAT_VERSION {
+        return Err(ash_core::AshError::Config(format!(
+            "unsupported session format {} in {} (expected {SESSION_FORMAT_VERSION})",
+            header.format_version,
+            path.display()
+        )));
+    }
     let invalid = || {
         ash_core::AshError::Config(format!(
             "invalid session header in {}: {}",
@@ -353,23 +420,10 @@ impl JsonlSessionStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<PathBuf>, ash_core::AshError> {
+        // One session id maps to exactly one canonical path. Directory scans
+        // and legacy fallbacks are intentionally absent.
         let path = self.directory.join(session_filename(session_id));
-        if tokio::fs::try_exists(&path).await? {
-            return Ok(Some(path));
-        }
-
-        let mut entries = match tokio::fs::read_dir(&self.directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if canonical_session_id(&path) == Some(session_id) {
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
+        Ok(tokio::fs::try_exists(&path).await?.then_some(path))
     }
 
     async fn session_paths(&self) -> Result<Vec<PathBuf>, ash_core::AshError> {
@@ -599,6 +653,7 @@ async fn read_summary(
 fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
     match record {
         FileRecord::SessionHeader(header) => Some(StoredHeader {
+            format_version: header.format_version,
             identity: header.identity(),
             created_at: timestamp.to_string(),
             title: header.title.clone(),
@@ -1128,6 +1183,54 @@ mod tests {
 
         let error = store.open(session_id).await.unwrap_err();
         assert!(error.to_string().contains("missing its header"));
+    }
+
+    #[test]
+    fn rejects_a_header_that_omits_parent_id() {
+        // Everything except the required parent_id field. Without the presence
+        // check this would silently degrade to a root session.
+        let json = r#"{"format_version":1,"session_id":"e990cdf4-3efb-4f0e-9de4-71131ad45d37","root_id":"e990cdf4-3efb-4f0e-9de4-71131ad45d37","path":"/root"}"#;
+
+        let error = serde_json::from_str::<SessionHeader>(json).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing required field `parent_id`"));
+    }
+
+    #[tokio::test]
+    async fn rejects_headers_from_an_unsupported_format_version() {
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let path = directory.path().join(session_filename(session_id));
+        tokio::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"t\",\"type\":\"session_header\",\"payload\":{{\"format_version\":0,\"session_id\":\"{session_id}\",\"root_id\":\"{session_id}\",\"parent_id\":null,\"path\":\"/root\",\"title\":null}}}}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+
+        let error = store.open(session_id).await.unwrap_err();
+        assert!(error.to_string().contains("unsupported session format"));
+    }
+
+    #[test]
+    fn serializes_a_strict_header_with_explicit_null_parent() {
+        let session_id = SessionId::new();
+        let header = SessionHeader::new(SessionIdentity::root(session_id), None);
+        let json = serde_json::to_value(&header).unwrap();
+
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(
+            json["session_id"],
+            serde_json::to_value(session_id).unwrap()
+        );
+        assert_eq!(json["root_id"], serde_json::to_value(session_id).unwrap());
+        assert_eq!(json["parent_id"], serde_json::Value::Null);
+        assert_eq!(json["path"], "/root");
+        assert!(json.get("title").is_some());
     }
 
     #[tokio::test]
