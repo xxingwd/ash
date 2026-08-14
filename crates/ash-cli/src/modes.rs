@@ -513,7 +513,7 @@ impl InteractiveController {
     }
 
     async fn list_sessions(&self) {
-        let event = match self.runtime.sessions(Some(self.session.id())).await {
+        let event = match self.runtime.list_sessions(Some(self.session.id())).await {
             Ok(sessions) => UiEvent::SessionsListed { sessions },
             Err(error) => UiEvent::CommandFailed(format!("Failed to list saved chats: {error}")),
         };

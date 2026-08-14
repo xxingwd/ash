@@ -396,8 +396,27 @@ impl JsonlSessionStore {
         candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         Ok(candidates.into_iter().map(|(_, path)| path).collect())
     }
-}
 
+    async fn read_summaries(
+        &self,
+        scope: SummaryScope,
+        excluded_session: Option<SessionId>,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        let mut summaries = Vec::new();
+        for path in self.session_paths().await? {
+            match read_summary(&path, scope).await {
+                Ok(Some(summary)) if Some(summary.session_id) != excluded_session => {
+                    summaries.push(summary);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "skipping unreadable session");
+                }
+            }
+        }
+        Ok(summaries)
+    }
+}
 #[async_trait::async_trait]
 impl SessionStore for JsonlSessionStore {
     async fn create(
@@ -445,19 +464,12 @@ impl SessionStore for JsonlSessionStore {
         &self,
         excluded_session: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        let mut summaries = Vec::new();
-        for path in self.session_paths().await? {
-            match read_summary(&path).await {
-                Ok(Some(summary)) if Some(summary.session_id) != excluded_session => {
-                    summaries.push(summary);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping unreadable session");
-                }
-            }
-        }
-        Ok(summaries)
+        self.read_summaries(SummaryScope::Roots, excluded_session)
+            .await
+    }
+
+    async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        self.read_summaries(SummaryScope::Tree(root_id), None).await
     }
 
     async fn open_writer(
@@ -465,6 +477,24 @@ impl SessionStore for JsonlSessionStore {
         identity: SessionIdentity,
     ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
         Ok(Box::new(SessionWriter::new(&self.directory, identity)))
+    }
+}
+
+/// Which sessions a summary query should surface.
+#[derive(Clone, Copy)]
+enum SummaryScope {
+    /// Root sessions only: the default session picker.
+    Roots,
+    /// Every session belonging to one collaboration tree.
+    Tree(SessionId),
+}
+
+impl SummaryScope {
+    fn includes(&self, identity: &SessionIdentity) -> bool {
+        match self {
+            Self::Roots => identity.parent_id.is_none(),
+            Self::Tree(root_id) => identity.root_id == *root_id,
+        }
     }
 }
 
@@ -557,7 +587,10 @@ where
     replay.finish(path)
 }
 
-async fn read_summary(path: &Path) -> Result<Option<SessionSummary>, ash_core::AshError> {
+async fn read_summary(
+    path: &Path,
+    scope: SummaryScope,
+) -> Result<Option<SessionSummary>, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     let mut reader = tokio::io::BufReader::new(file);
     let Some(first) = read_first_record(&mut reader, path).await? else {
@@ -569,7 +602,7 @@ async fn read_summary(path: &Path) -> Result<Option<SessionSummary>, ash_core::A
     if let Some(session_id) = canonical_session_id(path) {
         ensure_session_id(header.identity.id, session_id, path)?;
     }
-    if header.identity.parent_id.is_some() {
+    if !scope.includes(&header.identity) {
         return Ok(None);
     }
     if header.title.is_none() {
@@ -1033,6 +1066,47 @@ mod tests {
         let listed = store.list(None).await.unwrap();
         assert!(listed.iter().any(|summary| summary.session_id == root_id));
         assert!(!listed.iter().any(|summary| summary.session_id == child_id));
+    }
+
+    #[tokio::test]
+    async fn tree_lists_every_session_in_a_root_tree() {
+        let directory = TempDir::new().unwrap();
+        let root_id = SessionId::new();
+        let other_root_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
+        let child_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id),
+            "research",
+            &[LogEntry::Message(Message::user("subagent"))],
+        )
+        .await;
+        let grandchild_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id)
+                .child(child_id, "research")
+                .unwrap(),
+            "scan",
+            &[LogEntry::Message(Message::user("deep"))],
+        )
+        .await;
+        create_session(
+            &store,
+            other_root_id,
+            &[LogEntry::Message(Message::user("other"))],
+        )
+        .await;
+
+        let tree = store.tree(root_id).await.unwrap();
+        let tree_ids = tree
+            .iter()
+            .map(|summary| summary.session_id)
+            .collect::<Vec<_>>();
+        assert!(tree_ids.contains(&root_id));
+        assert!(tree_ids.contains(&child_id));
+        assert!(tree_ids.contains(&grandchild_id));
+        assert!(!tree_ids.contains(&other_root_id));
     }
 
     #[tokio::test]

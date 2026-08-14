@@ -59,6 +59,11 @@ pub trait SessionStore: Send + Sync {
         excluded_session: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError>;
 
+    /// List every session in one collaboration tree, root included, newest
+    /// first. Children are durable history: they are discoverable here but
+    /// never resumable as root sessions.
+    async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError>;
+
     /// Open an append-only writer for a session. The runtime's hot write path
     /// holds one exclusively locked writer per active session.
     async fn open_writer(

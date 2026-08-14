@@ -82,16 +82,28 @@ impl Runtime {
         Ok(Some(Session::spawn(state)))
     }
 
-    /// List session summaries, optionally excluding one session.
+    /// List root session summaries, optionally excluding one session.
     ///
     /// # Errors
     ///
     /// Returns `AshError` when the session store cannot be read.
-    pub async fn sessions(
+    pub async fn list_sessions(
         &self,
         excluded: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         self.sessions.list(excluded).await
+    }
+
+    /// List every session in one collaboration tree, root included.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the session store cannot be read.
+    pub async fn session_tree(
+        &self,
+        root_id: SessionId,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        self.sessions.tree(root_id).await
     }
 
     #[must_use]
