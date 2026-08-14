@@ -4,9 +4,8 @@ expression: msg
 ---
 {
   "id": "[uuid]",
-  "role": "system",
   "content": {
-    "User": [
+    "System": [
       {
         "Text": "You are a helpful assistant."
       }

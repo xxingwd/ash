@@ -269,9 +269,7 @@ impl sse::Decoder for CompletionsDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{
-        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
-    };
+    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -355,17 +353,13 @@ mod tests {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![
-                    ContentBlock::Thought {
-                        text: "private reasoning".into(),
-                        elapsed_seconds: 2,
-                    },
-                    ContentBlock::Text("visible answer".into()),
-                ]),
-            }],
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thought {
+                    text: "private reasoning".into(),
+                    elapsed_seconds: 2,
+                },
+                ContentBlock::Text("visible answer".into()),
+            ])],
             tools: Vec::new(),
             max_tokens: None,
         };
@@ -393,21 +387,17 @@ mod tests {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![
-                    ContentBlock::Thought {
-                        text: "step reasoning".into(),
-                        elapsed_seconds: 2,
-                    },
-                    ContentBlock::ToolCall {
-                        id: ToolCallId::from_provider("call_1"),
-                        name: "bash".into(),
-                        arguments: serde_json::json!({"command": "pwd"}),
-                    },
-                ]),
-            }],
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thought {
+                    text: "step reasoning".into(),
+                    elapsed_seconds: 2,
+                },
+                ContentBlock::ToolCall {
+                    id: ToolCallId::from_provider("call_1"),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                },
+            ])],
             tools: Vec::new(),
             max_tokens: None,
         };

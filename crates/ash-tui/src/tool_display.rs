@@ -1,9 +1,8 @@
 use std::fmt::Write;
 
 use serde_json::Value;
-use unicode_width::UnicodeWidthStr;
 
-use crate::text_width::truncate_end;
+use crate::scrollback::{sanitize_single_line, sanitize_terminal_text};
 
 const GROUP_DETAIL_LIMIT: usize = 4;
 
@@ -36,9 +35,9 @@ impl ToolKind {
             "bash" => Self::Bash,
             "skill" => Self::Skill,
             "spawn_agent" => Self::SpawnAgent,
-            "message_agent" | "send_message" | "followup_task" => Self::MessageAgent,
+            "message_agent" => Self::MessageAgent,
             "interrupt_agent" => Self::InterruptAgent,
-            "wait_agent" | "list_agents" => Self::WaitAgent,
+            "wait_agent" => Self::WaitAgent,
             _ => Self::Other,
         }
     }
@@ -47,6 +46,8 @@ impl ToolKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolRenderer {
     Bash,
+    Edit,
+    Write,
     Generic { show_output: bool },
 }
 
@@ -54,9 +55,10 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
     let kind = ToolKind::from_name(name);
     match (kind, is_error) {
         (ToolKind::Bash, _) => ToolRenderer::Bash,
-        (ToolKind::Read | ToolKind::Edit | ToolKind::Write, _) => {
-            ToolRenderer::Generic { show_output: false }
-        }
+        (_, true) => ToolRenderer::Generic { show_output: true },
+        (ToolKind::Edit, false) => ToolRenderer::Edit,
+        (ToolKind::Write, false) => ToolRenderer::Write,
+        (ToolKind::Read, false) => ToolRenderer::Generic { show_output: false },
         _ => ToolRenderer::Generic { show_output: true },
     }
 }
@@ -65,22 +67,22 @@ pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
     (ToolKind::from_name(name) == ToolKind::Read).then(|| path_argument(arguments))
 }
 
-pub fn tool_call_summary(
-    name: &str,
-    arguments: &Value,
-    is_error: bool,
-    max_width: u16,
-) -> (String, String) {
+pub fn tool_call_summary(name: &str, arguments: &Value, is_error: bool) -> (String, String) {
     let phrase = tool_phrase(name, arguments);
     let (action, detail) = if is_error {
-        ("Failed", join_parts(phrase.failed, &phrase.detail))
+        ("Failed", join_parts(phrase.running, &phrase.detail))
     } else {
         (phrase.completed, phrase.detail)
     };
-    fit_action_and_detail(action, &detail, usize::from(max_width.max(1)))
+    (action.to_string(), detail)
 }
 
-pub fn read_group_summary(details: &[String], max_width: u16) -> (String, String) {
+pub fn running_tool_call_summary(name: &str, arguments: &Value) -> (String, String) {
+    let phrase = tool_phrase(name, arguments);
+    (sentence_case(phrase.running), phrase.detail)
+}
+
+pub fn read_group_summary(details: &[String]) -> (String, String) {
     let mut unique = details.iter().filter(|detail| !detail.is_empty()).fold(
         Vec::new(),
         |mut unique, detail| {
@@ -96,12 +98,12 @@ pub fn read_group_summary(details: &[String], max_width: u16) -> (String, String
     if hidden > 0 {
         let _ = write!(detail, " +{hidden}");
     }
-    fit_action_and_detail("Read", &detail, usize::from(max_width.max(1)))
+    ("Read".to_string(), detail)
 }
 
 struct ToolPhrase {
     completed: &'static str,
-    failed: &'static str,
+    running: &'static str,
     detail: String,
 }
 
@@ -157,19 +159,26 @@ fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
     }
 }
 
-const fn phrase(completed: &'static str, failed: &'static str, detail: String) -> ToolPhrase {
+const fn phrase(completed: &'static str, running: &'static str, detail: String) -> ToolPhrase {
     ToolPhrase {
         completed,
-        failed,
+        running,
         detail,
     }
+}
+
+fn sentence_case(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+    })
 }
 
 fn path_argument(arguments: &Value) -> String {
     arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(short_display_path)
+        .map(display_path)
         .unwrap_or_default()
 }
 
@@ -198,8 +207,8 @@ fn url_argument(arguments: &Value) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-fn short_display_path(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
+pub(crate) fn display_path(path: &str) -> String {
+    let normalized = sanitize_single_line(path).replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
     trimmed
         .split('/')
@@ -212,7 +221,7 @@ fn short_display_path(path: &str) -> String {
 /// Collapse runs of whitespace to single spaces (unlike
 /// `scrollback::sanitize_single_line`, which only replaces newlines).
 fn collapse_whitespace(value: &str) -> String {
-    crate::scrollback::sanitize_terminal_text(value)
+    sanitize_terminal_text(value)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -226,21 +235,6 @@ fn join_parts(action: &str, detail: &str) -> String {
     }
 }
 
-fn fit_action_and_detail(action: &str, detail: &str, max_width: usize) -> (String, String) {
-    let action = truncate_end(action, max_width);
-    if detail.is_empty() {
-        return (action, String::new());
-    }
-    let remaining = max_width
-        .saturating_sub(UnicodeWidthStr::width(action.as_str()))
-        .saturating_sub(1);
-    if remaining == 0 {
-        (action, String::new())
-    } else {
-        (action, truncate_end(detail, remaining))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +243,7 @@ mod tests {
     #[test]
     fn renders_builtin_tools_as_semantic_summaries() {
         assert_eq!(
-            tool_call_summary("bash", &json!({"command": "cargo test"}), false, 80,),
+            tool_call_summary("bash", &json!({"command": "cargo test"}), false),
             ("Ran".to_string(), "cargo test".to_string())
         );
         assert_eq!(
@@ -257,7 +251,6 @@ mod tests {
                 "bash",
                 &json!({"command": "rg reasoning /work/ash/crates/ash-tui/src"}),
                 false,
-                80,
             ),
             (
                 "Ran".to_string(),
@@ -269,7 +262,6 @@ mod tests {
                 "webfetch",
                 &json!({"url": "https://user:secret@example.com/docs?q=token#section"}),
                 false,
-                80,
             ),
             (
                 "Fetched".to_string(),
@@ -277,16 +269,28 @@ mod tests {
             )
         );
         assert_eq!(
-            tool_call_summary("glob", &json!({"pattern": "**/*.rs"}), false, 80),
+            tool_call_summary("glob", &json!({"pattern": "**/*.rs"}), false),
             ("Found".to_string(), "**/*.rs".to_string())
         );
         assert_eq!(
-            tool_call_summary("grep", &json!({"pattern": "TODO|FIXME"}), false, 80),
+            tool_call_summary("grep", &json!({"pattern": "TODO|FIXME"}), false),
             ("Searched".to_string(), "TODO|FIXME".to_string())
         );
         assert_eq!(
-            tool_call_summary("skill", &json!({"name": "review"}), false, 80),
+            tool_call_summary("skill", &json!({"name": "review"}), false),
             ("Loaded".to_string(), "review".to_string())
+        );
+    }
+
+    #[test]
+    fn renders_running_calls_in_the_present_tense() {
+        assert_eq!(
+            running_tool_call_summary("bash", &json!({"command": "cargo test"})),
+            ("Running".to_string(), "cargo test".to_string())
+        );
+        assert_eq!(
+            running_tool_call_summary("read", &json!({"path": "/work/ash/src/main.rs"})),
+            ("Reading".to_string(), "main.rs".to_string())
         );
     }
 
@@ -300,7 +304,6 @@ mod tests {
                 "new": "many lines of new content"
             }),
             false,
-            80,
         );
 
         assert_eq!(summary, ("Edited".to_string(), "inline.rs".to_string()));
@@ -313,7 +316,6 @@ mod tests {
                 "write",
                 &json!({"path": "/tmp/report.md", "content": "one\ntwo"}),
                 true,
-                80,
             ),
             ("Failed".to_string(), "writing report.md".to_string())
         );
@@ -322,7 +324,7 @@ mod tests {
     #[test]
     fn groups_matching_tools_behind_one_action() {
         assert_eq!(
-            read_group_summary(&["inline.rs".to_string(), "viewport.rs".to_string()], 80,),
+            read_group_summary(&["inline.rs".to_string(), "viewport.rs".to_string()]),
             ("Read".to_string(), "inline.rs, viewport.rs".to_string())
         );
     }
@@ -332,7 +334,7 @@ mod tests {
         let details = ["a", "b", "c", "d", "e", "f"].map(str::to_string);
 
         assert_eq!(
-            read_group_summary(&details, 80),
+            read_group_summary(&details),
             ("Read".to_string(), "a, b, c, d +2".to_string())
         );
     }
@@ -340,39 +342,20 @@ mod tests {
     #[test]
     fn group_summaries_deduplicate_details() {
         assert_eq!(
-            read_group_summary(&["app.rs".to_string(), "app.rs".to_string()], 80,),
+            read_group_summary(&["app.rs".to_string(), "app.rs".to_string()]),
             ("Read".to_string(), "app.rs".to_string())
         );
     }
 
     #[test]
-    fn truncates_the_detail_to_the_available_width() {
-        let (action, detail) = tool_call_summary(
-            "bash",
-            &json!({"command": "cargo test --workspace --all-targets"}),
-            false,
-            20,
-        );
-        let rendered = join_parts(&action, &detail);
-
-        assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
-        assert!(detail.ends_with('…'));
-    }
-
     #[test]
     fn renderer_policy_is_centralized_by_tool_kind() {
         assert_eq!(tool_renderer("bash", false), ToolRenderer::Bash);
-        assert_eq!(
-            tool_renderer("edit", false),
-            ToolRenderer::Generic { show_output: false }
-        );
-        assert_eq!(
-            tool_renderer("write", false),
-            ToolRenderer::Generic { show_output: false }
-        );
+        assert_eq!(tool_renderer("edit", false), ToolRenderer::Edit);
+        assert_eq!(tool_renderer("write", false), ToolRenderer::Write);
         assert_eq!(
             tool_renderer("read", true),
-            ToolRenderer::Generic { show_output: false }
+            ToolRenderer::Generic { show_output: true }
         );
         assert_eq!(
             tool_renderer("custom_tool", false),

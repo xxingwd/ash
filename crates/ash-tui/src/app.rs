@@ -2,14 +2,15 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ash_core::{AshError, EventKind, LiveEvent, MessageId, SubagentSnapshot, ThreadId};
+use ash_collab::SubagentSnapshot;
+#[cfg(test)]
+use ash_core::SessionError;
+use ash_core::{AshError, EventKind, LiveEvent, Message, MessageId, SessionId, TurnId, TurnView};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use futures::StreamExt;
 
-#[cfg(test)]
-use crate::operation::CancellationMode;
 use crate::{
     fork_picker::ForkPickerState,
     inline::{TerminalUi, TerminalView},
@@ -39,8 +40,8 @@ impl fmt::Display for UiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Agent(error) => write!(formatter, "{error}"),
-            Self::ControllerStopped => formatter.write_str("thread controller has stopped"),
-            Self::InputDropped => formatter.write_str("thread controller dropped the input"),
+            Self::ControllerStopped => formatter.write_str("session controller has stopped"),
+            Self::InputDropped => formatter.write_str("session controller dropped the input"),
         }
     }
 }
@@ -57,7 +58,7 @@ impl From<AshError> for UiError {
 pub enum UiCommand {
     Submit {
         input: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), UiError>>,
+        reply: tokio::sync::oneshot::Sender<Result<TurnId, UiError>>,
     },
     Steer {
         input: String,
@@ -69,7 +70,7 @@ pub enum UiCommand {
     NewSession,
     ListSessions,
     ListForkPoints,
-    ResumeSession(ThreadId),
+    ResumeSession(SessionId),
     ForkSession(MessageId),
     Exit,
 }
@@ -141,20 +142,26 @@ impl AppState {
         }
     }
 
-    fn refresh_subagents(&mut self) {
+    fn refresh_subagents(&mut self) -> bool {
         let Some(receiver) = &mut self.subagent_rx else {
-            return;
+            return false;
         };
         match receiver.has_changed() {
             Ok(true) => {
                 self.subagents.clone_from(&receiver.borrow_and_update());
+                true
             }
-            Ok(false) => {}
+            Ok(false) => false,
             // The monitor channel closed: no further snapshots will arrive, so
             // stop tracking subagents instead of freezing the last stale list.
             Err(_) => {
                 self.subagent_rx = None;
-                self.subagents.clear();
+                if self.subagents.is_empty() {
+                    false
+                } else {
+                    self.subagents.clear();
+                    true
+                }
             }
         }
     }
@@ -169,6 +176,8 @@ impl AppState {
             input: &self.input,
             menu: self.menu.view(),
             busy: self.operation.shows_activity(),
+            interruptible: self.operation.can_cancel(),
+            status_header: self.operation.status_header(),
         }
     }
 
@@ -263,8 +272,9 @@ impl App {
         loop {
             tokio::select! {
                 _ = status_tick.tick() => {
-                    state.refresh_subagents();
-                    terminal.set_subagents(state.subagents.clone())?;
+                    if state.refresh_subagents() {
+                        terminal.set_subagents(state.subagents.clone())?;
+                    }
                     if state.operation.shows_activity() {
                         terminal.refresh_status()?;
                     }
@@ -300,7 +310,7 @@ impl App {
 
 // One branch per `EventKind`: an exhaustive match over the whole event
 // vocabulary, where each branch only touches the few structures it needs.
-// Splitting this into per-event handlers would thread `state`, `terminal`,
+// Splitting this into per-event handlers would session `state`, `terminal`,
 // and `commands` through every call for no readability gain.
 #[allow(clippy::too_many_lines)]
 async fn handle_agent_event(
@@ -328,19 +338,22 @@ async fn handle_agent_event(
             terminal.thinking(&text)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Live(LiveEvent::ToolStarted { .. }) => {
-            terminal.tool_start()?;
+        EventKind::Live(LiveEvent::ToolStarted {
+            id,
+            name,
+            arguments,
+        }) => {
+            terminal.tool_started(id, name, arguments)?;
             Ok(LoopAction::Continue)
         }
         EventKind::Live(LiveEvent::ToolFinished {
+            id,
             name,
             arguments,
             output,
             is_error,
-            file_change,
-            ..
         }) => {
-            terminal.tool_end(&name, &arguments, &output, is_error, file_change)?;
+            terminal.tool_finished(&id, &name, &arguments, &output, is_error)?;
             Ok(LoopAction::Continue)
         }
         EventKind::Error(error) => {
@@ -360,18 +373,21 @@ async fn handle_agent_event(
                     terminal.commit_turn(&view)?;
                     state.render(terminal)?;
                 }
-                TurnCompletion::AwaitRollback => {
-                    if commands.send(UiCommand::Rollback).await.is_err() {
-                        return Ok(LoopAction::Exit);
+                TurnCompletion::Cancelled => {
+                    if turn_has_completed_tool(&view) {
+                        terminal.commit_turn(&view)?;
+                        state.render(terminal)?;
+                    } else {
+                        state.operation.start_background(BackgroundAction::Rollback);
+                        if commands.send(UiCommand::Rollback).await.is_err() {
+                            return Ok(LoopAction::Exit);
+                        }
                     }
                 }
             }
             Ok(LoopAction::Continue)
         }
-        EventKind::TurnRolledBack {
-            prompt,
-            context_tokens,
-        } => {
+        EventKind::TurnRolledBack { prompt } => {
             state
                 .operation
                 .finish_background(BackgroundAction::Rollback);
@@ -379,9 +395,6 @@ async fn handle_agent_event(
                 state.input.restore_submission(prompt);
             }
             terminal.rollback_turn()?;
-            if let Some(tokens) = context_tokens {
-                terminal.record_rollback_context(tokens)?;
-            }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
@@ -400,24 +413,21 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::Restored {
-            view,
-            context_tokens,
-        } => {
+        EventKind::Restored { view } => {
             state.menu.close_picker();
             state.operation.finish();
-            terminal.restore_session(&view, context_tokens)?;
+            terminal.restore_session(&view)?;
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ThreadsListed { threads } => {
+        EventKind::SessionsListed { sessions } => {
             state
                 .operation
                 .finish_background(BackgroundAction::ListSessions);
-            if threads.is_empty() {
+            if sessions.is_empty() {
                 terminal.command_output("No saved chats are available to resume.")?;
             } else {
-                state.menu.open_threads(threads);
+                state.menu.open_sessions(sessions);
             }
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -434,14 +444,10 @@ async fn handle_agent_event(
             state.render(terminal)?;
             Ok(LoopAction::Continue)
         }
-        EventKind::ThreadForked {
-            view,
-            prompt,
-            context_tokens,
-        } => {
+        EventKind::SessionForked { view, prompt } => {
             state.menu.close_picker();
             state.operation.finish_background(BackgroundAction::Fork);
-            terminal.restore_session(&view, context_tokens)?;
+            terminal.restore_session(&view)?;
             state.input.set_text(prompt);
             state.render(terminal)?;
             Ok(LoopAction::Continue)
@@ -517,7 +523,7 @@ async fn handle_key(
         }
         KeyCode::Enter => return submit_input(state, terminal, commands).await,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            match ctrl_c_action(state.input.is_empty(), state.operation.is_busy()) {
+            match ctrl_c_action(state.input.is_empty(), state.operation.can_cancel()) {
                 CtrlCAction::ClearInput => state.input.clear(),
                 CtrlCAction::CancelTurn => {
                     // A running turn treats Ctrl+C as a cancellation request
@@ -566,27 +572,27 @@ async fn handle_session_key(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     key: KeyEvent,
 ) -> anyhow::Result<LoopAction> {
-    let Some(threads) = state.menu.visible_session_picker_mut() else {
+    let Some(sessions) = state.menu.visible_session_picker_mut() else {
         return Ok(LoopAction::Continue);
     };
-    let Some(action) = picker_key_action(threads, key, SessionPickerState::selected_thread_id)
+    let Some(action) = picker_key_action(sessions, key, SessionPickerState::selected_session_id)
     else {
         return Ok(LoopAction::Continue);
     };
     match action {
         PickerAction::KeepOpen => {}
-        PickerAction::Close => state.menu.close_threads(),
+        PickerAction::Close => state.menu.close_sessions(),
         PickerAction::Confirm(_) => {
-            state.menu.close_threads();
+            state.menu.close_sessions();
             state.operation.start_background(BackgroundAction::Resume);
         }
     }
     state.render(terminal)?;
-    let PickerAction::Confirm(thread_id) = action else {
+    let PickerAction::Confirm(session_id) = action else {
         return Ok(LoopAction::Continue);
     };
     if commands
-        .send(UiCommand::ResumeSession(thread_id))
+        .send(UiCommand::ResumeSession(session_id))
         .await
         .is_err()
     {
@@ -712,10 +718,10 @@ enum CtrlCAction {
     Exit,
 }
 
-const fn ctrl_c_action(input_is_empty: bool, busy: bool) -> CtrlCAction {
+const fn ctrl_c_action(input_is_empty: bool, can_cancel: bool) -> CtrlCAction {
     if !input_is_empty {
         CtrlCAction::ClearInput
-    } else if busy {
+    } else if can_cancel {
         CtrlCAction::CancelTurn
     } else {
         CtrlCAction::Exit
@@ -727,8 +733,8 @@ async fn cancel_turn(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
-    let mode = terminal.prepare_cancellation();
-    if !state.operation.begin_cancellation(mode) {
+    let _ = terminal.prepare_cancellation();
+    if !state.operation.begin_cancellation() {
         return Ok(LoopAction::Continue);
     }
     state.render(terminal)?;
@@ -792,9 +798,9 @@ async fn start_message(
         reply,
     };
     match send_confirmed(commands, command, result).await {
-        Ok(()) => {
+        Ok(turn_id) => {
             state.operation.start_turn();
-            terminal.commit_input(&input)?;
+            terminal.commit_input(turn_id, &input)?;
             state.input.record_submission(&input);
             state.render(terminal)?;
             Ok(LoopAction::ResetTimers)
@@ -825,11 +831,11 @@ async fn steer_message(
     }
 }
 
-async fn send_confirmed(
+async fn send_confirmed<T>(
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     command: UiCommand,
-    result: tokio::sync::oneshot::Receiver<Result<(), UiError>>,
-) -> Result<(), UiError> {
+    result: tokio::sync::oneshot::Receiver<Result<T, UiError>>,
+) -> Result<T, UiError> {
     commands
         .send(command)
         .await
@@ -881,7 +887,6 @@ async fn run_command(
         }
         SlashCommand::Compact => {
             state.operation.start_background(BackgroundAction::Compact);
-            terminal.start_compaction()?;
             Some(UiCommand::Compact)
         }
         SlashCommand::Status => {
@@ -904,13 +909,12 @@ async fn run_command(
 }
 
 const fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
-    matches!(
-        (policy, input),
-        (
-            SubmissionPolicy::Steer,
-            ParsedInput::Command(command)
-        ) if command.requires_idle()
-    )
+    match (policy, input) {
+        (SubmissionPolicy::Start, _) => false,
+        (SubmissionPolicy::Steer, ParsedInput::Message) => false,
+        (SubmissionPolicy::Steer, ParsedInput::Command(command)) => !command.can_run_while_busy(),
+        (SubmissionPolicy::Steer, ParsedInput::Invalid(_)) => true,
+    }
 }
 
 fn inserts_newline(key: &KeyEvent) -> bool {
@@ -919,6 +923,19 @@ fn inserts_newline(key: &KeyEvent) -> bool {
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
         || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn turn_has_completed_tool(view: &TurnView) -> bool {
+    view.messages.iter().any(message_has_completed_tool)
+}
+
+fn message_has_completed_tool(message: &Message) -> bool {
+    match &message.content {
+        ash_core::MessageContent::ToolResult { .. } => true,
+        ash_core::MessageContent::User(_)
+        | ash_core::MessageContent::Assistant(_)
+        | ash_core::MessageContent::System(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -942,14 +959,38 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_turns_keep_completed_tool_results() {
+        let call = ash_core::ToolCallId::from_provider("call-1");
+        let kept = TurnView {
+            id: ash_core::TurnId::new(),
+            result: ash_core::TurnResult::Completed(ash_core::StopReason::Aborted),
+            messages: vec![ash_core::Message::tool_result(
+                call,
+                Ok("done".into()),
+                Vec::new(),
+            )],
+            usage: None,
+            context_tokens: None,
+        };
+        let rolled_back = TurnView {
+            id: ash_core::TurnId::new(),
+            result: ash_core::TurnResult::Completed(ash_core::StopReason::Aborted),
+            messages: vec![ash_core::Message::assistant_text("partial")],
+            usage: None,
+            context_tokens: None,
+        };
+
+        assert!(turn_has_completed_tool(&kept));
+        assert!(!turn_has_completed_tool(&rolled_back));
+    }
+
+    #[test]
     fn cancellation_finishes_when_the_turn_finishes() {
         let mut state = AppState::new(Vec::new());
         state.operation.start_turn();
-        assert!(state
-            .operation
-            .begin_cancellation(CancellationMode::Interrupt));
+        assert!(state.operation.begin_cancellation());
 
-        assert_eq!(state.operation.complete_turn(), TurnCompletion::Commit);
+        assert_eq!(state.operation.complete_turn(), TurnCompletion::Cancelled);
         assert!(!state.operation.is_busy());
         assert!(state.input.is_empty());
     }
@@ -973,7 +1014,7 @@ mod tests {
         // While a turn is running and the composer is empty, Ctrl+C cancels
         // the turn instead of inserting a literal 'c'.
         assert_eq!(ctrl_c_action(true, true), CtrlCAction::CancelTurn);
-        // Idle with an empty composer: Ctrl+C exits.
+        // Compacting or cancelling is busy but not interruptible: empty Ctrl+C exits.
         assert_eq!(ctrl_c_action(true, false), CtrlCAction::Exit);
     }
 
@@ -989,14 +1030,18 @@ mod tests {
         assert_eq!(state.input.text(), "/new");
 
         let parsed = slash_command::parse("/status");
-        assert!(!submission_is_blocked(policy, &parsed));
+        assert!(submission_is_blocked(policy, &parsed));
+
+        let parsed = slash_command::parse("/missing");
+        assert!(submission_is_blocked(policy, &parsed));
 
         let parsed = slash_command::parse("steer this turn");
         assert!(!submission_is_blocked(policy, &parsed));
 
-        assert!(state
-            .operation
-            .begin_cancellation(CancellationMode::Interrupt));
+        let parsed = slash_command::parse("/exit");
+        assert!(!submission_is_blocked(policy, &parsed));
+
+        assert!(state.operation.begin_cancellation());
         assert_eq!(state.operation.submission_policy(), None);
         assert_eq!(state.input.text(), "/new");
     }
@@ -1022,11 +1067,13 @@ mod tests {
         };
         assert_eq!(input, "change direction");
         reply
-            .send(Err(UiError::Agent(AshError::Config("turn ended".into()))))
+            .send(Err(UiError::Agent(AshError::Session(
+                SessionError::InactiveTurn,
+            ))))
             .unwrap();
 
         let error = client.await.unwrap().unwrap_err();
-        assert_eq!(error.to_string(), "config: turn ended");
+        assert_eq!(error.to_string(), SessionError::InactiveTurn.to_string());
     }
 
     #[test]

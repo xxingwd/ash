@@ -1,8 +1,8 @@
 mod bash;
-mod change;
 mod edit;
 mod glob;
 mod grep;
+mod image;
 mod path;
 mod read;
 mod timeout;

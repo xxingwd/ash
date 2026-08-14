@@ -55,7 +55,7 @@ impl Tool for McpToolAdapter {
 
     async fn execute(
         &self,
-        _ctx: ToolContext,
+        ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         let arguments: Option<JsonObject> = serde_json::from_value(args)
@@ -66,12 +66,11 @@ impl Tool for McpToolAdapter {
             request = request.with_arguments(arguments);
         }
 
-        let result = self
-            .connection
-            .peer
-            .call_tool(request)
-            .await
-            .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
+        let result = tokio::select! {
+            () = ctx.cancellation.cancelled() => return Err(ToolError::Cancelled),
+            result = self.connection.peer.call_tool(request) => result
+                .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?,
+        };
 
         let mut output = String::new();
         for item in &result.content {
@@ -195,7 +194,7 @@ pub async fn load_mcp_tools(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{AgentToolContext, CancellationToken, ThreadId, ToolContext, TreeId, TurnId};
+    use ash_core::{AgentToolContext, CancellationToken, SessionId, ToolContext, TreeId, TurnId};
     use rmcp::{
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
@@ -241,7 +240,7 @@ mod tests {
 
     fn tool_context() -> ToolContext {
         ToolContext {
-            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
             turn_id: TurnId::new(),
             cancellation: CancellationToken::new(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),

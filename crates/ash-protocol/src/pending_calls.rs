@@ -39,27 +39,31 @@ pub fn stop_reason(provider_reason: &str) -> StopReason {
 /// protocol error named after the provider).
 #[derive(Default)]
 pub struct PendingCall {
-    /// Provider tool-call id; empty means the provider never sent one.
-    id: String,
-    name: String,
+    /// Provider tool-call id; `None` means the provider never sent one.
+    id: Option<String>,
+    name: Option<String>,
     arguments: String,
 }
 
 impl PendingCall {
     pub(crate) fn new(id: &str, name: &str) -> Self {
         Self {
-            id: id.to_string(),
-            name: name.to_string(),
+            id: nonempty(id),
+            name: nonempty(name),
             arguments: String::new(),
         }
     }
 
     pub(crate) fn set_id(&mut self, id: &str) {
-        self.id = id.to_string();
+        if let Some(id) = nonempty(id) {
+            self.id = Some(id);
+        }
     }
 
     pub(crate) fn set_name(&mut self, name: &str) {
-        self.name = name.to_string();
+        if let Some(name) = nonempty(name) {
+            self.name = Some(name);
+        }
     }
 
     /// Replace the accumulated arguments with a complete payload.
@@ -73,10 +77,10 @@ impl PendingCall {
 
     /// Merge a call re-keyed from an output index into this item-keyed call.
     pub(crate) fn merge(&mut self, other: Self) {
-        if self.id.is_empty() {
+        if self.id.is_none() {
             self.id = other.id;
         }
-        if self.name.is_empty() {
+        if self.name.is_none() {
             self.name = other.name;
         }
         if self.arguments.is_empty() {
@@ -106,13 +110,13 @@ impl PendingCall {
         }
     }
 
-    /// Close the accumulated call into a provider-neutral event.
     pub(crate) fn finish(self, protocol: &str) -> Result<ModelEvent, ProtocolError> {
-        if self.name.trim().is_empty() {
-            return Err(ProtocolError::InvalidResponse(format!(
-                "{protocol} tool call is missing a name"
-            )));
-        }
+        let name = self
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                ProtocolError::InvalidResponse(format!("{protocol} tool call is missing a name"))
+            })?;
         let arguments = if self.arguments.trim().is_empty() {
             json!({})
         } else {
@@ -122,17 +126,21 @@ impl PendingCall {
                 ))
             })?
         };
-        let id = if self.id.is_empty() {
-            ToolCallId::new()
-        } else {
-            ToolCallId::from_provider(self.id)
-        };
+        let id = self
+            .id
+            .map(ToolCallId::from_provider)
+            .unwrap_or_else(ToolCallId::new);
         Ok(ModelEvent::ToolCall {
             id,
-            name: self.name,
+            name,
             arguments,
         })
     }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Tool calls keyed by the provider's own call identifier (a block index, a
@@ -310,7 +318,7 @@ mod tests {
 
         let names = accumulator
             .drain()
-            .map(|(_, call)| call.name)
+            .map(|(_, call)| call.name.unwrap_or_default())
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["first", "second"]);

@@ -1,7 +1,7 @@
 use ash_core::{
-    AgentToolContext, CancellationToken, ContentBlock, EventKind, LiveEvent, Message,
-    MessageContent, ModelClient, ModelEvent, ModelRequest, ModelStream, Role, StopReason, ThreadId,
-    ToolCallId, ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
+    AgentToolContext, CancellationToken, ContentBlock, EventKind, LiveEvent, Message, ModelClient,
+    ModelEvent, ModelRequest, ModelStream, SessionId, StopReason, ToolCallId, ToolContext,
+    ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
 };
 use futures::StreamExt;
 use std::time::Instant;
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::agent::RetryBackoff;
-use crate::store::ThreadPersistence;
+use crate::store::SessionPersistence;
 use crate::{
     context::count_output_tokens,
     context_policy::{ContextRequest, DefaultContextPolicy},
@@ -87,7 +87,7 @@ struct AgentTurnRunner<'config, 'store> {
     cancel: CancellationToken,
     ids: ExecutionIds,
     model: &'config dyn ModelClient,
-    persistence: Option<&'store mut ThreadPersistence>,
+    persistence: Option<&'store mut SessionPersistence>,
     steering: mpsc::UnboundedReceiver<Input>,
     ephemeral_context: Vec<Message>,
     tool_defs: Vec<ToolDefinition>,
@@ -95,7 +95,7 @@ struct AgentTurnRunner<'config, 'store> {
 
 #[derive(Clone, Copy)]
 pub struct ExecutionIds {
-    pub thread_id: ThreadId,
+    pub session_id: SessionId,
     pub turn_id: TurnId,
 }
 
@@ -108,14 +108,17 @@ pub struct TurnExecution {
 }
 
 impl ExecutionIds {
-    const fn new(thread_id: ThreadId, turn_id: TurnId) -> Self {
-        Self { thread_id, turn_id }
+    const fn new(session_id: SessionId, turn_id: TurnId) -> Self {
+        Self {
+            session_id,
+            turn_id,
+        }
     }
 }
 
 impl TurnExecution {
     pub(crate) const fn new(
-        thread_id: ThreadId,
+        session_id: SessionId,
         turn_id: TurnId,
         tx: mpsc::Sender<EventKind>,
         cancel: CancellationToken,
@@ -123,7 +126,7 @@ impl TurnExecution {
         ephemeral_context: Vec<Message>,
     ) -> Self {
         Self {
-            ids: ExecutionIds::new(thread_id, turn_id),
+            ids: ExecutionIds::new(session_id, turn_id),
             tx,
             cancel,
             steering,
@@ -194,7 +197,7 @@ pub async fn run_agent_turn_persisted(
     config: &RunConfig,
     messages: &mut Vec<Message>,
     execution: TurnExecution,
-    persistence: &mut ThreadPersistence,
+    persistence: &mut SessionPersistence,
 ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     run_agent_turn_inner(model, config, messages, execution, Some(persistence)).await
 }
@@ -204,7 +207,7 @@ async fn run_agent_turn_inner(
     config: &RunConfig,
     messages: &mut Vec<Message>,
     execution: TurnExecution,
-    persistence: Option<&mut ThreadPersistence>,
+    persistence: Option<&mut SessionPersistence>,
 ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
     AgentTurnRunner::new(config, model, persistence, execution)
         .run(messages)
@@ -215,7 +218,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     fn new(
         config: &'config RunConfig,
         model: &'config dyn ModelClient,
-        persistence: Option<&'store mut ThreadPersistence>,
+        persistence: Option<&'store mut SessionPersistence>,
         execution: TurnExecution,
     ) -> Self {
         let tool_defs = config.tool_definitions();
@@ -499,18 +502,14 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 self.execute_tool(messages, &call.name, call.arguments.clone())
                     .await,
             );
-            let (output, is_error, result, attachments, file_change) = match result {
+            let (output, is_error, result, attachments) = match result {
                 Ok(output) => {
-                    let ToolOutput {
-                        text,
-                        attachments,
-                        file_change,
-                    } = output;
-                    (text.clone(), false, Ok(text), attachments, file_change)
+                    let ToolOutput { text, attachments } = output;
+                    (text.clone(), false, Ok(text), attachments)
                 }
                 Err(error) => {
                     let text = error.to_string();
-                    (text.clone(), true, Err(text), Vec::new(), None)
+                    (text.clone(), true, Err(text), Vec::new())
                 }
             };
             send_live(
@@ -521,20 +520,10 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     arguments: call.arguments,
                     output,
                     is_error,
-                    file_change: file_change.clone(),
                 }),
             )
             .await;
-            let message = Message {
-                id: ash_core::MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id: call.id,
-                    result,
-                    attachments,
-                    file_change,
-                },
-            };
+            let message = Message::tool_result(call.id, result, attachments);
             self.persist_message(&message)?;
             messages.push(message);
         }
@@ -551,7 +540,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             return Err(ToolError::Execution(format!("unknown tool: {name}")));
         };
         let context = ToolContext {
-            thread_id: self.ids.thread_id,
+            session_id: self.ids.session_id,
             turn_id: self.ids.turn_id,
             cancellation: self.cancel.clone(),
             deadline: Instant::now() + self.config.max_tool_duration,
@@ -559,7 +548,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 tree_id: self
                     .config
                     .tree_id
-                    .unwrap_or_else(|| self.ids.thread_id.into()),
+                    .unwrap_or_else(|| self.ids.session_id.into()),
                 path: self.config.agent_path.clone(),
                 messages: self.request_messages(messages),
             },
@@ -582,8 +571,8 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     }
 }
 
-/// Send one live event to the thread actor. A closed receiver means the
-/// thread is shutting down (or already gone): the turn keeps running to a
+/// Send one live event to the session actor. A closed receiver means the
+/// session is shutting down (or already gone): the turn keeps running to a
 /// result, but its streaming preview has nowhere to go. Log instead of
 /// failing the turn silently.
 async fn send_live(tx: &mpsc::Sender<EventKind>, kind: EventKind) {
@@ -720,11 +709,7 @@ impl ResponseAccumulator {
         }
 
         let calls = pending_tool_calls(&blocks);
-        let message = (!blocks.is_empty()).then(|| Message {
-            id: ash_core::MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(blocks),
-        });
+        let message = (!blocks.is_empty()).then(|| Message::assistant(blocks));
         let outcome = response_action(stream_exit, calls, stop_reason);
 
         CollectedResponse {
@@ -894,57 +879,57 @@ mod tests {
     };
 
     use ash_core::{
-        Content, FileChange, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool,
+        Content, MessageContent, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool,
         ToolCallId, ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
     use super::*;
     use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
-    use crate::{JsonlThreadStore, SharedThreadStore, StoredThread, ThreadMetadata};
+    use crate::{JsonlSessionStore, SessionMetadata, SharedSessionStore, StoredSession};
 
     async fn run_with_adapter(
         config: &RunConfig,
         messages: &mut Vec<Message>,
         tx: mpsc::Sender<EventKind>,
         cancel: CancellationToken,
-        thread_id: ThreadId,
+        session_id: SessionId,
         model: &dyn ModelClient,
-        persistence: Option<&mut ThreadPersistence>,
+        persistence: Option<&mut SessionPersistence>,
     ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
         let (_, steering) = mpsc::unbounded_channel();
         let execution =
-            TurnExecution::new(thread_id, TurnId::new(), tx, cancel, steering, Vec::new());
+            TurnExecution::new(session_id, TurnId::new(), tx, cancel, steering, Vec::new());
         run_agent_turn_inner(model, config, messages, execution, persistence).await
     }
 
-    fn metadata(thread_id: ThreadId) -> ThreadMetadata {
-        ThreadMetadata {
-            thread_id,
-            kind: crate::ThreadKind::Root,
+    fn metadata(session_id: SessionId) -> SessionMetadata {
+        SessionMetadata {
+            session_id,
+            kind: crate::SessionKind::Root,
         }
     }
 
-    async fn persisted_thread(
+    async fn persisted_session(
         directory: &std::path::Path,
         messages: &[Message],
-    ) -> (ThreadId, SharedThreadStore, ThreadPersistence) {
-        let thread_id = ThreadId::new();
-        let store: SharedThreadStore = Arc::new(JsonlThreadStore::new(directory));
+    ) -> (SessionId, SharedSessionStore, SessionPersistence) {
+        let session_id = SessionId::new();
+        let store: SharedSessionStore = Arc::new(JsonlSessionStore::new(directory));
         let records = messages
             .iter()
             .cloned()
             .map(LogEntry::Message)
             .collect::<Vec<_>>();
-        store.create(metadata(thread_id), &records).await.unwrap();
-        let opened = store.open(thread_id).await.unwrap().unwrap();
+        store.create(metadata(session_id), &records).await.unwrap();
+        let opened = store.open(session_id).await.unwrap().unwrap();
         let writer = Arc::new(tokio::sync::Mutex::new(opened.writer));
-        let persistence = ThreadPersistence::new(writer);
-        (thread_id, store, persistence)
+        let persistence = SessionPersistence::new(writer);
+        (session_id, store, persistence)
     }
 
-    async fn load_thread(store: &SharedThreadStore, thread_id: ThreadId) -> StoredThread {
-        store.load(thread_id).await.unwrap().unwrap()
+    async fn load_session(store: &SharedSessionStore, session_id: SessionId) -> StoredSession {
+        store.load(session_id).await.unwrap().unwrap()
     }
 
     struct MockAdapter {
@@ -1059,14 +1044,14 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("use a tool")];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(32);
 
         let (reason, _usage) = run_with_adapter(
@@ -1074,7 +1059,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &adapter,
             Some(&mut persistence),
         )
@@ -1089,7 +1074,7 @@ mod tests {
             messages[2].content,
             MessageContent::ToolResult { .. }
         ));
-        let persisted = load_thread(&store, thread_id).await;
+        let persisted = load_session(&store, session_id).await;
         assert_eq!(persisted.log.messages().len(), 4);
         assert!(matches!(
             persisted.log.messages()[2].content,
@@ -1124,7 +1109,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1137,8 +1122,8 @@ mod tests {
             Message::assistant_text("answer two"),
         ];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, mut rx) = mpsc::channel(16);
 
         let (reason, _usage) = run_with_adapter(
@@ -1146,7 +1131,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &adapter,
             Some(&mut persistence),
         )
@@ -1155,7 +1140,7 @@ mod tests {
         persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
-        let stored = load_thread(&store, thread_id).await;
+        let stored = load_session(&store, session_id).await;
         assert_eq!(stored.log.messages().len(), 7);
         assert_eq!(stored.log.model_context().len(), 6);
         assert!(matches!(
@@ -1219,7 +1204,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1235,8 +1220,8 @@ mod tests {
             Message::assistant_text("answer two"),
         ];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(16);
 
         let (reason, _usage) = run_with_adapter(
@@ -1244,7 +1229,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &adapter,
             Some(&mut persistence),
         )
@@ -1254,7 +1239,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::EndTurn);
         assert_eq!(requests.lock().unwrap().len(), 3);
-        let stored = load_thread(&store, thread_id).await;
+        let stored = load_session(&store, session_id).await;
         assert_eq!(stored.log.model_context(), messages);
         assert_eq!(stored.log.messages().len(), 7);
         let persisted = serde_json::to_string(&stored.log).unwrap();
@@ -1289,7 +1274,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1304,12 +1289,12 @@ mod tests {
         let ephemeral = Message::system("turn-only extension context");
         let ephemeral_id = ephemeral.id;
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(16);
         let (_, steering) = mpsc::unbounded_channel();
         let execution = TurnExecution::new(
-            thread_id,
+            session_id,
             TurnId::new(),
             tx,
             CancellationToken::new(),
@@ -1342,7 +1327,7 @@ mod tests {
                 .any(|message| message.id == ephemeral_id));
             drop(requests);
         }
-        let stored = load_thread(&store, thread_id).await;
+        let stored = load_session(&store, session_id).await;
         assert!(!stored
             .log
             .model_context()
@@ -1369,7 +1354,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1385,7 +1370,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -1416,7 +1401,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1424,25 +1409,16 @@ mod tests {
         for turn in 0..7 {
             let call = ToolCallId::from_provider(format!("call-{turn}"));
             messages.push(Message::user(&format!("request {turn}")));
-            messages.push(Message {
-                id: ash_core::MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![ContentBlock::ToolCall {
-                    id: call.clone(),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({}),
-                }]),
-            });
-            messages.push(Message {
-                id: ash_core::MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id: call,
-                    result: Ok("x".repeat(64_000)),
-                    attachments: Vec::new(),
-                    file_change: None,
-                },
-            });
+            messages.push(Message::assistant(vec![ContentBlock::ToolCall {
+                id: call.clone(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }]));
+            messages.push(Message::tool_result(
+                call,
+                Ok("x".repeat(64_000)),
+                Vec::new(),
+            ));
             messages.push(Message::assistant_text(&format!("answer {turn}")));
         }
         let (tx, _rx) = mpsc::channel(16);
@@ -1452,7 +1428,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -1511,7 +1487,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1523,7 +1499,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -1579,7 +1555,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1591,7 +1567,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -1669,7 +1645,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1681,7 +1657,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -1701,7 +1677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_reasoning_blocks_in_thread_history() {
+    async fn persists_reasoning_blocks_in_session_history() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
                 ModelEvent::Reasoning("inspect first".into()),
@@ -1721,14 +1697,14 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(32);
 
         run_with_adapter(
@@ -1736,7 +1712,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &adapter,
             Some(&mut persistence),
         )
@@ -1752,7 +1728,7 @@ mod tests {
                     ContentBlock::Text(answer),
                 ] if text == "inspect first" && answer == "done")
         ));
-        let persisted = serde_json::to_string(&load_thread(&store, thread_id).await.log).unwrap();
+        let persisted = serde_json::to_string(&load_session(&store, session_id).await.log).unwrap();
         assert!(persisted.contains("inspect first"));
         assert!(persisted.contains("elapsed_seconds"));
     }
@@ -1781,7 +1757,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1794,7 +1770,7 @@ mod tests {
                 &mut messages,
                 tx,
                 cancel.clone(),
-                ThreadId::new(),
+                SessionId::new(),
                 &PendingAdapter,
                 None,
             );
@@ -1814,12 +1790,9 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert!(matches!(
-            &messages[0],
-            Message {
-                role: Role::User,
-                content: MessageContent::User(content),
-                ..
-            } if content.as_slice() == [ash_core::Content::Text("question".into())]
+            &messages[0].content,
+            MessageContent::User(content)
+                if content.as_slice() == [ash_core::Content::Text("question".into())]
         ));
     }
 
@@ -1886,14 +1859,14 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(8);
 
         let error = run_with_adapter(
@@ -1901,7 +1874,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &FailingAdapter,
             Some(&mut persistence),
         )
@@ -1918,7 +1891,7 @@ mod tests {
                     ContentBlock::Text(answer),
                 ] if text == "checking" && answer == "partial")
         ));
-        let persisted = serde_json::to_string(&load_thread(&store, thread_id).await.log).unwrap();
+        let persisted = serde_json::to_string(&load_session(&store, session_id).await.log).unwrap();
         assert!(persisted.contains("checking"));
         assert!(persisted.contains("partial"));
     }
@@ -1949,7 +1922,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1958,8 +1931,8 @@ mod tests {
         };
         let mut messages = vec![Message::user("question")];
         let directory = TempDir::new().unwrap();
-        let (thread_id, store, mut persistence) =
-            persisted_thread(directory.path(), &messages).await;
+        let (session_id, store, mut persistence) =
+            persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(8);
 
         let (reason, _usage) = run_with_adapter(
@@ -1967,7 +1940,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            thread_id,
+            session_id,
             &adapter,
             Some(&mut persistence),
         )
@@ -1991,7 +1964,7 @@ mod tests {
             MessageContent::Assistant(blocks)
                 if matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text == "complete")
         ));
-        let persisted = serde_json::to_string(&load_thread(&store, thread_id).await.log).unwrap();
+        let persisted = serde_json::to_string(&load_session(&store, session_id).await.log).unwrap();
         assert!(!persisted.contains("partial thought"));
         assert!(persisted.contains("complete"));
     }
@@ -2016,7 +1989,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2031,7 +2004,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -2085,7 +2058,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2099,7 +2072,7 @@ mod tests {
             &mut messages,
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -2116,7 +2089,7 @@ mod tests {
             &mut vec![Message::user("question")],
             tx,
             CancellationToken::new(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         )
@@ -2149,7 +2122,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(30),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -2162,7 +2135,7 @@ mod tests {
                 &mut messages,
                 tx,
                 cancel.clone(),
-                ThreadId::new(),
+                SessionId::new(),
                 &adapter,
                 None,
             );
@@ -2241,18 +2214,12 @@ mod tests {
     }
 
     #[test]
-    fn preserves_file_changes_while_limiting_tool_text() {
-        let change = FileChange::Add {
-            path: PathBuf::from("large.txt"),
-            content: "x".repeat(MAX_AGENT_OUTPUT_BYTES + 1),
-        };
-        let output =
-            ToolOutput::with_file_change("x".repeat(MAX_AGENT_OUTPUT_BYTES + 1), change.clone());
+    fn limits_tool_output_text() {
+        let output = ToolOutput::from("x".repeat(MAX_AGENT_OUTPUT_BYTES + 1));
 
         let limited = limit_tool_result(Ok(output)).unwrap();
 
         assert!(limited.text.contains("tool output truncated"));
-        assert_eq!(limited.file_change, Some(change));
     }
 
     #[test]
@@ -2296,7 +2263,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(1),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 5,
             retry_backoff: RetryBackoff {
                 base: Duration::from_secs(1),
@@ -2311,7 +2278,7 @@ mod tests {
             &mut messages,
             tx,
             cancel.clone(),
-            ThreadId::new(),
+            SessionId::new(),
             &adapter,
             None,
         );

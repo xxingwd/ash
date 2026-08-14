@@ -119,10 +119,10 @@ Review the relevant code and report concrete findings.
 ## 会话历史
 
 交互会话按“一会话一文件”保存为 JSONL。Linux 默认目录为
-`~/.local/share/ash/threads/`，文件名就是 Session ID：
+`~/.local/share/ash/sessions/`，文件名就是 Session ID：
 
 ```text
-<thread-id>.jsonl
+<session-id>.jsonl
 ```
 
 普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
@@ -161,7 +161,7 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临时移除，因此 Ash
 也不对外暴露它。子 Agent 继承当前模型、协议、工作目录、工具、AGENTS.md 和 Skills
-上下文，并通过与父 Agent 相同的 `Runtime -> Thread -> Turn` 流水线运行。
+上下文，并通过与父 Agent 相同的 `Runtime -> Session -> Turn` 流水线运行。
 `ASH_MAX_CONCURRENT_AGENTS` 可选地限制同时活跃的子 Agent 数量；不设置时不施加额外
 子 Agent 上限。`fork_turns` 支持 `none`、`all` 或最近 N 轮。子 Agent 树按根 Session ID 隔离，执行 `/new` 或
 `/clear` 后不会混入旧会话的 Agent。

@@ -1,4 +1,4 @@
-use ash_core::{Message, MessageId, ThreadView, TurnId, TurnResult, TurnView, Usage};
+use ash_core::{Message, MessageId, SessionView, TurnId, TurnResult, TurnView, Usage};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Input;
@@ -52,7 +52,7 @@ pub enum LogEntry {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct ThreadLog {
+pub struct SessionLog {
     entries: Vec<LogEntry>,
     #[serde(skip)]
     projection: Projector,
@@ -102,7 +102,7 @@ struct AppliedCheckpoint {
     all_len: usize,
 }
 
-impl<'de> Deserialize<'de> for ThreadLog {
+impl<'de> Deserialize<'de> for SessionLog {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -117,7 +117,7 @@ impl<'de> Deserialize<'de> for ThreadLog {
     }
 }
 
-impl ThreadLog {
+impl SessionLog {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -199,8 +199,8 @@ impl ThreadLog {
 
     /// Full projected state: history, model context, and turn views.
     #[must_use]
-    pub fn view(&self) -> ThreadView {
-        ThreadView {
+    pub fn view(&self) -> SessionView {
+        SessionView {
             messages: self.projection.history.clone(),
             context: self.projection.context.clone(),
             turns: self.projection.turns(),
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
     use ash_core::{MessageContent, StopReason};
 
-    fn reference_projection(entries: &[LogEntry]) -> ThreadView {
+    fn reference_projection(entries: &[LogEntry]) -> SessionView {
         let mut active = Vec::new();
         for entry in entries {
             if matches!(entry, LogEntry::Rollback) {
@@ -476,7 +476,7 @@ mod tests {
         if let Some((id, messages)) = open {
             turns.push(interrupted_turn(id, messages));
         }
-        ThreadView {
+        SessionView {
             messages,
             context,
             turns,
@@ -507,7 +507,7 @@ mod tests {
         let answer = Message::assistant_text("answer");
         let recent = Message::user("recent");
         let summary = Message::system("summary");
-        let mut log = ThreadLog::from_messages([first.clone(), answer.clone(), recent.clone()]);
+        let mut log = SessionLog::from_messages([first.clone(), answer.clone(), recent.clone()]);
         log.push(LogEntry::Checkpoint(ContextCheckpoint {
             summary: summary.clone(),
             tail_start_id: Some(recent.id),
@@ -534,7 +534,7 @@ mod tests {
         let first = Message::user("first");
         let answer = Message::assistant_text("answer");
         let second = Message::user("second");
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(TurnId::new()));
         log.push(LogEntry::Message(first.clone()));
         log.push(LogEntry::Message(answer));
@@ -564,7 +564,7 @@ mod tests {
             .metadata
             .insert("source".to_string(), serde_json::json!("scheduler"));
         let message = Message::user_content(input.content.clone());
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::Input(AcceptedInput {
             turn_id: TurnId::new(),
             input,
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn projects_one_turn_view_per_settled_turn() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Message(Message::user("question")));
         log.push(LogEntry::Message(Message::assistant_text("answer")));
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn open_turn_is_projected_as_interrupted() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Message(Message::user("question")));
         log.push(LogEntry::Message(Message::assistant_text("partial answer")));
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn settled_turn_keeps_all_of_its_messages() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Message(Message::user("question")));
         log.push(LogEntry::Message(Message::assistant_text("answer")));
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn open_turn_partial_messages_stay_out_of_history_and_context() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Message(Message::user("question")));
         log.push(LogEntry::Message(Message::assistant_text("partial answer")));
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn rollback_drops_the_open_turn_before_it_settles() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Message(Message::user("question")));
         log.push(LogEntry::Message(Message::assistant_text("partial")));
@@ -676,7 +676,7 @@ mod tests {
         let turn_id = TurnId::new();
         let first_input = Message::user("note");
         let second_input = Message::user("task");
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(LogEntry::Input(AcceptedInput {
             turn_id,
@@ -738,7 +738,7 @@ mod tests {
             },
         ];
 
-        let mut incremental = ThreadLog::new();
+        let mut incremental = SessionLog::new();
         for (index, entry) in entries.iter().cloned().enumerate() {
             incremental.push(entry);
             assert_eq!(
@@ -753,7 +753,7 @@ mod tests {
     fn rollback_after_mid_turn_checkpoint_restores_previous_context() {
         let original = Message::user("original");
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::from_messages([original.clone()]);
+        let mut log = SessionLog::from_messages([original.clone()]);
         log.push(LogEntry::TurnStart(turn_id));
         log.push(accepted(turn_id, "new task"));
         log.push(LogEntry::Checkpoint(ContextCheckpoint {
@@ -770,7 +770,7 @@ mod tests {
     fn consecutive_rollbacks_restore_each_turn_boundary() {
         let first = TurnId::new();
         let second = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         for (turn_id, prompt, answer) in [
             (first, "first", "first answer"),
             (second, "second", "second answer"),
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn deserialization_rebuilds_the_incremental_projection() {
         let turn_id = TurnId::new();
-        let mut log = ThreadLog::new();
+        let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
         log.push(accepted(turn_id, "question"));
         log.push(LogEntry::Message(Message::assistant_text("answer")));
@@ -807,7 +807,7 @@ mod tests {
             usage: None,
         });
 
-        let restored: ThreadLog =
+        let restored: SessionLog =
             serde_json::from_value(serde_json::to_value(&log).unwrap()).unwrap();
         assert_eq!(restored.view(), log.view());
     }

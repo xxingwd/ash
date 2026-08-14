@@ -5,8 +5,8 @@ use std::{
 };
 
 use ash_core::{
-    CancellationToken, Event, EventKind, ForkPoint, Message, MessageId, StopReason, ThreadId,
-    ThreadView, TurnId, TurnResult, TurnView, Usage,
+    CancellationToken, Event, EventKind, ForkPoint, Message, MessageId, SessionId, SessionView,
+    TurnId, TurnResult, TurnView, Usage,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -14,35 +14,32 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::{
-    AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedThread, RunConfig, Runtime,
-    SharedThreadStore, ThreadAppender, ThreadLog, ThreadMetadata,
+    AcceptedInput, ContextCheckpoint, Input, LogEntry, OpenedSession, RunConfig, Runtime,
+    SessionAppender, SessionLog, SessionMetadata, SharedSessionStore,
 };
 
-const EMPTY_INPUT_ERROR: &str = "thread input cannot be empty";
-const INACTIVE_TURN_ERROR: &str = "the target turn is not active";
-const BUSY_THREAD_ERROR: &str =
-    "thread is busy; cancel and wait for the active turn before retrying";
+const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
 
 #[derive(Clone)]
-pub struct Thread {
-    id: ThreadId,
+pub struct Session {
+    id: SessionId,
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<Event>,
 }
 
 pub struct Turn {
-    thread_id: ThreadId,
+    session_id: SessionId,
     id: TurnId,
     commands: mpsc::Sender<Command>,
     cancellation: CancellationToken,
-    completion: oneshot::Receiver<Result<StopReason, ash_core::AshError>>,
+    completion: oneshot::Receiver<Result<TurnResult, ash_core::AshError>>,
 }
 
 struct QueuedTurn {
     id: TurnId,
     inputs: Vec<Input>,
     cancellation: CancellationToken,
-    completion: Option<oneshot::Sender<Result<StopReason, ash_core::AshError>>>,
+    completion: Option<oneshot::Sender<Result<TurnResult, ash_core::AshError>>>,
 }
 
 #[derive(Default)]
@@ -62,7 +59,7 @@ enum Command {
     Rollback(oneshot::Sender<Result<Option<String>, ash_core::AshError>>),
     Compact(oneshot::Sender<Result<ContextCompaction, ash_core::AshError>>),
     Messages(oneshot::Sender<Result<Vec<Message>, ash_core::AshError>>),
-    View(oneshot::Sender<Result<ThreadView, ash_core::AshError>>),
+    View(oneshot::Sender<Result<SessionView, ash_core::AshError>>),
     ForkPoints(oneshot::Sender<Result<Vec<ForkPoint>, ash_core::AshError>>),
     Fork {
         message_id: MessageId,
@@ -70,8 +67,8 @@ enum Command {
     },
 }
 
-impl Thread {
-    pub(crate) fn spawn(state: ThreadState) -> Self {
+impl Session {
+    pub(crate) fn spawn(state: SessionState) -> Self {
         let id = state.id();
         let (commands, command_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(256);
@@ -80,14 +77,14 @@ impl Thread {
             // Keep actor panics visible: the JoinHandle is dropped here, so a
             // panic inside the actor would otherwise disappear with it.
             if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                run_thread(state, command_rx, events_clone),
+                run_session(state, command_rx, events_clone),
             ))
             .await
             {
                 tracing::error!(
                     %id,
                     message = %panic_payload(panic.as_ref()),
-                    "thread actor panicked"
+                    "session actor panicked"
                 );
             }
         });
@@ -99,7 +96,7 @@ impl Thread {
     }
 
     #[must_use]
-    pub const fn id(&self) -> ThreadId {
+    pub const fn id(&self) -> SessionId {
         self.id
     }
 
@@ -112,7 +109,7 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// Returns `AshError` when the input is empty or the session runtime has
     /// stopped.
     pub async fn submit(&self, input: impl Into<Input>) -> Result<Turn, ash_core::AshError> {
         let input = input.into();
@@ -124,9 +121,9 @@ impl Thread {
         self.commands
             .send(Command::Submit(queued))
             .await
-            .map_err(|_| thread_closed())?;
+            .map_err(|_| session_closed())?;
         Ok(Turn {
-            thread_id: self.id,
+            session_id: self.id,
             id,
             commands: self.commands.clone(),
             cancellation,
@@ -138,7 +135,7 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// Returns `AshError` when the input is empty or the session runtime has
     /// stopped.
     pub async fn enqueue(&self, input: impl Into<Input>) -> Result<TurnId, ash_core::AshError> {
         let input = input.into();
@@ -148,7 +145,7 @@ impl Thread {
         self.commands
             .send(Command::Submit(queued))
             .await
-            .map_err(|_| thread_closed())?;
+            .map_err(|_| session_closed())?;
         Ok(id)
     }
 
@@ -156,7 +153,7 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// Returns `AshError` when the input is empty or the session runtime has
     /// stopped.
     pub async fn notify(&self, input: impl Into<Input>) -> Result<(), ash_core::AshError> {
         let input = input.into();
@@ -164,14 +161,14 @@ impl Thread {
         self.commands
             .send(Command::Notify(input))
             .await
-            .map_err(|_| thread_closed())
+            .map_err(|_| session_closed())
     }
 
-    /// Durable messages of this thread.
+    /// Durable messages of this session.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
+    /// Returns `AshError` when the session runtime has stopped.
     pub async fn messages(&self) -> Result<Vec<Message>, ash_core::AshError> {
         self.ask(Command::Messages).await
     }
@@ -180,16 +177,16 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
-    pub async fn view(&self) -> Result<ThreadView, ash_core::AshError> {
+    /// Returns `AshError` when the session runtime has stopped.
+    pub async fn view(&self) -> Result<SessionView, ash_core::AshError> {
         self.ask(Command::View).await
     }
 
-    /// Forkable submission points in this thread.
+    /// Forkable submission points in this session.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
+    /// Returns `AshError` when the session runtime has stopped.
     pub async fn fork_points(&self) -> Result<Vec<ForkPoint>, ash_core::AshError> {
         self.ask(Command::ForkPoints).await
     }
@@ -198,16 +195,16 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
+    /// Returns `AshError` when the session runtime has stopped.
     pub async fn rollback(&self) -> Result<Option<String>, ash_core::AshError> {
         self.ask(Command::Rollback).await
     }
 
-    /// Fork the thread from the message with the given id.
+    /// Fork the session from the message with the given id.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
+    /// Returns `AshError` when the session runtime has stopped.
     pub async fn fork_at(&self, message_id: MessageId) -> Result<Option<Fork>, ash_core::AshError> {
         self.ask(|reply| Command::Fork { message_id, reply }).await
     }
@@ -216,7 +213,7 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread runtime has stopped.
+    /// Returns `AshError` when the session runtime has stopped.
     pub async fn compact(&self) -> Result<ContextCompaction, ash_core::AshError> {
         self.ask(Command::Compact).await
     }
@@ -229,15 +226,15 @@ impl Thread {
         self.commands
             .send(make_command(reply))
             .await
-            .map_err(|_| thread_closed())?;
-        result.await.map_err(|_| thread_closed())?
+            .map_err(|_| session_closed())?;
+        result.await.map_err(|_| session_closed())?
     }
 }
 
 impl Turn {
     #[must_use]
-    pub const fn thread_id(&self) -> ThreadId {
-        self.thread_id
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     #[must_use]
@@ -254,7 +251,7 @@ impl Turn {
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the input is empty or the thread runtime has
+    /// Returns `AshError` when the input is empty or the session runtime has
     /// stopped.
     pub async fn steer(&self, input: impl Into<Input>) -> Result<(), ash_core::AshError> {
         let input = input.into();
@@ -267,22 +264,22 @@ impl Turn {
                 reply,
             })
             .await
-            .map_err(|_| thread_closed())?;
-        result.await.map_err(|_| thread_closed())?
+            .map_err(|_| session_closed())?;
+        result.await.map_err(|_| session_closed())?
     }
 
-    /// Wait for this turn to settle and return its stop reason.
+    /// Wait for this turn to settle and return its terminal result.
     ///
     /// # Errors
     ///
     /// Returns `AshError` when the turn ends without a completion signal.
-    pub async fn wait(self) -> Result<StopReason, ash_core::AshError> {
-        self.completion.await.map_err(|_| thread_closed())?
+    pub async fn wait(self) -> Result<TurnResult, ash_core::AshError> {
+        self.completion.await.map_err(|_| session_closed())?
     }
 }
 
-async fn run_thread(
-    mut state: ThreadState,
+async fn run_session(
+    mut state: SessionState,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
 ) {
@@ -309,7 +306,7 @@ async fn run_thread(
 }
 
 async fn run_turn(
-    state: &mut ThreadState,
+    state: &mut SessionState,
     turn: QueuedTurn,
     queues: &mut ActorQueues,
     commands: &mut mpsc::Receiver<Command>,
@@ -326,8 +323,8 @@ async fn run_turn(
         queues.inbox.append(&mut inputs);
         inputs = std::mem::take(&mut queues.inbox);
     }
-    let thread_id = state.id();
-    publish(events, thread_id, Some(id), sequence, EventKind::TurnStart);
+    let session_id = state.id();
+    publish(events, session_id, Some(id), sequence, EventKind::TurnStart);
     let (payload_tx, mut payload_rx) = mpsc::channel(64);
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let execution = state.submit_inputs(id, inputs, steer_rx, payload_tx, cancellation.clone());
@@ -340,7 +337,7 @@ async fn run_turn(
             result = &mut execution => break result,
             payload = payload_rx.recv() => {
                 if let Some(kind) = payload {
-                    publish(events, thread_id, Some(id), sequence, kind);
+                    publish(events, session_id, Some(id), sequence, kind);
                 }
             }
             command = commands.recv(), if commands_open => {
@@ -354,19 +351,12 @@ async fn run_turn(
         }
     };
     while let Ok(kind) = payload_rx.try_recv() {
-        publish(events, thread_id, Some(id), sequence, kind);
+        publish(events, session_id, Some(id), sequence, kind);
     }
     drop(execution);
     let view = match &result {
         Ok(view) => view.clone(),
         Err(error) => {
-            publish(
-                events,
-                thread_id,
-                Some(id),
-                sequence,
-                EventKind::Error(error.to_string()),
-            );
             // `submit_inputs` can fail before writing anything (empty input,
             // duplicate idempotency key), so look up this exact turn.
             state.log.turn_view(id).unwrap_or_else(|| TurnView {
@@ -378,16 +368,19 @@ async fn run_turn(
             })
         }
     };
-    publish(events, thread_id, Some(id), sequence, EventKind::Turn(view));
+    publish(
+        events,
+        session_id,
+        Some(id),
+        sequence,
+        EventKind::Turn(view),
+    );
     if let Some(completion) = completion {
-        let _ = completion.send(result.map(|view| match view.result {
-            TurnResult::Completed(reason) => reason,
-            TurnResult::Failed(_) | TurnResult::Interrupted(_) => StopReason::Aborted,
-        }));
+        let _ = completion.send(result.map(|view| view.result));
     }
 }
 
-/// Route a command while a turn is active. Never touches `ThreadState` (the
+/// Route a command while a turn is active. Never touches `SessionState` (the
 /// turn's execution already borrows it), so this stays synchronous.
 fn dispatch_active_command(
     command: Command,
@@ -416,10 +409,10 @@ fn dispatch_active_command(
     }
 }
 
-/// Route a command while the thread is idle.
+/// Route a command while the session is idle.
 async fn dispatch_idle_command(
     command: Command,
-    state: &mut ThreadState,
+    state: &mut SessionState,
     queues: &mut ActorQueues,
 ) {
     match command {
@@ -444,7 +437,7 @@ async fn dispatch_idle_command(
         Command::Fork { message_id, reply } => {
             let result = state.fork_at(message_id).await.map(|forked| {
                 forked.map(|(state, data)| Fork {
-                    thread: Thread::spawn(state),
+                    session: Session::spawn(state),
                     messages: data.messages,
                     model: data.model,
                     protocol: data.protocol,
@@ -462,25 +455,25 @@ fn reject_steer(reply: oneshot::Sender<Result<(), ash_core::AshError>>) {
 }
 
 fn reject_busy<T>(reply: oneshot::Sender<Result<T, ash_core::AshError>>) {
-    let _ = reply.send(Err(busy_thread()));
+    let _ = reply.send(Err(busy_session()));
 }
 
 fn publish(
     events: &broadcast::Sender<Event>,
-    thread_id: ThreadId,
+    session_id: SessionId,
     turn_id: Option<TurnId>,
     sequence: &mut u64,
     kind: EventKind,
 ) {
     *sequence = sequence.saturating_add(1);
     let event = Event {
-        thread_id,
+        session_id,
         turn_id,
         sequence: *sequence,
         timestamp: chrono::Utc::now(),
         kind,
     };
-    // The thread is the single publisher of everything the UI can observe.
+    // The session is the single publisher of everything the UI can observe.
     // Log every event here so agent output is always visible in the logs,
     // regardless of whether any UI is attached. Streaming deltas are too
     // chatty for info level; everything else is a stable boundary event.
@@ -488,17 +481,17 @@ fn publish(
         EventKind::Live(
             ash_core::LiveEvent::TextDelta(_) | ash_core::LiveEvent::ReasoningDelta(_),
         ) => {
-            tracing::debug!(%thread_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+            tracing::debug!(%session_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
         }
         _ => {
-            tracing::info!(%thread_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
+            tracing::info!(%session_id, ?turn_id, sequence, kind = ?event.kind, "agent event");
         }
     }
     let _ = events.send(event);
 }
 
-fn thread_closed() -> ash_core::AshError {
-    ash_core::AshError::Config("thread runtime has stopped".to_string())
+fn session_closed() -> ash_core::AshError {
+    ash_core::AshError::Session(ash_core::SessionError::Closed)
 }
 
 /// Extract a human-readable message from a panic payload for logging.
@@ -511,11 +504,11 @@ fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn inactive_turn() -> ash_core::AshError {
-    ash_core::AshError::Config(INACTIVE_TURN_ERROR.to_string())
+    ash_core::AshError::Session(ash_core::SessionError::InactiveTurn)
 }
 
-fn busy_thread() -> ash_core::AshError {
-    ash_core::AshError::Config(BUSY_THREAD_ERROR.to_string())
+fn busy_session() -> ash_core::AshError {
+    ash_core::AshError::Session(ash_core::SessionError::Busy)
 }
 
 fn ensure_nonempty(input: &Input) -> Result<(), ash_core::AshError> {
@@ -527,7 +520,7 @@ fn ensure_nonempty(input: &Input) -> Result<(), ash_core::AshError> {
 
 fn queued_turn(
     input: Input,
-    completion: Option<oneshot::Sender<Result<StopReason, ash_core::AshError>>>,
+    completion: Option<oneshot::Sender<Result<TurnResult, ash_core::AshError>>>,
 ) -> QueuedTurn {
     QueuedTurn {
         id: TurnId::new(),
@@ -538,9 +531,9 @@ fn queued_turn(
 }
 
 pub struct Fork {
-    pub thread: Thread,
+    pub session: Session,
     pub messages: Vec<Message>,
-    pub model: String,
+    pub model: ash_core::ModelId,
     pub protocol: String,
     pub working_dir: PathBuf,
     pub prompt: String,
@@ -553,36 +546,36 @@ pub struct ContextCompaction {
     pub dropped_messages: usize,
 }
 
-pub struct ThreadState {
-    id: ThreadId,
+pub struct SessionState {
+    id: SessionId,
     config: RunConfig,
     runtime: Runtime,
-    log: ThreadLog,
-    metadata: ThreadMetadata,
-    store: SharedThreadStore,
-    /// Open append-only handle to this thread's file. Initialized lazily so
-    /// `ThreadState::new` stays synchronous; every write goes through it
+    log: SessionLog,
+    metadata: SessionMetadata,
+    store: SharedSessionStore,
+    /// Open append-only handle to this session's file. Initialized lazily so
+    /// `SessionState::new` stays synchronous; every write goes through it
     /// without re-scanning or re-reading the file.
-    writer: Option<Arc<tokio::sync::Mutex<Box<dyn ThreadAppender>>>>,
+    writer: Option<Arc<tokio::sync::Mutex<Box<dyn SessionAppender>>>>,
 }
 
-impl ThreadState {
+impl SessionState {
     pub(crate) fn new(config: RunConfig, runtime: Runtime) -> Self {
-        let id = ThreadId::new();
-        let metadata = thread_metadata(&config, id);
-        let store = runtime.thread_store_handle();
+        let id = SessionId::new();
+        let metadata = session_metadata(&config, id);
+        let store = runtime.session_store_handle();
         Self {
             id,
             config,
             runtime,
-            log: ThreadLog::new(),
+            log: SessionLog::new(),
             metadata,
             store,
             writer: None,
         }
     }
 
-    pub const fn id(&self) -> ThreadId {
+    pub const fn id(&self) -> SessionId {
         self.id
     }
 
@@ -590,17 +583,20 @@ impl ThreadState {
         self.log.messages()
     }
 
-    pub fn view(&self) -> ThreadView {
+    pub fn view(&self) -> SessionView {
         let mut view = self.log.view();
         view.context_tokens = self.estimate_context_tokens(&view.context);
         view
     }
 
-    pub(crate) async fn resume(&mut self, thread_id: ThreadId) -> Result<bool, ash_core::AshError> {
-        let Some(opened) = self.store.open(thread_id).await? else {
+    pub(crate) async fn resume(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<bool, ash_core::AshError> {
+        let Some(opened) = self.store.open(session_id).await? else {
             return Ok(false);
         };
-        if opened.thread.metadata.kind == crate::ThreadKind::Subagent {
+        if opened.session.metadata.kind == crate::SessionKind::Subagent {
             return Ok(false);
         }
         self.restore(opened);
@@ -649,7 +645,7 @@ impl ThreadState {
         let messages = self.log.messages()[..turn_start].to_vec();
         let config = self.config.clone();
         let runtime = self.runtime.clone();
-        let model = config.model.as_str().to_string();
+        let model = config.model.clone();
         let protocol = runtime.model_backend().to_string();
         let working_dir = config.working_dir.clone();
 
@@ -666,10 +662,10 @@ impl ThreadState {
         Ok(Some((state, details)))
     }
 
-    fn restore(&mut self, opened: OpenedThread) {
-        self.id = opened.thread.metadata.thread_id;
-        self.metadata = opened.thread.metadata;
-        self.log = opened.thread.log;
+    fn restore(&mut self, opened: OpenedSession) {
+        self.id = opened.session.metadata.session_id;
+        self.metadata = opened.session.metadata;
+        self.log = opened.session.log;
         self.writer = Some(Arc::new(tokio::sync::Mutex::new(opened.writer)));
     }
 
@@ -709,7 +705,7 @@ impl ThreadState {
         let mut model_context = self.log.model_context();
         let turn_config = self.config.clone();
         let writer = self.writer().await?;
-        let mut persistence = crate::store::ThreadPersistence::new(writer);
+        let mut persistence = crate::store::SessionPersistence::new(writer);
         let execution = TurnExecution::new(
             self.id,
             turn_id,
@@ -753,7 +749,7 @@ impl ThreadState {
             Err(_) => Vec::new(),
         };
         // Replay what this turn appended into the in-memory log instead of
-        // reloading the thread from disk (which scans the whole directory and
+        // reloading the session from disk (which scans the whole directory and
         // visibly delays the turn-completed event after the last delta).
         drop(persistence);
         for entry in appended {
@@ -840,7 +836,7 @@ impl ThreadState {
     fn project_terminal_view(
         &self,
         turn_id: TurnId,
-        persistence: &crate::store::ThreadPersistence,
+        persistence: &crate::store::SessionPersistence,
         turn_result: TurnResult,
         usage: Option<Usage>,
         context_tokens: Option<u64>,
@@ -865,7 +861,7 @@ impl ThreadState {
 
     async fn writer(
         &mut self,
-    ) -> Result<Arc<tokio::sync::Mutex<Box<dyn ThreadAppender>>>, ash_core::AshError> {
+    ) -> Result<Arc<tokio::sync::Mutex<Box<dyn SessionAppender>>>, ash_core::AshError> {
         if let Some(writer) = &self.writer {
             return Ok(Arc::clone(writer));
         }
@@ -879,15 +875,15 @@ impl ThreadState {
 
 struct ForkData {
     messages: Vec<Message>,
-    model: String,
+    model: ash_core::ModelId,
     protocol: String,
     working_dir: PathBuf,
     prompt: String,
 }
 
-const fn thread_metadata(config: &RunConfig, thread_id: ThreadId) -> ThreadMetadata {
-    ThreadMetadata {
-        thread_id,
+const fn session_metadata(config: &RunConfig, session_id: SessionId) -> SessionMetadata {
+    SessionMetadata {
+        session_id,
         kind: config.kind,
     }
 }
@@ -915,7 +911,7 @@ mod tests {
     use crate::agent::RetryBackoff;
     use ash_core::{
         Content, ContentBlock, MessageContent, MessageId, ModelClient, ModelEvent, ModelId,
-        ModelRequest, ModelStream, Role, ToolCallId,
+        ModelRequest, ModelStream, StopReason, ToolCallId,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -986,7 +982,7 @@ mod tests {
             max_tool_duration: Duration::from_secs(5),
             agent_path: "/root".to_string(),
             tree_id: None,
-            kind: crate::ThreadKind::Root,
+            kind: crate::SessionKind::Root,
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         }
@@ -1003,15 +999,15 @@ mod tests {
     }
 
     fn runtime_in(directory: &std::path::Path) -> Runtime {
-        runtime().with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory)))
+        runtime().with_session_store(Arc::new(crate::JsonlSessionStore::new(directory)))
     }
 
-    async fn thread_with_messages(
+    async fn session_with_messages(
         config: RunConfig,
         runtime: Runtime,
         messages: &[Message],
-    ) -> ThreadState {
-        let mut state = ThreadState::new(config, runtime);
+    ) -> SessionState {
+        let mut state = SessionState::new(config, runtime);
         state.seed(messages.to_vec()).await.unwrap();
         state
     }
@@ -1023,25 +1019,12 @@ mod tests {
             Message::user("first"),
             Message::assistant_text("first answer"),
             Message::user("second"),
-            Message {
-                id: MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![ContentBlock::ToolCall {
-                    id: tool_id.clone(),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({}),
-                }]),
-            },
-            Message {
-                id: MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id: tool_id,
-                    result: Ok("done".to_string()),
-                    attachments: Vec::new(),
-                    file_change: None,
-                },
-            },
+            Message::assistant(vec![ContentBlock::ToolCall {
+                id: tool_id.clone(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            Message::tool_result(tool_id, Ok("done".to_string()), Vec::new()),
         ];
 
         let (turn_start, prompt) = last_user_turn(&messages).unwrap();
@@ -1054,20 +1037,11 @@ mod tests {
         let tool_id = ToolCallId::from_provider("call");
         let first = Message::user("first");
         let second = Message::user("second\nline");
-        let mut state = ThreadState::new(config(PathBuf::from(".")), runtime());
-        state.log = ThreadLog::from_messages(vec![
+        let mut state = SessionState::new(config(PathBuf::from(".")), runtime());
+        state.log = SessionLog::from_messages(vec![
             first.clone(),
             Message::assistant_text("answer"),
-            Message {
-                id: MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id: tool_id,
-                    result: Ok("result".to_string()),
-                    attachments: Vec::new(),
-                    file_change: None,
-                },
-            },
+            Message::tool_result(tool_id, Ok("result".to_string()), Vec::new()),
             second.clone(),
         ]);
 
@@ -1087,7 +1061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_creates_a_new_thread_before_the_selected_prompt() {
+    async fn fork_creates_a_new_session_before_the_selected_prompt() {
         let directory = TempDir::new().unwrap();
         let config = config(directory.path().to_path_buf());
         let runtime = runtime_in(directory.path());
@@ -1097,7 +1071,7 @@ mod tests {
         let selected = Message::user("try another direction");
         let later = Message::assistant_text("second answer");
         let messages = vec![first.clone(), answer.clone(), selected.clone(), later];
-        let state = thread_with_messages(config, runtime.clone(), &messages).await;
+        let state = session_with_messages(config, runtime.clone(), &messages).await;
         let original_id = state.id();
 
         let (fork_state, forked) = state.fork_at(selected.id).await.unwrap().unwrap();
@@ -1123,7 +1097,7 @@ mod tests {
         );
         assert_eq!(forked.prompt, "try another direction");
         let original = runtime
-            .thread_store_handle()
+            .session_store_handle()
             .load(original_id)
             .await
             .unwrap()
@@ -1152,13 +1126,13 @@ mod tests {
         let current_dir = directory.path().join("current");
         tokio::fs::create_dir(&current_dir).await.unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = ThreadState::new(config(current_dir.clone()), runtime.clone());
-        let saved_id = ThreadId::new();
+        let mut state = SessionState::new(config(current_dir.clone()), runtime.clone());
+        let saved_id = SessionId::new();
         let saved_message = Message::user("saved question");
         runtime
-            .thread_store_handle()
+            .session_store_handle()
             .create(
-                thread_metadata(&config(directory.path().join("old")), saved_id),
+                session_metadata(&config(directory.path().join("old")), saved_id),
                 &[LogEntry::Message(saved_message)],
             )
             .await
@@ -1180,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_keeps_memory_when_persistence_fails() {
         let directory = TempDir::new().unwrap();
-        let mut state = ThreadState::new(config(directory.path().to_path_buf()), runtime());
+        let mut state = SessionState::new(config(directory.path().to_path_buf()), runtime());
         let message = Message::user("unpersisted");
         state.log.push(LogEntry::Message(message));
 
@@ -1198,7 +1172,7 @@ mod tests {
         tokio::fs::write(&blocked_parent, b"file").await.unwrap();
         let config = config(directory.path().to_path_buf());
         let runtime = runtime_in(&blocked_parent);
-        let mut state = ThreadState::new(config, runtime);
+        let mut state = SessionState::new(config, runtime);
         let (events, mut received) = mpsc::channel(4);
         let (_, steering) = mpsc::unbounded_channel();
 
@@ -1231,7 +1205,7 @@ mod tests {
             Message::user("recent request"),
             Message::assistant_text("recent answer"),
         ];
-        let mut state = thread_with_messages(config, runtime, &messages).await;
+        let mut state = session_with_messages(config, runtime, &messages).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
@@ -1267,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_serializes_submitted_turns_in_acceptance_order() {
+    async fn session_serializes_submitted_turns_in_acceptance_order() {
         let directory = TempDir::new().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let runtime = Runtime::new(
@@ -1277,15 +1251,15 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
 
-        let first = thread.submit("first").await.unwrap();
-        let second = thread.submit("second").await.unwrap();
+        let first = session.submit("first").await.unwrap();
+        let second = session.submit("second").await.unwrap();
         first.wait().await.unwrap();
         second.wait().await.unwrap();
 
-        let messages = thread.messages().await.unwrap();
+        let messages = session.messages().await.unwrap();
         let prompts = messages
             .iter()
             .filter_map(Message::user_turn_text)
@@ -1306,29 +1280,30 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let turn = thread.submit("work").await.unwrap();
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let turn = session.submit("work").await.unwrap();
         started.notified().await;
 
         let errors = [
-            thread.rollback().await.unwrap_err(),
-            thread.compact().await.unwrap_err(),
-            thread.messages().await.unwrap_err(),
-            thread.view().await.unwrap_err(),
-            thread.fork_points().await.unwrap_err(),
-            thread.fork_at(MessageId::new()).await.err().unwrap(),
+            session.rollback().await.unwrap_err(),
+            session.compact().await.unwrap_err(),
+            session.messages().await.unwrap_err(),
+            session.view().await.unwrap_err(),
+            session.fork_points().await.unwrap_err(),
+            session.fork_at(MessageId::new()).await.err().unwrap(),
         ];
 
         for error in errors {
-            assert!(
-                matches!(error, ash_core::AshError::Config(message) if message == BUSY_THREAD_ERROR)
-            );
+            assert!(matches!(
+                error,
+                ash_core::AshError::Session(ash_core::SessionError::Busy)
+            ));
         }
 
         release.notify_one();
         turn.wait().await.unwrap();
-        assert_eq!(thread.messages().await.unwrap().len(), 1);
+        assert_eq!(session.messages().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1343,13 +1318,13 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
 
-        let submit_error = thread.submit("").await.err().unwrap();
-        let enqueue_error = thread.enqueue("").await.unwrap_err();
-        let notify_error = thread.notify("").await.unwrap_err();
-        let turn = thread.submit("work").await.unwrap();
+        let submit_error = session.submit("").await.err().unwrap();
+        let enqueue_error = session.enqueue("").await.unwrap_err();
+        let notify_error = session.notify("").await.unwrap_err();
+        let turn = session.submit("work").await.unwrap();
         let steer_error = turn.steer("").await.unwrap_err();
 
         for error in [submit_error, enqueue_error, notify_error, steer_error] {
@@ -1373,18 +1348,18 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let mut events = thread.events();
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let mut events = session.events();
 
-        thread.submit("work").await.unwrap().wait().await.unwrap();
+        session.submit("work").await.unwrap().wait().await.unwrap();
         let emitted = loop {
             let event = events.next().await.unwrap().unwrap();
             if let EventKind::Turn(view) = event.kind {
                 break view;
             }
         };
-        let projected = thread.view().await.unwrap().turns.pop().unwrap();
+        let projected = session.view().await.unwrap().turns.pop().unwrap();
 
         assert_eq!(emitted.id, projected.id);
         assert_eq!(emitted.messages, projected.messages);
@@ -1405,18 +1380,18 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
 
-        thread
+        session
             .notify(Input::from_text(crate::InputSource::Agent, "note"))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(thread.messages().await.unwrap().is_empty());
-        thread.submit("task").await.unwrap().wait().await.unwrap();
+        assert!(session.messages().await.unwrap().is_empty());
+        session.submit("task").await.unwrap().wait().await.unwrap();
 
-        let prompts = thread
+        let prompts = session
             .messages()
             .await
             .unwrap()
@@ -1437,20 +1412,20 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
 
-        let first = thread.submit("first").await.unwrap();
+        let first = session.submit("first").await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let second = thread.submit("second").await.unwrap();
-        thread
+        let second = session.submit("second").await.unwrap();
+        session
             .notify(Input::from_text(crate::InputSource::Agent, "note"))
             .await
             .unwrap();
         first.wait().await.unwrap();
         second.wait().await.unwrap();
 
-        let prompts = thread
+        let prompts = session
             .messages()
             .await
             .unwrap()
@@ -1472,11 +1447,11 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let mut events = thread.events();
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let mut events = session.events();
 
-        let turn_id = thread
+        let turn_id = session
             .enqueue(Input::from_text(crate::InputSource::Heartbeat, "check"))
             .await
             .unwrap();
@@ -1505,9 +1480,9 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let turn = thread.submit("first").await.unwrap();
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let turn = session.submit("first").await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         turn.steer("updated direction").await.unwrap();
@@ -1534,10 +1509,10 @@ mod tests {
             }),
             "test",
         )
-        .with_thread_store(Arc::new(crate::JsonlThreadStore::new(directory.path())));
-        let thread = Thread::spawn(ThreadState::new(config(directory.path().into()), runtime));
-        let mut events = thread.events();
-        let turn = thread.submit("first").await.unwrap();
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let mut events = session.events();
+        let turn = session.submit("first").await.unwrap();
 
         loop {
             let event = events.next().await.unwrap().unwrap();
@@ -1547,9 +1522,10 @@ mod tests {
         }
 
         let error = turn.steer("too late").await.unwrap_err();
-        assert!(
-            matches!(error, ash_core::AshError::Config(message) if message == INACTIVE_TURN_ERROR)
-        );
+        assert!(matches!(
+            error,
+            ash_core::AshError::Session(ash_core::SessionError::InactiveTurn)
+        ));
         turn.wait().await.unwrap();
     }
 
@@ -1557,7 +1533,7 @@ mod tests {
     async fn duplicate_keys_in_one_turn_are_rejected_before_persistence() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = ThreadState::new(config(directory.path().into()), runtime);
+        let mut state = SessionState::new(config(directory.path().into()), runtime);
         let mut first = Input::user("first");
         first.idempotency_key = Some("same".to_string());
         let mut second = Input::user("second");

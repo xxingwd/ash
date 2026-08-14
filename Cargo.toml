@@ -58,7 +58,6 @@ pulldown-cmark = "0.13.4"
 # Type system
 strum = { version = "0.28.0", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["display", "from", "into", "deref", "constructor"] }
-enum-as-inner = "0.7.0"
 schemars = "1.2.2"
 smart-default = "0.7.1"
 
@@ -81,11 +80,11 @@ rustix = "1.1.4"
 # Tools
 tempfile = "3.27.0"
 base64 = "0.23.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 htmd = "0.5.5"
 cap-std = "4.0.2"
 ignore = "0.4.31"
 regex = "1.13.1"
-similar = "2.7.0"
 
 # MCP
 rmcp = { version = "3.0.1", features = ["client", "transport-io", "transport-child-process"] }

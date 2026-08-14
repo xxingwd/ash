@@ -15,15 +15,9 @@ pub enum SubmissionPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CancellationMode {
-    Interrupt,
-    Rollback,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TurnCompletion {
     Commit,
-    AwaitRollback,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,7 +48,7 @@ enum Operation {
 #[derive(Debug)]
 enum TurnOperation {
     Running,
-    Cancelling(CancellationMode),
+    Cancelling,
 }
 
 impl OperationState {
@@ -73,12 +67,21 @@ impl OperationState {
         match self.current {
             Operation::Idle => Some(SubmissionPolicy::Start),
             Operation::Turn(TurnOperation::Running) => Some(SubmissionPolicy::Steer),
-            Operation::Turn(TurnOperation::Cancelling(_)) | Operation::Background(_) => None,
+            Operation::Turn(TurnOperation::Cancelling) | Operation::Background(_) => None,
         }
     }
 
     pub(crate) const fn can_cancel(&self) -> bool {
         matches!(self.current, Operation::Turn(TurnOperation::Running))
+    }
+
+    pub(crate) const fn status_header(&self) -> Option<&'static str> {
+        match self.current {
+            Operation::Turn(TurnOperation::Running) => Some("Working"),
+            Operation::Turn(TurnOperation::Cancelling) => Some("Interrupting"),
+            Operation::Background(BackgroundAction::Compact) => Some("Compacting"),
+            Operation::Idle | Operation::Background(_) => None,
+        }
     }
 
     pub(crate) const fn accepts_live_output(&self) -> bool {
@@ -102,29 +105,23 @@ impl OperationState {
         self.current = Operation::Background(action);
     }
 
-    pub(crate) const fn begin_cancellation(&mut self, mode: CancellationMode) -> bool {
+    pub(crate) const fn begin_cancellation(&mut self) -> bool {
         if !matches!(self.current, Operation::Turn(TurnOperation::Running)) {
             return false;
         }
-        self.current = Operation::Turn(TurnOperation::Cancelling(mode));
+        self.current = Operation::Turn(TurnOperation::Cancelling);
         true
     }
 
     pub(crate) fn complete_turn(&mut self) -> TurnCompletion {
         let current = std::mem::take(&mut self.current);
         match current {
-            Operation::Turn(TurnOperation::Cancelling(CancellationMode::Rollback)) => {
-                self.current = Operation::Background(BackgroundAction::Rollback);
-                TurnCompletion::AwaitRollback
-            }
             current @ Operation::Background(_) => {
                 self.current = current;
                 TurnCompletion::Commit
             }
-            Operation::Idle
-            | Operation::Turn(
-                TurnOperation::Running | TurnOperation::Cancelling(CancellationMode::Interrupt),
-            ) => TurnCompletion::Commit,
+            Operation::Turn(TurnOperation::Cancelling) => TurnCompletion::Cancelled,
+            Operation::Idle | Operation::Turn(TurnOperation::Running) => TurnCompletion::Commit,
         }
     }
 
@@ -151,6 +148,25 @@ impl OperationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_header_follows_the_active_operation() {
+        let mut state = OperationState::default();
+        assert_eq!(state.status_header(), None);
+
+        state.start_turn();
+        assert_eq!(state.status_header(), Some("Working"));
+        assert!(state.can_cancel());
+
+        assert!(state.begin_cancellation());
+        assert_eq!(state.status_header(), Some("Interrupting"));
+        assert!(!state.can_cancel());
+
+        let mut state = OperationState::default();
+        state.start_background(BackgroundAction::Compact);
+        assert_eq!(state.status_header(), Some("Compacting"));
+        assert!(!state.can_cancel());
+    }
 
     #[test]
     fn agent_start_reports_whether_the_turn_was_already_tracked() {
@@ -180,7 +196,7 @@ mod tests {
         state.start_turn();
         assert_eq!(state.submission_policy(), Some(SubmissionPolicy::Steer));
 
-        assert!(state.begin_cancellation(CancellationMode::Interrupt));
+        assert!(state.begin_cancellation());
         assert_eq!(state.submission_policy(), None);
     }
 
@@ -188,25 +204,22 @@ mod tests {
     fn cancellation_keeps_late_output_until_the_turn_finishes() {
         let mut state = OperationState::default();
         state.start_turn();
-        assert!(state.begin_cancellation(CancellationMode::Interrupt));
+        assert!(state.begin_cancellation());
 
-        assert_eq!(state.complete_turn(), TurnCompletion::Commit);
+        assert_eq!(state.complete_turn(), TurnCompletion::Cancelled);
         assert!(!state.is_busy());
     }
 
     #[test]
-    fn cancellation_without_a_completed_tool_becomes_a_rollback() {
+    fn cancelled_turns_settle_before_the_controller_decides() {
         let mut state = OperationState::default();
         state.start_turn();
 
-        assert!(state.begin_cancellation(CancellationMode::Rollback));
+        assert!(state.begin_cancellation());
         assert!(!state.accepts_live_output());
 
-        assert_eq!(state.complete_turn(), TurnCompletion::AwaitRollback);
-        assert!(matches!(
-            state.current,
-            Operation::Background(BackgroundAction::Rollback)
-        ));
+        assert_eq!(state.complete_turn(), TurnCompletion::Cancelled);
+        assert!(!state.is_busy());
     }
 
     #[test]

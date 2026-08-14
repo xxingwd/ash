@@ -1,15 +1,12 @@
 use std::{
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
-use ash_core::{define_tool, CancellationToken, FileChange, Tool, ToolError, ToolOutput};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
-
-const MAX_DIFF_SOURCE_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteArgs {
@@ -22,7 +19,6 @@ struct WriteArgs {
 #[derive(Debug)]
 struct WriteResult {
     path: PathBuf,
-    change: Option<FileChange>,
 }
 
 pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
@@ -42,10 +38,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
                     args.content.len(),
                     result.path.display()
                 );
-                Ok(match result.change {
-                    Some(change) => ToolOutput::with_file_change(text, change),
-                    None => ToolOutput::from(text),
-                })
+                Ok(ToolOutput::from(text))
             }
         },
     )
@@ -64,57 +57,12 @@ async fn write_file(
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
         let path = crate::path::WorkspacePath::new(&root, &requested)?;
-        let previous = read_existing_text(&path, &cancellation, deadline);
         path.atomic_write(content.as_bytes(), None, &cancellation, deadline)?;
-        let display_path = path.relative_path().to_path_buf();
-        let change = match previous {
-            ExistingText::Missing => Some(crate::change::added(display_path, content)),
-            ExistingText::Text(previous) => {
-                crate::change::updated(display_path, &previous, &content)
-            }
-            ExistingText::Unavailable => None,
-        };
         Ok(WriteResult {
             path: path.full_path().to_path_buf(),
-            change,
         })
     })
     .await
-}
-
-enum ExistingText {
-    Missing,
-    Text(String),
-    Unavailable,
-}
-
-fn read_existing_text(
-    path: &crate::path::WorkspacePath,
-    cancellation: &CancellationToken,
-    deadline: Instant,
-) -> ExistingText {
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true);
-    let file = match path.open_with(&options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ExistingText::Missing;
-        }
-        Err(_) => return ExistingText::Unavailable,
-    };
-    let limit = u64::try_from(MAX_DIFF_SOURCE_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    crate::path::read_all(
-        &mut file.take(limit),
-        path.full_path(),
-        cancellation,
-        deadline,
-    )
-    .ok()
-    .filter(|content| content.len() <= MAX_DIFF_SOURCE_BYTES)
-    .and_then(|content| String::from_utf8(content).ok())
-    .map_or(ExistingText::Unavailable, ExistingText::Text)
 }
 
 #[cfg(test)]
@@ -144,92 +92,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            added.change,
-            Some(FileChange::Add {
-                path: PathBuf::from("src/new.rs"),
-                content: "first".to_string(),
-            })
-        );
-        let Some(FileChange::Update { path, unified_diff }) = updated.change else {
-            panic!("overwrite must report an update");
-        };
-        assert_eq!(path, Path::new("src/new.rs"));
-        assert!(unified_diff.contains("-first"));
-        assert!(unified_diff.contains("+second"));
+        assert_eq!(added.path, root.path().join("src/new.rs"));
+        assert_eq!(updated.path, root.path().join("src/new.rs"));
         assert_eq!(
             tokio::fs::read_to_string(root.path().join("src/new.rs"))
                 .await
                 .unwrap(),
             "second"
-        );
-    }
-
-    #[tokio::test]
-    async fn omits_a_change_when_the_written_content_is_identical() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("same.txt"), "same\n").unwrap();
-
-        let result = write_file(
-            root.path(),
-            "same.txt",
-            "same\n",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_mins(1),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.change, None);
-    }
-
-    #[tokio::test]
-    async fn large_overwrites_succeed_without_reading_an_unbounded_preview() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("large.txt"),
-            vec![b'x'; MAX_DIFF_SOURCE_BYTES + 1],
-        )
-        .unwrap();
-
-        let result = write_file(
-            root.path(),
-            "large.txt",
-            "replacement",
-            CancellationToken::new(),
-            Instant::now() + Duration::from_mins(1),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.change, None);
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("large.txt")).unwrap(),
-            "replacement"
-        );
-    }
-
-    #[tokio::test]
-    async fn large_new_files_report_the_complete_addition() {
-        let root = tempfile::tempdir().unwrap();
-        let content = "x".repeat(MAX_DIFF_SOURCE_BYTES + 1);
-
-        let result = write_file(
-            root.path(),
-            "large.txt",
-            &content,
-            CancellationToken::new(),
-            Instant::now() + Duration::from_mins(1),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.change,
-            Some(FileChange::Add {
-                path: PathBuf::from("large.txt"),
-                content,
-            })
         );
     }
 

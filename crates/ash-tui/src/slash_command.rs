@@ -92,11 +92,8 @@ const COMMANDS: &[CommandSpec] = &[
 ];
 
 impl SlashCommand {
-    pub(crate) const fn requires_idle(self) -> bool {
-        matches!(
-            self,
-            Self::New | Self::Clear | Self::Undo | Self::Fork | Self::Compact | Self::Resume
-        )
+    pub(crate) const fn can_run_while_busy(self) -> bool {
+        matches!(self, Self::Exit)
     }
 }
 
@@ -241,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn only_non_mutating_commands_can_run_during_a_turn() {
+    fn only_exit_can_run_during_a_turn() {
         for command in [
             SlashCommand::New,
             SlashCommand::Clear,
@@ -249,11 +246,11 @@ mod tests {
             SlashCommand::Fork,
             SlashCommand::Compact,
             SlashCommand::Resume,
+            SlashCommand::Status,
         ] {
-            assert!(command.requires_idle(), "{command:?}");
+            assert!(!command.can_run_while_busy(), "{command:?}");
         }
-        assert!(!SlashCommand::Status.requires_idle());
-        assert!(!SlashCommand::Exit.requires_idle());
+        assert!(SlashCommand::Exit.can_run_while_busy());
     }
 
     #[test]

@@ -130,9 +130,10 @@ impl Skill {
         })
     }
 
-    pub fn apply_overrides(&self, agent: &mut crate::Agent) {
-        if let Some(model) = &self.model {
-            agent.model = model.clone();
+    pub fn apply_overrides(&self, agent: crate::Agent) -> crate::Agent {
+        match &self.model {
+            Some(model) => agent.with_model(model.clone()),
+            None => agent,
         }
     }
 

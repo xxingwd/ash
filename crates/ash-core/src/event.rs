@@ -1,15 +1,12 @@
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    message::{Message, MessageId, ThreadId, ToolCallId, TurnId},
-    FileChange,
-};
+use crate::message::{Message, MessageId, SessionId, ToolCallId, TurnId};
 
-/// A routed event emitted by a thread. `sequence` is monotonic within one thread.
+/// A routed event emitted by a session. `sequence` is monotonic within one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    pub thread_id: ThreadId,
+    pub session_id: SessionId,
     pub turn_id: Option<TurnId>,
     pub sequence: u64,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -58,10 +55,10 @@ pub struct TurnView {
     pub context_tokens: Option<u64>,
 }
 
-/// Full projected state of a thread, derived from its durable log. Never
+/// Full projected state of a session, derived from its durable log. Never
 /// mutated directly; rebuilt from `LogEntry` records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadView {
+pub struct SessionView {
     pub messages: Vec<Message>,
     pub context: Vec<Message>,
     pub turns: Vec<TurnView>,
@@ -89,14 +86,12 @@ pub enum LiveEvent {
         arguments: serde_json::Value,
         output: String,
         is_error: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_change: Option<FileChange>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadSummary {
-    pub thread_id: ThreadId,
+pub struct SessionSummary {
+    pub session_id: SessionId,
     pub title: String,
     pub created_at: String,
 }
@@ -115,17 +110,12 @@ pub enum EventKind {
     Live(LiveEvent),
     /// A turn settled: the canonical boundary for committing scrollback.
     Turn(TurnView),
-    /// A persisted thread was restored; `view` is its full projection.
+    /// A persisted session was restored; `view` is its full projection.
     Restored {
-        view: ThreadView,
-        /// Estimated token count of the restored context (local estimate; no
-        /// API usage is available for a restored session).
-        context_tokens: Option<u64>,
+        view: SessionView,
     },
     TurnRolledBack {
         prompt: String,
-        /// Estimated token count of the context after rollback.
-        context_tokens: Option<u64>,
     },
     Compacted {
         before: u64,
@@ -133,17 +123,15 @@ pub enum EventKind {
         dropped: u64,
         automatic: bool,
     },
-    ThreadsListed {
-        threads: Vec<ThreadSummary>,
+    SessionsListed {
+        sessions: Vec<SessionSummary>,
     },
     ForkPointsListed {
         points: Vec<ForkPoint>,
     },
-    ThreadForked {
-        view: ThreadView,
+    SessionForked {
+        view: SessionView,
         prompt: String,
-        /// Estimated token count of the forked context (local estimate).
-        context_tokens: Option<u64>,
     },
     Error(String),
 }

@@ -1,12 +1,14 @@
 use std::time::Duration;
 
+use crate::message_history::MessageHistoryStore;
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, MessageHistoryStore, Runtime, Skill, Thread,
-    ThreadOptions, Turn, DEFAULT_MAX_CONTEXT_TOKENS,
+    build_system_prompt, skill_tool, Agent, Runtime, Session, SessionOptions, Skill, Turn,
+    DEFAULT_MAX_CONTEXT_TOKENS,
 };
+use ash_collab::SubagentSnapshot;
 use ash_core::{
-    EventKind, LiveEvent, MessageId, ModelId, SubagentSnapshot, ThreadId, ThreadView, TurnId,
+    EventKind, LiveEvent, MessageId, ModelId, SessionId, SessionView, TurnId, TurnResult,
 };
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::{UiCommand, UiError};
@@ -21,9 +23,9 @@ const DEFAULT_MAX_TURNS: u32 = 100;
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct InteractiveController {
-    thread: Thread,
+    session: Session,
     agent: Agent,
-    options: ThreadOptions,
+    options: SessionOptions,
     runtime: Runtime,
     event_tx: tokio::sync::mpsc::Sender<EventKind>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
@@ -54,8 +56,8 @@ impl TurnState {
 
     async fn steer_active(&self, input: String) -> Result<(), UiError> {
         let turn = self.active.as_ref().ok_or_else(|| {
-            UiError::Agent(ash_core::AshError::Config(
-                "the active turn has already finished".to_string(),
+            UiError::Agent(ash_core::AshError::Session(
+                ash_core::SessionError::InactiveTurn,
             ))
         })?;
         turn.steer(input).await.map_err(UiError::from)
@@ -68,7 +70,7 @@ impl TurnState {
 
 struct AgentSetup {
     agent: Agent,
-    options: ThreadOptions,
+    options: SessionOptions,
     runtime: Runtime,
     subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>>,
 }
@@ -112,31 +114,27 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         api_key: SecretString::from(api_key),
         base_url,
     };
-    let mut agent = Agent {
-        system_prompt: Some(system_prompt),
-        model: ModelId::new(model),
-        tools,
-        max_turns: DEFAULT_MAX_TURNS,
-        max_context_tokens,
-        context_policy: std::sync::Arc::new(ash_agent::DefaultContextPolicy),
-    };
-    let options = ThreadOptions {
+    let mut agent = Agent::new(ModelId::new(model), tools)
+        .with_system_prompt(system_prompt)
+        .with_max_turns(DEFAULT_MAX_TURNS)
+        .with_max_context_tokens(max_context_tokens);
+    let options = SessionOptions {
         working_dir,
         tool_timeout: DEFAULT_TOOL_TIMEOUT,
-        ..ThreadOptions::default()
+        ..SessionOptions::default()
     };
     if let Some(skill) = active_skill {
-        skill.apply_overrides(&mut agent);
+        agent = skill.apply_overrides(agent);
     }
     let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
     let max_concurrent_agents = env_usize("ASH_MAX_CONCURRENT_AGENTS")?;
-    let subagent_monitor = ash_collab::install_subagent_tools(
-        &mut agent,
+    let (agent, control) = ash_collab::install_subagent_tools(
+        agent,
         options.clone(),
         runtime.clone(),
         max_concurrent_agents,
-    )?
-    .map(|control| control.subscribe());
+    )?;
+    let subagent_monitor = control.map(|control| control.subscribe());
 
     Ok(AgentSetup {
         agent,
@@ -147,12 +145,15 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
 }
 
 fn resolve_protocol(cli: &Cli) -> Result<Protocol> {
-    let name = cli
-        .protocol
-        .clone()
-        .or_else(|| env_value("ASH_PROTOCOL"))
-        .unwrap_or_else(|| "anthropic".into());
-    parse_protocol(&name)
+    if let Some(protocol) = cli.protocol.clone() {
+        return Ok(protocol);
+    }
+    match env_value("ASH_PROTOCOL") {
+        Some(name) => name
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown protocol: {name}")),
+        None => Ok(Protocol::AnthropicMessages),
+    }
 }
 
 /// Resolve the model name with `--model` > `ASH_MODEL` > the protocol's
@@ -176,11 +177,6 @@ fn resolve_active_skill(cli: &Cli, skills: &[Skill]) -> Result<Option<Skill>> {
                 .with_context(|| format!("skill not found: {skill_name}"))
         })
         .transpose()
-}
-
-fn parse_protocol(name: &str) -> Result<Protocol> {
-    name.parse()
-        .map_err(|_| anyhow::anyhow!("unknown protocol: {name}"))
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -220,9 +216,9 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         stdin.read_line(&mut input).await?;
         input
     };
-    let thread = setup.runtime.start(&setup.agent, &setup.options);
-    let mut events = thread.events();
-    let turn = thread.submit(input).await?;
+    let session = setup.runtime.start(&setup.agent, &setup.options);
+    let mut events = session.events();
+    let turn = session.submit(input).await?;
     let mut completion = Box::pin(turn.wait());
 
     loop {
@@ -240,14 +236,14 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         }
     }
     println!();
-    print_usage(&thread).await;
+    print_usage(&session).await;
     Ok(())
 }
 
 /// Print the completed turn's token usage to stderr, mirroring the tool
 /// diagnostics already shown there. Useful when diagnosing a run.
-async fn print_usage(thread: &Thread) {
-    let Ok(view) = thread.view().await else {
+async fn print_usage(session: &Session) {
+    let Ok(view) = session.view().await else {
         return;
     };
     let Some(turn) = view.turns.last() else {
@@ -276,6 +272,12 @@ fn print_event(event: EventKind) {
             output,
             ..
         }) => eprintln!("{}", format!("[error: {output}]").red()),
+        EventKind::Turn(view) => match view.result {
+            TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
+                eprintln!("{}", format!("[error: {error}]").red());
+            }
+            TurnResult::Completed(_) => {}
+        },
         EventKind::Error(error) => eprintln!("{}", format!("[error: {error}]").red()),
         _ => {}
     }
@@ -289,9 +291,9 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         subagent_monitor,
     } = setup;
     let protocol = runtime.model_backend().to_string();
-    let model = agent.model.as_str().to_string();
+    let model = agent.model().as_str().to_string();
     let working_dir = options.working_dir.clone();
-    let context_limit = Some(u64::try_from(agent.max_context_tokens).unwrap_or(u64::MAX));
+    let context_limit = Some(u64::try_from(agent.max_context_tokens()).unwrap_or(u64::MAX));
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
     let event_rx = tokio_stream::wrappers::ReceiverStream::new(event_rx);
@@ -308,10 +310,10 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         .with_input_history(input_history)
         .with_subagent_monitor(subagent_monitor);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
-    let thread = runtime.start(&agent, &options);
+    let session = runtime.start(&agent, &options);
 
     InteractiveController {
-        thread,
+        session,
         agent,
         options,
         runtime,
@@ -328,7 +330,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
 
 impl InteractiveController {
     async fn run(mut self) {
-        let mut events = self.thread.events();
+        let mut events = self.session.events();
         let mut turns = TurnState::default();
         loop {
             tokio::select! {
@@ -346,11 +348,12 @@ impl InteractiveController {
                     let Some(command) = command else { break };
                     match command {
                         UiCommand::Submit { input, reply } => {
-                            let result = match self.thread.submit(input.clone()).await {
+                            let result = match self.session.submit(input.clone()).await {
                                 Ok(turn) => {
+                                    let turn_id = turn.id();
                                     turns.track(turn);
                                     self.record_input(&input).await;
-                                    Ok(())
+                                    Ok(turn_id)
                                 }
                                 Err(error) => Err(error.into()),
                             };
@@ -367,22 +370,22 @@ impl InteractiveController {
                             turns.cancel_active();
                         }
                         UiCommand::Rollback => self.rollback_last_turn().await,
-                        UiCommand::Compact => self.compact_thread().await,
+                        UiCommand::Compact => self.compact_session().await,
                         UiCommand::NewSession => {
-                            self.thread = self.runtime.start(&self.agent, &self.options);
-                            events = self.thread.events();
+                            self.session = self.runtime.start(&self.agent, &self.options);
+                            events = self.session.events();
                             turns.reset();
                         }
-                        UiCommand::ListSessions => self.list_threads().await,
+                        UiCommand::ListSessions => self.list_sessions().await,
                         UiCommand::ListForkPoints => self.list_fork_points().await,
-                        UiCommand::ResumeSession(thread_id) => {
-                            self.resume_thread(thread_id).await;
-                            events = self.thread.events();
+                        UiCommand::ResumeSession(session_id) => {
+                            self.resume_session(session_id).await;
+                            events = self.session.events();
                             turns.reset();
                         }
                         UiCommand::ForkSession(message_id) => {
-                            self.fork_thread(message_id).await;
-                            events = self.thread.events();
+                            self.fork_session(message_id).await;
+                            events = self.session.events();
                             turns.reset();
                         }
                         UiCommand::Exit => {
@@ -396,27 +399,18 @@ impl InteractiveController {
     }
 
     async fn record_input(&self, input: &str) {
-        if let Err(error) = self.history_store.append(self.thread.id(), input).await {
+        if let Err(error) = self.history_store.append(self.session.id(), input).await {
             tracing::warn!(%error, "failed to persist input history");
         }
     }
 
     async fn rollback_last_turn(&self) {
-        let event = match self.thread.rollback().await {
+        let event = match self.session.rollback().await {
             Ok(Some(prompt)) => {
-                if let Err(error) = self.history_store.undo(self.thread.id(), &prompt).await {
+                if let Err(error) = self.history_store.undo(self.session.id(), &prompt).await {
                     tracing::warn!(%error, "failed to undo input history entry");
                 }
-                let context_tokens = self
-                    .thread
-                    .view()
-                    .await
-                    .ok()
-                    .and_then(|view| view.context_tokens);
-                EventKind::TurnRolledBack {
-                    prompt,
-                    context_tokens,
-                }
+                EventKind::TurnRolledBack { prompt }
             }
             Ok(None) => EventKind::Error("No submitted turn is available to undo.".to_string()),
             Err(error) => EventKind::Error(format!("Failed to undo the last turn: {error}")),
@@ -424,8 +418,8 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn compact_thread(&self) {
-        let event = match self.thread.compact().await {
+    async fn compact_session(&self) {
+        let event = match self.session.compact().await {
             Ok(result) => EventKind::Compacted {
                 before: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
                 after: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
@@ -437,16 +431,16 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn list_threads(&self) {
-        let event = match self.runtime.threads(Some(self.thread.id())).await {
-            Ok(threads) => EventKind::ThreadsListed { threads },
+    async fn list_sessions(&self) {
+        let event = match self.runtime.sessions(Some(self.session.id())).await {
+            Ok(sessions) => EventKind::SessionsListed { sessions },
             Err(error) => EventKind::Error(format!("Failed to list saved chats: {error}")),
         };
         let _ = self.event_tx.send(event).await;
     }
 
     async fn list_fork_points(&self) {
-        let event = match self.thread.fork_points().await {
+        let event = match self.session.fork_points().await {
             Ok(points) => EventKind::ForkPointsListed { points },
             Err(error) => EventKind::Error(format!("Failed to list fork points: {error}")),
         };
@@ -455,19 +449,16 @@ impl InteractiveController {
 
     /// Estimate the model-context size for a given message history, using the
     /// same estimator the runtime uses when the API does not report usage.
-    async fn resume_thread(&mut self, thread_id: ThreadId) {
+    async fn resume_session(&mut self, session_id: SessionId) {
         let event = match self
             .runtime
-            .resume(self.agent.clone(), self.options.clone(), thread_id)
+            .resume(&self.agent, &self.options, session_id)
             .await
         {
-            Ok(Some(thread)) => {
-                self.thread = thread;
-                self.with_current_view("restore chat", |view| EventKind::Restored {
-                    context_tokens: view.context_tokens,
-                    view,
-                })
-                .await
+            Ok(Some(session)) => {
+                self.session = session;
+                self.with_current_view("restore chat", |view| EventKind::Restored { view })
+                    .await
             }
             Ok(None) => EventKind::Error("That saved chat is no longer available.".to_string()),
             Err(error) => EventKind::Error(format!("Failed to resume saved chat: {error}")),
@@ -475,13 +466,12 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn fork_thread(&mut self, message_id: MessageId) {
-        let event = match self.thread.fork_at(message_id).await {
+    async fn fork_session(&mut self, message_id: MessageId) {
+        let event = match self.session.fork_at(message_id).await {
             Ok(Some(forked)) => {
                 let prompt = forked.prompt;
-                self.thread = forked.thread;
-                self.with_current_view("fork the current chat", |view| EventKind::ThreadForked {
-                    context_tokens: view.context_tokens,
+                self.session = forked.session;
+                self.with_current_view("fork the current chat", |view| EventKind::SessionForked {
                     view,
                     prompt,
                 })
@@ -495,14 +485,14 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    /// Read the thread's current view and map it to an event. Centralizes the
+    /// Read the session's current view and map it to an event. Centralizes the
     /// error event produced when the view cannot be read.
     async fn with_current_view(
         &self,
         view_error_context: &str,
-        on_view: impl FnOnce(ThreadView) -> EventKind,
+        on_view: impl FnOnce(SessionView) -> EventKind,
     ) -> EventKind {
-        match self.thread.view().await {
+        match self.session.view().await {
             Ok(view) => on_view(view),
             Err(error) => EventKind::Error(format!("Failed to {view_error_context}: {error}")),
         }
@@ -530,8 +520,8 @@ mod tests {
             Protocol::Responses,
         ] {
             let name = protocol.as_cli_name();
-            assert_eq!(parse_protocol(name).unwrap().as_cli_name(), name);
+            assert_eq!(name.parse::<Protocol>().unwrap().as_cli_name(), name);
         }
-        assert!(parse_protocol("responses").is_err());
+        assert!("responses".parse::<Protocol>().is_err());
     }
 }

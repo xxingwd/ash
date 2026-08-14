@@ -42,6 +42,21 @@ pub fn format_token_rate(tokens: u64, duration_ms: u64) -> Option<String> {
     })
 }
 
+pub fn format_elapsed(elapsed_seconds: u64) -> String {
+    if elapsed_seconds < 60 {
+        return format!("{elapsed_seconds}s");
+    }
+    if elapsed_seconds < 3600 {
+        return format!("{}m {:02}s", elapsed_seconds / 60, elapsed_seconds % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        elapsed_seconds / 3600,
+        (elapsed_seconds % 3600) / 60,
+        elapsed_seconds % 60
+    )
+}
+
 fn format_compact(value: u64, scale: u64, suffix: &str) -> String {
     let tenths = value.saturating_mul(10) / scale;
     format!("{}.{:01}{suffix}", tenths / 10, tenths % 10)
@@ -110,5 +125,12 @@ mod tests {
         assert_eq!(format_token_rate(250, 2_000).as_deref(), Some("125 tok/s"));
         assert_eq!(format_token_rate(1, 300).as_deref(), Some("3.3 tok/s"));
         assert_eq!(format_token_rate(1, 0), None);
+    }
+
+    #[test]
+    fn formats_elapsed_status_like_codex() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(61), "1m 01s");
+        assert_eq!(format_elapsed(3661), "1h 01m 01s");
     }
 }

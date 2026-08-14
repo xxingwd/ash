@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use ash_core::{
-    Content, Message, MessageContent, MessageId, ThreadId, ThreadSummary, TurnId, TurnResult, Usage,
+    Content, Message, MessageContent, MessageId, SessionId, SessionSummary, TurnId, TurnResult,
+    Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,28 +10,28 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, Async
 use tracing::warn;
 
 use crate::{
-    AcceptedInput, ContextCheckpoint, LogEntry, OpenedThread, StoredThread, ThreadAppender,
-    ThreadKind, ThreadLog, ThreadMetadata, ThreadStore,
+    AcceptedInput, ContextCheckpoint, LogEntry, OpenedSession, SessionAppender, SessionKind,
+    SessionLog, SessionMetadata, SessionStore, StoredSession,
 };
 
-const MAX_THREAD_TITLE_CHARS: usize = 160;
+const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
-/// Immutable data needed to discover and display a thread without replaying it.
+/// Immutable data needed to discover and display a session without replaying it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ThreadHeader {
-    thread_id: ThreadId,
+struct SessionHeader {
+    session_id: SessionId,
     title: Option<String>,
     #[serde(default)]
-    kind: ThreadKind,
+    kind: SessionKind,
 }
 
 #[derive(Clone, Debug)]
 struct StoredHeader {
-    thread_id: ThreadId,
+    session_id: SessionId,
     created_at: String,
     title: Option<String>,
-    kind: ThreadKind,
+    kind: SessionKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,12 +40,12 @@ struct ContextCompactedRecord {
     tail_start_id: Option<MessageId>,
 }
 
-/// One durable entry on disk. Messages are split by role so a thread file is
+/// One durable entry on disk. Messages are split by role so a session file is
 /// readable at a glance; `from_entry`/`into_entry` map them to `LogEntry`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum FileRecord {
-    ThreadHeader(ThreadHeader),
+    SessionHeader(SessionHeader),
     TurnStart {
         turn_id: TurnId,
     },
@@ -70,7 +71,7 @@ impl FileRecord {
                 // Match on a borrow to pick the variant, then move the message
                 // into it without cloning.
                 let variant = match &message.content {
-                    MessageContent::User(_) => Self::UserMessage,
+                    MessageContent::User(_) | MessageContent::System(_) => Self::UserMessage,
                     MessageContent::Assistant(_) => Self::AssistantMessage,
                     MessageContent::ToolResult { .. } => Self::ToolResult,
                 };
@@ -110,7 +111,7 @@ impl FileRecord {
                 usage,
             }),
             Self::Rollback => Some(LogEntry::Rollback),
-            Self::ThreadHeader(_) => None,
+            Self::SessionHeader(_) => None,
         }
     }
 
@@ -142,14 +143,14 @@ impl FileLine {
 #[derive(Debug)]
 struct StoredFile {
     header: StoredHeader,
-    log: ThreadLog,
+    log: SessionLog,
 }
 
 impl StoredFile {
-    fn into_stored(self) -> StoredThread {
-        StoredThread {
-            metadata: ThreadMetadata {
-                thread_id: self.header.thread_id,
+    fn into_stored(self) -> StoredSession {
+        StoredSession {
+            metadata: SessionMetadata {
+                session_id: self.header.session_id,
                 kind: self.header.kind,
             },
             log: self.log,
@@ -184,7 +185,7 @@ impl Replay {
 
     fn finish(self, path: &Path) -> Result<StoredFile, ash_core::AshError> {
         let mut header = self.header.ok_or_else(|| missing_header(path))?;
-        let log = ThreadLog::from_entries(
+        let log = SessionLog::from_entries(
             self.records
                 .into_iter()
                 .filter_map(FileRecord::into_entry)
@@ -200,7 +201,7 @@ impl Replay {
 /// An exclusively locked append handle. The lock follows the file descriptor
 /// and is released automatically when the writer is dropped.
 #[derive(Debug)]
-pub struct ThreadWriter {
+pub struct SessionWriter {
     path: PathBuf,
     state: WriterState,
 }
@@ -210,14 +211,14 @@ pub struct ThreadWriter {
 /// are modelled as one enum instead of two optional fields.
 #[derive(Debug)]
 enum WriterState {
-    New { metadata: ThreadMetadata },
+    New { metadata: SessionMetadata },
     Open { file: tokio::fs::File },
 }
 
-impl ThreadWriter {
-    fn new(directory: &Path, metadata: ThreadMetadata) -> Self {
+impl SessionWriter {
+    fn new(directory: &Path, metadata: SessionMetadata) -> Self {
         Self {
-            path: directory.join(thread_filename(metadata.thread_id)),
+            path: directory.join(session_filename(metadata.session_id)),
             state: WriterState::New { metadata },
         }
     }
@@ -240,7 +241,7 @@ impl ThreadWriter {
             && is_new
         {
             return Err(ash_core::AshError::Config(
-                "thread store has no persisted turn to roll back".to_string(),
+                "session store has no persisted turn to roll back".to_string(),
             ));
         }
 
@@ -250,13 +251,13 @@ impl ThreadWriter {
                 // `is_new` was captured before any mutation, so this is
                 // unreachable; fail closed rather than panic.
                 return Err(ash_core::AshError::Config(
-                    "thread writer state changed during append".to_string(),
+                    "session writer state changed during append".to_string(),
                 ));
             };
             push_line(
                 &mut data,
-                FileRecord::ThreadHeader(ThreadHeader {
-                    thread_id: metadata.thread_id,
+                FileRecord::SessionHeader(SessionHeader {
+                    session_id: metadata.session_id,
                     title: title_from_entries(entries),
                     kind: metadata.kind,
                 }),
@@ -270,13 +271,13 @@ impl ThreadWriter {
             if let Some(parent) = self.path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let file = create_locked_thread(&self.path).await?;
+            let file = create_locked_session(&self.path).await?;
             self.state = WriterState::Open { file };
         }
         let WriterState::Open { file } = &mut self.state else {
             // Guaranteed by the `is_new` transition above.
             return Err(ash_core::AshError::Config(
-                "thread store was not materialized".to_string(),
+                "session store was not materialized".to_string(),
             ));
         };
         file.write_all(data.as_bytes()).await?;
@@ -286,36 +287,38 @@ impl ThreadWriter {
 }
 
 #[async_trait::async_trait]
-impl ThreadAppender for ThreadWriter {
+impl SessionAppender for SessionWriter {
     async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
         Self::append(self, entries).await
     }
 }
 
-pub struct JsonlThreadStore {
+pub struct JsonlSessionStore {
     directory: PathBuf,
 }
 
-impl Default for JsonlThreadStore {
+impl Default for JsonlSessionStore {
     fn default() -> Self {
+        let data_dir =
+            directories::ProjectDirs::from("", "", "ash").map(|dirs| dirs.data_dir().to_path_buf());
         Self {
-            directory: default_thread_dir(),
+            directory: session_dir_from_data_dir(data_dir),
         }
     }
 }
 
-impl JsonlThreadStore {
+impl JsonlSessionStore {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
         }
     }
 
-    async fn find_thread(
+    async fn find_session(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
     ) -> Result<Option<PathBuf>, ash_core::AshError> {
-        let path = self.directory.join(thread_filename(thread_id));
+        let path = self.directory.join(session_filename(session_id));
         if tokio::fs::try_exists(&path).await? {
             return Ok(Some(path));
         }
@@ -327,14 +330,14 @@ impl JsonlThreadStore {
         };
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if canonical_thread_id(&path) == Some(thread_id) {
+            if canonical_session_id(&path) == Some(session_id) {
                 return Ok(Some(path));
             }
         }
         Ok(None)
     }
 
-    async fn thread_paths(&self) -> Result<Vec<PathBuf>, ash_core::AshError> {
+    async fn session_paths(&self) -> Result<Vec<PathBuf>, ash_core::AshError> {
         let mut entries = match tokio::fs::read_dir(&self.directory).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -343,7 +346,7 @@ impl JsonlThreadStore {
         let mut candidates = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if !is_thread_file(&path) {
+            if canonical_session_id(&path).is_none() {
                 continue;
             }
             let modified = entry
@@ -359,55 +362,61 @@ impl JsonlThreadStore {
 }
 
 #[async_trait::async_trait]
-impl ThreadStore for JsonlThreadStore {
+impl SessionStore for JsonlSessionStore {
     async fn create(
         &self,
-        metadata: ThreadMetadata,
+        metadata: SessionMetadata,
         entries: &[LogEntry],
     ) -> Result<(), ash_core::AshError> {
-        ThreadWriter::new(&self.directory, metadata)
+        SessionWriter::new(&self.directory, metadata)
             .append(entries)
             .await
     }
 
-    async fn load(&self, thread_id: ThreadId) -> Result<Option<StoredThread>, ash_core::AshError> {
-        let Some(path) = self.find_thread(thread_id).await? else {
+    async fn load(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, ash_core::AshError> {
+        let Some(path) = self.find_session(session_id).await? else {
             return Ok(None);
         };
-        let stored = read_thread(&path).await?;
-        ensure_thread_id(stored.header.thread_id, thread_id, &path)?;
+        let stored = read_session(&path).await?;
+        ensure_session_id(stored.header.session_id, session_id, &path)?;
         Ok(Some(stored.into_stored()))
     }
 
-    async fn open(&self, thread_id: ThreadId) -> Result<Option<OpenedThread>, ash_core::AshError> {
-        let Some(path) = self.find_thread(thread_id).await? else {
+    async fn open(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<OpenedSession>, ash_core::AshError> {
+        let Some(path) = self.find_session(session_id).await? else {
             return Ok(None);
         };
-        let file = open_locked_thread(&path).await?;
+        let file = open_locked_session(&path).await?;
         let mut reader = tokio::io::BufReader::new(file);
-        let stored = replay_thread(&mut reader, &path).await?;
-        ensure_thread_id(stored.header.thread_id, thread_id, &path)?;
+        let stored = replay_session(&mut reader, &path).await?;
+        ensure_session_id(stored.header.session_id, session_id, &path)?;
         let mut file = reader.into_inner();
         ensure_newline_terminated(&mut file).await?;
-        Ok(Some(OpenedThread {
-            thread: stored.into_stored(),
-            writer: Box::new(ThreadWriter::existing(path, file)),
+        Ok(Some(OpenedSession {
+            session: stored.into_stored(),
+            writer: Box::new(SessionWriter::existing(path, file)),
         }))
     }
 
     async fn list(
         &self,
-        excluded_thread: Option<ThreadId>,
-    ) -> Result<Vec<ThreadSummary>, ash_core::AshError> {
+        excluded_session: Option<SessionId>,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         let mut summaries = Vec::new();
-        for path in self.thread_paths().await? {
+        for path in self.session_paths().await? {
             match read_summary(&path).await {
-                Ok(Some(summary)) if Some(summary.thread_id) != excluded_thread => {
+                Ok(Some(summary)) if Some(summary.session_id) != excluded_session => {
                     summaries.push(summary);
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping unreadable thread");
+                    warn!(path = %path.display(), %error, "skipping unreadable session");
                 }
             }
         }
@@ -416,9 +425,9 @@ impl ThreadStore for JsonlThreadStore {
 
     async fn open_writer(
         &self,
-        metadata: ThreadMetadata,
-    ) -> Result<Box<dyn ThreadAppender>, ash_core::AshError> {
-        Ok(Box::new(ThreadWriter::new(&self.directory, metadata)))
+        metadata: SessionMetadata,
+    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
+        Ok(Box::new(SessionWriter::new(&self.directory, metadata)))
     }
 }
 
@@ -431,46 +440,33 @@ fn push_line(data: &mut String, record: FileRecord) -> Result<(), ash_core::AshE
     Ok(())
 }
 
-fn default_thread_dir() -> PathBuf {
-    thread_dir_from_data_dir(
-        directories::ProjectDirs::from("", "", "ash").map(|dirs| dirs.data_dir().to_path_buf()),
-    )
-}
-
-/// The default threads directory is the platform data dir plus `threads`, or
-/// the relative `.ash/threads` fallback when no platform data dir is
-/// available. Pure so both branches are covered by regression tests.
-fn thread_dir_from_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
+fn session_dir_from_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
     data_dir.map_or_else(
-        || PathBuf::from(".ash").join("threads"),
-        |dir| dir.join("threads"),
+        || PathBuf::from(".ash").join("sessions"),
+        |dir| dir.join("sessions"),
     )
 }
 
-fn thread_filename(thread_id: ThreadId) -> String {
-    format!("{thread_id}.jsonl")
+fn session_filename(session_id: SessionId) -> String {
+    format!("{session_id}.jsonl")
 }
 
-fn is_thread_file(path: &Path) -> bool {
-    canonical_thread_id(path).is_some()
-}
-
-fn canonical_thread_id(path: &Path) -> Option<ThreadId> {
+fn canonical_session_id(path: &Path) -> Option<SessionId> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
         return None;
     }
     path.file_stem()?.to_str()?.parse().ok()
 }
 
-async fn create_locked_thread(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    locked_thread(path, true).await
+async fn create_locked_session(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
+    locked_session(path, true).await
 }
 
-async fn open_locked_thread(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    locked_thread(path, false).await
+async fn open_locked_session(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
+    locked_session(path, false).await
 }
 
-async fn locked_thread(
+async fn locked_session(
     path: &Path,
     create_new: bool,
 ) -> Result<tokio::fs::File, ash_core::AshError> {
@@ -480,17 +476,17 @@ async fn locked_thread(
         options.create_new(true);
     }
     let file = options.open(path).await?;
-    lock_thread(file, path).await
+    lock_session(file, path).await
 }
 
-async fn lock_thread(
+async fn lock_session(
     file: tokio::fs::File,
     path: &Path,
 ) -> Result<tokio::fs::File, ash_core::AshError> {
     let file = file.into_std().await;
     file.try_lock().map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => ash_core::AshError::Config(format!(
-            "thread is already open in another runtime: {}",
+            "session is already open in another runtime: {}",
             path.display()
         )),
         std::fs::TryLockError::Error(error) => error.into(),
@@ -498,12 +494,12 @@ async fn lock_thread(
     Ok(tokio::fs::File::from_std(file))
 }
 
-async fn read_thread(path: &Path) -> Result<StoredFile, ash_core::AshError> {
+async fn read_session(path: &Path) -> Result<StoredFile, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
-    replay_thread(&mut tokio::io::BufReader::new(file), path).await
+    replay_session(&mut tokio::io::BufReader::new(file), path).await
 }
 
-async fn replay_thread<R>(reader: &mut R, path: &Path) -> Result<StoredFile, ash_core::AshError>
+async fn replay_session<R>(reader: &mut R, path: &Path) -> Result<StoredFile, ash_core::AshError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -515,7 +511,7 @@ where
             match serde_json::from_str::<FileLine>(value) {
                 Ok(parsed) => replay.apply(parsed),
                 Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping malformed thread line");
+                    warn!(path = %path.display(), %error, "skipping malformed session line");
                 }
             }
         }
@@ -524,7 +520,7 @@ where
     replay.finish(path)
 }
 
-async fn read_summary(path: &Path) -> Result<Option<ThreadSummary>, ash_core::AshError> {
+async fn read_summary(path: &Path) -> Result<Option<SessionSummary>, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     let mut reader = tokio::io::BufReader::new(file);
     let Some(first) = read_first_record(&mut reader, path).await? else {
@@ -532,17 +528,17 @@ async fn read_summary(path: &Path) -> Result<Option<ThreadSummary>, ash_core::As
     };
     let mut header =
         stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
-    if let Some(thread_id) = canonical_thread_id(path) {
-        ensure_thread_id(header.thread_id, thread_id, path)?;
+    if let Some(session_id) = canonical_session_id(path) {
+        ensure_session_id(header.session_id, session_id, path)?;
     }
-    if header.kind == ThreadKind::Subagent {
+    if header.kind == SessionKind::Subagent {
         return Ok(None);
     }
     if header.title.is_none() {
         header.title = read_first_user_title(&mut reader, path).await?;
     }
-    Ok(header.title.map(|title| ThreadSummary {
-        thread_id: header.thread_id,
+    Ok(header.title.map(|title| SessionSummary {
+        session_id: header.session_id,
         title,
         created_at: display_created_at(&header.created_at),
     }))
@@ -550,8 +546,8 @@ async fn read_summary(path: &Path) -> Result<Option<ThreadSummary>, ash_core::As
 
 fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
     match record {
-        FileRecord::ThreadHeader(header) => Some(StoredHeader {
-            thread_id: header.thread_id,
+        FileRecord::SessionHeader(header) => Some(StoredHeader {
+            session_id: header.session_id,
             created_at: timestamp.to_string(),
             title: header.title.clone(),
             kind: header.kind,
@@ -576,7 +572,7 @@ where
         }
         return serde_json::from_str(value).map(Some).map_err(|error| {
             ash_core::AshError::Config(format!(
-                "invalid thread header in {}: {error}",
+                "invalid session header in {}: {error}",
                 path.display()
             ))
         });
@@ -602,7 +598,7 @@ where
                     }
                 }
                 Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping malformed thread line");
+                    warn!(path = %path.display(), %error, "skipping malformed session line");
                 }
             }
         }
@@ -613,21 +609,21 @@ where
 
 fn missing_header(path: &Path) -> ash_core::AshError {
     ash_core::AshError::Config(format!(
-        "thread file is missing its header: {}",
+        "session file is missing its header: {}",
         path.display()
     ))
 }
 
-fn ensure_thread_id(
-    actual: ThreadId,
-    expected: ThreadId,
+fn ensure_session_id(
+    actual: SessionId,
+    expected: SessionId,
     path: &Path,
 ) -> Result<(), ash_core::AshError> {
     if actual == expected {
         return Ok(());
     }
     Err(ash_core::AshError::Config(format!(
-        "thread id in header does not match filename {}: expected {expected}, found {actual}",
+        "session id in header does not match filename {}: expected {expected}, found {actual}",
         path.display()
     )))
 }
@@ -668,20 +664,20 @@ fn shorten_title(title: &str) -> String {
     let mut chars = title.chars();
     let prefix = chars
         .by_ref()
-        .take(MAX_THREAD_TITLE_CHARS)
+        .take(MAX_SESSION_TITLE_CHARS)
         .collect::<String>();
     if chars.next().is_none() {
         return prefix;
     }
     prefix
         .chars()
-        .take(MAX_THREAD_TITLE_CHARS - 3)
+        .take(MAX_SESSION_TITLE_CHARS - 3)
         .chain("...".chars())
         .collect()
 }
 
 #[cfg(test)]
-fn thread_title(messages: &[Message]) -> String {
+fn session_title(messages: &[Message]) -> String {
     title_from_messages(messages).unwrap_or_else(|| UNTITLED_CHAT.to_string())
 }
 
@@ -718,82 +714,84 @@ mod tests {
 
     use super::*;
 
-    fn metadata(thread_id: ThreadId, kind: ThreadKind) -> ThreadMetadata {
-        ThreadMetadata { thread_id, kind }
+    fn metadata(session_id: SessionId, kind: SessionKind) -> SessionMetadata {
+        SessionMetadata { session_id, kind }
     }
 
-    async fn create_thread(
-        store: &JsonlThreadStore,
-        thread_id: ThreadId,
-        kind: ThreadKind,
+    async fn create_session(
+        store: &JsonlSessionStore,
+        session_id: SessionId,
+        kind: SessionKind,
         entries: &[LogEntry],
     ) {
         store
-            .create(metadata(thread_id, kind), entries)
+            .create(metadata(session_id, kind), entries)
             .await
             .unwrap();
     }
 
     #[test]
-    fn uses_the_thread_id_as_the_filename() {
-        let thread_id = ThreadId::new();
+    fn uses_the_session_id_as_the_filename() {
+        let session_id = SessionId::new();
 
-        assert_eq!(thread_filename(thread_id), format!("{thread_id}.jsonl"));
+        assert_eq!(session_filename(session_id), format!("{session_id}.jsonl"));
     }
 
     #[tokio::test]
     async fn opening_a_new_writer_does_not_create_a_file() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
         let writer = store
-            .open_writer(metadata(thread_id, ThreadKind::Root))
+            .open_writer(metadata(session_id, SessionKind::Root))
             .await
             .unwrap();
 
-        assert!(!directory.path().join(thread_filename(thread_id)).exists());
+        assert!(!directory.path().join(session_filename(session_id)).exists());
         drop(writer);
     }
 
     #[tokio::test]
-    async fn creating_a_thread_without_entries_does_not_create_a_file() {
+    async fn creating_a_session_without_entries_does_not_create_a_file() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
 
-        create_thread(&store, thread_id, ThreadKind::Root, &[]).await;
+        create_session(&store, session_id, SessionKind::Root, &[]).await;
 
-        assert!(!directory.path().join(thread_filename(thread_id)).exists());
-        assert!(store.load(thread_id).await.unwrap().is_none());
+        assert!(!directory.path().join(session_filename(session_id)).exists());
+        assert!(store.load(session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn writes_a_compact_header_before_the_log() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
-        create_thread(
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(
             &store,
-            thread_id,
-            ThreadKind::Root,
+            session_id,
+            SessionKind::Root,
             &[LogEntry::Message(Message::user(
-                "  First thread title\nwith details  ",
+                "  First session title\nwith details  ",
             ))],
         )
         .await;
 
-        let path = directory.path().join(thread_filename(thread_id));
+        let path = directory.path().join(session_filename(session_id));
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
         let first = serde_json::from_str::<FileLine>(contents.lines().next().unwrap()).unwrap();
         assert!(matches!(
             first.record,
-            FileRecord::ThreadHeader(ThreadHeader { title: Some(ref title), .. })
-                if title == "First thread title with details"
+            FileRecord::SessionHeader(SessionHeader { title: Some(ref title), .. })
+                if title == "First session title with details"
         ));
         assert!(!contents.contains("system_prompt"));
+        assert!(contents.contains(r#""type":"session_header""#));
+        assert!(contents.contains(r#""session_id""#));
 
-        let loaded = read_thread(&path).await.unwrap();
-        assert_eq!(loaded.header.thread_id, thread_id);
+        let loaded = read_session(&path).await.unwrap();
+        assert_eq!(loaded.header.session_id, session_id);
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.model_context().len(), 1);
     }
@@ -801,36 +799,36 @@ mod tests {
     #[tokio::test]
     async fn holds_an_exclusive_lock_for_the_open_writer() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
-        create_thread(
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(
             &store,
-            thread_id,
-            ThreadKind::Root,
+            session_id,
+            SessionKind::Root,
             &[LogEntry::Message(Message::user("question"))],
         )
         .await;
 
-        let opened = store.open(thread_id).await.unwrap().unwrap();
-        let error = store.open(thread_id).await.unwrap_err();
+        let opened = store.open(session_id).await.unwrap().unwrap();
+        let error = store.open(session_id).await.unwrap_err();
         assert!(error.to_string().contains("already open"));
 
         drop(opened);
-        assert!(store.open(thread_id).await.unwrap().is_some());
+        assert!(store.open(session_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn appends_rollback_and_replays_without_the_last_turn() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
         let first = Message::user("first");
         let first_answer = Message::assistant_text("first answer");
         let second = Message::user("second");
-        create_thread(
+        create_session(
             &store,
-            thread_id,
-            ThreadKind::Root,
+            session_id,
+            SessionKind::Root,
             &[
                 LogEntry::TurnStart(TurnId::new()),
                 LogEntry::Message(first),
@@ -841,11 +839,11 @@ mod tests {
             ],
         )
         .await;
-        let mut opened = store.open(thread_id).await.unwrap().unwrap();
+        let mut opened = store.open(session_id).await.unwrap().unwrap();
         opened.writer.append(&[LogEntry::Rollback]).await.unwrap();
         drop(opened);
 
-        let loaded = store.load(thread_id).await.unwrap().unwrap();
+        let loaded = store.load(session_id).await.unwrap().unwrap();
         let messages = loaded.log.messages();
         // history keeps only user messages; the second turn is rolled back.
         assert_eq!(messages.len(), 1);
@@ -855,14 +853,14 @@ mod tests {
     #[tokio::test]
     async fn compaction_keeps_full_history_and_rebuilds_only_model_context() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
         let recent_request = Message::user("recent request");
         let recent_answer = Message::assistant_text("recent answer");
-        create_thread(
+        create_session(
             &store,
-            thread_id,
-            ThreadKind::Root,
+            session_id,
+            SessionKind::Root,
             &[
                 LogEntry::Message(Message::user("old request")),
                 LogEntry::Message(Message::assistant_text("old answer")),
@@ -871,7 +869,7 @@ mod tests {
             ],
         )
         .await;
-        let mut opened = store.open(thread_id).await.unwrap().unwrap();
+        let mut opened = store.open(session_id).await.unwrap().unwrap();
         opened
             .writer
             .append(&[LogEntry::Checkpoint(
@@ -886,48 +884,48 @@ mod tests {
             .unwrap();
         drop(opened);
 
-        let loaded = store.load(thread_id).await.unwrap().unwrap();
+        let loaded = store.load(session_id).await.unwrap().unwrap();
         assert_eq!(loaded.log.messages().len(), 4);
         assert_eq!(loaded.log.model_context().len(), 3);
-        assert_eq!(thread_title(&loaded.log.messages()), "old request");
+        assert_eq!(session_title(&loaded.log.messages()), "old request");
     }
 
     #[tokio::test]
-    async fn lists_new_threads_from_the_first_line() {
+    async fn lists_new_sessions_from_the_first_line() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
-        create_thread(
+        let session_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(
             &store,
-            thread_id,
-            ThreadKind::Root,
-            &[LogEntry::Message(Message::user("thread title"))],
+            session_id,
+            SessionKind::Root,
+            &[LogEntry::Message(Message::user("session title"))],
         )
         .await;
-        let path = directory.path().join(thread_filename(thread_id));
+        let path = directory.path().join(session_filename(session_id));
         let mut contents = tokio::fs::read_to_string(&path).await.unwrap();
         contents.push_str("malformed tail that list must not read\n");
         tokio::fs::write(&path, contents).await.unwrap();
 
         let listed = store.list(None).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].thread_id, thread_id);
-        assert_eq!(listed[0].title, "thread title");
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].title, "session title");
         assert_eq!(listed[0].created_at.len(), 16);
     }
 
     #[tokio::test]
     async fn loading_skips_a_malformed_record_and_keeps_the_valid_tail() {
         let directory = TempDir::new().unwrap();
-        let thread_id = ThreadId::new();
-        let path = directory.path().join(thread_filename(thread_id));
+        let session_id = SessionId::new();
+        let path = directory.path().join(session_filename(session_id));
         let mut contents = String::new();
         push_line(
             &mut contents,
-            FileRecord::ThreadHeader(ThreadHeader {
-                thread_id,
+            FileRecord::SessionHeader(SessionHeader {
+                session_id,
                 title: Some("recoverable".to_string()),
-                kind: ThreadKind::Root,
+                kind: SessionKind::Root,
             }),
         )
         .unwrap();
@@ -944,8 +942,8 @@ mod tests {
         .unwrap();
         tokio::fs::write(path, contents).await.unwrap();
 
-        let store = JsonlThreadStore::new(directory.path());
-        let loaded = store.load(thread_id).await.unwrap().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let loaded = store.load(session_id).await.unwrap().unwrap();
         let prompts = loaded
             .log
             .messages()
@@ -958,21 +956,21 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_header_that_does_not_match_the_filename() {
         let directory = TempDir::new().unwrap();
-        let filename_id = ThreadId::new();
-        let header_id = ThreadId::new();
-        let path = directory.path().join(thread_filename(filename_id));
+        let filename_id = SessionId::new();
+        let header_id = SessionId::new();
+        let path = directory.path().join(session_filename(filename_id));
         let mut contents = String::new();
         push_line(
             &mut contents,
-            FileRecord::ThreadHeader(ThreadHeader {
-                thread_id: header_id,
+            FileRecord::SessionHeader(SessionHeader {
+                session_id: header_id,
                 title: Some("mismatched".to_string()),
-                kind: ThreadKind::Root,
+                kind: SessionKind::Root,
             }),
         )
         .unwrap();
         tokio::fs::write(path, contents).await.unwrap();
-        let store = JsonlThreadStore::new(directory.path());
+        let store = JsonlSessionStore::new(directory.path());
 
         let error = store.load(filename_id).await.unwrap_err();
         assert!(error.to_string().contains("does not match filename"));
@@ -980,40 +978,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hides_subagent_threads_from_the_session_list() {
+    async fn hides_subagent_sessions_from_the_session_list() {
         let directory = TempDir::new().unwrap();
-        let root_id = ThreadId::new();
-        let subagent_id = ThreadId::new();
-        let store = JsonlThreadStore::new(directory.path());
-        create_thread(
+        let root_id = SessionId::new();
+        let subagent_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(
             &store,
             root_id,
-            ThreadKind::Root,
+            SessionKind::Root,
             &[LogEntry::Message(Message::user("root"))],
         )
         .await;
-        create_thread(
+        create_session(
             &store,
             subagent_id,
-            ThreadKind::Subagent,
+            SessionKind::Subagent,
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
 
         let listed = store.list(None).await.unwrap();
-        assert!(listed.iter().any(|summary| summary.thread_id == root_id));
+        assert!(listed.iter().any(|summary| summary.session_id == root_id));
         assert!(!listed
             .iter()
-            .any(|summary| summary.thread_id == subagent_id));
+            .any(|summary| summary.session_id == subagent_id));
     }
 
     #[tokio::test]
     async fn writer_reuses_the_locked_file_handle() {
         let directory = TempDir::new().unwrap();
-        let store = JsonlThreadStore::new(directory.path());
-        let thread_id = ThreadId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        let session_id = SessionId::new();
         let mut writer = store
-            .open_writer(metadata(thread_id, ThreadKind::Root))
+            .open_writer(metadata(session_id, SessionKind::Root))
             .await
             .unwrap();
         let turn_id = TurnId::new();
@@ -1025,7 +1023,7 @@ mod tests {
             ])
             .await
             .unwrap();
-        assert!(directory.path().join(thread_filename(thread_id)).exists());
+        assert!(directory.path().join(session_filename(session_id)).exists());
         writer
             .append(&[
                 LogEntry::Message(Message::assistant_text("answer")),
@@ -1038,33 +1036,33 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store.load(thread_id).await.unwrap().unwrap();
+        let loaded = store.load(session_id).await.unwrap().unwrap();
         assert_eq!(loaded.log.messages().len(), 2);
     }
 
     #[test]
-    fn default_thread_dir_appends_threads_to_the_platform_data_dir() {
+    fn default_session_dir_appends_sessions_to_the_platform_data_dir() {
         let data_dir = PathBuf::from("var/lib/ash");
         assert_eq!(
-            thread_dir_from_data_dir(Some(data_dir.clone())),
-            data_dir.join("threads")
+            session_dir_from_data_dir(Some(data_dir.clone())),
+            data_dir.join("sessions")
         );
     }
 
     #[test]
-    fn default_thread_dir_falls_back_to_a_relative_dot_ash_dir() {
+    fn default_session_dir_falls_back_to_a_relative_dot_ash_dir() {
         assert_eq!(
-            thread_dir_from_data_dir(None),
-            PathBuf::from(".ash").join("threads")
+            session_dir_from_data_dir(None),
+            PathBuf::from(".ash").join("sessions")
         );
     }
 
     #[test]
     fn limits_titles_stored_in_the_header() {
-        let title = "a".repeat(MAX_THREAD_TITLE_CHARS + 20);
-        let shortened = thread_title(&[Message::user(&title)]);
+        let title = "a".repeat(MAX_SESSION_TITLE_CHARS + 20);
+        let shortened = session_title(&[Message::user(&title)]);
 
-        assert_eq!(shortened.chars().count(), MAX_THREAD_TITLE_CHARS);
+        assert_eq!(shortened.chars().count(), MAX_SESSION_TITLE_CHARS);
         assert!(shortened.ends_with("..."));
     }
 }

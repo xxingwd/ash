@@ -1,16 +1,16 @@
-use ash_core::{ThreadId, ThreadSummary};
+use ash_core::{SessionId, SessionSummary};
 
 use crate::picker::PickerState;
 
 #[derive(Debug, Default)]
 pub struct SessionPickerState {
-    inner: PickerState<ThreadSummary>,
+    inner: PickerState<SessionSummary>,
 }
 
 impl SessionPickerState {
-    pub(crate) const fn with_items(threads: Vec<ThreadSummary>) -> Self {
+    pub(crate) const fn with_items(sessions: Vec<SessionSummary>) -> Self {
         Self {
-            inner: PickerState::with_items(threads),
+            inner: PickerState::with_items(sessions),
         }
     }
 
@@ -18,7 +18,7 @@ impl SessionPickerState {
         self.inner.is_visible()
     }
 
-    pub(crate) fn threads(&self) -> &[ThreadSummary] {
+    pub(crate) fn sessions(&self) -> &[SessionSummary] {
         self.inner.items()
     }
 
@@ -26,11 +26,11 @@ impl SessionPickerState {
         self.inner.selected_index()
     }
 
-    pub(crate) fn selected_thread_id(&self) -> Option<ThreadId> {
+    pub(crate) fn selected_session_id(&self) -> Option<SessionId> {
         self.inner
             .items()
             .get(self.inner.selected_index())
-            .map(|session| session.thread_id)
+            .map(|session| session.session_id)
     }
 
     pub(crate) const fn move_up(&mut self) {
@@ -46,9 +46,9 @@ impl SessionPickerState {
 mod tests {
     use super::*;
 
-    fn summary(title: &str) -> ThreadSummary {
-        ThreadSummary {
-            thread_id: ThreadId::new(),
+    fn summary(title: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: SessionId::new(),
             title: title.to_string(),
             created_at: "2026-07-15 12:00".to_string(),
         }
@@ -60,10 +60,10 @@ mod tests {
         let second = summary("second");
         let mut picker = SessionPickerState::with_items(vec![first.clone(), second.clone()]);
 
-        assert_eq!(picker.selected_thread_id(), Some(first.thread_id));
+        assert_eq!(picker.selected_session_id(), Some(first.session_id));
         picker.move_up();
-        assert_eq!(picker.selected_thread_id(), Some(second.thread_id));
+        assert_eq!(picker.selected_session_id(), Some(second.session_id));
         picker.move_down();
-        assert_eq!(picker.selected_thread_id(), Some(first.thread_id));
+        assert_eq!(picker.selected_session_id(), Some(first.session_id));
     }
 }

@@ -53,6 +53,16 @@ pub fn read_all(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<Vec<u8>, ToolError> {
+    read_limited(reader, path, usize::MAX, cancellation, deadline)
+}
+
+pub fn read_limited(
+    reader: &mut impl Read,
+    path: &Path,
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<u8>, ToolError> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; IO_BUFFER_BYTES];
     loop {
@@ -62,6 +72,13 @@ pub fn read_all(
         })?;
         if count == 0 {
             return Ok(output);
+        }
+        if output.len().saturating_add(count) > max_bytes {
+            return Err(ToolError::Execution(format!(
+                "{} exceeds the {} read limit",
+                path.display(),
+                crate::truncate::format_size(max_bytes)
+            )));
         }
         output.extend_from_slice(&buffer[..count]);
     }
@@ -186,10 +203,6 @@ impl WorkspacePath {
 
     pub(crate) fn full_path(&self) -> &Path {
         &self.full_path
-    }
-
-    pub(crate) fn relative_path(&self) -> &Path {
-        &self.relative
     }
 
     pub(crate) fn open_with(
@@ -431,6 +444,26 @@ mod tests {
         assert!(matches!(
             ensure_running(&CancellationToken::new(), Instant::now()),
             Err(ToolError::DeadlineExceeded)
+        ));
+    }
+
+    #[test]
+    fn read_limited_rejects_input_over_the_byte_budget() {
+        let cancellation = CancellationToken::new();
+        let mut reader = std::io::Cursor::new(vec![b'x'; 16]);
+
+        let error = read_limited(
+            &mut reader,
+            Path::new("file"),
+            8,
+            &cancellation,
+            Instant::now() + Duration::from_mins(1),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Execution(message) if message == "file exceeds the 8B read limit"
         ));
     }
 

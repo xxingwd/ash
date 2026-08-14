@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Where an input originated. Delivery policy is expressed by the Thread API.
+/// Where an input originated. Delivery policy is expressed by the Session API.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputSource {

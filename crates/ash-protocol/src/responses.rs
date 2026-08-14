@@ -397,9 +397,7 @@ impl ResponsesDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{
-        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
-    };
+    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -564,17 +562,13 @@ mod tests {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![
-                    ContentBlock::Thought {
-                        text: "private reasoning".into(),
-                        elapsed_seconds: 2,
-                    },
-                    ContentBlock::Text("visible answer".into()),
-                ]),
-            }],
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thought {
+                    text: "private reasoning".into(),
+                    elapsed_seconds: 2,
+                },
+                ContentBlock::Text("visible answer".into()),
+            ])],
             tools: Vec::new(),
             max_tokens: None,
         };

@@ -1,7 +1,15 @@
+mod message_history;
 mod modes;
 
+use ash_protocol::Protocol;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+fn parse_protocol_arg(value: &str) -> Result<Protocol, String> {
+    value
+        .parse()
+        .map_err(|_| format!("unknown protocol: {value}"))
+}
 
 #[derive(Parser)]
 #[command(name = "ash", about = "AI coding agent", version)]
@@ -15,8 +23,8 @@ struct Cli {
     skill: Option<String>,
 
     /// Provider protocol (anthropic, openai, openai-responses)
-    #[arg(long)]
-    protocol: Option<String>,
+    #[arg(long, value_parser = parse_protocol_arg)]
+    protocol: Option<Protocol>,
 
     /// Base URL override
     #[arg(long)]

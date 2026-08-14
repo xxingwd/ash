@@ -3,7 +3,7 @@ source: crates/ash-core/tests/snapshots.rs
 expression: event
 ---
 {
-  "thread_id": "[uuid]",
+  "session_id": "[uuid]",
   "turn_id": "[uuid]",
   "sequence": 3,
   "timestamp": "2026-07-31T06:15:28Z",

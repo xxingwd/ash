@@ -1,4 +1,4 @@
-use ash_core::{ForkPoint, ThreadSummary};
+use ash_core::{ForkPoint, SessionSummary};
 
 use crate::{
     fork_picker::ForkPickerState,
@@ -15,7 +15,7 @@ pub enum MenuView<'a> {
         selected: usize,
     },
     Sessions {
-        items: &'a [ThreadSummary],
+        items: &'a [SessionSummary],
         selected: usize,
     },
     ForkPoints {
@@ -62,7 +62,7 @@ impl ComposerMenuState {
                 selected: completion.selected_index(),
             },
             Self::Sessions(picker) if picker.is_visible() => MenuView::Sessions {
-                items: picker.threads(),
+                items: picker.sessions(),
                 selected: picker.selected_index(),
             },
             Self::ForkPoints(picker) if picker.is_visible() => MenuView::ForkPoints {
@@ -106,15 +106,15 @@ impl ComposerMenuState {
         self.session_picker_is_visible() || self.fork_picker_is_visible()
     }
 
-    pub(crate) fn open_threads(&mut self, threads: Vec<ThreadSummary>) {
-        *self = Self::Sessions(SessionPickerState::with_items(threads));
+    pub(crate) fn open_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        *self = Self::Sessions(SessionPickerState::with_items(sessions));
     }
 
     pub(crate) fn open_fork_points(&mut self, points: Vec<ForkPoint>) {
         *self = Self::ForkPoints(ForkPickerState::with_items(points));
     }
 
-    pub(crate) fn close_threads(&mut self) {
+    pub(crate) fn close_sessions(&mut self) {
         if matches!(self, Self::Sessions(_)) {
             *self = Self::default();
         }
@@ -129,7 +129,7 @@ impl ComposerMenuState {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{ForkPoint, MessageId, ThreadId, ThreadSummary};
+    use ash_core::{ForkPoint, MessageId, SessionId, SessionSummary};
 
     use super::*;
 
@@ -139,8 +139,8 @@ mod tests {
         menu.sync_commands("/", 1);
         assert!(matches!(menu.view(), MenuView::Commands { .. }));
 
-        menu.open_threads(vec![ThreadSummary {
-            thread_id: ThreadId::new(),
+        menu.open_sessions(vec![SessionSummary {
+            session_id: SessionId::new(),
             title: "saved chat".to_string(),
             created_at: "2026-07-28 12:00".to_string(),
         }]);

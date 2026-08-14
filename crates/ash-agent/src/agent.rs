@@ -2,50 +2,142 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ash_core::{ModelId, Tool, ToolDefinition, TreeId};
 
-use crate::{ContextPolicy, ThreadKind};
+use crate::{ContextPolicy, SessionKind};
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
 
-/// Immutable behavior shared by every thread that runs this agent.
+/// Immutable behavior shared by every session that runs this agent.
 #[derive(Clone)]
 pub struct Agent {
-    pub system_prompt: Option<String>,
-    pub tools: Vec<Arc<dyn Tool>>,
-    pub model: ModelId,
-    pub max_turns: u32,
-    pub max_context_tokens: usize,
-    pub context_policy: Arc<dyn ContextPolicy>,
+    system_prompt: Option<String>,
+    tools: Vec<Arc<dyn Tool>>,
+    model: ModelId,
+    max_turns: u32,
+    max_context_tokens: usize,
+    context_policy: Arc<dyn ContextPolicy>,
 }
 
-/// Per-thread execution scope.
+impl Agent {
+    #[must_use]
+    pub fn new(model: impl Into<ModelId>, tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self {
+            system_prompt: None,
+            tools,
+            model: model.into(),
+            max_turns: 100,
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+        }
+    }
+
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<ModelId>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_turns(mut self, max_turns: u32) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_context_tokens(mut self, max_context_tokens: usize) -> Self {
+        self.max_context_tokens = max_context_tokens;
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_policy(mut self, policy: Arc<dyn ContextPolicy>) -> Self {
+        self.context_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn pushing_tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
+    #[must_use]
+    pub fn without_tools(mut self, names: &[&str]) -> Self {
+        self.tools.retain(|tool| !names.contains(&tool.name()));
+        self
+    }
+
+    #[must_use]
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    #[must_use]
+    pub const fn max_turns(&self) -> u32 {
+        self.max_turns
+    }
+
+    #[must_use]
+    pub const fn max_context_tokens(&self) -> usize {
+        self.max_context_tokens
+    }
+
+    #[must_use]
+    pub fn context_policy(&self) -> &Arc<dyn ContextPolicy> {
+        &self.context_policy
+    }
+}
+
+/// Per-session execution scope.
 #[derive(Clone)]
-pub struct ThreadOptions {
+pub struct SessionOptions {
     pub working_dir: PathBuf,
     pub tool_timeout: Duration,
     pub path: String,
     pub tree_id: Option<TreeId>,
-    pub kind: ThreadKind,
+    pub kind: SessionKind,
 }
 
-impl Default for ThreadOptions {
+impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             working_dir: PathBuf::from("."),
             tool_timeout: Duration::from_mins(2),
             path: default_agent_path(),
             tree_id: None,
-            kind: ThreadKind::Root,
+            kind: SessionKind::Root,
         }
     }
 }
 
 /// The agent's root path defaults to the process working directory, matching
-/// the relative `working_dir` default. Falls back to `/root` only when the
-/// directory cannot be resolved (for example because it was removed).
+/// the relative `working_dir` default. Falls back to `.` only when the
+/// directory cannot be resolved.
 fn default_agent_path() -> String {
     std::env::current_dir().map_or_else(
-        |_| "/root".to_string(),
+        |_| ".".to_string(),
         |directory| directory.display().to_string(),
     )
 }
@@ -80,7 +172,7 @@ pub struct RunConfig {
     pub max_tool_duration: Duration,
     pub agent_path: String,
     pub tree_id: Option<TreeId>,
-    pub kind: ThreadKind,
+    pub kind: SessionKind,
     /// How many times a single model call may be retried after a safe,
     /// retryable failure (network error, upstream 5xx, rate limit, or a
     /// truncated stream). Retries only happen before any tool call has been
@@ -92,15 +184,15 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
-    pub(crate) fn new(agent: &Agent, options: &ThreadOptions) -> Self {
+    pub(crate) fn new(agent: &Agent, options: &SessionOptions) -> Self {
         Self {
-            system_prompt: agent.system_prompt.clone(),
-            tools: agent.tools.clone(),
-            model: agent.model.clone(),
-            max_turns: agent.max_turns,
+            system_prompt: agent.system_prompt().map(str::to_string),
+            tools: agent.tools().to_vec(),
+            model: agent.model().clone(),
+            max_turns: agent.max_turns(),
             working_dir: options.working_dir.clone(),
-            max_context_tokens: agent.max_context_tokens,
-            context_policy: Arc::clone(&agent.context_policy),
+            max_context_tokens: agent.max_context_tokens(),
+            context_policy: Arc::clone(agent.context_policy()),
             max_tool_duration: options.tool_timeout,
             agent_path: options.path.clone(),
             tree_id: options.tree_id,

@@ -10,8 +10,21 @@ pub enum AshError {
     Io(#[from] std::io::Error),
     #[error("config: {0}")]
     Config(String),
+    #[error("{0}")]
+    Session(#[from] SessionError),
     #[error("cancelled")]
     Cancelled,
+}
+
+/// Session lifecycle failures that callers already branch on.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum SessionError {
+    #[error("session is busy; cancel and wait for the active turn before retrying")]
+    Busy,
+    #[error("the target turn is not active")]
+    InactiveTurn,
+    #[error("session runtime has stopped")]
+    Closed,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

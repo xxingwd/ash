@@ -2,8 +2,6 @@ use derive_more::{Display, From, Into};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::FileChange;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into)]
 pub struct MessageId(Uuid);
 
@@ -55,6 +53,11 @@ impl TurnId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    #[must_use]
+    pub fn from_u128(value: u128) -> Self {
+        Self(Uuid::from_u128(value))
+    }
 }
 
 impl Default for TurnId {
@@ -76,22 +79,22 @@ impl Default for TurnId {
     Into,
     derive_more::Display,
 )]
-pub struct ThreadId(Uuid);
+pub struct SessionId(Uuid);
 
-impl ThreadId {
+impl SessionId {
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 }
 
-impl Default for ThreadId {
+impl Default for SessionId {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl std::str::FromStr for ThreadId {
+impl std::str::FromStr for SessionId {
     type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -115,8 +118,8 @@ impl Default for TreeId {
     }
 }
 
-impl From<ThreadId> for TreeId {
-    fn from(value: ThreadId) -> Self {
+impl From<SessionId> for TreeId {
+    fn from(value: SessionId) -> Self {
         Self(value.0)
     }
 }
@@ -177,9 +180,7 @@ pub enum Content {
     Image { media_type: String, data: Vec<u8> },
 }
 
-// `EnumAsInner` generates unsafe accessor methods; serde itself is safe here.
-#[allow(clippy::unsafe_derive_deserialize)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, enum_as_inner::EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
     Thought {
@@ -197,23 +198,39 @@ pub enum ContentBlock {
 pub enum MessageContent {
     User(Vec<Content>),
     Assistant(Vec<ContentBlock>),
+    System(Vec<Content>),
     ToolResult {
         id: ToolCallId,
         result: std::result::Result<String, String>,
         attachments: Vec<Content>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_change: Option<FileChange>,
     },
 }
 
+impl MessageContent {
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        match self {
+            Self::User(_) | Self::ToolResult { .. } => Role::User,
+            Self::Assistant(_) => Role::Assistant,
+            Self::System(_) => Role::System,
+        }
+    }
+}
+
+/// Durable transcript message. `role` is derived from `content` so illegal
+/// role/content pairs cannot be constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
-    pub role: Role,
     pub content: MessageContent,
 }
 
 impl Message {
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.content.role()
+    }
+
     #[must_use]
     pub fn user(text: &str) -> Self {
         Self::user_content(vec![Content::Text(text.to_string())])
@@ -223,32 +240,55 @@ impl Message {
     pub fn user_content(content: Vec<Content>) -> Self {
         Self {
             id: MessageId::new(),
-            role: Role::User,
             content: MessageContent::User(content),
         }
     }
 
     #[must_use]
-    pub fn assistant_text(text: &str) -> Self {
+    pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
         Self {
             id: MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(vec![ContentBlock::Text(text.to_string())]),
+            content: MessageContent::Assistant(blocks),
         }
     }
 
     #[must_use]
+    pub fn assistant_text(text: &str) -> Self {
+        Self::assistant(vec![ContentBlock::Text(text.to_string())])
+    }
+
+    #[must_use]
     pub fn system(text: &str) -> Self {
+        Self::system_content(vec![Content::Text(text.to_string())])
+    }
+
+    #[must_use]
+    pub fn system_content(content: Vec<Content>) -> Self {
         Self {
             id: MessageId::new(),
-            role: Role::System,
-            content: MessageContent::User(vec![Content::Text(text.to_string())]),
+            content: MessageContent::System(content),
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result(
+        id: ToolCallId,
+        result: std::result::Result<String, String>,
+        attachments: Vec<Content>,
+    ) -> Self {
+        Self {
+            id: MessageId::new(),
+            content: MessageContent::ToolResult {
+                id,
+                result,
+                attachments,
+            },
         }
     }
 
     #[must_use]
     pub fn is_user_turn(&self) -> bool {
-        self.role == Role::User && matches!(self.content, MessageContent::User(_))
+        matches!(self.content, MessageContent::User(_))
     }
 
     #[must_use]
@@ -261,8 +301,9 @@ impl Message {
     }
 
     pub fn content_text(&self) -> Option<String> {
-        let MessageContent::User(contents) = &self.content else {
-            return None;
+        let contents = match &self.content {
+            MessageContent::User(contents) | MessageContent::System(contents) => contents,
+            MessageContent::Assistant(_) | MessageContent::ToolResult { .. } => return None,
         };
         Some(
             contents
@@ -307,49 +348,17 @@ mod tests {
         assert!(!system.is_user_turn());
         assert_eq!(system.user_turn_text(), None);
         assert_eq!(system.content_text().as_deref(), Some("rules"));
+        assert_eq!(system.role(), Role::System);
     }
 
     #[test]
-    fn file_changes_round_trip_with_tool_results() {
-        let message = Message {
-            id: MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id: ToolCallId::from_provider("call-1"),
-                result: Ok("updated".to_string()),
-                attachments: Vec::new(),
-                file_change: Some(FileChange::Update {
-                    path: "src/main.rs".into(),
-                    unified_diff: "--- before\n+++ after\n-old\n+new\n".to_string(),
-                }),
-            },
-        };
+    fn messages_serialize_content_without_a_role_field() {
+        let json = serde_json::to_value(Message::system("rules")).unwrap();
+        let message: Message = serde_json::from_value(json.clone()).unwrap();
 
-        let encoded = serde_json::to_string(&message).unwrap();
-        let decoded = serde_json::from_str::<Message>(&encoded).unwrap();
-
-        assert_eq!(decoded, message);
-        assert!(encoded.contains("\"file_change\""));
-        assert!(encoded.contains("\"type\":\"update\""));
-    }
-
-    #[test]
-    fn tool_results_without_file_changes_remain_compatible() {
-        let content = serde_json::from_value::<MessageContent>(serde_json::json!({
-            "ToolResult": {
-                "id": "call-1",
-                "result": { "Ok": "done" },
-                "attachments": []
-            }
-        }))
-        .unwrap();
-
-        assert!(matches!(
-            content,
-            MessageContent::ToolResult {
-                file_change: None,
-                ..
-            }
-        ));
+        assert!(json.get("role").is_none());
+        assert_eq!(json["content"]["System"][0]["Text"], "rules");
+        assert_eq!(message.role(), Role::System);
+        assert!(matches!(message.content, MessageContent::System(_)));
     }
 }

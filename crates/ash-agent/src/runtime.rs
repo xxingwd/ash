@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
-use ash_core::{Message, ModelClient, ThreadId, ThreadSummary};
+use ash_core::{Message, ModelClient, SessionId, SessionSummary};
 
 use crate::{
-    agent::RunConfig, Agent, JsonlThreadStore, SharedThreadStore, Thread, ThreadOptions,
-    ThreadState, ThreadStore,
+    agent::RunConfig, Agent, JsonlSessionStore, Session, SessionOptions, SessionState,
+    SessionStore, SharedSessionStore,
 };
 
-/// Provider-neutral dependencies and the only entry point for creating threads.
+/// Provider-neutral dependencies and the only entry point for creating sessions.
 #[derive(Clone)]
 pub struct Runtime {
     model: Arc<dyn ModelClient>,
     model_backend: Arc<str>,
-    threads: SharedThreadStore,
+    sessions: SharedSessionStore,
 }
 
 impl Runtime {
@@ -20,69 +20,69 @@ impl Runtime {
         Self {
             model,
             model_backend: Arc::from(model_backend.into()),
-            threads: Arc::new(JsonlThreadStore::default()),
+            sessions: Arc::new(JsonlSessionStore::default()),
         }
     }
 
     #[must_use]
-    pub fn with_thread_store(mut self, threads: Arc<dyn ThreadStore>) -> Self {
-        self.threads = threads;
+    pub fn with_session_store(mut self, sessions: Arc<dyn SessionStore>) -> Self {
+        self.sessions = sessions;
         self
     }
 
     #[must_use]
-    pub fn start(&self, agent: &Agent, options: &ThreadOptions) -> Thread {
-        Thread::spawn(ThreadState::new(
+    pub fn start(&self, agent: &Agent, options: &SessionOptions) -> Session {
+        Session::spawn(SessionState::new(
             RunConfig::new(agent, options),
             self.clone(),
         ))
     }
 
-    /// Start a thread seeded with the given history.
+    /// Start a session seeded with the given history.
     ///
     /// # Errors
     ///
     /// Returns `AshError` when seeding the history fails.
     pub async fn start_with_history(
         &self,
-        agent: Agent,
-        options: ThreadOptions,
+        agent: &Agent,
+        options: &SessionOptions,
         history: Vec<Message>,
-    ) -> Result<Thread, ash_core::AshError> {
-        let mut state = ThreadState::new(RunConfig::new(&agent, &options), self.clone());
+    ) -> Result<Session, ash_core::AshError> {
+        let mut state = SessionState::new(RunConfig::new(agent, options), self.clone());
         state.seed(history).await?;
-        Ok(Thread::spawn(state))
+        Ok(Session::spawn(state))
     }
 
-    /// Resume an existing thread by id.
+    /// Resume an existing session by id.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread store cannot be read or the stored
-    /// thread cannot be replayed.
+    /// Returns `AshError` when the session store cannot be read or the stored
+    /// session cannot be replayed.
     pub async fn resume(
         &self,
-        agent: Agent,
-        options: ThreadOptions,
-        thread_id: ThreadId,
-    ) -> Result<Option<Thread>, ash_core::AshError> {
-        let mut state = ThreadState::new(RunConfig::new(&agent, &options), self.clone());
-        if !state.resume(thread_id).await? {
+        agent: &Agent,
+        options: &SessionOptions,
+        session_id: SessionId,
+    ) -> Result<Option<Session>, ash_core::AshError> {
+        let mut state = SessionState::new(RunConfig::new(agent, options), self.clone());
+        if !state.resume(session_id).await? {
             return Ok(None);
         }
-        Ok(Some(Thread::spawn(state)))
+        Ok(Some(Session::spawn(state)))
     }
 
-    /// List thread summaries, optionally excluding one thread.
+    /// List session summaries, optionally excluding one session.
     ///
     /// # Errors
     ///
-    /// Returns `AshError` when the thread store cannot be read.
-    pub async fn threads(
+    /// Returns `AshError` when the session store cannot be read.
+    pub async fn sessions(
         &self,
-        excluded: Option<ThreadId>,
-    ) -> Result<Vec<ThreadSummary>, ash_core::AshError> {
-        self.threads.list(excluded).await
+        excluded: Option<SessionId>,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        self.sessions.list(excluded).await
     }
 
     #[must_use]
@@ -99,7 +99,7 @@ impl Runtime {
         self.model.as_ref()
     }
 
-    pub(crate) fn thread_store_handle(&self) -> SharedThreadStore {
-        Arc::clone(&self.threads)
+    pub(crate) fn session_store_handle(&self) -> SharedSessionStore {
+        Arc::clone(&self.sessions)
     }
 }

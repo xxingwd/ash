@@ -1,4 +1,4 @@
-use std::{cell::RefCell, path::PathBuf, sync::Arc};
+use std::{cell::RefCell, path::PathBuf, sync::Arc, time::Instant};
 
 use ratatui::{
     buffer::{Buffer, Cell},
@@ -9,26 +9,26 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use ash_core::FileChange;
+use ash_core::{ToolCallId, TurnId};
 
 use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::{sanitize_single_line, sanitize_terminal_text, wrap_text},
     tool_display::{
-        read_group_detail, read_group_summary, tool_call_summary, tool_renderer, ToolRenderer,
+        display_path, read_group_detail, read_group_summary, running_tool_call_summary,
+        tool_call_summary, tool_renderer, ToolRenderer,
     },
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
-const COLLAPSED_CHANGE_MAX_LINES: usize = 12;
 
 /// A complete transcript entry retained by Ash and re-rendered after updates.
 #[derive(Clone, Debug)]
 pub struct LiveBlock {
     id: u64,
-    turn_id: Option<u64>,
+    turn_id: Option<TurnId>,
     kind: LiveBlockKind,
     cache: RefCell<Option<RenderCache>>,
 }
@@ -37,6 +37,7 @@ pub struct LiveBlock {
 struct RenderCache {
     width: u16,
     source_len: Option<usize>,
+    elapsed_seconds: Option<u64>,
     expanded: bool,
     buffer: Arc<Buffer>,
     streaming_markdown: Option<StreamingMarkdownCache>,
@@ -50,18 +51,28 @@ enum LiveBlockKind {
         source: String,
         streaming: bool,
     },
-    Thought {
+    Reasoning {
         source: String,
-        elapsed_seconds: u64,
+        state: ReasoningState,
     },
     ReadGroup(Vec<String>),
     Tool {
         name: String,
         arguments: Value,
-        output: String,
-        is_error: bool,
-        file_change: Option<FileChange>,
+        state: ToolState,
     },
+}
+
+#[derive(Clone, Debug)]
+enum ReasoningState {
+    Running { started_at: Instant },
+    Finished { elapsed_seconds: u64 },
+}
+
+#[derive(Clone, Debug)]
+enum ToolState {
+    Running { id: ToolCallId },
+    Finished { output: String, is_error: bool },
 }
 
 impl LiveBlock {
@@ -86,9 +97,21 @@ impl LiveBlock {
     pub(crate) const fn thought(id: u64, source: String, elapsed_seconds: u64) -> Self {
         Self::new(
             id,
-            LiveBlockKind::Thought {
+            LiveBlockKind::Reasoning {
                 source,
-                elapsed_seconds,
+                state: ReasoningState::Finished { elapsed_seconds },
+            },
+        )
+    }
+
+    pub(crate) fn reasoning(id: u64) -> Self {
+        Self::new(
+            id,
+            LiveBlockKind::Reasoning {
+                source: String::new(),
+                state: ReasoningState::Running {
+                    started_at: Instant::now(),
+                },
             },
         )
     }
@@ -99,7 +122,6 @@ impl LiveBlock {
         arguments: Value,
         output: String,
         is_error: bool,
-        file_change: Option<FileChange>,
     ) -> Self {
         if !is_error {
             if let Some(detail) = read_group_detail(&name, &arguments) {
@@ -111,9 +133,23 @@ impl LiveBlock {
             LiveBlockKind::Tool {
                 name,
                 arguments,
-                output,
-                is_error,
-                file_change,
+                state: ToolState::Finished { output, is_error },
+            },
+        )
+    }
+
+    pub(crate) fn running_tool(
+        block_id: u64,
+        id: ToolCallId,
+        name: String,
+        arguments: Value,
+    ) -> Self {
+        Self::new(
+            block_id,
+            LiveBlockKind::Tool {
+                name,
+                arguments,
+                state: ToolState::Running { id },
             },
         )
     }
@@ -127,7 +163,7 @@ impl LiveBlock {
         }
     }
 
-    pub(crate) const fn with_turn(mut self, turn_id: Option<u64>) -> Self {
+    pub(crate) const fn with_turn(mut self, turn_id: Option<TurnId>) -> Self {
         self.turn_id = turn_id;
         self
     }
@@ -136,23 +172,23 @@ impl LiveBlock {
         self.id
     }
 
-    pub(crate) fn belongs_to_turn(&self, turn_id: u64) -> bool {
+    pub(crate) fn belongs_to_turn(&self, turn_id: TurnId) -> bool {
         self.turn_id == Some(turn_id)
     }
 
-    pub(crate) const fn turn_id(&self) -> Option<u64> {
+    pub(crate) const fn turn_id(&self) -> Option<TurnId> {
         self.turn_id
     }
 
     /// Blocks produced by live streaming for this turn (assistant text,
     /// reasoning, tool output). They are replaced by the canonical projection
     /// when the turn settles; user input and error blocks are kept.
-    pub(crate) fn is_streamed_for_turn(&self, turn_id: u64) -> bool {
+    pub(crate) fn is_streamed_for_turn(&self, turn_id: TurnId) -> bool {
         self.belongs_to_turn(turn_id)
             && matches!(
                 self.kind,
                 LiveBlockKind::Assistant { .. }
-                    | LiveBlockKind::Thought { .. }
+                    | LiveBlockKind::Reasoning { .. }
                     | LiveBlockKind::ReadGroup(_)
                     | LiveBlockKind::Tool { .. }
             )
@@ -161,28 +197,33 @@ impl LiveBlock {
     /// Whether this turn has a completed tool result. Tool completion is the
     /// only reliable boundary while a streamed response is still active;
     /// finalized text and reasoning do not keep an interrupted turn.
-    pub(crate) fn is_completed_tool_for_turn(&self, turn_id: u64) -> bool {
+    pub(crate) fn is_completed_tool_for_turn(&self, turn_id: TurnId) -> bool {
         self.belongs_to_turn(turn_id)
             && matches!(
-                self.kind,
-                LiveBlockKind::ReadGroup(_) | LiveBlockKind::Tool { .. }
+                &self.kind,
+                LiveBlockKind::ReadGroup(_)
+                    | LiveBlockKind::Tool {
+                        state: ToolState::Finished { .. },
+                        ..
+                    }
             )
     }
 
-    pub(crate) fn is_unfinished_response_for_turn(&self, turn_id: u64) -> bool {
+    pub(crate) fn is_unfinished_response_for_turn(&self, turn_id: TurnId) -> bool {
         self.belongs_to_turn(turn_id)
             && matches!(
-                self.kind,
+                &self.kind,
                 LiveBlockKind::Assistant {
                     streaming: true,
                     ..
+                } | LiveBlockKind::Reasoning {
+                    state: ReasoningState::Running { .. },
+                    ..
+                } | LiveBlockKind::Tool {
+                    state: ToolState::Running { .. },
+                    ..
                 }
             )
-    }
-
-    pub(crate) fn matches_history_for_turn(&self, turn_id: u64, expected: &HistoryBlock) -> bool {
-        self.belongs_to_turn(turn_id)
-            && matches!(&self.kind, LiveBlockKind::History(actual) if actual == expected)
     }
 
     pub(crate) fn append_markdown_source(&mut self, source: &str) -> bool {
@@ -206,6 +247,70 @@ impl LiveBlock {
         self.invalidate();
     }
 
+    pub(crate) fn append_reasoning_source(&mut self, delta: &str) -> bool {
+        let LiveBlockKind::Reasoning {
+            source,
+            state: ReasoningState::Running { .. },
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        source.push_str(&sanitize_terminal_text(delta));
+        true
+    }
+
+    pub(crate) fn finish_reasoning(&mut self) -> bool {
+        let LiveBlockKind::Reasoning { source, state } = &mut self.kind else {
+            return false;
+        };
+        let ReasoningState::Running { started_at } = state else {
+            return false;
+        };
+        *state = ReasoningState::Finished {
+            elapsed_seconds: started_at.elapsed().as_secs(),
+        };
+        let has_content = !source.trim().is_empty();
+        self.invalidate();
+        has_content
+    }
+
+    pub(crate) fn finish_tool(&mut self, id: &ToolCallId, output: String, is_error: bool) -> bool {
+        let LiveBlockKind::Tool {
+            name,
+            arguments,
+            state: ToolState::Running { id: running_id },
+        } = &self.kind
+        else {
+            return false;
+        };
+        if running_id != id {
+            return false;
+        }
+        let read_detail = (!is_error)
+            .then(|| read_group_detail(name, arguments))
+            .flatten();
+        if let Some(detail) = read_detail {
+            self.kind = LiveBlockKind::ReadGroup(vec![detail]);
+        } else {
+            let LiveBlockKind::Tool { state, .. } = &mut self.kind else {
+                unreachable!("tool state changed while completing it");
+            };
+            *state = ToolState::Finished { output, is_error };
+        }
+        self.invalidate();
+        true
+    }
+
+    pub(crate) fn is_running_tool(&self, id: &ToolCallId) -> bool {
+        matches!(
+            &self.kind,
+            LiveBlockKind::Tool {
+                state: ToolState::Running { id: running_id },
+                ..
+            } if running_id == id
+        )
+    }
+
     pub(crate) fn try_append_tool(
         &mut self,
         name: &str,
@@ -226,9 +331,18 @@ impl LiveBlock {
         true
     }
 
+    /// A follow-up `read` can join this group without a separate running row.
+    /// Showing that row and then folding it back in would grow and shrink the
+    /// live viewport on every consecutive read.
+    pub(crate) fn can_group_read(&self, name: &str, arguments: &Value) -> bool {
+        read_group_detail(name, arguments).is_some()
+            && matches!(self.kind, LiveBlockKind::ReadGroup(_))
+    }
+
     pub(crate) fn render(&self, width: u16, expanded: bool) -> Arc<Buffer> {
         let width = width.max(1);
         let source_len = self.source_len();
+        let elapsed_seconds = self.running_elapsed_seconds();
         if let Some(buffer) = self
             .cache
             .borrow()
@@ -236,6 +350,7 @@ impl LiveBlock {
             .filter(|cached| {
                 cached.width == width
                     && cached.source_len == source_len
+                    && cached.elapsed_seconds == elapsed_seconds
                     && cached.expanded == expanded
             })
             .map(|cached| Arc::clone(&cached.buffer))
@@ -272,12 +387,32 @@ impl LiveBlock {
                 );
                 (buffer, Some(markdown))
             }
+            LiveBlockKind::Reasoning {
+                source,
+                state: ReasoningState::Running { .. },
+            } => {
+                let previous = previous.filter(|cached| cached.width == width);
+                let mut markdown = previous
+                    .and_then(|cached| cached.streaming_markdown)
+                    .unwrap_or_default();
+                let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
+                let tail = markdown.update(source, content_width);
+                let buffer = render_running_reasoning(
+                    elapsed_seconds.unwrap_or_default(),
+                    width,
+                    expanded,
+                    &markdown,
+                    &tail,
+                );
+                (buffer, Some(markdown))
+            }
             _ => (self.render_uncached(width, expanded), None),
         };
         let buffer = Arc::new(buffer);
         self.cache.replace(Some(RenderCache {
             width,
             source_len,
+            elapsed_seconds,
             expanded,
             buffer: Arc::clone(&buffer),
             streaming_markdown,
@@ -296,26 +431,25 @@ impl LiveBlock {
             LiveBlockKind::Assistant { source, .. } => {
                 render_markdown_block(source, Style::default(), width)
             }
-            LiveBlockKind::Thought {
+            LiveBlockKind::Reasoning {
                 source,
-                elapsed_seconds,
+                state: ReasoningState::Finished { elapsed_seconds },
             } => render_thought(source, *elapsed_seconds, width, expanded),
+            LiveBlockKind::Reasoning {
+                state: ReasoningState::Running { .. },
+                ..
+            } => unreachable!("running reasoning is rendered through the streaming cache"),
             LiveBlockKind::ReadGroup(details) => render_read_group(details, width),
             LiveBlockKind::Tool {
                 name,
                 arguments,
-                output,
-                is_error,
-                file_change,
-            } => render_tool(
+                state: ToolState::Running { .. },
+            } => render_running_tool(name, arguments, width, expanded),
+            LiveBlockKind::Tool {
                 name,
                 arguments,
-                output,
-                *is_error,
-                file_change.as_ref(),
-                width,
-                expanded,
-            ),
+                state: ToolState::Finished { output, is_error },
+            } => render_tool(name, arguments, output, *is_error, width, expanded),
         }
     }
 
@@ -325,10 +459,54 @@ impl LiveBlock {
 
     const fn source_len(&self) -> Option<usize> {
         match &self.kind {
-            LiveBlockKind::Assistant { source, .. } => Some(source.len()),
+            LiveBlockKind::Assistant { source, .. } | LiveBlockKind::Reasoning { source, .. } => {
+                Some(source.len())
+            }
             _ => None,
         }
     }
+
+    fn running_elapsed_seconds(&self) -> Option<u64> {
+        match &self.kind {
+            LiveBlockKind::Reasoning {
+                state: ReasoningState::Running { started_at },
+                ..
+            } => Some(started_at.elapsed().as_secs()),
+            _ => None,
+        }
+    }
+}
+
+fn render_running_reasoning(
+    elapsed_seconds: u64,
+    width: u16,
+    expanded: bool,
+    markdown: &StreamingMarkdownCache,
+    tail: &[RenderedLine],
+) -> Buffer {
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+    let mut header = render_markdown(
+        &format!(
+            "Thinking ({})",
+            crate::status_line::format_elapsed(elapsed_seconds)
+        ),
+        width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1),
+    );
+    let limit = if expanded {
+        crate::ansi::EXPANDED_MAX_LINES
+    } else {
+        crate::ansi::COLLAPSED_MAX_LINES
+    };
+    let mut body = markdown.latest_lines(tail, limit);
+    while body.last().is_some_and(RenderedLine::is_blank) {
+        body.pop();
+    }
+    render_markdown_lines(
+        &[],
+        &[header.as_mut_slice(), body.as_mut_slice()].concat(),
+        style,
+        width,
+    )
 }
 
 fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool) -> Buffer {
@@ -343,7 +521,7 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
             &Line::styled(
                 format!(
                     "• Thought for {}",
-                    crate::stream_state::format_elapsed(elapsed_seconds)
+                    crate::status_line::format_elapsed(elapsed_seconds)
                 ),
                 style,
             ),
@@ -367,7 +545,7 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
         &Line::styled(
             format!(
                 "• Thought for {} — expanded",
-                crate::stream_state::format_elapsed(elapsed_seconds)
+                crate::status_line::format_elapsed(elapsed_seconds)
             ),
             style,
         ),
@@ -387,8 +565,7 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
 }
 
 fn render_read_group(details: &[String], width: u16) -> Buffer {
-    let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let (action, detail) = read_group_summary(details, detail_width);
+    let (action, detail) = read_group_summary(details);
     render_tool_title(action, detail, false, width)
 }
 
@@ -548,23 +725,28 @@ fn render_tool(
     arguments: &Value,
     output: &str,
     is_error: bool,
-    file_change: Option<&FileChange>,
     width: u16,
     expanded: bool,
 ) -> Buffer {
-    if !is_error {
-        if let Some(file_change) = file_change {
-            return render_file_change(file_change, width, expanded);
-        }
-    }
     let show_output = match tool_renderer(name, is_error) {
         ToolRenderer::Bash => {
             return render_bash_tool(name, arguments, output, is_error, width, expanded);
         }
+        ToolRenderer::Edit => {
+            if let Some(rendered) = render_edit_tool(arguments, width) {
+                return rendered;
+            }
+            true
+        }
+        ToolRenderer::Write => {
+            if let Some(rendered) = render_write_tool(arguments, width) {
+                return rendered;
+            }
+            true
+        }
         ToolRenderer::Generic { show_output } => show_output,
     };
-    let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let (action, detail) = tool_call_summary(name, arguments, is_error, detail_width);
+    let (action, detail) = tool_call_summary(name, arguments, is_error);
     let title = render_tool_title(action, detail, is_error, width);
     if output.is_empty() {
         return title;
@@ -574,6 +756,19 @@ fn render_tool(
         rows.push(render_tool_output(output, width, expanded));
     }
     stack_rows(&rows, width)
+}
+
+fn render_running_tool(name: &str, arguments: &Value, width: u16, expanded: bool) -> Buffer {
+    if matches!(tool_renderer(name, false), ToolRenderer::Bash) {
+        let (action, _) = running_tool_call_summary(name, arguments);
+        let (title, continuation, _) =
+            render_bash_command_line_with_action(arguments, action, Color::Cyan, width, expanded);
+        return continuation.map_or(title.clone(), |continuation| {
+            stack_rows(&[title, continuation], width)
+        });
+    }
+    let (action, detail) = running_tool_call_summary(name, arguments);
+    render_tool_title_with_color(action, detail, Color::Cyan, width)
 }
 
 /// Render a bash tool call: the highlighted command (the "input") inline on
@@ -611,17 +806,21 @@ fn render_bash_command_line(
     width: u16,
     expanded: bool,
 ) -> (Buffer, Option<Buffer>, u16) {
+    let (action, _) = tool_call_summary(name, arguments, is_error);
+    let color = if is_error { Color::Red } else { Color::Green };
+    render_bash_command_line_with_action(arguments, action, color, width, expanded)
+}
+
+fn render_bash_command_line_with_action(
+    arguments: &Value,
+    action: String,
+    color: Color,
+    width: u16,
+    expanded: bool,
+) -> (Buffer, Option<Buffer>, u16) {
     use crate::ansi::highlight_bash_command;
 
-    let detail_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
-    let (action, _) = tool_call_summary(name, arguments, is_error, detail_width);
-    let bullet_style = if is_error {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    };
+    let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let mut header_spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
     header_spans.push(Span::styled(
         action,
@@ -760,13 +959,17 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
 }
 
 fn render_tool_title(action: String, detail: String, is_error: bool, width: u16) -> Buffer {
-    let bullet_style = if is_error {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    };
+    let color = if is_error { Color::Red } else { Color::Green };
+    render_tool_title_with_color(action, detail, color, width)
+}
+
+fn render_tool_title_with_color(
+    action: String,
+    detail: String,
+    color: Color,
+    width: u16,
+) -> Buffer {
+    let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
     spans.push(Span::styled(
         action,
@@ -792,30 +995,51 @@ fn render_tool_title(action: String, detail: String, is_error: bool, width: u16)
     buffer
 }
 
-fn render_file_change(change: &FileChange, width: u16, expanded: bool) -> Buffer {
-    let (action, path, added, removed, lines) = match change {
-        FileChange::Add { path, content } => {
-            let lines = sanitize_terminal_text(content)
-                .lines()
-                .map(|line| format!("+{line}"))
-                .collect::<Vec<_>>();
-            ("Added", path, lines.len(), 0, lines)
+fn render_edit_tool(arguments: &Value, width: u16) -> Option<Buffer> {
+    let path = tool_argument(arguments, "path")?;
+    let edits = arguments.get("edits")?.as_array()?;
+    let mut lines = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        let old_text = tool_argument(edit, "oldText")?;
+        let new_text = tool_argument(edit, "newText")?;
+        if index > 0 {
+            lines.push("@@".to_string());
         }
-        FileChange::Update { path, unified_diff } => {
-            let lines = sanitize_terminal_text(unified_diff)
-                .lines()
-                .enumerate()
-                .filter(|(index, line)| {
-                    !(*index < 2 && matches!(*line, "--- before" | "+++ after"))
-                })
-                .map(|(_, line)| line)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            let (added, removed) = changed_line_counts(&lines);
-            ("Edited", path, added, removed, lines)
-        }
-    };
-    let path = sanitize_single_line(&path.display().to_string());
+        extend_change_lines(&mut lines, '-', &old_text);
+        extend_change_lines(&mut lines, '+', &new_text);
+    }
+    let (added, removed) = changed_line_counts(&lines);
+    Some(render_file_change(
+        "Edited", &path, added, removed, lines, width,
+    ))
+}
+
+fn render_write_tool(arguments: &Value, width: u16) -> Option<Buffer> {
+    let path = tool_argument(arguments, "path")?;
+    let content = tool_argument(arguments, "content")?;
+    let mut lines = Vec::new();
+    extend_change_lines(&mut lines, '+', &content);
+    let added = lines.len();
+    Some(render_file_change("Wrote", &path, added, 0, lines, width))
+}
+
+fn tool_argument(arguments: &Value, name: &str) -> Option<String> {
+    arguments.get(name)?.as_str().map(sanitize_terminal_text)
+}
+
+fn extend_change_lines(lines: &mut Vec<String>, prefix: char, text: &str) {
+    lines.extend(text.lines().map(|line| format!("{prefix}{line}")));
+}
+
+fn render_file_change(
+    action: &'static str,
+    path: &str,
+    added: usize,
+    removed: usize,
+    lines: Vec<String>,
+    width: u16,
+) -> Buffer {
+    let path = display_path(path);
     let title = Line::from(vec![
         Span::styled(
             "•",
@@ -833,7 +1057,7 @@ fn render_file_change(change: &FileChange, width: u16, expanded: bool) -> Buffer
         Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
         Span::raw(")"),
     ]);
-    render_change_block(title, lines, width, expanded)
+    render_change_block(title, lines, width)
 }
 
 fn changed_line_counts(lines: &[String]) -> (usize, usize) {
@@ -848,14 +1072,8 @@ fn changed_line_counts(lines: &[String]) -> (usize, usize) {
     })
 }
 
-fn render_change_block(
-    title: Line<'static>,
-    lines: Vec<String>,
-    width: u16,
-    expanded: bool,
-) -> Buffer {
+fn render_change_block(title: Line<'static>, lines: Vec<String>, width: u16) -> Buffer {
     let title_rows = crate::ansi::wrap_highlighted_line(&title, usize::from(width.max(1)));
-    let lines = truncate_change_lines(lines, expanded);
     let content_x = if width > BULLET_PREFIX_COLUMNS {
         BULLET_PREFIX_COLUMNS
     } else {
@@ -890,27 +1108,6 @@ fn render_change_block(
     buffer
 }
 
-fn truncate_change_lines(mut lines: Vec<String>, expanded: bool) -> Vec<String> {
-    let limit = if expanded {
-        crate::ansi::EXPANDED_MAX_LINES
-    } else {
-        COLLAPSED_CHANGE_MAX_LINES
-    };
-    if lines.len() <= limit {
-        return lines;
-    }
-    let kept = limit.saturating_sub(1);
-    let head = kept / 2;
-    let tail = kept - head;
-    let omitted = lines.len() - kept;
-    crate::ansi::split_with_ellipsis(
-        std::mem::take(&mut lines),
-        head,
-        tail,
-        format!("… +{omitted} lines (truncated for display)"),
-    )
-}
-
 fn change_line_style(line: &str) -> Style {
     if line.starts_with('+') {
         Style::default().fg(Color::Green)
@@ -926,6 +1123,10 @@ fn change_line_style(line: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_turn(n: u128) -> TurnId {
+        TurnId::from_u128(n)
+    }
 
     #[test]
     fn markdown_blocks_reflow_at_the_current_width() {
@@ -1037,20 +1238,11 @@ mod tests {
 
     #[test]
     fn blocks_keep_turn_ownership() {
-        let response = LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(7));
+        let response =
+            LiveBlock::history(1, HistoryBlock::info("done")).with_turn(Some(test_turn(7)));
 
-        assert!(response.belongs_to_turn(7));
-        assert!(!response.belongs_to_turn(8));
-    }
-
-    #[test]
-    fn history_matching_requires_the_same_content_and_turn() {
-        let error = HistoryBlock::error("provider failed");
-        let block = LiveBlock::history(1, error.clone()).with_turn(Some(7));
-
-        assert!(block.matches_history_for_turn(7, &error));
-        assert!(!block.matches_history_for_turn(8, &error));
-        assert!(!block.matches_history_for_turn(7, &HistoryBlock::error("other error")));
+        assert!(response.belongs_to_turn(test_turn(7)));
+        assert!(!response.belongs_to_turn(test_turn(8)));
     }
 
     #[test]
@@ -1060,6 +1252,65 @@ mod tests {
 
         assert_eq!(rendered.area.height, 1);
         assert_eq!(row_text(&rendered, 0), "• Thought for 3s");
+    }
+
+    #[test]
+    fn running_reasoning_is_a_live_transcript_block() {
+        let mut block = LiveBlock::reasoning(1).with_turn(Some(test_turn(7)));
+        assert!(block.append_reasoning_source("inspect first"));
+
+        let rendered = block.render(40, false);
+        assert_eq!(row_text(&rendered, 0), "• Thinking (0s)");
+        assert_eq!(row_text(&rendered, 1), "  inspect first");
+        assert!(block.is_unfinished_response_for_turn(test_turn(7)));
+
+        assert!(block.finish_reasoning());
+        assert_eq!(row_text(&block.render(40, false), 0), "• Thought for 0s");
+        assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
+    }
+
+    #[test]
+    fn running_tool_becomes_completed_in_the_same_block() {
+        let call_id = ToolCallId::from_provider("call-1");
+        let mut block = LiveBlock::running_tool(
+            1,
+            call_id.clone(),
+            "bash".to_string(),
+            serde_json::json!({"command": "cargo test"}),
+        )
+        .with_turn(Some(test_turn(7)));
+
+        let running = block.render(60, false);
+        assert_eq!(row_text(&running, 0), "• Running cargo test");
+        assert!(block.is_running_tool(&call_id));
+        assert!(block.is_unfinished_response_for_turn(test_turn(7)));
+        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
+
+        assert!(block.finish_tool(&call_id, "ok".to_string(), false));
+        let finished = block.render(60, false);
+        assert_eq!(row_text(&finished, 0), "• Ran cargo test");
+        assert_eq!(row_text(&finished, 1), "  └ ok");
+        assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
+        assert!(block.is_completed_tool_for_turn(test_turn(7)));
+    }
+
+    #[test]
+    fn tool_completion_requires_the_matching_call_id() {
+        let call_id = ToolCallId::from_provider("call-1");
+        let mut block = LiveBlock::running_tool(
+            1,
+            call_id.clone(),
+            "bash".to_string(),
+            serde_json::json!({"command": "pwd"}),
+        );
+
+        assert!(!block.finish_tool(
+            &ToolCallId::from_provider("call-2"),
+            "wrong".to_string(),
+            false,
+        ));
+        assert!(block.is_running_tool(&call_id));
+        assert_eq!(row_text(&block.render(40, false), 0), "• Running pwd");
     }
 
     #[test]
@@ -1081,7 +1332,6 @@ mod tests {
             serde_json::json!({"path": "/workspace/src/inline.rs"}),
             String::new(),
             false,
-            None,
         );
 
         assert!(block.try_append_tool(
@@ -1109,6 +1359,33 @@ mod tests {
     }
 
     #[test]
+    fn a_read_group_absorbs_the_next_read_without_a_running_row() {
+        let group = LiveBlock::tool(
+            1,
+            "read".to_string(),
+            serde_json::json!({"path": "/workspace/src/inline.rs"}),
+            String::new(),
+            false,
+        );
+        let running = LiveBlock::running_tool(
+            2,
+            ToolCallId::from_provider("call-2"),
+            "read".to_string(),
+            serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+        );
+
+        assert!(group.can_group_read(
+            "read",
+            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+        ));
+        assert!(!group.can_group_read("bash", &serde_json::json!({"command": "pwd"}),));
+        assert!(!running.can_group_read(
+            "read",
+            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+        ));
+    }
+
+    #[test]
     fn non_groupable_tools_remain_independent() {
         let mut block = LiveBlock::tool(
             1,
@@ -1116,7 +1393,6 @@ mod tests {
             serde_json::json!({"command": "cargo test"}),
             String::new(),
             false,
-            None,
         );
 
         assert!(!block.try_append_tool(
@@ -1138,7 +1414,6 @@ mod tests {
             serde_json::json!({"command": "seq 120"}),
             output,
             false,
-            None,
         );
         let rendered = block.render(40, false);
 
@@ -1163,7 +1438,6 @@ mod tests {
             serde_json::json!({"command": "seq 120"}),
             output,
             false,
-            None,
         );
         // Collapsed: 5 output lines (2 head + 1 ellipsis + 2 tail).
         assert_eq!(block.render(40, false).area.height, 6);
@@ -1185,7 +1459,6 @@ mod tests {
             serde_json::json!({"command": "ls --color"}),
             "\x1b[31mred.txt\x1b[0m\nplain".to_string(),
             false,
-            None,
         );
         let rendered = block.render(40, false);
         // Title row (command inline) + two output lines.
@@ -1211,7 +1484,6 @@ mod tests {
             serde_json::json!({"command": command}),
             "done".to_string(),
             false,
-            None,
         );
         let rendered = block.render(40, false);
         // Title (first line inline) + 2 head + 1 ellipsis + 2 tail continuations
@@ -1224,36 +1496,34 @@ mod tests {
     }
 
     #[test]
-    fn structured_file_changes_distinguish_adds_from_overwrites() {
+    fn edit_and_write_render_from_tool_arguments() {
         let edit = LiveBlock::tool(
             1,
-            "write".to_string(),
-            serde_json::json!({"path": "/workspace/src/main.rs"}),
-            "Wrote 4 bytes".to_string(),
-            false,
-            Some(FileChange::Update {
-                path: PathBuf::from("src/main.rs"),
-                unified_diff: "--- before\n+++ after\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            "edit".to_string(),
+            serde_json::json!({
+                "path": "/workspace/src/main.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
             }),
+            "Successfully replaced 1 block".to_string(),
+            false,
         )
         .render(60, false);
         let write = LiveBlock::tool(
             2,
             "write".to_string(),
             serde_json::json!({"path": "/workspace/src/new.rs", "content": "one\ntwo"}),
-            String::new(),
+            "Wrote 7 bytes".to_string(),
             false,
-            Some(FileChange::Add {
-                path: PathBuf::from("src/new.rs"),
-                content: "one\ntwo".to_string(),
-            }),
         )
         .render(60, false);
 
-        assert_eq!(row_text(&edit, 0), "• Edited src/main.rs (+1 -1)");
-        assert_eq!(row_text(&write, 0), "• Added src/new.rs (+2 -0)");
-        assert_eq!(edit.cell((2, 2)).expect("deleted line").fg, Color::Red);
-        assert_eq!(edit.cell((2, 3)).expect("added line").fg, Color::Green);
+        assert_eq!(
+            row_text(&edit, 0),
+            "• Edited /workspace/src/main.rs (+1 -1)"
+        );
+        assert_eq!(row_text(&write, 0), "• Wrote /workspace/src/new.rs (+2 -0)");
+        assert_eq!(edit.cell((2, 1)).expect("deleted line").fg, Color::Red);
+        assert_eq!(edit.cell((2, 2)).expect("added line").fg, Color::Green);
         assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);
 
         let tiny = LiveBlock::tool(
@@ -1262,39 +1532,33 @@ mod tests {
             serde_json::json!({"path": "new.rs", "content": "one"}),
             String::new(),
             false,
-            Some(FileChange::Add {
-                path: PathBuf::from("new.rs"),
-                content: "one".to_string(),
-            }),
         )
         .render(1, false);
         assert_eq!(tiny.area.width, 1);
     }
 
     #[test]
-    fn diff_content_that_resembles_headers_is_not_hidden() {
+    fn edit_content_that_resembles_diff_headers_is_not_hidden() {
         let block = LiveBlock::tool(
             1,
             "edit".to_string(),
-            serde_json::json!({"path": "markers.txt"}),
+            serde_json::json!({
+                "path": "markers.txt",
+                "edits": [{"oldText": "-- before", "newText": "++ after"}]
+            }),
             String::new(),
             false,
-            Some(FileChange::Update {
-                path: PathBuf::from("markers.txt"),
-                unified_diff: "--- before\n+++ after\n@@ -1 +1 @@\n--- before\n+++ after\n"
-                    .to_string(),
-            }),
         );
 
         let rendered = block.render(60, false);
 
         assert_eq!(row_text(&rendered, 0), "• Edited markers.txt (+1 -1)");
-        assert_eq!(row_text(&rendered, 2), "  --- before");
-        assert_eq!(row_text(&rendered, 3), "  +++ after");
+        assert_eq!(row_text(&rendered, 1), "  --- before");
+        assert_eq!(row_text(&rendered, 2), "  +++ after");
     }
 
     #[test]
-    fn long_file_changes_keep_head_and_tail_and_expand() {
+    fn long_write_arguments_render_completely() {
         let content = (1..=30)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
@@ -1302,19 +1566,16 @@ mod tests {
         let block = LiveBlock::tool(
             1,
             "write".to_string(),
-            serde_json::json!({"path": "long.txt"}),
+            serde_json::json!({"path": "long.txt", "content": content}),
             String::new(),
             false,
-            Some(FileChange::Add {
-                path: PathBuf::from("long.txt"),
-                content,
-            }),
         );
 
         let collapsed = block.render(80, false);
-        assert_eq!(collapsed.area.height, 13);
-        assert!(row_text(&collapsed, 6).contains("+19 lines"));
-        assert!(row_text(&collapsed, 12).contains("line 30"));
+        assert_eq!(collapsed.area.height, 31);
+        assert!(row_text(&collapsed, 30).contains("line 30"));
+        assert!(!(0..collapsed.area.height)
+            .any(|row| row_text(&collapsed, row).contains("truncated for display")));
 
         let expanded = block.render(80, true);
         assert_eq!(expanded.area.height, 31);
@@ -1322,20 +1583,20 @@ mod tests {
     }
 
     #[test]
-    fn writes_without_a_reported_change_do_not_invent_a_preview() {
+    fn malformed_specialized_tool_arguments_fall_back_to_generic_output() {
         let block = LiveBlock::tool(
             1,
             "write".to_string(),
-            serde_json::json!({"path": "same.txt", "content": "same\n"}),
+            serde_json::json!({"path": "same.txt"}),
             "Wrote 5 bytes".to_string(),
             false,
-            None,
         );
 
         let rendered = block.render(60, false);
 
-        assert_eq!(rendered.area.height, 1);
+        assert_eq!(rendered.area.height, 2);
         assert_eq!(row_text(&rendered, 0), "• Wrote same.txt");
+        assert_eq!(row_text(&rendered, 1), "  └ Wrote 5 bytes");
     }
 
     #[test]
@@ -1384,6 +1645,10 @@ mod tests {
 mod generic_output_tests {
     use super::*;
 
+    fn test_turn(n: u128) -> TurnId {
+        TurnId::from_u128(n)
+    }
+
     fn row_text(buffer: &Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .filter_map(|column| buffer.cell((column, row)))
@@ -1393,21 +1658,22 @@ mod generic_output_tests {
 
     #[test]
     fn finalized_assistant_does_not_count_as_a_completed_tool() {
-        let mut block = LiveBlock::assistant(1, String::new()).with_turn(Some(7));
+        let mut block = LiveBlock::assistant(1, String::new()).with_turn(Some(test_turn(7)));
         assert!(block.append_markdown_source("partial"));
-        assert!(block.is_unfinished_response_for_turn(7));
-        assert!(!block.is_completed_tool_for_turn(7));
+        assert!(block.is_unfinished_response_for_turn(test_turn(7)));
+        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
 
         block.finalize_markdown();
-        assert!(!block.is_unfinished_response_for_turn(7));
-        assert!(!block.is_completed_tool_for_turn(7));
+        assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
+        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
     }
 
     #[test]
     fn completed_thought_does_not_count_as_a_completed_tool() {
-        let block = LiveBlock::thought(1, "finished reasoning".to_string(), 3).with_turn(Some(7));
+        let block = LiveBlock::thought(1, "finished reasoning".to_string(), 3)
+            .with_turn(Some(test_turn(7)));
 
-        assert!(!block.is_completed_tool_for_turn(7));
+        assert!(!block.is_completed_tool_for_turn(test_turn(7)));
     }
 
     #[test]
@@ -1418,12 +1684,11 @@ mod generic_output_tests {
             serde_json::json!({"command": "pwd"}),
             "/work/ash".to_string(),
             false,
-            None,
         )
-        .with_turn(Some(7));
+        .with_turn(Some(test_turn(7)));
 
-        assert!(block.is_completed_tool_for_turn(7));
-        assert!(!block.is_completed_tool_for_turn(8));
+        assert!(block.is_completed_tool_for_turn(test_turn(7)));
+        assert!(!block.is_completed_tool_for_turn(test_turn(8)));
     }
 
     #[test]
@@ -1435,20 +1700,17 @@ mod generic_output_tests {
             serde_json::json!({"pattern": pattern, "path": "src"}),
             "match".to_string(),
             false,
-            None,
         );
-        // Non-bash titles are pre-truncated by fit_action_and_detail, so they
-        // stay on one row (title + output).
+        // Generic titles wrap at the renderer's current width, like bash
+        // command lines do.
         let rendered = block.render(30, false);
-        assert_eq!(rendered.area.height, 2);
-        // The bash command line, by contrast, wraps instead of truncating.
+        assert!(rendered.area.height > 2);
         let bash_block = LiveBlock::tool(
             2,
             "bash".to_string(),
             serde_json::json!({"command": format!("cargo {}", "x".repeat(60))}),
             "ok".to_string(),
             false,
-            None,
         );
         assert!(bash_block.render(30, false).area.height > 2);
     }
@@ -1462,7 +1724,6 @@ mod generic_output_tests {
             serde_json::json!({"pattern": "[", "path": "src"}),
             "invalid regular expression".to_string(),
             true,
-            None,
         );
         let rendered = block.render(40, false);
         assert_eq!(rendered.area.height, 2);
@@ -1478,7 +1739,6 @@ mod generic_output_tests {
             serde_json::json!({"command": "false"}),
             "exit code 1".to_string(),
             true,
-            None,
         );
         let rendered = block.render(40, false);
         assert!(
@@ -1498,7 +1758,6 @@ mod generic_output_tests {
             serde_json::json!({"pattern": "let x", "path": "src"}),
             output.to_string(),
             false,
-            None,
         );
         let rendered = block.render(50, false);
         assert_eq!(rendered.area.height, 1 + 3);
@@ -1524,7 +1783,6 @@ mod toggle_tests {
             serde_json::json!({"command": "seq 30"}),
             output,
             false,
-            None,
         );
         // collapsed: 1 title + 5 output (2+1+2)
         assert_eq!(block.render(40, false).area.height, 6);

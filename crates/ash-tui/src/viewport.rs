@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::{ForkPoint, SubagentSnapshot, ThreadSummary};
+use ash_collab::{SubagentSnapshot, SubagentState};
+use ash_core::{ForkPoint, SessionSummary};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
@@ -12,7 +13,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     block_layout::{layout_stack, StackItem},
     live_block::LiveBlock,
-    markdown::RenderedLine,
     menu::MenuView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
@@ -48,7 +48,7 @@ pub struct ViewportInput<'a> {
     pub(crate) transcript: &'a [LiveBlock],
     pub(crate) scroll_top: Option<u16>,
     pub(crate) busy: bool,
-    pub(crate) active_lines: &'a [RenderedLine],
+    pub(crate) interruptible: bool,
     pub(crate) status_header: &'a str,
     pub(crate) status_dots: &'a str,
     pub(crate) elapsed: &'a str,
@@ -104,11 +104,10 @@ pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .iter()
         .map(|block| block.render(width, input.tools_expanded))
         .collect::<Vec<_>>();
-    let active =
-        (!input.active_lines.is_empty()).then(|| render_active_buffer(width, input.active_lines));
-    let active_rows = active.as_ref().map(|buffer| buffer.area.height);
-    let regions = transcript_regions(&rendered_blocks, active_rows);
-    let items = regions.iter().map(|region| region.item).collect::<Vec<_>>();
+    let items = rendered_blocks
+        .iter()
+        .map(|block| StackItem::block(block.area.height))
+        .collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
     let menu_rows = u16::try_from(input.menu.item_count().min(MENU_MAX_ROWS)).unwrap_or(u16::MAX);
     let active_subagents = input
@@ -137,10 +136,8 @@ pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .min(max_scroll_top);
     let mut buffer = Buffer::empty(Rect::new(0, 0, terminal_width, terminal_height));
     render_transcript(
-        &regions,
         &layout.areas,
         &rendered_blocks,
-        active.as_ref(),
         scroll_top,
         transcript_view_rows,
         &mut buffer,
@@ -383,33 +380,15 @@ fn prompt_window<'a>(input: &'a ViewportInput<'_>, rows: u16) -> PromptWindow<'a
     }
 }
 
-fn render_active_buffer(width: u16, lines: &[RenderedLine]) -> Arc<Buffer> {
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    for (index, rendered) in lines.iter().take(usize::from(height)).enumerate() {
-        let mut spans = crate::scrollback::content_row_prefix(index == 0);
-        spans.extend(rendered.ratatui_line().spans);
-        buffer.set_line(
-            0,
-            u16::try_from(index).unwrap_or(u16::MAX),
-            &Line::from(spans),
-            width,
-        );
-    }
-    Arc::new(buffer)
-}
-
 fn render_transcript(
-    regions: &[RegionSpec],
     areas: &[Rect],
     blocks: &[Arc<Buffer>],
-    active: Option<&Arc<Buffer>>,
     scroll_top: u16,
     visible_rows: u16,
     buffer: &mut Buffer,
 ) {
     let visible_bottom = scroll_top.saturating_add(visible_rows);
-    for (region, area) in regions.iter().zip(areas) {
+    for (block, area) in blocks.iter().zip(areas) {
         let top = area.y.max(scroll_top);
         let bottom = area.bottom().min(visible_bottom);
         if top >= bottom {
@@ -422,48 +401,8 @@ fn render_transcript(
             bottom.saturating_sub(top),
         );
         let source_y = top.saturating_sub(area.y);
-        match region.kind {
-            ViewportRegion::Live(index) => {
-                if let Some(block) = blocks.get(index) {
-                    crate::buffer::copy_rows(block, buffer, source_y, target);
-                }
-            }
-            ViewportRegion::Active => {
-                if let Some(block) = active {
-                    crate::buffer::copy_rows(block, buffer, source_y, target);
-                }
-            }
-        }
+        crate::buffer::copy_rows(block, buffer, source_y, target);
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ViewportRegion {
-    Live(usize),
-    Active,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RegionSpec {
-    kind: ViewportRegion,
-    item: StackItem,
-}
-
-fn transcript_regions(blocks: &[Arc<Buffer>], active_rows: Option<u16>) -> Vec<RegionSpec> {
-    let mut regions = Vec::with_capacity(blocks.len().saturating_add(1));
-    for (index, block) in blocks.iter().enumerate() {
-        regions.push(RegionSpec {
-            kind: ViewportRegion::Live(index),
-            item: StackItem::block(block.area.height),
-        });
-    }
-    if let Some(height) = active_rows {
-        regions.push(RegionSpec {
-            kind: ViewportRegion::Active,
-            item: StackItem::block(height),
-        });
-    }
-    regions
 }
 
 fn subagent_rows(subagents: &[&SubagentSnapshot]) -> u16 {
@@ -532,32 +471,32 @@ fn render_subagents(area: Rect, subagents: &[&SubagentSnapshot], buffer: &mut Bu
     }
 }
 
-const fn subagent_state_symbol(state: ash_core::SubagentState) -> &'static str {
+const fn subagent_state_symbol(state: SubagentState) -> &'static str {
     match state {
-        ash_core::SubagentState::Pending => "○",
-        ash_core::SubagentState::Running => "●",
-        ash_core::SubagentState::Completed => "✓",
-        ash_core::SubagentState::Interrupted => "⏸",
-        ash_core::SubagentState::Errored => "✗",
+        SubagentState::Pending => "○",
+        SubagentState::Running => "●",
+        SubagentState::Completed => "✓",
+        SubagentState::Interrupted => "⏸",
+        SubagentState::Errored => "✗",
     }
 }
 
-const fn subagent_state_label(state: ash_core::SubagentState) -> &'static str {
+const fn subagent_state_label(state: SubagentState) -> &'static str {
     match state {
-        ash_core::SubagentState::Pending => "pending",
-        ash_core::SubagentState::Running => "running",
-        ash_core::SubagentState::Completed => "done",
-        ash_core::SubagentState::Interrupted => "interrupted",
-        ash_core::SubagentState::Errored => "error",
+        SubagentState::Pending => "pending",
+        SubagentState::Running => "running",
+        SubagentState::Completed => "done",
+        SubagentState::Interrupted => "interrupted",
+        SubagentState::Errored => "error",
     }
 }
 
-const fn subagent_state_color(state: ash_core::SubagentState) -> Color {
+const fn subagent_state_color(state: SubagentState) -> Color {
     match state {
-        ash_core::SubagentState::Pending | ash_core::SubagentState::Interrupted => Color::Yellow,
-        ash_core::SubagentState::Running => Color::Cyan,
-        ash_core::SubagentState::Completed => Color::Green,
-        ash_core::SubagentState::Errored => Color::Red,
+        SubagentState::Pending | SubagentState::Interrupted => Color::Yellow,
+        SubagentState::Running => Color::Cyan,
+        SubagentState::Completed => Color::Green,
+        SubagentState::Errored => Color::Red,
     }
 }
 
@@ -582,7 +521,11 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
-                format!(" ({} • esc to interrupt)", input.elapsed),
+                if input.interruptible {
+                    format!(" ({} • esc to interrupt)", input.elapsed)
+                } else {
+                    format!(" ({})", input.elapsed)
+                },
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])
@@ -818,13 +761,13 @@ fn render_command_menu(
 
 fn render_session_menu(
     area: Rect,
-    threads: &[ThreadSummary],
+    sessions: &[SessionSummary],
     selected: usize,
     buffer: &mut Buffer,
 ) {
     render_menu_rows(
         area,
-        threads,
+        sessions,
         selected,
         buffer,
         |_index, style, prefix, session| {
@@ -941,11 +884,9 @@ fn menu_window(items_len: usize, selected: usize, max_visible: usize) -> Option<
 mod tests {
     use std::path::Path;
 
-    use ash_core::{MessageId, ThreadId};
+    use ash_core::{MessageId, SessionId};
 
     use super::*;
-    use crate::markdown::render_markdown;
-
     fn row_text(buffer: &Buffer, y: u16) -> String {
         let mut continuation_columns = 0usize;
         let mut text = String::new();
@@ -1003,14 +944,14 @@ mod tests {
 
     #[test]
     fn places_status_composer_and_footer_after_short_content() {
-        let active = render_markdown("answer", 80);
+        let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            transcript: &[],
+            transcript: &blocks,
             scroll_top: None,
             busy: true,
-            active_lines: &active,
+            interruptible: true,
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
@@ -1046,28 +987,28 @@ mod tests {
 
     #[test]
     fn subagents_render_below_the_composer_and_above_the_footer() {
-        let active = render_markdown("answer", 80);
+        let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [
             SubagentSnapshot {
                 task_name: "inspect_glob".to_string(),
                 agent_type: "explorer".to_string(),
-                state: ash_core::SubagentState::Running,
+                state: SubagentState::Running,
                 last_task_message: "Inspect the glob API".to_string(),
             },
             SubagentSnapshot {
                 task_name: "fix_bash".to_string(),
                 agent_type: "worker".to_string(),
-                state: ash_core::SubagentState::Pending,
+                state: SubagentState::Pending,
                 last_task_message: "Add cwd to bash".to_string(),
             },
         ];
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            transcript: &[],
+            transcript: &blocks,
             scroll_top: None,
             busy: true,
-            active_lines: &active,
+            interruptible: true,
             status_header: "Working",
             status_dots: "...",
             elapsed: "2s",
@@ -1098,20 +1039,20 @@ mod tests {
 
     #[test]
     fn completed_subagents_do_not_occupy_a_row() {
-        let active = render_markdown("answer", 80);
+        let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [SubagentSnapshot {
             task_name: "inspect_glob".to_string(),
             agent_type: "explorer".to_string(),
-            state: ash_core::SubagentState::Completed,
+            state: SubagentState::Completed,
             last_task_message: "Inspect the glob API".to_string(),
         }];
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            transcript: &[],
+            transcript: &blocks,
             scroll_top: None,
             busy: false,
-            active_lines: &active,
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1152,7 +1093,7 @@ mod tests {
             transcript: &[],
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1192,19 +1133,19 @@ mod tests {
 
     #[test]
     fn session_picker_renders_multiple_rows_below_the_composer() {
-        let threads = [
-            ThreadSummary {
-                thread_id: ThreadId::new(),
+        let sessions = [
+            SessionSummary {
+                session_id: SessionId::new(),
                 title: "继续这个中文会话".to_string(),
                 created_at: "2026-07-14 09:00".to_string(),
             },
-            ThreadSummary {
-                thread_id: ThreadId::new(),
+            SessionSummary {
+                session_id: SessionId::new(),
                 title: "Inspect the session picker".to_string(),
                 created_at: "2026-07-15 12:30".to_string(),
             },
-            ThreadSummary {
-                thread_id: ThreadId::new(),
+            SessionSummary {
+                session_id: SessionId::new(),
                 title: "Third saved chat".to_string(),
                 created_at: "2026-07-16 18:45".to_string(),
             },
@@ -1215,7 +1156,7 @@ mod tests {
             transcript: &[],
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1235,7 +1176,7 @@ mod tests {
         let baseline = render(input);
         let frame = render(ViewportInput {
             menu: MenuView::Sessions {
-                items: &threads,
+                items: &sessions,
                 selected: 1,
             },
             ..input
@@ -1275,7 +1216,7 @@ mod tests {
             transcript: &[],
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1301,15 +1242,17 @@ mod tests {
     }
 
     #[test]
-    fn active_output_starts_at_the_top_of_the_transcript() {
-        let active = render_markdown("Thinking (0s)", 80);
+    fn running_reasoning_starts_at_the_top_of_the_transcript() {
+        let mut reasoning = LiveBlock::reasoning(1);
+        assert!(reasoning.append_reasoning_source("inspect first"));
+        let blocks = [reasoning];
         let frame = render(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
-            transcript: &[],
+            transcript: &blocks,
             scroll_top: None,
             busy: true,
-            active_lines: &active,
+            interruptible: false,
             status_header: "Thinking",
             status_dots: "...",
             elapsed: "0s",
@@ -1342,7 +1285,7 @@ mod tests {
             transcript: &blocks,
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1380,7 +1323,7 @@ mod tests {
             transcript: &blocks,
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1418,7 +1361,7 @@ mod tests {
             transcript: &blocks,
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1457,7 +1400,7 @@ mod tests {
             transcript: &[],
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1498,7 +1441,7 @@ mod tests {
             transcript: &blocks,
             scroll_top: None,
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",
@@ -1542,7 +1485,7 @@ mod tests {
             transcript: &blocks,
             scroll_top: Some(4),
             busy: false,
-            active_lines: &[],
+            interruptible: false,
             status_header: "",
             status_dots: "",
             elapsed: "0s",

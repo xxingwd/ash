@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use ash_core::{define_tool, CancellationToken, FileChange, Tool, ToolError, ToolOutput};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -28,7 +28,6 @@ struct EditArgs {
 #[derive(Debug)]
 struct EditResult {
     path: PathBuf,
-    change: FileChange,
 }
 
 pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
@@ -48,7 +47,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
                     count,
                     result.path.display()
                 );
-                Ok(ToolOutput::with_file_change(text, result.change))
+                Ok(ToolOutput::from(text))
             }
         },
     )
@@ -117,13 +116,11 @@ async fn edit_file(
         };
         let content = format!("{bom}{edited}");
 
-        let Some(change) =
-            crate::change::updated(path.relative_path().to_path_buf(), &original, &content)
-        else {
+        if original == content {
             return Err(ToolError::Execution(
                 "edits did not change the resulting file".to_string(),
             ));
-        };
+        }
         path.atomic_write(
             content.as_bytes(),
             Some(permissions),
@@ -132,7 +129,6 @@ async fn edit_file(
         )?;
         Ok(EditResult {
             path: path.full_path().to_path_buf(),
-            change,
         })
     })
     .await
@@ -248,12 +244,7 @@ mod tests {
         .await
         .unwrap();
 
-        let FileChange::Update { path, unified_diff } = result.change else {
-            panic!("edit must report an update");
-        };
-        assert_eq!(path, Path::new("input.txt"));
-        assert!(unified_diff.contains("-one\r"));
-        assert!(unified_diff.contains("+three\r"));
+        assert_eq!(result.path, root.path().join("input.txt"));
         assert_eq!(
             std::fs::read_to_string(root.path().join("input.txt")).unwrap(),
             "three\r\n"
@@ -261,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_edits_report_the_complete_change() {
+    async fn large_edits_succeed() {
         let root = tempfile::tempdir().unwrap();
         let content = format!("needle\n{}", "x".repeat(64 * 1024));
         std::fs::write(root.path().join("large.txt"), content).unwrap();
@@ -276,11 +267,7 @@ mod tests {
         .await
         .unwrap();
 
-        let FileChange::Update { unified_diff, .. } = result.change else {
-            panic!("edit must report an update");
-        };
-        assert!(unified_diff.contains("-needle"));
-        assert!(unified_diff.contains("+changed"));
+        assert_eq!(result.path, root.path().join("large.txt"));
         assert!(std::fs::read_to_string(root.path().join("large.txt"))
             .unwrap()
             .starts_with("changed\n"));

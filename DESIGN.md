@@ -10,7 +10,7 @@ scheduler, or service own transport and presentation; Ash owns agent execution s
 | `ash-core` | Provider-neutral messages, model, tool, event, ID, error, and cancellation types |
 | `ash-protocol` | Model-provider protocol adapters and streaming translation |
 | `ash-tools` | Sandboxed file, process, search, and web tools |
-| `ash-agent` | Agent definition, runtime, threads, turns, input, context, and persistence |
+| `ash-agent` | Agent definition, runtime, sessions, turns, input, context, and persistence |
 | `ash-collab` | Optional child-agent spawning, messaging, lifecycle, and collaboration tools |
 | `ash-tui` | Terminal rendering and interaction only |
 | `ash-cli` | Binary composition and product command routing |
@@ -23,20 +23,20 @@ terminal state, or collaboration. `ash-agent` does not depend on the CLI or TUI.
 The stable execution vocabulary is deliberately small:
 
 - `Agent` is immutable behavior: model, prompt, tools, limits, and context policy.
-- `Runtime` owns injected capabilities: model client and thread store.
-- `ThreadOptions` is per-thread scope: working directory, timeout, agent path, tree ID,
-  and typed `ThreadKind`.
-- `Thread` is the durable concurrent conversation boundary and the sole input-queue owner.
+- `Runtime` owns injected capabilities: model client and session store.
+- `SessionOptions` is per-session scope: working directory, timeout, agent path, tree ID,
+  and typed `SessionKind`.
+- `Session` is the durable concurrent conversation boundary and the sole input-queue owner.
 - `Turn` is one submitted unit of execution. It can be awaited, interrupted, or steered.
 - `Input` carries content, source, metadata, and an optional idempotency key.
-- `Event` routes an `EventKind` with thread ID, optional turn ID, sequence, and timestamp.
+- `Event` routes an `EventKind` with session ID, optional turn ID, sequence, and timestamp.
 
-`Runtime::start`, `start_with_history`, and `resume` are the only thread construction paths.
-All products and child agents execute through the `Thread` input APIs.
+`Runtime::start`, `start_with_history`, and `resume` are the only session construction paths.
+All products and child agents execute through the `Session` input APIs.
 
-## Thread Ownership
+## Session Ownership
 
-Each `Thread` is backed by one actor task. The actor owns:
+Each `Session` is backed by one actor task. The actor owns:
 
 - the ordered queue of submitted turns;
 - the active turn and its cancellation state;
@@ -48,15 +48,15 @@ Products submit immediately. They may mirror pending prompts for display, but th
 decide when queued work starts. This gives chat gateways, CLI/TUI clients, schedules,
 heartbeats, and child agents identical ordering and cancellation behavior.
 
-`Thread::submit` returns a `Turn` handle. `Thread::enqueue` creates fire-and-forget work for
-external triggers. `Thread::notify` queues a message without starting work; the inbox is prepended
+`Session::submit` returns a `Turn` handle. `Session::enqueue` creates fire-and-forget work for
+external triggers. `Session::notify` queues a message without starting work; the inbox is prepended
 when the next queued turn starts, including a turn that was already submitted while another turn
 was active. This is useful for child-agent mailboxes. Schedulers and heartbeat timers remain product
-infrastructure; they create typed `Input` values and call `enqueue` instead of bypassing the thread.
+infrastructure; they create typed `Input` values and call `enqueue` instead of bypassing the session.
 
 ## Submit And Steer
 
-`submit` creates a new turn and appends it to the thread queue. Multiple submissions are
+`submit` creates a new turn and appends it to the session queue. Multiple submissions are
 executed in acceptance order.
 
 `Turn::steer` targets only its currently active turn. The input is sent through the active
@@ -66,7 +66,7 @@ inactive turn returns an explicit error.
 
 ## Durable Log
 
-`ThreadLog` is the durable append-only log and the only source for full user-visible
+`SessionLog` is the durable append-only log and the only source for full user-visible
 history, compacted model context, and turn views. Its entries are:
 
 - `TurnStart`;
@@ -85,29 +85,31 @@ All inputs in a submitted turn are validated before persistence. Empty input, a 
 idempotency key, or duplicate keys within one batch reject the whole turn before `TurnStart`
 is written.
 
-`ThreadStore` is the only public persistence boundary:
+`SessionStore` is the only public persistence boundary:
 
 ```text
 create(metadata, entries)
-load(thread_id) -> stored thread
-open(thread_id) -> stored thread + locked writer
-open_writer(metadata) -> locked writer for a new thread
-list(excluded_thread) -> summaries
+load(session_id) -> stored session
+open(session_id) -> stored session + locked writer
+open_writer(metadata) -> locked writer for a new session
+list(excluded_session) -> summaries
 ```
 
-Locked writers are exposed through the storage-neutral `ThreadAppender` capability. A backend may
+Locked writers are exposed through the storage-neutral `SessionAppender` capability. A backend may
 hold a file lock, database transaction, or remote lease in that handle; runtime code never depends
 on the JSONL writer type.
 
-The default `JsonlThreadStore` stores new threads as `{thread_id}.jsonl`. Its compact first record
-contains only list metadata, so listing does not replay thread logs. Loading addresses files
-directly by id and only replays the selected thread. The header must be valid; later malformed
-records are skipped with a warning so valid records after a damaged line can still be recovered.
+The default `JsonlSessionStore` writes sessions to the platform data directory's `sessions/`
+subdirectory as `{session_id}.jsonl`. New records use `session_header` / `session_id`; old storage
+formats are not read. Its compact first record contains only list metadata, so listing does not
+replay session logs. Loading addresses files directly by id and only replays the selected session.
+The header must be valid; later malformed records are skipped with a warning so valid records after
+a damaged line can still be recovered.
 
-`ThreadMetadata` carries the typed `ThreadKind` (`Root` or `Subagent`) used by persistence and
-session listing. Runtime code derives that value from `ThreadOptions.kind`.
+`SessionMetadata` carries the typed `SessionKind` (`Root` or `Subagent`) used by persistence and
+session listing. Runtime code derives that value from `SessionOptions.kind`.
 
-The runtime's hot write path keeps one exclusively locked `ThreadAppender` per active thread. Resume
+The runtime's hot write path keeps one exclusively locked `SessionAppender` per active session. Resume
 replays the selected file through that same handle, so later appends are a single write+flush with
 no second read. Writes are batched at commit points: accepted inputs are persisted when the turn
 starts, and all turn messages plus `TurnEnd` are flushed together when the turn settles. A crash
@@ -121,13 +123,13 @@ before that commit point leaves a turn without `TurnEnd`, which the projection r
 - `Live(LiveEvent)` carries ephemeral streaming deltas for the active turn's preview only.
 - `Turn(TurnView)` is emitted when a turn settles and carries its canonical messages, result,
   and usage; clients use it to commit scrollback.
-- `Restored(ThreadView)` / `ThreadForked` carry the full projection after resume or fork.
+- `Restored(SessionView)` / `SessionForked` carry the full projection after resume or fork.
 - `Compacted` reports a context-checkpoint change; `TurnRolledBack` reports a rollback.
 
 All memory state is derived from the log through one reducer direction:
-`LogEntry -> ThreadView -> messages / context / turns -> transcript blocks`. The TUI draws
-live deltas as a preview and replaces them with the canonical projection on `Turn`. `ThreadLog`
-maintains that projection incrementally as entries arrive, and thread events obtain settled turn
+`LogEntry -> SessionView -> messages / context / turns -> transcript blocks`. The TUI draws
+live deltas as a preview and replaces them with the canonical projection on `Turn`. `SessionLog`
+maintains that projection incrementally as entries arrive, and session events obtain settled turn
 views from the same reducer rather than assembling a parallel view in the execution path.
 
 ## Context And Memory
@@ -155,8 +157,8 @@ role/content combinations and system images fail locally as invalid requests.
 - `SpawnRequest` for the typed spawn contract;
 - `ChildAgent` for the runtime, agent definition, options, and inherited history.
 
-Every child gets its own `Thread` and executes through the same runtime path as a root agent.
-Tree identity and canonical agent path live in `ThreadOptions` and `ToolContext`; collaboration
+Every child gets its own `Session` and executes through the same runtime path as a root agent.
+Tree identity and canonical agent path live in `SessionOptions` and `ToolContext`; collaboration
 state does not leak into `ash-core` or terminal state.
 
 The controller counts every accepted follow-up until it settles. A child with queued follow-ups
@@ -200,7 +202,7 @@ during the wait aborts the turn instead of retrying.
 Non-retryable failures (`Auth`, `InvalidRequest`, `ContextTooLong`,
 `InvalidResponse`, upstream 4xx) fail the turn immediately and surface as
 `TurnResult::Failed`. On retry, the partial assistant message is discarded both
-from memory and from the staged log (`ThreadPersistence::rollback_to`), so a
+from memory and from the staged log (`SessionPersistence::rollback_to`), so a
 successful retry leaves no trace of the failed attempt; when the retry budget
 is exhausted the final partial output is kept and the turn ends with
 `StopReason::Truncated`, visible to the user as an incomplete response.
@@ -210,16 +212,14 @@ created for the request remains durable across failed attempts.
 ## Product Boundary
 
 The TUI owns drafts, menus, viewport state, and interaction feedback. While idle, Enter submits a
-new turn; while a turn is running, Enter steers that exact turn. Escape discards the open response
-block and interrupts the active turn. Only a completed tool result keeps an interrupted turn; text
-and reasoning are not reliable completion boundaries while a response is streaming. Without a
-completed tool result, the controller settles and rolls back the whole turn so the original prompt
-returns to the composer. Commands remain visible while work is active, but
-session-mutating commands are silently rejected locally and remain in the composer; read-only
-commands execute immediately. The CLI retains the active `Turn` handle, routes UI commands, and
-continuously forwards thread events. Cancellation only cancels that handle; after its `Turn` event,
-the TUI either commits the interrupted turn or requests an ordinary rollback. Neither layer owns
-execution order.
+new turn; while a turn is running, Enter steers that exact turn. Escape discards unfinished streamed
+output and cancels the active turn. The TUI does not decide whether that turn is kept: after the
+canonical `Turn` event arrives, a completed tool result commits the interrupted turn; otherwise the
+controller requests an ordinary rollback so the original prompt returns to the composer. Commands
+remain visible while work is active, but session-mutating commands are silently rejected locally
+and remain in the composer; `/status` and invalid commands are also rejected while a turn is
+running. The CLI retains the active `Turn` handle, routes UI commands, and continuously forwards
+session events. Cancellation only cancels that handle. Neither layer owns execution order.
 
 A chat integration follows the same pattern:
 

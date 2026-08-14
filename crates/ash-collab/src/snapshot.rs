@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Display-oriented snapshot of a sub-agent, published for UI consumers
-/// (e.g. the inline TUI's sub-agent status region below the composer).
+/// Display-oriented snapshot of a sub-agent, published for UI consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
     pub task_name: String,

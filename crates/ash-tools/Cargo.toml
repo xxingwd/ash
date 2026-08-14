@@ -10,11 +10,11 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 schemars = { workspace = true }
 tempfile = { workspace = true }
+image = { workspace = true }
 htmd = { workspace = true }
 cap-std = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
-similar = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }

@@ -39,16 +39,11 @@ fn serializes_tool_call_block_with_the_stable_contract() {
 
 #[test]
 fn serializes_tool_result_message_with_the_stable_contract() {
-    let msg = Message {
-        id: MessageId::new(),
-        role: Role::User,
-        content: MessageContent::ToolResult {
-            id: ToolCallId::new(),
-            result: Ok("file1.txt\nfile2.txt".to_string()),
-            attachments: Vec::new(),
-            file_change: None,
-        },
-    };
+    let msg = Message::tool_result(
+        ToolCallId::new(),
+        Ok("file1.txt\nfile2.txt".to_string()),
+        Vec::new(),
+    );
     assert_json_snapshot!("tool_result_message", msg, {
         ".id" => "[uuid]",
         ".content.id" => "[uuid]",
@@ -57,16 +52,11 @@ fn serializes_tool_result_message_with_the_stable_contract() {
 
 #[test]
 fn serializes_tool_result_error_with_the_stable_contract() {
-    let msg = Message {
-        id: MessageId::new(),
-        role: Role::User,
-        content: MessageContent::ToolResult {
-            id: ToolCallId::new(),
-            result: Err("command not found".to_string()),
-            attachments: Vec::new(),
-            file_change: None,
-        },
-    };
+    let msg = Message::tool_result(
+        ToolCallId::new(),
+        Err("command not found".to_string()),
+        Vec::new(),
+    );
     assert_json_snapshot!("tool_result_error", msg, {
         ".id" => "[uuid]",
         ".content.id" => "[uuid]",
@@ -97,7 +87,7 @@ fn serializes_event_text_delta_with_the_stable_contract() {
 #[test]
 fn serializes_event_envelope_with_the_stable_contract() {
     let event = Event {
-        thread_id: ThreadId::new(),
+        session_id: SessionId::new(),
         turn_id: Some(TurnId::new()),
         sequence: 3,
         timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-31T06:15:28Z")
@@ -106,7 +96,7 @@ fn serializes_event_envelope_with_the_stable_contract() {
         kind: EventKind::Live(LiveEvent::TextDelta("Hello".to_string())),
     };
     assert_json_snapshot!("event_envelope", event, {
-        ".thread_id" => "[uuid]",
+        ".session_id" => "[uuid]",
         ".turn_id" => "[uuid]",
     });
 }

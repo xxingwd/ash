@@ -4,7 +4,6 @@ expression: msg
 ---
 {
   "id": "[uuid]",
-  "role": "user",
   "content": {
     "ToolResult": {
       "id": "[uuid]",

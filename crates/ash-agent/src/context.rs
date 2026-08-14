@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use ash_core::{Content, ContentBlock, Message, MessageContent, Role, ToolCallId, ToolDefinition};
+use ash_core::{Content, ContentBlock, Message, MessageContent, ToolCallId, ToolDefinition};
 
 use crate::{agent::COMPACTION_TRIGGER_PERCENT, skill::SKILL_TOOL_NAME};
 
@@ -178,7 +178,9 @@ fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
         .iter()
         .filter_map(|message| match &message.content {
             MessageContent::Assistant(blocks) => Some(blocks),
-            MessageContent::User(_) | MessageContent::ToolResult { .. } => None,
+            MessageContent::User(_)
+            | MessageContent::System(_)
+            | MessageContent::ToolResult { .. } => None,
         })
         .flatten()
         .filter_map(|block| match block {
@@ -333,17 +335,14 @@ fn serialize_messages(messages: &[Message]) -> String {
 
 fn serialize_message(message: &Message) -> String {
     match &message.content {
-        MessageContent::User(contents) => {
-            let label = if message.role == Role::System {
-                "System update"
-            } else {
-                "User"
-            };
-            format!(
-                "[{label}]: {}",
-                serialize_contents(contents, TextSerialization::Full)
-            )
-        }
+        MessageContent::System(contents) => format!(
+            "[System update]: {}",
+            serialize_contents(contents, TextSerialization::Full)
+        ),
+        MessageContent::User(contents) => format!(
+            "[User]: {}",
+            serialize_contents(contents, TextSerialization::Full)
+        ),
         MessageContent::Assistant(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
@@ -427,7 +426,9 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 
 fn message_characters(message: &Message) -> usize {
     match &message.content {
-        MessageContent::User(contents) => content_characters(contents),
+        MessageContent::User(contents) | MessageContent::System(contents) => {
+            content_characters(contents)
+        }
         MessageContent::Assistant(blocks) => blocks
             .iter()
             .map(|block| match block {
@@ -468,33 +469,20 @@ fn content_characters(contents: &[Content]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{MessageId, ToolCallId};
+    use ash_core::ToolCallId;
 
     use super::*;
 
     fn tool_call(id: &ToolCallId) -> Message {
-        Message {
-            id: MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(vec![ContentBlock::ToolCall {
-                id: id.clone(),
-                name: "read".to_string(),
-                arguments: serde_json::json!({"path": "Cargo.toml"}),
-            }]),
-        }
+        Message::assistant(vec![ContentBlock::ToolCall {
+            id: id.clone(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "Cargo.toml"}),
+        }])
     }
 
     fn tool_result(id: ToolCallId, output: String, attachments: Vec<Content>) -> Message {
-        Message {
-            id: MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id,
-                result: Ok(output),
-                attachments,
-                file_change: None,
-            },
-        }
+        Message::tool_result(id, Ok(output), attachments)
     }
 
     #[test]
@@ -646,39 +634,27 @@ mod tests {
 
     #[test]
     fn output_estimate_includes_visible_reasoning() {
-        let message = Message {
-            id: MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(vec![
-                ContentBlock::Thought {
-                    text: "reasoning".to_string(),
-                    elapsed_seconds: 0,
-                },
-                ContentBlock::Text("answer".to_string()),
-            ]),
-        };
+        let message = Message::assistant(vec![
+            ContentBlock::Thought {
+                text: "reasoning".to_string(),
+                elapsed_seconds: 0,
+            },
+            ContentBlock::Text("answer".to_string()),
+        ]);
 
         assert!(count_output_tokens(&message) >= 3);
     }
 
     #[test]
     fn request_estimate_counts_persisted_thoughts() {
-        let text_only = Message {
-            id: MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(vec![ContentBlock::Text("x".repeat(400))]),
-        };
-        let with_thought = Message {
-            id: MessageId::new(),
-            role: Role::Assistant,
-            content: MessageContent::Assistant(vec![
-                ContentBlock::Thought {
-                    text: "x".repeat(400),
-                    elapsed_seconds: 0,
-                },
-                ContentBlock::Text("x".repeat(400)),
-            ]),
-        };
+        let text_only = Message::assistant_text(&"x".repeat(400));
+        let with_thought = Message::assistant(vec![
+            ContentBlock::Thought {
+                text: "x".repeat(400),
+                elapsed_seconds: 0,
+            },
+            ContentBlock::Text("x".repeat(400)),
+        ]);
 
         let plain = count_tokens(std::slice::from_ref(&text_only));
         let reasoned = count_tokens(std::slice::from_ref(&with_thought));

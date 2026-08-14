@@ -1,12 +1,13 @@
 use std::{
     fmt::Write as _,
     io::Read,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
-use ash_core::{define_tool, CancellationToken, Content, Tool, ToolError, ToolOutput};
+use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -17,9 +18,9 @@ struct ReadArgs {
     /// File path, relative to the working directory or absolute within it
     path: String,
     /// First line to read (1-indexed)
-    offset: Option<usize>,
+    offset: Option<NonZeroUsize>,
     /// Maximum number of lines to read
-    limit: Option<usize>,
+    limit: Option<NonZeroUsize>,
 }
 
 enum CurrentLine {
@@ -31,6 +32,8 @@ struct TextReadState {
     offset: usize,
     end: usize,
     line: usize,
+    saw_input: bool,
+    ends_with_line_break: bool,
     current: CurrentLine,
     selected: Vec<u8>,
     output_lines: usize,
@@ -43,6 +46,8 @@ impl TextReadState {
             offset,
             end,
             line: 1,
+            saw_input: false,
+            ends_with_line_break: false,
             current: CurrentLine::Buffered(Vec::new()),
             selected: Vec::with_capacity(DEFAULT_MAX_BYTES.min(8 * 1024)),
             output_lines: 0,
@@ -55,6 +60,8 @@ impl TextReadState {
     }
 
     fn push(&mut self, byte: u8) {
+        self.saw_input = true;
+        self.ends_with_line_break = false;
         if !self.accepts_current_line() {
             return;
         }
@@ -97,14 +104,34 @@ impl TextReadState {
 
     fn next_line(&mut self) {
         self.finish_line();
+        self.saw_input = true;
+        self.ends_with_line_break = true;
         self.line = self.line.saturating_add(1);
+    }
+
+    fn finish_file(&mut self) {
+        let output_lines = self.output_lines;
+        let terminal_line_is_empty = !self.saw_input || self.ends_with_line_break;
+        self.finish_line();
+        if terminal_line_is_empty && self.output_lines > output_lines {
+            self.output_lines -= 1;
+        }
+    }
+
+    fn total_lines(&self) -> usize {
+        if self.saw_input {
+            self.line
+                .saturating_sub(usize::from(self.ends_with_line_break))
+        } else {
+            0
+        }
     }
 }
 
 pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "read",
-        "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Supported images: jpg, png, gif, webp, and bmp.",
+        "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Images are resized to 2000px / 5MB. Supported images: jpg, png, gif, webp, and bmp.",
         move |ctx, args: ReadArgs| {
             let working_dir = Arc::clone(&working_dir);
             let cancellation = ctx.cancellation;
@@ -113,8 +140,8 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
                 read_file(
                     &working_dir,
                     &args.path,
-                    args.offset,
-                    args.limit,
+                    args.offset.map(NonZeroUsize::get),
+                    args.limit.map(NonZeroUsize::get),
                     cancellation,
                     deadline,
                 )
@@ -147,15 +174,14 @@ async fn read_file(
             ))
         })?;
         if let Some(media_type) = image_media_type(path.full_path()) {
-            let bytes =
-                crate::path::read_all(&mut file, path.full_path(), &cancellation, deadline)?;
-            return Ok(ToolOutput::with_attachments(
-                format!("Read image file [{media_type}]"),
-                vec![Content::Image {
-                    media_type: media_type.to_string(),
-                    data: bytes,
-                }],
-            ));
+            let bytes = crate::path::read_limited(
+                &mut file,
+                path.full_path(),
+                crate::image::MAX_IMAGE_INGEST_BYTES,
+                &cancellation,
+                deadline,
+            )?;
+            return crate::image::tool_output(media_type, bytes);
         }
         render_reader(file, offset, limit, &cancellation, deadline).map(Into::into)
     })
@@ -202,13 +228,6 @@ fn render_reader(
 ) -> Result<String, ToolError> {
     crate::path::ensure_running(cancellation, deadline)?;
     let offset = offset.unwrap_or(1);
-    if offset == 0 {
-        return Err(ToolError::Execution("offset must be at least 1".into()));
-    }
-    if limit == Some(0) {
-        return Err(ToolError::Execution("limit must be at least 1".into()));
-    }
-
     let requested_lines = limit.unwrap_or(usize::MAX).min(DEFAULT_MAX_LINES);
     let end = offset.saturating_add(requested_lines);
     let mut state = TextReadState::new(offset, end);
@@ -221,7 +240,7 @@ fn render_reader(
             .read(&mut buffer)
             .map_err(|error| ToolError::Execution(format!("cannot read file: {error}")))?;
         if count == 0 {
-            state.finish_line();
+            state.finish_file();
             break;
         }
         for &byte in &buffer[..count] {
@@ -241,8 +260,8 @@ fn render_reader(
     }
     crate::path::ensure_running(cancellation, deadline)?;
 
-    let total_lines = state.line;
-    if offset > total_lines {
+    let total_lines = state.total_lines();
+    if offset > total_lines.max(1) {
         return Err(ToolError::Execution(format!(
             "offset {offset} is beyond end of file ({total_lines} lines total)"
         )));
@@ -286,6 +305,8 @@ fn render_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash_core::Content;
+    use image::GenericImageView;
     use std::time::Duration;
 
     #[test]
@@ -322,6 +343,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_offset_after_a_trailing_newline() {
+        let error = render_text("one\ntwo\n", Some(3), None).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Execution(message)
+                if message == "offset 3 is beyond end of file (2 lines total)"
+        ));
+    }
+
+    #[test]
+    fn does_not_report_a_phantom_line_after_a_trailing_newline() {
+        let rendered = render_text("one\ntwo\n", Some(2), Some(1)).unwrap();
+
+        assert_eq!(rendered, "two");
+    }
+
+    #[test]
     fn bounds_memory_for_an_oversized_text_line() {
         let content = "x".repeat(DEFAULT_MAX_BYTES * 4);
         let rendered = render_text(&content, None, None).unwrap();
@@ -336,10 +375,23 @@ mod tests {
         assert_eq!(image_media_type(Path::new("image.svg")), None);
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        use image::{ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+
+        let image = RgbImage::from_pixel(width, height, Rgb([0xcc, 0x33, 0x00]));
+        let mut bytes = Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, ImageFormat::Png)
+            .expect("encode png");
+        bytes.into_inner()
+    }
+
     #[tokio::test]
     async fn returns_images_as_attachments() {
         let root = tempfile::tempdir().unwrap();
-        tokio::fs::write(root.path().join("image.png"), [0x89, 0x50, 0x4e, 0x47])
+        let bytes = png_bytes(8, 4);
+        tokio::fs::write(root.path().join("image.png"), &bytes)
             .await
             .unwrap();
 
@@ -358,7 +410,65 @@ mod tests {
         assert!(matches!(
             output.attachments.as_slice(),
             [Content::Image { media_type, data }]
-                if media_type == "image/png" && data == &[0x89, 0x50, 0x4e, 0x47]
+                if media_type == "image/png" && data == &bytes
+        ));
+    }
+
+    #[tokio::test]
+    async fn resizes_oversized_images_before_attaching_them() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::write(root.path().join("wide.png"), png_bytes(2_400, 800))
+            .await
+            .unwrap();
+
+        let output = read_file(
+            root.path(),
+            "wide.png",
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(output
+            .text
+            .contains("[Image converted from image/png to image/jpeg.]"));
+        assert!(output
+            .text
+            .contains("[Image resized from 2400x800 to 2000x666.]"));
+        assert!(matches!(
+            output.attachments.as_slice(),
+            [Content::Image { media_type, data }]
+                if media_type == "image/jpeg"
+                    && image::load_from_memory(data).unwrap().dimensions() == (2000, 666)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_images_over_the_ingest_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("huge.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((crate::image::MAX_IMAGE_INGEST_BYTES as u64) + 1)
+            .unwrap();
+
+        let error = read_file(
+            root.path(),
+            "huge.png",
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Execution(message)
+                if message.contains("exceeds the 20.0MB read limit")
         ));
     }
 

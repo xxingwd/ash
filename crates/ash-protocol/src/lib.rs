@@ -7,7 +7,7 @@ mod sse;
 
 use std::{borrow::Cow, sync::Arc};
 
-use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, Role, ToolCallId};
+use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, ToolCallId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -145,10 +145,8 @@ struct ProjectedMessages<'a> {
     messages: Vec<&'a Message>,
 }
 
-/// Validate the provider-neutral role/content pair and lift system messages to
-/// the provider's privileged instruction field. `MessageContent` predates a
-/// dedicated system variant, so persisted system messages intentionally carry
-/// user-shaped text content.
+/// Validate the provider-neutral content and lift system messages to the
+/// provider's privileged instruction field.
 fn project_request_messages(
     request: &ModelRequest,
 ) -> Result<ProjectedMessages<'_>, ProtocolError> {
@@ -156,8 +154,8 @@ fn project_request_messages(
     let mut messages = Vec::with_capacity(request.messages.len());
 
     for message in &request.messages {
-        match (&message.role, &message.content) {
-            (Role::System, MessageContent::User(contents)) => {
+        match &message.content {
+            MessageContent::System(contents) => {
                 let text = contents
                     .iter()
                     .map(|content| match content {
@@ -170,14 +168,9 @@ fn project_request_messages(
                     .join("\n");
                 system_parts.push(text);
             }
-            (Role::User, MessageContent::User(_) | MessageContent::ToolResult { .. })
-            | (Role::Assistant, MessageContent::Assistant(_)) => messages.push(message),
-            (role, content) => {
-                return Err(ProtocolError::InvalidRequest(format!(
-                    "message role {role:?} does not match {} content",
-                    content_kind(content)
-                )));
-            }
+            MessageContent::User(_)
+            | MessageContent::ToolResult { .. }
+            | MessageContent::Assistant(_) => messages.push(message),
         }
     }
 
@@ -185,14 +178,6 @@ fn project_request_messages(
         system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
         messages,
     })
-}
-
-const fn content_kind(content: &MessageContent) -> &'static str {
-    match content {
-        MessageContent::User(_) => "user",
-        MessageContent::Assistant(_) => "assistant",
-        MessageContent::ToolResult { .. } => "tool-result",
-    }
 }
 
 /// A maximal run of consecutive tool-result messages grouped for one adapter
@@ -205,6 +190,8 @@ pub(crate) struct ToolResultGroup<'a> {
 pub(crate) struct ToolResultRef<'a> {
     pub(crate) id: &'a ToolCallId,
     pub(crate) output: Cow<'a, str>,
+    pub(crate) is_error: bool,
+    pub(crate) attachments: &'a [Content],
 }
 
 fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolResultGroup<'a> {
@@ -221,11 +208,16 @@ fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolR
         else {
             break;
         };
-        let output = match result {
-            Ok(output) => Cow::Borrowed(output.as_str()),
-            Err(error) => Cow::Owned(format!("Error: {error}")),
+        let (output, is_error) = match result {
+            Ok(output) => (Cow::Borrowed(output.as_str()), false),
+            Err(error) => (Cow::Owned(format!("Error: {error}")), true),
         };
-        results.push(ToolResultRef { id, output });
+        results.push(ToolResultRef {
+            id,
+            output,
+            is_error,
+            attachments: result_attachments,
+        });
         attachments.extend(result_attachments.iter().cloned());
         index += 1;
     }
@@ -261,46 +253,43 @@ impl<'a> Iterator for MessageGroupIter<'a> {
     type Item = MessageGroup<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let message = *self.messages.get(self.index)?;
-        let group = match &message.content {
-            MessageContent::User(contents) => MessageGroup::User(contents.as_slice()),
-            MessageContent::Assistant(blocks) => MessageGroup::Assistant(blocks.as_slice()),
-            MessageContent::ToolResult { .. } => {
-                let group = consecutive_tool_results(self.messages, self.index);
-                self.index += group.results.len();
-                MessageGroup::ToolResults(group)
+        loop {
+            let message = *self.messages.get(self.index)?;
+            let group = match &message.content {
+                MessageContent::User(contents) => MessageGroup::User(contents.as_slice()),
+                MessageContent::Assistant(blocks) => MessageGroup::Assistant(blocks.as_slice()),
+                MessageContent::System(_) => {
+                    self.index += 1;
+                    continue;
+                }
+                MessageContent::ToolResult { .. } => {
+                    let group = consecutive_tool_results(self.messages, self.index);
+                    self.index += group.results.len();
+                    MessageGroup::ToolResults(group)
+                }
+            };
+            if !matches!(group, MessageGroup::ToolResults(_)) {
+                self.index += 1;
             }
-        };
-        if !matches!(group, MessageGroup::ToolResults(_)) {
-            self.index += 1;
+            return Some(group);
         }
-        Some(group)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use ash_core::{Content, Message, MessageContent, MessageId, Role, ToolCallId};
+    use ash_core::{Content, Message, ToolCallId};
 
     /// A provider-neutral tool-result message shared by the adapter tests.
     pub fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
-        Message {
-            id: MessageId::new(),
-            role: Role::User,
-            content: MessageContent::ToolResult {
-                id: ToolCallId::new(),
-                result: Ok(text.into()),
-                attachments,
-                file_change: None,
-            },
-        }
+        Message::tool_result(ToolCallId::new(), Ok(text.into()), attachments)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash_core::{ContentBlock, MessageId, ModelId};
+    use ash_core::{Content, ModelId};
 
     #[test]
     fn protocol_display_uses_the_stable_configuration_names() {
@@ -413,15 +402,14 @@ mod tests {
     }
 
     #[test]
-    fn request_projection_rejects_role_content_mismatches() {
+    fn request_projection_rejects_system_images() {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::User,
-                content: MessageContent::Assistant(vec![ContentBlock::Text("answer".into())]),
-            }],
+            messages: vec![Message::system_content(vec![Content::Image {
+                media_type: "image/png".into(),
+                data: vec![1],
+            }])],
             tools: Vec::new(),
             max_tokens: None,
         };

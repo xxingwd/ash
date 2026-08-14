@@ -469,7 +469,7 @@ fn output_length_usize(length: u64) -> Result<usize, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash_core::{AgentToolContext, CancellationToken, ThreadId, ToolContext, TreeId, TurnId};
+    use ash_core::{AgentToolContext, CancellationToken, SessionId, ToolContext, TreeId, TurnId};
 
     fn test_context() -> ToolContext {
         test_context_with(CancellationToken::new())
@@ -477,7 +477,7 @@ mod tests {
 
     fn test_context_with(cancellation: CancellationToken) -> ToolContext {
         ToolContext {
-            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
             turn_id: TurnId::new(),
             cancellation,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),

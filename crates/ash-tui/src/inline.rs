@@ -5,9 +5,10 @@ use std::{
     time::Instant,
 };
 
+use ash_collab::SubagentSnapshot;
 use ash_core::{
-    Content, ContentBlock, FileChange, ForkPoint, Message, MessageContent, MessageId, StopReason,
-    SubagentSnapshot, ThreadSummary, ThreadView, ToolCallId, TurnResult, TurnView, Usage,
+    Content, ContentBlock, ForkPoint, Message, MessageContent, MessageId, SessionSummary,
+    SessionView, StopReason, ToolCallId, TurnId, TurnResult, TurnView, Usage,
 };
 use crossterm::terminal;
 use serde_json::Value;
@@ -20,25 +21,23 @@ use crate::{
     input::InputState,
     live_block::LiveBlock,
     menu::MenuView,
-    operation::CancellationMode,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
-    stream_state::{format_elapsed, FinishedThought, StreamState},
+    status_line::format_elapsed,
     viewport::{self, ViewportInput, COMPOSER_TEXT_COLUMN},
 };
 
-const CONTENT_PREFIX_COLUMNS: u16 = 2;
 const TERMINAL_SAFE_COLUMN: u16 = 1;
 
 #[derive(Debug)]
-struct SessionView {
+struct SessionUiInfo {
     protocol: String,
     model: String,
     working_dir: PathBuf,
     context_limit: Option<u64>,
 }
 
-impl SessionView {
+impl SessionUiInfo {
     fn new(protocol: &str, model: &str, working_dir: &Path, context_limit: Option<u64>) -> Self {
         Self {
             protocol: protocol.to_string(),
@@ -95,6 +94,8 @@ pub struct TerminalView<'a> {
     pub(crate) input: &'a InputState,
     pub(crate) menu: MenuView<'a>,
     pub(crate) busy: bool,
+    pub(crate) interruptible: bool,
+    pub(crate) status_header: Option<&'static str>,
 }
 
 impl ComposerState {
@@ -145,7 +146,7 @@ enum RenderedMenu {
         selected: usize,
     },
     Sessions {
-        items: Vec<ThreadSummary>,
+        items: Vec<SessionSummary>,
         selected: usize,
     },
     ForkPoints {
@@ -201,11 +202,12 @@ struct ViewState {
     composer: ComposerState,
     menu: RenderedMenu,
     busy: bool,
+    interruptible: bool,
 }
 
 pub struct TerminalUi {
     surface: InlineScreen,
-    session: SessionView,
+    session: SessionUiInfo,
     view: ViewState,
     history: Vec<LiveBlock>,
     transcript: Vec<LiveBlock>,
@@ -219,9 +221,8 @@ pub struct TerminalUi {
     next_block_id: u64,
     status: StatusState,
     usage: UsageState,
-    stream: StreamState,
-    current_turn_id: Option<u64>,
-    next_turn_id: u64,
+    current_turn_id: Option<TurnId>,
+    reasoning_block_id: Option<u64>,
     /// Id of the turn's active streaming assistant block (if any). Deltas are
     /// appended straight into this block; cleared when the turn commits.
     assistant_block_id: Option<u64>,
@@ -244,7 +245,7 @@ impl TerminalUi {
         let surface = InlineScreen::enter()?;
         Ok(Self {
             surface,
-            session: SessionView::new(protocol, model, working_dir, context_limit),
+            session: SessionUiInfo::new(protocol, model, working_dir, context_limit),
             view: ViewState::default(),
             history: Vec::new(),
             transcript: Vec::new(),
@@ -254,9 +255,8 @@ impl TerminalUi {
             next_block_id: 1,
             status: StatusState::default(),
             usage: UsageState::default(),
-            stream: StreamState::default(),
             current_turn_id: None,
-            next_turn_id: 1,
+            reasoning_block_id: None,
             assistant_block_id: None,
         })
     }
@@ -295,13 +295,6 @@ impl TerminalUi {
         self.commit_transcript_to_scrollback()
     }
 
-    pub fn start_compaction(&mut self) -> io::Result<()> {
-        self.view.composer.clear();
-        self.scroll_top = None;
-        self.status.start("Compacting");
-        self.redraw()
-    }
-
     pub fn finish_compaction(
         &mut self,
         before_tokens: u64,
@@ -322,13 +315,6 @@ impl TerminalUi {
 
     pub fn record_automatic_compaction(&mut self, after_tokens: u64) -> io::Result<()> {
         self.usage.set_context_tokens(after_tokens);
-        self.redraw()
-    }
-
-    /// Update the status-line context occupancy after a rollback, without
-    /// clearing the transcript (unlike `restore_session`).
-    pub fn record_rollback_context(&mut self, tokens: u64) -> io::Result<()> {
-        self.usage.set_context_tokens(tokens);
         self.redraw()
     }
 
@@ -361,28 +347,24 @@ impl TerminalUi {
         self.rebuild_scrollback_at(width, height)
     }
 
-    pub fn restore_session(
-        &mut self,
-        thread: &ThreadView,
-        context_tokens: Option<u64>,
-    ) -> io::Result<()> {
+    pub fn restore_session(&mut self, session: &SessionView) -> io::Result<()> {
         self.begin_fresh_viewport()?;
         self.enqueue_welcome();
-        if thread.turns.is_empty() {
-            self.push_restored_messages(&thread.messages);
+        if session.turns.is_empty() {
+            self.push_restored_messages(&session.messages);
         } else {
-            let turn_message_ids = thread
+            let turn_message_ids = session
                 .turns
                 .iter()
                 .flat_map(|turn| turn.messages.iter().map(|message| message.id))
                 .collect::<HashSet<_>>();
-            self.push_restored_messages_excluding(&thread.messages, &turn_message_ids);
-            self.push_restored_turns(&thread.turns);
+            self.push_restored_messages_excluding(&session.messages, &turn_message_ids);
+            self.push_restored_turns(&session.turns);
         }
         // `begin_fresh_viewport` resets usage; restore the estimated context
         // size so the status line reflects current occupancy before any API
         // usage is reported for the new history.
-        if let Some(tokens) = context_tokens {
+        if let Some(tokens) = session.context_tokens {
             self.usage.set_context_tokens(tokens);
         }
         self.commit_transcript_to_scrollback()
@@ -407,15 +389,22 @@ impl TerminalUi {
         self.view.composer.cursor_column = input.cursor_column;
         self.view.menu.set(view.menu);
         self.view.busy = view.busy;
+        self.view.interruptible = view.interruptible;
+        match view.status_header {
+            Some(header) if self.status.started_at.is_none() => self.status.start(header),
+            Some(header) => {
+                self.status.header.clear();
+                self.status.header.push_str(header);
+            }
+            None => self.status.stop(),
+        }
     }
 
     pub fn composer_text_width() -> io::Result<u16> {
         Ok(composer_text_width(terminal_size()?.0))
     }
 
-    pub fn commit_input(&mut self, input: &str) -> io::Result<()> {
-        let turn_id = self.next_turn_id;
-        self.next_turn_id = self.next_turn_id.saturating_add(1);
+    pub fn commit_input(&mut self, turn_id: TurnId, input: &str) -> io::Result<()> {
         self.current_turn_id = Some(turn_id);
         self.scroll_top = None;
         self.status.start("Working");
@@ -423,14 +412,13 @@ impl TerminalUi {
     }
 
     pub fn commit_steer(&mut self, input: &str) -> io::Result<()> {
-        self.finish_stream();
-        self.assistant_block_id = None;
+        self.finish_live_output();
         self.scroll_top = None;
         self.commit_user_message(input)
     }
 
     pub fn commit_exit(&mut self, input: &str) -> io::Result<()> {
-        self.finish_stream();
+        self.finish_live_output();
         self.current_turn_id = None;
         self.status.stop();
         self.view.busy = false;
@@ -440,7 +428,6 @@ impl TerminalUi {
 
     fn commit_user_message(&mut self, input: &str) -> io::Result<()> {
         self.view.composer.clear();
-        self.stream.reset();
         self.view.menu.clear();
         self.push_history_block(HistoryBlock::user(input));
         self.redraw()
@@ -462,11 +449,7 @@ impl TerminalUi {
             return;
         }
         let id = self.assistant_block_id.unwrap_or_else(|| {
-            // Force-finish any in-progress reasoning before the first text
-            // delta: `start_reasoning` is a no-op when already reasoning, so
-            // use `finish` to always solidify the thought into a block.
-            let finished = self.stream.finish();
-            self.commit_finished_stream(finished);
+            self.finish_reasoning();
             let id = self.allocate_block_id();
             self.push_block(LiveBlock::assistant(id, String::new()));
             self.assistant_block_id = Some(id);
@@ -483,7 +466,7 @@ impl TerminalUi {
     pub fn text(&mut self, text: &str) -> io::Result<()> {
         self.append_assistant(text);
         if delta_completes_line(text) {
-            self.refresh_stream_view()?;
+            self.redraw()?;
         }
         Ok(())
     }
@@ -495,63 +478,80 @@ impl TerminalUi {
     /// thinking blocks before text output, so no late-reasoning handling is
     /// needed here.
     pub fn thinking(&mut self, text: &str) -> io::Result<()> {
-        self.stream.start_reasoning();
-        self.stream.push_reasoning(text);
+        let id = self.reasoning_block_id.unwrap_or_else(|| {
+            let id = self.allocate_block_id();
+            self.push_block(LiveBlock::reasoning(id));
+            self.reasoning_block_id = Some(id);
+            id
+        });
+        if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
+            block.append_reasoning_source(text);
+        }
         if delta_completes_line(text) {
-            self.refresh_stream_view()?;
+            self.redraw()?;
         }
         Ok(())
     }
 
-    pub fn tool_start(&mut self) -> io::Result<()> {
-        self.finish_stream();
+    pub fn tool_started(
+        &mut self,
+        id: ToolCallId,
+        name: String,
+        arguments: Value,
+    ) -> io::Result<()> {
+        self.finish_live_output();
+        if absorbs_running_read(&self.transcript, &name, &arguments) {
+            return Ok(());
+        }
+        let block_id = self.allocate_block_id();
+        self.push_block(LiveBlock::running_tool(block_id, id, name, arguments));
         self.redraw()
     }
 
-    pub fn tool_end(
+    pub fn tool_finished(
         &mut self,
+        id: &ToolCallId,
         name: &str,
         arguments: &Value,
         output: &str,
         is_error: bool,
-        file_change: Option<FileChange>,
     ) -> io::Result<()> {
-        self.push_tool_block(
-            name.to_string(),
-            arguments.clone(),
-            output.to_string(),
-            is_error,
-            file_change,
-        );
+        if let Some(position) = self
+            .transcript
+            .iter()
+            .position(|block| block.is_running_tool(id))
+        {
+            self.transcript[position].finish_tool(id, output.to_string(), is_error);
+            if position > 0
+                && self.transcript[position - 1].try_append_tool(name, arguments, is_error)
+            {
+                self.transcript.remove(position);
+            }
+        } else {
+            self.push_tool_block(
+                name.to_string(),
+                arguments.clone(),
+                output.to_string(),
+                is_error,
+            );
+        }
         self.redraw()
     }
 
-    /// Prepare the live projection for cancellation. A completed tool result
-    /// keeps the turn; otherwise all streamed output is removed immediately
-    /// because text and reasoning have no reliable completion boundary.
-    pub fn prepare_cancellation(&mut self) -> CancellationMode {
-        self.stream.reset();
-        let Some(turn_id) = self.current_turn_id else {
-            self.assistant_block_id = None;
-            return CancellationMode::Rollback;
-        };
-        let mode = if self
-            .transcript
-            .iter()
-            .any(|block| block.is_completed_tool_for_turn(turn_id))
-        {
-            CancellationMode::Interrupt
-        } else {
-            CancellationMode::Rollback
-        };
-        self.transcript
-            .retain(|block| keep_during_cancellation(block, turn_id, mode));
+    /// Discard unfinished streamed output after the user cancels. Completed
+    /// tool results stay until the settled `TurnView` arrives; that view is
+    /// what decides whether the turn is kept or rolled back.
+    pub fn prepare_cancellation(&mut self) {
+        self.reasoning_block_id = None;
+        if let Some(turn_id) = self.current_turn_id {
+            self.transcript
+                .retain(|block| !block.is_unfinished_response_for_turn(turn_id));
+        }
         self.assistant_block_id = None;
-        mode
     }
 
     pub fn error(&mut self, error: &str) -> io::Result<()> {
-        self.finish_stream();
+        self.finish_live_output();
         self.push_history_block(HistoryBlock::error(error));
         if self.current_turn_id.is_some() {
             self.redraw()
@@ -563,7 +563,7 @@ impl TerminalUi {
     /// Commit a settled turn: replace the streamed preview with the canonical
     /// projection of the turn's messages, then move it into the scrollback.
     pub fn commit_turn(&mut self, view: &TurnView) -> io::Result<()> {
-        self.finish_stream();
+        self.finish_live_output();
         let elapsed_seconds = self.status.elapsed_seconds();
         if let Some(tokens) = view.context_tokens {
             self.usage.set_context_tokens(tokens);
@@ -571,10 +571,8 @@ impl TerminalUi {
         let usage = UsageState::commit_turn_usage(view.usage.as_ref());
         let footer = turn_footer(&view.result, elapsed_seconds, usage);
         if let Some(turn_id) = self.current_turn_id {
-            self.transcript.retain(|block| {
-                !block.is_streamed_for_turn(turn_id)
-                    && !block.matches_history_for_turn(turn_id, &footer)
-            });
+            self.transcript
+                .retain(|block| !block.is_streamed_for_turn(turn_id));
         }
         self.assistant_block_id = None;
         self.push_turn_messages(&view.messages);
@@ -594,10 +592,6 @@ impl TerminalUi {
         let width = width.max(1);
         let height = height.max(1);
         self.surface.resize(width, height)?;
-        if self.stream.is_reasoning() {
-            let width = width.saturating_sub(CONTENT_PREFIX_COLUMNS).max(1);
-            self.stream.refresh_reasoning(width, self.tools_expanded);
-        }
         self.apply_view(view, width);
         self.rebuild_scrollback_at(width, height)
     }
@@ -625,10 +619,6 @@ impl TerminalUi {
             let (width, height) = terminal_size()?;
             self.rebuild_scrollback_at(width, height)?;
         }
-        if self.stream.is_reasoning() {
-            let width = Self::markdown_width()?;
-            self.stream.refresh_reasoning(width, self.tools_expanded);
-        }
         self.redraw()
     }
 
@@ -650,16 +640,6 @@ impl TerminalUi {
         // The periodic working refresh is the fallback flush point: it
         // redraws current state, so partial lines that never completed a
         // newline still appear here.
-        self.refresh_stream_view()
-    }
-
-    /// Single render path for live streamed content: refresh the reasoning
-    /// view (elapsed header + latest lines) and redraw the viewport.
-    fn refresh_stream_view(&mut self) -> io::Result<()> {
-        if self.stream.is_reasoning() {
-            let width = Self::markdown_width()?;
-            self.stream.refresh_reasoning(width, self.tools_expanded);
-        }
         self.redraw()
     }
 
@@ -673,7 +653,7 @@ impl TerminalUi {
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
-        self.finish_stream();
+        self.finish_live_output();
         self.status.stop();
         self.view.busy = false;
         self.current_turn_id = None;
@@ -681,9 +661,8 @@ impl TerminalUi {
         self.surface.leave_screen()
     }
 
-    fn finish_stream(&mut self) {
-        let finished = self.stream.finish();
-        self.commit_finished_stream(finished);
+    fn finish_live_output(&mut self) {
+        self.finish_reasoning();
         if let Some(id) = self.assistant_block_id.take() {
             if let Some(block) = self.transcript.iter_mut().find(|block| block.id() == id) {
                 block.finalize_markdown();
@@ -691,13 +670,15 @@ impl TerminalUi {
         }
     }
 
-    fn commit_finished_stream(&mut self, finished: Option<FinishedThought>) {
-        if let Some(FinishedThought {
-            source,
-            elapsed_seconds,
-        }) = finished
-        {
-            self.push_thought_block(source, elapsed_seconds);
+    fn finish_reasoning(&mut self) {
+        let Some(id) = self.reasoning_block_id.take() else {
+            return;
+        };
+        let Some(position) = self.transcript.iter().position(|block| block.id() == id) else {
+            return;
+        };
+        if !self.transcript[position].finish_reasoning() {
+            self.transcript.remove(position);
         }
     }
 
@@ -712,15 +693,8 @@ impl TerminalUi {
     fn reset_turn_state(&mut self) {
         self.status.reset();
         self.current_turn_id = None;
-        self.stream.reset();
+        self.reasoning_block_id = None;
         self.assistant_block_id = None;
-    }
-
-    fn markdown_width() -> io::Result<u16> {
-        Ok(terminal::size()?
-            .0
-            .saturating_sub(CONTENT_PREFIX_COLUMNS)
-            .max(1))
     }
 
     fn redraw(&mut self) -> io::Result<()> {
@@ -860,14 +834,7 @@ impl TerminalUi {
         self.push_block(LiveBlock::thought(id, source, elapsed_seconds));
     }
 
-    fn push_tool_block(
-        &mut self,
-        name: String,
-        arguments: Value,
-        output: String,
-        is_error: bool,
-        file_change: Option<FileChange>,
-    ) {
+    fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
         if self
             .transcript
             .last_mut()
@@ -876,14 +843,7 @@ impl TerminalUi {
             return;
         }
         let id = self.allocate_block_id();
-        self.push_block(LiveBlock::tool(
-            id,
-            name,
-            arguments,
-            output,
-            is_error,
-            file_change,
-        ));
+        self.push_block(LiveBlock::tool(id, name, arguments, output, is_error));
     }
 
     fn push_restored_messages(&mut self, messages: &[Message]) {
@@ -902,9 +862,7 @@ impl TerminalUi {
             .filter(|message| !excluded.contains(&message.id))
         {
             if matches!(&message.content, MessageContent::User(_)) {
-                let turn_id = self.next_turn_id;
-                self.next_turn_id = self.next_turn_id.saturating_add(1);
-                self.current_turn_id = Some(turn_id);
+                self.current_turn_id = Some(TurnId::new());
             }
             self.push_turn_message(message, &tool_results, true);
         }
@@ -913,9 +871,7 @@ impl TerminalUi {
 
     fn push_restored_turns(&mut self, turns: &[TurnView]) {
         for turn in turns {
-            let turn_id = self.next_turn_id;
-            self.next_turn_id = self.next_turn_id.saturating_add(1);
-            self.current_turn_id = Some(turn_id);
+            self.current_turn_id = Some(turn.id);
             self.push_restored_turn_messages(&turn.messages);
             if let Some(footer) = restored_turn_footer(&turn.result) {
                 self.push_history_block(footer);
@@ -961,7 +917,9 @@ impl TerminalUi {
                     .join("\n");
                 self.push_history_block(HistoryBlock::user(&text));
             }
-            MessageContent::User(_) | MessageContent::ToolResult { .. } => {}
+            MessageContent::User(_)
+            | MessageContent::System(_)
+            | MessageContent::ToolResult { .. } => {}
             MessageContent::Assistant(blocks) => {
                 self.push_assistant_blocks(blocks, tool_results);
             }
@@ -992,14 +950,12 @@ impl TerminalUi {
                     let result = tool_results.get(id).copied().unwrap_or(ToolResultView {
                         is_error: true,
                         output: "tool result unavailable",
-                        file_change: None,
                     });
                     self.push_tool_block(
                         name.clone(),
                         arguments.clone(),
                         result.output.to_string(),
                         result.is_error,
-                        result.file_change.cloned(),
                     );
                 }
                 ContentBlock::Text(_) | ContentBlock::Thought { .. } => {}
@@ -1018,7 +974,7 @@ impl TerminalUi {
             transcript: &self.transcript,
             scroll_top: self.scroll_top,
             busy: self.view.busy,
-            active_lines: self.stream.active_lines(),
+            interruptible: self.view.interruptible,
             status_header: &status_header,
             status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
@@ -1125,51 +1081,34 @@ fn composer_text_width(terminal_width: u16) -> u16 {
 struct ToolResultView<'a> {
     is_error: bool,
     output: &'a str,
-    file_change: Option<&'a FileChange>,
 }
 
 fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, ToolResultView<'_>> {
     let mut results = HashMap::new();
     for message in messages {
-        if let MessageContent::ToolResult {
-            id,
-            result,
-            file_change,
-            ..
-        } = &message.content
-        {
+        if let MessageContent::ToolResult { id, result, .. } = &message.content {
             let (is_error, output) = match result {
                 Ok(output) => (false, output.as_str()),
                 Err(error) => (true, error.as_str()),
             };
-            results.insert(
-                id.clone(),
-                ToolResultView {
-                    is_error,
-                    output,
-                    file_change: file_change.as_ref(),
-                },
-            );
+            results.insert(id.clone(), ToolResultView { is_error, output });
         }
     }
     results
 }
 
 fn latest_turn_id(
-    current_turn_id: Option<u64>,
+    current_turn_id: Option<TurnId>,
     transcript: &[LiveBlock],
     history: &[LiveBlock],
-) -> Option<u64> {
+) -> Option<TurnId> {
     current_turn_id
         .or_else(|| transcript.iter().rev().find_map(LiveBlock::turn_id))
         .or_else(|| history.iter().rev().find_map(LiveBlock::turn_id))
 }
 
-fn keep_during_cancellation(block: &LiveBlock, turn_id: u64, mode: CancellationMode) -> bool {
-    match mode {
-        CancellationMode::Interrupt => !block.is_unfinished_response_for_turn(turn_id),
-        CancellationMode::Rollback => !block.is_streamed_for_turn(turn_id),
-    }
+fn keep_during_cancellation(block: &LiveBlock, turn_id: TurnId) -> bool {
+    !block.is_unfinished_response_for_turn(turn_id)
 }
 
 fn turn_footer(result: &TurnResult, elapsed_seconds: u64, usage: TurnUsage) -> HistoryBlock {
@@ -1195,9 +1134,19 @@ fn restored_turn_footer(result: &TurnResult) -> Option<HistoryBlock> {
     }
 }
 
+fn absorbs_running_read(transcript: &[LiveBlock], name: &str, arguments: &Value) -> bool {
+    transcript
+        .last()
+        .is_some_and(|block| block.can_group_read(name, arguments))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_turn(n: u128) -> TurnId {
+        TurnId::from_u128(n)
+    }
 
     #[test]
     fn delta_completes_line_flags_newline_deltas() {
@@ -1272,37 +1221,41 @@ mod tests {
     #[test]
     fn rollback_finds_the_latest_committed_turn_behind_non_turn_history() {
         let history = [
-            LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(7)),
-            LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(7)),
+            LiveBlock::history(1, HistoryBlock::user("question")).with_turn(Some(test_turn(7))),
+            LiveBlock::assistant(2, "answer".to_string()).with_turn(Some(test_turn(7))),
             LiveBlock::history(3, HistoryBlock::info("status")),
         ];
 
-        assert_eq!(latest_turn_id(None, &[], &history), Some(7));
+        assert_eq!(latest_turn_id(None, &[], &history), Some(test_turn(7)));
     }
 
     #[test]
-    fn rollback_cancellation_removes_finalized_text_from_the_live_projection() {
-        let mut text = LiveBlock::assistant(1, String::new()).with_turn(Some(7));
+    fn cancellation_keeps_finalized_text_until_the_turn_settles() {
+        let mut text = LiveBlock::assistant(1, String::new()).with_turn(Some(test_turn(7)));
         assert!(text.append_markdown_source("Inspecting before the tool call."));
         text.finalize_markdown();
 
-        assert!(keep_during_cancellation(
-            &text,
-            7,
-            CancellationMode::Interrupt
-        ));
-        assert!(!keep_during_cancellation(
-            &text,
-            7,
-            CancellationMode::Rollback
-        ));
+        assert!(keep_during_cancellation(&text, test_turn(7)));
 
-        let prompt = LiveBlock::history(2, HistoryBlock::user("inspect")).with_turn(Some(7));
-        assert!(keep_during_cancellation(
-            &prompt,
-            7,
-            CancellationMode::Rollback
-        ));
+        let prompt =
+            LiveBlock::history(2, HistoryBlock::user("inspect")).with_turn(Some(test_turn(7)));
+        assert!(keep_during_cancellation(&prompt, test_turn(7)));
+    }
+
+    #[test]
+    fn cancellation_removes_a_running_tool_until_it_has_a_result() {
+        let call_id = ToolCallId::from_provider("call-1");
+        let mut tool = LiveBlock::running_tool(
+            1,
+            call_id.clone(),
+            "bash".to_string(),
+            serde_json::json!({"command": "sleep 10"}),
+        )
+        .with_turn(Some(test_turn(7)));
+
+        assert!(!keep_during_cancellation(&tool, test_turn(7)));
+        assert!(tool.finish_tool(&call_id, "done".to_string(), false));
+        assert!(keep_during_cancellation(&tool, test_turn(7)));
     }
 
     #[test]
@@ -1373,30 +1326,47 @@ mod tests {
     }
 
     #[test]
-    fn durable_tool_results_retain_file_changes_for_replay() {
+    fn durable_tool_results_retain_output_for_replay() {
         let id = ToolCallId::from_provider("call-1");
-        let messages = [Message {
-            id: MessageId::new(),
-            role: ash_core::Role::User,
-            content: MessageContent::ToolResult {
-                id: id.clone(),
-                result: Ok("updated".to_string()),
-                attachments: Vec::new(),
-                file_change: Some(FileChange::Update {
-                    path: PathBuf::from("src/main.rs"),
-                    unified_diff: "-old\n+new\n".to_string(),
-                }),
-            },
-        }];
+        let messages = [Message::tool_result(
+            id.clone(),
+            Ok("updated".to_string()),
+            Vec::new(),
+        )];
 
         let results = tool_results_map(&messages);
         let result = results.get(&id).expect("tool result");
 
         assert!(!result.is_error);
         assert_eq!(result.output, "updated");
-        assert_eq!(
-            result.file_change.map(FileChange::path),
-            Some(Path::new("src/main.rs"))
+    }
+
+    #[test]
+    fn consecutive_reads_do_not_open_a_running_row() {
+        let first = LiveBlock::tool(
+            1,
+            "read".to_string(),
+            serde_json::json!({"path": "/workspace/src/inline.rs"}),
+            String::new(),
+            false,
         );
+        let second = LiveBlock::tool(
+            2,
+            "bash".to_string(),
+            serde_json::json!({"command": "pwd"}),
+            String::new(),
+            false,
+        );
+
+        assert!(absorbs_running_read(
+            &[first.clone()],
+            "read",
+            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+        ));
+        assert!(!absorbs_running_read(
+            &[first, second],
+            "read",
+            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+        ));
     }
 }

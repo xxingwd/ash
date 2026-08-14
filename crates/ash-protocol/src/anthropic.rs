@@ -1,4 +1,4 @@
-use ash_core::{ContentBlock, MessageContent, ProtocolError, StopReason};
+use ash_core::{ContentBlock, ProtocolError, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
@@ -7,7 +7,7 @@ use crate::{
     base64_image, model_config,
     pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
-    project_request_messages, sse, ProviderConfig,
+    project_request_messages, sse, MessageGroup, MessageGroupIter, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -43,25 +43,26 @@ impl AnthropicAdapter {
 
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
-        let messages: Vec<Value> = projected
-            .messages
-            .iter()
-            .filter_map(|msg| match &msg.content {
-                MessageContent::User(contents) => {
-                    let content: Vec<Value> = contents
-                        .iter()
-                        .map(|content| match content {
-                            ash_core::Content::Text(text) => {
-                                json!({"type": "text", "text": text})
-                            }
-                            ash_core::Content::Image { media_type, data } => {
-                                anthropic_image_block(media_type, data)
-                            }
-                        })
-                        .collect();
-                    Some(json!({"role": "user", "content": content}))
+        let mut messages = Vec::new();
+        for group in MessageGroupIter::new(&projected.messages) {
+            match group {
+                MessageGroup::User(contents) => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": contents
+                            .iter()
+                            .map(|content| match content {
+                                ash_core::Content::Text(text) => {
+                                    json!({"type": "text", "text": text})
+                                }
+                                ash_core::Content::Image { media_type, data } => {
+                                    anthropic_image_block(media_type, data)
+                                }
+                            })
+                            .collect::<Vec<Value>>(),
+                    }));
                 }
-                MessageContent::Assistant(blocks) => {
+                MessageGroup::Assistant(blocks) => {
                     let content: Vec<Value> = blocks
                         .iter()
                         .map(|block| match block {
@@ -82,37 +83,39 @@ impl AnthropicAdapter {
                             }),
                         })
                         .collect();
-                    (!content.is_empty()).then(|| json!({"role": "assistant", "content": content}))
+                    if !content.is_empty() {
+                        messages.push(json!({"role": "assistant", "content": content}));
+                    }
                 }
-                MessageContent::ToolResult {
-                    id,
-                    result,
-                    attachments,
-                    ..
-                } => {
-                    let (text, is_error) = match result {
-                        Ok(output) => (output, false),
-                        Err(error) => (error, true),
-                    };
-                    let mut content = vec![json!({"type": "text", "text": text})];
-                    content.extend(attachments.iter().map(|attachment| match attachment {
-                        ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
-                        ash_core::Content::Image { media_type, data } => {
-                            anthropic_image_block(media_type, data)
-                        }
-                    }));
-                    Some(json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": id.as_str(),
-                            "content": content,
-                            "is_error": is_error,
-                        }]
-                    }))
+                MessageGroup::ToolResults(group) => {
+                    let content: Vec<Value> = group
+                        .results
+                        .into_iter()
+                        .map(|result| {
+                            let mut content =
+                                vec![json!({"type": "text", "text": result.output.as_ref()})];
+                            content.extend(result.attachments.iter().map(|attachment| {
+                                match attachment {
+                                    ash_core::Content::Text(text) => {
+                                        json!({"type": "text", "text": text})
+                                    }
+                                    ash_core::Content::Image { media_type, data } => {
+                                        anthropic_image_block(media_type, data)
+                                    }
+                                }
+                            }));
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": result.id.as_str(),
+                                "content": content,
+                                "is_error": result.is_error,
+                            })
+                        })
+                        .collect();
+                    messages.push(json!({"role": "user", "content": content}));
                 }
-            })
-            .collect();
+            }
+        }
 
         let tools: Vec<Value> = req
             .tools
@@ -310,9 +313,7 @@ impl AnthropicDecoder {
 mod tests {
     use super::*;
     use crate::{sse::Decoder, Protocol};
-    use ash_core::{
-        Content, ContentBlock, Message, MessageContent, MessageId, ModelId, Role, ToolCallId,
-    };
+    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -432,17 +433,13 @@ mod tests {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::Assistant,
-                content: MessageContent::Assistant(vec![
-                    ContentBlock::Thought {
-                        text: "private reasoning".into(),
-                        elapsed_seconds: 2,
-                    },
-                    ContentBlock::Text("visible answer".into()),
-                ]),
-            }],
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thought {
+                    text: "private reasoning".into(),
+                    elapsed_seconds: 2,
+                },
+                ContentBlock::Text("visible answer".into()),
+            ])],
             tools: Vec::new(),
             max_tokens: None,
         };
@@ -466,19 +463,14 @@ mod tests {
         let request = ModelRequest {
             model: ModelId::new("test"),
             system: None,
-            messages: vec![Message {
-                id: MessageId::new(),
-                role: Role::User,
-                content: MessageContent::ToolResult {
-                    id: ToolCallId::from_provider("call"),
-                    result: Ok("Read image file [image/png]".into()),
-                    attachments: vec![Content::Image {
-                        media_type: "image/png".into(),
-                        data: vec![1, 2, 3],
-                    }],
-                    file_change: None,
-                },
-            }],
+            messages: vec![Message::tool_result(
+                ToolCallId::from_provider("call"),
+                Ok("Read image file [image/png]".into()),
+                vec![Content::Image {
+                    media_type: "image/png".into(),
+                    data: vec![1, 2, 3],
+                }],
+            )],
             tools: Vec::new(),
             max_tokens: None,
         };
