@@ -65,48 +65,16 @@ Operating rules:
 - Review returned changes before integrating them.
 </multi_agent_mode>";
 
+/// Schema-facing name of one built-in profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum AgentRole {
+pub(crate) enum ProfileName {
     Default,
     Explorer,
     Worker,
 }
 
-impl AgentRole {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Explorer => "explorer",
-            Self::Worker => "worker",
-        }
-    }
-
-    const fn available_roles_description() -> &'static str {
-        r"Optional type name for the new agent. If omitted, `default` is used.
-Available roles:
-default: General-purpose agent for a self-contained task that inherits the current configuration.
-explorer: Use whenever a specific, well-scoped codebase question can be answered independently. Explorers are fast, read-only, and authoritative. Spawn multiple explorers in the same round for distinct questions; reuse an existing explorer for related follow-ups.
-worker: Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared."
-    }
-
-    const fn child_instructions(self) -> &'static str {
-        match self {
-            Self::Default => {
-                "Handle the assigned task directly. Stay within its scope, delegate independent subparts when that creates real parallel progress, and return a concise, evidence-backed result to the parent agent."
-            }
-            Self::Explorer => {
-                "Answer the assigned codebase question through read-only inspection. Do not edit files. Return concrete findings with relevant paths and symbols, and do not broaden the investigation beyond the question."
-            }
-            Self::Worker => {
-                "Execute the assigned implementation or production task. Respect the stated file or module ownership, preserve unrelated workspace changes, coordinate independent side questions through sub-agents when useful, verify your work, and report changed files plus validation results."
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-impl FromStr for AgentRole {
+impl std::str::FromStr for ProfileName {
     type Err = ToolError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -118,6 +86,103 @@ impl FromStr for AgentRole {
                 "unknown agent_type '{other}'"
             ))),
         }
+    }
+}
+
+/// How a profile filters the inherited tool set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPolicy {
+    /// Keep inherited tools and add the collaboration tools.
+    Inherit,
+    /// Keep only the named tools; collaboration tools are not installed.
+    Allow(&'static [&'static str]),
+}
+
+impl ToolPolicy {
+    fn apply(self, agent: Agent, collaboration_tools: Vec<Arc<dyn Tool>>) -> Agent {
+        match self {
+            Self::Inherit => agent.pushing_tools(collaboration_tools),
+            Self::Allow(names) => {
+                let tools = agent
+                    .tools()
+                    .iter()
+                    .filter(|tool| names.contains(&tool.name()))
+                    .cloned()
+                    .collect();
+                agent.with_tools(tools)
+            }
+        }
+    }
+}
+
+/// Data-driven description of one class of child session: a name, a
+/// description for the parent's tool documentation, a prompt overlay, and a
+/// tool policy. The session execution engine stays untouched when a new
+/// profile is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentProfile {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub prompt_overlay: &'static str,
+    pub tool_policy: ToolPolicy,
+}
+
+impl AgentProfile {
+    const fn builtin(
+        name: &'static str,
+        description: &'static str,
+        prompt_overlay: &'static str,
+        tool_policy: ToolPolicy,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            prompt_overlay,
+            tool_policy,
+        }
+    }
+
+    const fn default() -> Self {
+        Self::builtin(
+            "default",
+            "General-purpose agent for a self-contained task that inherits the current configuration.",
+            "Handle the assigned task directly. Stay within its scope, delegate independent subparts when that creates real parallel progress, and return a concise, evidence-backed result to the parent agent.",
+            ToolPolicy::Inherit,
+        )
+    }
+
+    const fn explorer() -> Self {
+        Self::builtin(
+            "explorer",
+            "Use whenever a specific, well-scoped codebase question can be answered independently. Explorers are fast, read-only, and authoritative. Spawn multiple explorers in the same round for distinct questions; reuse an existing explorer for related follow-ups.",
+            "Answer the assigned codebase question through read-only inspection. Do not edit files. Return concrete findings with relevant paths and symbols, and do not broaden the investigation beyond the question.",
+            ToolPolicy::Allow(&EXPLORER_TOOL_NAMES),
+        )
+    }
+
+    const fn worker() -> Self {
+        Self::builtin(
+            "worker",
+            "Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared.",
+            "Execute the assigned implementation or production task. Respect the stated file or module ownership, preserve unrelated workspace changes, coordinate independent side questions through sub-agents when useful, verify your work, and report changed files plus validation results.",
+            ToolPolicy::Inherit,
+        )
+    }
+
+    const fn for_name(name: ProfileName) -> Self {
+        match name {
+            ProfileName::Default => Self::default(),
+            ProfileName::Explorer => Self::explorer(),
+            ProfileName::Worker => Self::worker(),
+        }
+    }
+
+    const fn available_profiles_description() -> &'static str {
+        r"Optional type name for the new agent. If omitted, `default` is used.
+Available roles:
+default: General-purpose agent for a self-contained task that inherits the current configuration.
+explorer: Use whenever a specific, well-scoped codebase question can be answered independently. Explorers are fast, read-only, and authoritative. Spawn multiple explorers in the same round for distinct questions; reuse an existing explorer for related follow-ups.
+worker: Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared."
     }
 }
 
@@ -135,7 +200,7 @@ pub(crate) enum AgentStatus {
 pub(crate) struct AgentSnapshot {
     pub agent_id: SessionId,
     pub task_name: String,
-    pub agent_type: AgentRole,
+    pub agent_type: &'static str,
     pub status: AgentStatus,
     pub last_task_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +213,7 @@ impl From<AgentSnapshot> for SubagentSnapshot {
     fn from(snapshot: AgentSnapshot) -> Self {
         Self {
             task_name: snapshot.task_name,
-            agent_type: snapshot.agent_type.name().to_string(),
+            agent_type: snapshot.agent_type.to_string(),
             state: snapshot.status.into(),
             last_task_message: snapshot.last_task_message,
         }
@@ -176,7 +241,7 @@ struct ControlInner {
     state: Mutex<ControlState>,
     updates: Notify,
     max_concurrent_children: Option<usize>,
-    spawner: Arc<dyn AgentSpawner>,
+    spawner: Arc<dyn ChildSessionFactory>,
     subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
 }
 
@@ -240,8 +305,8 @@ impl Drop for SpawnReservation {
     }
 }
 
-pub(crate) struct SpawnRequest {
-    pub role: AgentRole,
+pub(crate) struct ChildSessionRequest {
+    pub profile: AgentProfile,
     /// Identity of the parent session that spawns this child.
     pub parent: SessionIdentity,
     /// One validated path segment naming this child under the parent.
@@ -249,26 +314,26 @@ pub(crate) struct SpawnRequest {
     pub messages: Vec<Message>,
 }
 
-pub(crate) struct ChildAgent {
+pub(crate) struct ChildSessionSpec {
     pub runtime: Runtime,
     pub agent: Agent,
     pub options: SessionOptions,
     pub history: Vec<Message>,
 }
 
-pub(crate) trait AgentSpawner: Send + Sync {
-    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError>;
+pub(crate) trait ChildSessionFactory: Send + Sync {
+    fn spawn(&self, request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError>;
 }
 
-struct InheritedAgentSpawner {
+struct InheritedSessionFactory {
     runtime: Runtime,
     system_prompt: Option<String>,
     definition: Agent,
     scope: SessionOptions,
 }
 
-impl AgentSpawner for InheritedAgentSpawner {
-    fn spawn(&self, request: SpawnRequest) -> Result<ChildAgent, ToolError> {
+impl ChildSessionFactory for InheritedSessionFactory {
+    fn spawn(&self, request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError> {
         let task_path = request
             .parent
             .path
@@ -279,7 +344,7 @@ impl AgentSpawner for InheritedAgentSpawner {
             .clone()
             .with_system_prompt(subagent_system_prompt(
                 self.system_prompt.as_deref(),
-                request.role,
+                request.profile,
                 request.parent.path.as_str(),
                 task_path.as_str(),
             ));
@@ -287,7 +352,7 @@ impl AgentSpawner for InheritedAgentSpawner {
             working_dir: self.scope.working_dir.clone(),
             tool_timeout: self.scope.tool_timeout,
         };
-        Ok(ChildAgent {
+        Ok(ChildSessionSpec {
             runtime: self.runtime.clone(),
             agent: definition,
             options: scope,
@@ -313,7 +378,7 @@ struct AgentTreeState {
 struct ChildRecord {
     id: SessionId,
     task_path: AgentPath,
-    role: AgentRole,
+    profile: AgentProfile,
     /// The durable session backing this child. Turn ordering is entirely the
     /// session actor's job; the controller never queues turns itself.
     session: Session,
@@ -369,7 +434,7 @@ impl ChildRecord {
         AgentSnapshot {
             agent_id: self.id,
             task_name: self.task_path.to_string(),
-            agent_type: self.role,
+            agent_type: self.profile.name,
             status: self.status(),
             last_task_message: self.last_task_message.clone(),
             final_message: self
@@ -555,7 +620,7 @@ struct SpawnAgentArgs {
     /// Initial plain-text task for the new agent.
     message: String,
     /// Optional role: default, explorer, or worker.
-    agent_type: Option<AgentRole>,
+    agent_type: Option<ProfileName>,
     /// Context to fork: none, all, or a positive number of recent turns.
     #[serde(default)]
     fork_turns: Option<ForkTurnsArg>,
@@ -638,7 +703,7 @@ impl ForkMode {
 impl AgentControl {
     pub(crate) fn new(
         max_concurrent_children: Option<usize>,
-        spawner: Arc<dyn AgentSpawner>,
+        spawner: Arc<dyn ChildSessionFactory>,
     ) -> Self {
         let (subagent_tx, _) = watch::channel(Vec::new());
         Self {
@@ -683,7 +748,7 @@ impl AgentControl {
         let spawn = self.clone();
         let spawn_description = format!(
             "Spawn a sub-agent for a concrete, bounded task that can make progress independently. Spawned agents use the same Runtime -> Session -> Turn execution pipeline as the parent and inherit the current model, environment, AGENTS.md instructions, skills, and tools.\n\nUse this when a separate agent makes the plan simpler or can answer an independent question:\n- Use `explorer` for an independent read-only codebase question.\n- Prefer `worker` for a bounded code change with explicit file or module ownership.\n- Use `default` for another self-contained task.\n- Multiple sub-agents are supported, but do not spawn for trivial tasks or immediate blockers.\n- Give the agent the exact output you need; do not duplicate its work locally.\n- After spawning, continue non-overlapping work when available and call `wait_agent` only when its result becomes relevant.\n\n{}",
-            AgentRole::available_roles_description()
+            AgentProfile::available_profiles_description()
         );
         let spawn_tool = define_tool(
             "spawn_agent",
@@ -734,7 +799,7 @@ impl AgentControl {
                 "spawn_agent message cannot be empty".to_string(),
             ));
         }
-        let role = args.agent_type.unwrap_or(AgentRole::Default);
+        let profile = AgentProfile::for_name(args.agent_type.unwrap_or(ProfileName::Default));
         let fork_mode = ForkMode::from_arg(args.fork_turns)?;
         let parent = context.agent.identity.clone();
         let task_path = parent
@@ -754,8 +819,8 @@ impl AgentControl {
         };
         let messages = fork_messages(&context.agent.messages, fork_mode);
         let session = match self
-            .prepare_child(SpawnRequest {
-                role,
+            .prepare_child(ChildSessionRequest {
+                profile,
                 parent: parent.clone(),
                 segment: args.task_name.clone(),
                 messages,
@@ -774,7 +839,7 @@ impl AgentControl {
             parent.root_id,
             id,
             task_path.clone(),
-            role,
+            profile,
             args.message.clone(),
             session.clone(),
         )
@@ -790,43 +855,24 @@ impl AgentControl {
         json_output(&serde_json::json!({
             "agent_id": id,
             "task_name": task_name,
-            "agent_type": role,
+            "agent_type": profile.name,
         }))
     }
 
     /// Build the child agent and start its runtime. Controller state is not
     /// touched, so the caller decides how to release the spawn reservation on
     /// failure.
-    async fn prepare_child(&self, request: SpawnRequest) -> Result<Session, ToolError> {
-        let role = request.role;
+    async fn prepare_child(&self, request: ChildSessionRequest) -> Result<Session, ToolError> {
+        let profile = request.profile;
         let parent = request.parent.clone();
         let segment = request.segment.clone();
         let child = self.inner.spawner.spawn(request)?;
-        let agent = Self::finalize_child_agent(child.agent, role, self.tools()?);
+        let agent = apply_profile(child.agent, profile, self.tools()?);
         child
             .runtime
             .start_child(&agent, &child.options, &parent, &segment, child.history)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))
-    }
-
-    fn finalize_child_agent(
-        agent: Agent,
-        role: AgentRole,
-        collaboration_tools: Vec<Arc<dyn Tool>>,
-    ) -> Agent {
-        match role {
-            AgentRole::Explorer => {
-                let tools = agent
-                    .tools()
-                    .iter()
-                    .filter(|tool| EXPLORER_TOOL_NAMES.contains(&tool.name()))
-                    .cloned()
-                    .collect();
-                agent.with_tools(tools)
-            }
-            AgentRole::Default | AgentRole::Worker => agent.pushing_tools(collaboration_tools),
-        }
     }
 
     /// Register the spawned session as a child agent in the shared state.
@@ -835,7 +881,7 @@ impl AgentControl {
         root_id: SessionId,
         id: SessionId,
         task_path: AgentPath,
-        role: AgentRole,
+        profile: AgentProfile,
         last_task_message: String,
         session: Session,
     ) {
@@ -846,7 +892,7 @@ impl AgentControl {
             ChildRecord {
                 id,
                 task_path,
-                role,
+                profile,
                 session,
                 active_turns: 0,
                 active_cancel: None,
@@ -1115,7 +1161,7 @@ pub fn install_subagent_tools(
     }
     let agent = agent.without_tools(&all_collaboration_tool_names());
     let agent = with_multi_agent_instructions(agent);
-    let spawner = Arc::new(InheritedAgentSpawner {
+    let spawner = Arc::new(InheritedSessionFactory {
         runtime,
         system_prompt: agent.system_prompt().map(str::to_string),
         definition: agent.clone(),
@@ -1265,16 +1311,26 @@ fn complete_history_end(messages: &[Message]) -> usize {
     }
 }
 
+/// Apply a profile's tool policy to a child agent's inherited definition.
+/// The collaboration tools are installed only by the `Inherit` policy.
+fn apply_profile(
+    agent: Agent,
+    profile: AgentProfile,
+    collaboration_tools: Vec<Arc<dyn Tool>>,
+) -> Agent {
+    profile.tool_policy.apply(agent, collaboration_tools)
+}
+
 fn subagent_system_prompt(
     base_prompt: Option<&str>,
-    role: AgentRole,
+    profile: AgentProfile,
     parent_path: &str,
     task_name: &str,
 ) -> String {
     let context = format!(
         "<subagent_context>\nYou are `{task_name}`, a `{}` sub-agent spawned by `{parent_path}`. You share the same workspace with the parent and other agents.\n\n{}\n</subagent_context>",
-        role.name(),
-        role.child_instructions()
+        profile.name,
+        profile.prompt_overlay
     );
     match base_prompt
         .map(str::trim)
@@ -1319,10 +1375,10 @@ mod tests {
 
     use super::*;
 
-    struct RejectingSpawner;
+    struct RejectingFactory;
 
-    impl AgentSpawner for RejectingSpawner {
-        fn spawn(&self, _request: SpawnRequest) -> Result<ChildAgent, ToolError> {
+    impl ChildSessionFactory for RejectingFactory {
+        fn spawn(&self, _request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError> {
             Err(ToolError::Execution(
                 "spawn is not used by this test".to_string(),
             ))
@@ -1330,7 +1386,7 @@ mod tests {
     }
 
     fn state_only_control() -> AgentControl {
-        AgentControl::new(None, Arc::new(RejectingSpawner))
+        AgentControl::new(None, Arc::new(RejectingFactory))
     }
 
     #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1399,7 +1455,7 @@ mod tests {
         ));
         let agent = make_agent().with_max_turns(max_turns);
         let options = make_options();
-        let spawner = Arc::new(InheritedAgentSpawner {
+        let spawner = Arc::new(InheritedSessionFactory {
             runtime: runtime.clone(),
             system_prompt: agent.system_prompt().map(str::to_string),
             definition: agent,
@@ -1433,7 +1489,7 @@ mod tests {
         runtime: &Runtime,
         root_id: SessionId,
         task_name: &str,
-        role: AgentRole,
+        profile: AgentProfile,
         terminal: Option<ChildState>,
         completion_revision: Option<u64>,
     ) -> Session {
@@ -1445,7 +1501,7 @@ mod tests {
             ChildRecord {
                 id: session.id(),
                 task_path,
-                role,
+                profile,
                 session: session.clone(),
                 active_turns: 0,
                 active_cancel: None,
@@ -1460,13 +1516,19 @@ mod tests {
 
     #[test]
     fn exposes_the_codex_0_144_3_builtin_roles() {
-        assert_eq!(AgentRole::from_str("default").unwrap(), AgentRole::Default);
         assert_eq!(
-            AgentRole::from_str("explorer").unwrap(),
-            AgentRole::Explorer
+            ProfileName::from_str("default").unwrap(),
+            ProfileName::Default
         );
-        assert_eq!(AgentRole::from_str("worker").unwrap(), AgentRole::Worker);
-        assert!(AgentRole::from_str("awaiter").is_err());
+        assert_eq!(
+            ProfileName::from_str("explorer").unwrap(),
+            ProfileName::Explorer
+        );
+        assert_eq!(
+            ProfileName::from_str("worker").unwrap(),
+            ProfileName::Worker
+        );
+        assert!(ProfileName::from_str("awaiter").is_err());
     }
 
     #[test]
@@ -1489,9 +1551,9 @@ mod tests {
             .into_iter()
             .map(named_tool)
             .collect();
-        let agent = AgentControl::finalize_child_agent(
+        let agent = apply_profile(
             make_agent().with_tools(inherited),
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             collaboration,
         );
 
@@ -1505,7 +1567,7 @@ mod tests {
 
     #[test]
     fn default_and_worker_keep_inherited_and_collaboration_tools() {
-        for role in [AgentRole::Default, AgentRole::Worker] {
+        for profile in [AgentProfile::default(), AgentProfile::worker()] {
             let inherited = ["read", "write", "custom_tool"]
                 .into_iter()
                 .map(named_tool)
@@ -1514,11 +1576,7 @@ mod tests {
                 .into_iter()
                 .map(named_tool)
                 .collect();
-            let agent = AgentControl::finalize_child_agent(
-                make_agent().with_tools(inherited),
-                role,
-                collaboration,
-            );
+            let agent = apply_profile(make_agent().with_tools(inherited), profile, collaboration);
 
             assert_eq!(
                 tool_names(&agent),
@@ -1531,7 +1589,7 @@ mod tests {
                     "interrupt_agent",
                     "wait_agent",
                 ],
-                "{role:?}"
+                "{profile:?}"
             );
         }
     }
@@ -1628,7 +1686,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrency_limit_rejects_before_calling_the_spawner() {
-        let control = AgentControl::new(Some(0), Arc::new(RejectingSpawner));
+        let control = AgentControl::new(Some(0), Arc::new(RejectingFactory));
         let error = control
             .spawn(
                 make_context(root_identity()),
@@ -1687,7 +1745,7 @@ mod tests {
             &runtime,
             root_id,
             "inspect",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             None,
             None,
         )
@@ -1732,7 +1790,7 @@ mod tests {
             &runtime,
             root_id,
             "inspect",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             Some(ChildState::Completed(Some("done".to_string()))),
             Some(1),
         )
@@ -1764,7 +1822,7 @@ mod tests {
             &runtime,
             root_id,
             "inspect",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             Some(ChildState::Completed(Some("done".to_string()))),
             Some(1),
         )
@@ -1860,7 +1918,7 @@ mod tests {
             &runtime,
             root,
             "inspect",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             Some(ChildState::Completed(Some("done".to_string()))),
             None,
         )
@@ -1879,7 +1937,7 @@ mod tests {
             &runtime,
             root_id,
             "completed",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             Some(ChildState::Completed(Some("first result".to_string()))),
             Some(1),
         )
@@ -1889,7 +1947,7 @@ mod tests {
             &runtime,
             root_id,
             "running",
-            AgentRole::Worker,
+            AgentProfile::worker(),
             None,
             None,
         )
@@ -1965,7 +2023,7 @@ mod tests {
             &runtime,
             root_id,
             "completed",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             Some(ChildState::Completed(Some("result".to_string()))),
             Some(1),
         )
@@ -2016,7 +2074,7 @@ mod tests {
             &runtime,
             root_id,
             "inspect",
-            AgentRole::Explorer,
+            AgentProfile::explorer(),
             None,
             None,
         )
@@ -2085,7 +2143,7 @@ mod tests {
                 SpawnAgentArgs {
                     task_name: "inspect".to_string(),
                     message: "Inspect the parser.".to_string(),
-                    agent_type: Some(AgentRole::Explorer),
+                    agent_type: Some(ProfileName::Explorer),
                     fork_turns: Some(ForkTurnsArg::Keyword(ForkTurnsKeyword::All)),
                 },
             )
@@ -2227,7 +2285,7 @@ mod tests {
                 SpawnAgentArgs {
                     task_name: "inspect".to_string(),
                     message: "Inspect the parser.".to_string(),
-                    agent_type: Some(AgentRole::Explorer),
+                    agent_type: Some(ProfileName::Explorer),
                     fork_turns: None,
                 },
             )
