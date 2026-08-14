@@ -6,14 +6,14 @@ use std::{
 };
 
 use crate::snapshot::{SubagentSnapshot, SubagentState};
-use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions};
+use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions, Turn};
 use ash_core::{
-    define_tool, CancellationToken, ContentBlock, Message, MessageContent, SessionId,
+    define_tool, AgentPath, CancellationToken, ContentBlock, Message, MessageContent, SessionId,
     SessionIdentity, StopReason, Tool, ToolContext, ToolError, TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
@@ -312,20 +312,26 @@ struct AgentTreeState {
 
 struct ChildRecord {
     id: SessionId,
-    task_name: String,
+    task_path: AgentPath,
     role: AgentRole,
-    state: ChildState,
-    /// Follow-up turns accepted by the controller but not yet settled. This
-    /// includes the currently running follow-up, if any.
-    pending_followups: usize,
+    /// The durable session backing this child. Turn ordering is entirely the
+    /// session actor's job; the controller never queues turns itself.
+    session: Session,
+    /// Turns submitted to `session` that have not yet settled, including any
+    /// currently running turn. A queued follow-up keeps this above zero, so a
+    /// child with pending work holds its concurrency slot.
+    active_turns: usize,
+    /// Cancellation handle of the currently running turn, if any.
+    active_cancel: Option<CancellationToken>,
+    /// Latest terminal outcome, present only when `active_turns` reached zero.
+    terminal: Option<ChildState>,
     completion_revision: Option<u64>,
     last_task_message: String,
-    command_tx: mpsc::Sender<ChildCommand>,
 }
 
+/// Terminal outcome of a child agent, reached only after every accepted turn
+/// (including queued follow-ups) has settled.
 enum ChildState {
-    Pending,
-    Running(CancellationToken),
     Completed(Option<String>),
     Interrupted(Option<String>),
     Errored {
@@ -337,23 +343,16 @@ enum ChildState {
 impl ChildState {
     const fn status(&self) -> AgentStatus {
         match self {
-            Self::Pending => AgentStatus::Pending,
-            Self::Running(_) => AgentStatus::Running,
             Self::Completed(_) => AgentStatus::Completed,
             Self::Interrupted(_) => AgentStatus::Interrupted,
             Self::Errored { .. } => AgentStatus::Errored,
         }
     }
 
-    const fn is_active(&self) -> bool {
-        matches!(self, Self::Pending | Self::Running(_))
-    }
-
     fn final_message(&self) -> Option<&str> {
         match self {
             Self::Completed(message) | Self::Interrupted(message) => message.as_deref(),
             Self::Errored { final_message, .. } => final_message.as_deref(),
-            Self::Pending | Self::Running(_) => None,
         }
     }
 
@@ -363,59 +362,44 @@ impl ChildState {
             _ => None,
         }
     }
-
-    fn cancel(&self) -> Option<CancellationToken> {
-        match self {
-            Self::Running(cancel) => Some(cancel.clone()),
-            _ => None,
-        }
-    }
 }
 
 impl ChildRecord {
     fn snapshot(&self) -> AgentSnapshot {
         AgentSnapshot {
             agent_id: self.id,
-            task_name: self.task_name.clone(),
+            task_name: self.task_path.to_string(),
             agent_type: self.role,
-            status: self.state.status(),
+            status: self.status(),
             last_task_message: self.last_task_message.clone(),
-            final_message: self.state.final_message().map(str::to_string),
-            error: self.state.error().map(str::to_string),
+            final_message: self
+                .terminal
+                .as_ref()
+                .and_then(ChildState::final_message)
+                .map(str::to_string),
+            error: self
+                .terminal
+                .as_ref()
+                .and_then(ChildState::error)
+                .map(str::to_string),
         }
     }
 
-    fn prepare_delivery(&mut self, delivery: MessageDelivery, message: &str) {
-        self.last_task_message = message.to_string();
-        if delivery == MessageDelivery::Followup {
-            self.pending_followups = self.pending_followups.saturating_add(1);
-            if !matches!(self.state, ChildState::Running(_)) {
-                self.state = ChildState::Pending;
-            }
-            self.completion_revision = None;
-        }
-    }
-
-    /// Settle one turn and report whether the agent is now terminal. A queued
-    /// follow-up keeps the record pending until every accepted follow-up has
-    /// finished, so waiters never observe an intermediate completion.
-    fn finish_turn(&mut self, completed: ChildState, was_followup: bool) -> bool {
-        if was_followup {
-            self.pending_followups = self.pending_followups.saturating_sub(1);
-        }
-        if self.pending_followups == 0 {
-            self.state = completed;
-            true
+    fn status(&self) -> AgentStatus {
+        if self.active_turns > 0 {
+            AgentStatus::Running
         } else {
-            self.state = ChildState::Pending;
-            false
+            self.terminal
+                .as_ref()
+                .map_or(AgentStatus::Pending, ChildState::status)
         }
     }
-}
 
-enum ChildCommand {
-    Queue(String),
-    Followup(String),
+    /// Whether the child is busy enough to hold a concurrency slot. A child
+    /// with queued follow-ups keeps its slot until they all settle.
+    fn holds_slot(&self) -> bool {
+        self.active_turns > 0
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -429,15 +413,8 @@ impl MessageDelivery {
         matches!(self, Self::Followup)
     }
 
-    const fn command(self, message: String) -> ChildCommand {
-        match self {
-            Self::Queue => ChildCommand::Queue(message),
-            Self::Followup => ChildCommand::Followup(message),
-        }
-    }
-
-    const fn needs_new_slot(self, state: &ChildState) -> bool {
-        self.triggers_turn() && !state.is_active()
+    fn needs_new_slot(self, record: &ChildRecord) -> bool {
+        self.triggers_turn() && !record.holds_slot()
     }
 }
 
@@ -476,25 +453,13 @@ impl ControlState {
                 tree.wait_snapshot(waiter, path_prefix)
             })
     }
-
-    fn finish_turn(
-        &mut self,
-        root_id: SessionId,
-        agent_id: SessionId,
-        completed: ChildState,
-        was_followup: bool,
-    ) -> bool {
-        self.trees
-            .get_mut(&root_id)
-            .is_some_and(|tree| tree.finish_turn(agent_id, completed, was_followup))
-    }
 }
 
 impl AgentTreeState {
     fn active_count(&self) -> usize {
         self.agents
             .values()
-            .filter(|record| record.state.is_active())
+            .filter(|record| record.holds_slot())
             .count()
             .saturating_add(self.pending_spawns.len())
     }
@@ -511,7 +476,7 @@ impl AgentTreeState {
             || self
                 .agents
                 .values()
-                .any(|record| record.task_name == task_name)
+                .any(|record| record.task_path.as_str() == task_name)
         {
             return Err(ToolError::Execution(format!(
                 "agent task name already exists: {task_name}; use message_agent with start_turn=true to reuse it"
@@ -531,7 +496,7 @@ impl AgentTreeState {
             .agents
             .values()
             .filter(|record| agent_path_matches(record, path_prefix))
-            .filter(|record| !record.state.is_active())
+            .filter(|record| !record.holds_slot())
             .filter_map(|record| record.completion_revision)
             .filter(|revision| *revision > cursor)
             .max();
@@ -549,19 +514,22 @@ impl AgentTreeState {
         }
     }
 
-    fn finish_turn(
-        &mut self,
-        agent_id: SessionId,
-        completed: ChildState,
-        was_followup: bool,
-    ) -> bool {
+    /// Fold one settled turn into a child record. The child reaches terminal
+    /// state (and bumps the completion revision) only after every accepted
+    /// turn, including queued follow-ups, has settled, so waiters never
+    /// observe an intermediate completion. Returns whether it went terminal.
+    fn settle_turn(&mut self, agent_id: SessionId, terminal: ChildState) -> bool {
         let Some(record) = self.agents.get_mut(&agent_id) else {
             return false;
         };
-        if record.finish_turn(completed, was_followup) {
-            self.next_completion_revision = self.next_completion_revision.saturating_add(1);
-            record.completion_revision = Some(self.next_completion_revision);
+        record.active_turns = record.active_turns.saturating_sub(1);
+        record.active_cancel = None;
+        if record.active_turns > 0 {
+            return false;
         }
+        record.terminal = Some(terminal);
+        self.next_completion_revision = self.next_completion_revision.saturating_add(1);
+        record.completion_revision = Some(self.next_completion_revision);
         true
     }
 }
@@ -784,8 +752,6 @@ impl AgentControl {
             drop(state);
             SpawnReservation::new(Arc::clone(&self.inner), parent.root_id, task_name.clone())
         };
-        let (command_tx, command_rx) = mpsc::channel(32);
-
         let messages = fork_messages(&context.agent.messages, fork_mode);
         let session = match self
             .prepare_child(SpawnRequest {
@@ -807,23 +773,17 @@ impl AgentControl {
         self.register_child(
             parent.root_id,
             id,
-            &task_name,
+            task_path.clone(),
             role,
             args.message.clone(),
-            command_tx,
+            session.clone(),
         )
         .await;
         release_spawn(&self.inner, parent.root_id, &task_name).await;
         reservation.commit();
 
-        let control = self.clone();
-        let root_id = parent.root_id;
-        let initial_input = args.message.clone();
-        tokio::spawn(async move {
-            control
-                .run_child(root_id, id, session, initial_input, command_rx)
-                .await;
-        });
+        self.submit_and_watch(&session, parent.root_id, &task_name, args.message.clone())
+            .await?;
         self.inner.updates.notify_waiters();
         self.publish().await;
 
@@ -869,16 +829,15 @@ impl AgentControl {
         }
     }
 
-    /// Register the spawned session as a pending child agent in the shared
-    /// state.
+    /// Register the spawned session as a child agent in the shared state.
     async fn register_child(
         &self,
         root_id: SessionId,
         id: SessionId,
-        task_name: &str,
+        task_path: AgentPath,
         role: AgentRole,
         last_task_message: String,
-        command_tx: mpsc::Sender<ChildCommand>,
+        session: Session,
     ) {
         let mut state = self.inner.state.lock().await;
         let tree = state.trees.entry(root_id).or_default();
@@ -886,13 +845,14 @@ impl AgentControl {
             id,
             ChildRecord {
                 id,
-                task_name: task_name.to_string(),
+                task_path,
                 role,
-                state: ChildState::Pending,
-                pending_followups: 0,
+                session,
+                active_turns: 0,
+                active_cancel: None,
+                terminal: None,
                 completion_revision: None,
                 last_task_message,
-                command_tx,
             },
         );
         drop(state);
@@ -911,41 +871,38 @@ impl AgentControl {
         } else {
             MessageDelivery::Queue
         };
-        let (target, command_tx) = {
-            let mut state = self.inner.state.lock().await;
-            let record = resolve_target_mut(
-                &mut state,
-                context.agent.identity.root_id,
-                context.agent.identity.path.as_str(),
-                &args.target,
-            )?;
-            let result = (record.task_name.clone(), record.command_tx.clone());
-            drop(state);
-            result
-        };
-        let permit = command_tx
-            .reserve()
-            .await
-            .map_err(|_| ToolError::Execution(format!("agent is no longer available: {target}")))?;
-        {
+        let (target, session) = {
             let mut state = self.inner.state.lock().await;
             let active_count = state.active_count(context.agent.identity.root_id);
             let record = resolve_target_mut(
                 &mut state,
                 context.agent.identity.root_id,
                 context.agent.identity.path.as_str(),
-                &target,
+                &args.target,
             )?;
             if let Some(max) = self.inner.max_concurrent_children {
-                if delivery.needs_new_slot(&record.state) && active_count >= max {
+                if delivery.needs_new_slot(record) && active_count >= max {
                     return Err(ToolError::Execution(format!(
                         "maximum of {max} concurrent sub-agents reached"
                     )));
                 }
             }
-            record.prepare_delivery(delivery, &args.message);
-            permit.send(delivery.command(args.message));
-            drop(state);
+            record.last_task_message = args.message.clone();
+            (record.task_path.to_string(), record.session.clone())
+        };
+        if delivery.triggers_turn() {
+            self.submit_and_watch(
+                &session,
+                context.agent.identity.root_id,
+                &target,
+                args.message.clone(),
+            )
+            .await?;
+        } else {
+            session
+                .notify(Input::from_text(InputSource::Agent, args.message))
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
         }
         self.inner.updates.notify_waiters();
         self.publish().await;
@@ -970,9 +927,9 @@ impl AgentControl {
                 &args.target,
             )?;
             let result = (
-                record.task_name.clone(),
-                record.state.status(),
-                record.state.cancel(),
+                record.task_path.to_string(),
+                record.status(),
+                record.active_cancel.clone(),
             );
             drop(state);
             result
@@ -1053,78 +1010,53 @@ impl AgentControl {
             .snapshots(root_id, path_prefix)
     }
 
-    async fn run_child(
+    /// Submit a turn to a child session and spawn a task that only observes
+    /// its completion. Turn ordering is left entirely to the session actor;
+    /// the controller never re-queues.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolError` when the session rejects the turn.
+    async fn submit_and_watch(
         &self,
-        root_id: SessionId,
-        agent_id: SessionId,
-        session: Session,
-        initial_input: String,
-        mut command_rx: mpsc::Receiver<ChildCommand>,
-    ) {
-        self.run_child_turn(root_id, agent_id, &session, initial_input, false)
-            .await;
-
-        while let Some(command) = command_rx.recv().await {
-            match command {
-                ChildCommand::Queue(message) => {
-                    let _ = session
-                        .notify(Input::from_text(InputSource::Agent, message))
-                        .await;
-                }
-                ChildCommand::Followup(message) => {
-                    self.run_child_turn(root_id, agent_id, &session, message, true)
-                        .await;
-                }
-            }
-        }
-    }
-
-    async fn run_child_turn(
-        &self,
-        root_id: SessionId,
-        agent_id: SessionId,
         session: &Session,
+        root_id: SessionId,
+        target: &str,
         input: String,
-        is_followup: bool,
-    ) {
-        let turn = match session
+    ) -> Result<(), ToolError> {
+        let turn = session
             .submit(Input::from_text(InputSource::Agent, input))
             .await
-        {
-            Ok(turn) => turn,
-            Err(error) => {
-                let mut state = self.inner.state.lock().await;
-                let _ = state.finish_turn(
-                    root_id,
-                    agent_id,
-                    ChildState::Errored {
-                        final_message: None,
-                        error: error.to_string(),
-                    },
-                    is_followup,
-                );
-                drop(state);
-                self.inner.updates.notify_waiters();
-                self.publish().await;
-                return;
-            }
-        };
+            .map_err(|error| ToolError::Execution(format!("{target}: {error}")))?;
         let cancel = turn.cancellation_token();
         {
             let mut state = self.inner.state.lock().await;
             let Some(record) = state
                 .trees
                 .get_mut(&root_id)
-                .and_then(|tree| tree.agents.get_mut(&agent_id))
+                .and_then(|tree| tree.agents.get_mut(&session.id()))
             else {
-                return;
+                return Err(ToolError::Execution(format!(
+                    "agent is no longer available: {target}"
+                )));
             };
-            record.state = ChildState::Running(cancel.clone());
+            record.active_turns = record.active_turns.saturating_add(1);
+            record.active_cancel = Some(cancel);
+            record.completion_revision = None;
             drop(state);
         }
-        self.inner.updates.notify_waiters();
-        self.publish().await;
+        let watcher = self.clone();
+        let agent_id = session.id();
+        tokio::spawn(async move {
+            watcher.observe_turn(root_id, agent_id, turn).await;
+        });
+        Ok(())
+    }
 
+    /// Observe one submitted turn to its settlement and fold the outcome into
+    /// the child's projection. The session actor owns the turn lifecycle; this
+    /// task only reports it.
+    async fn observe_turn(&self, root_id: SessionId, agent_id: SessionId, turn: Turn) {
         let result = turn.wait().await;
         let (result, final_message) = match result {
             Ok(view) => {
@@ -1133,8 +1065,7 @@ impl AgentControl {
             }
             Err(error) => (Err(error), None),
         };
-
-        let completed = match result {
+        let terminal = match result {
             Ok(TurnResult::Completed(StopReason::Aborted) | TurnResult::Interrupted(_)) => {
                 ChildState::Interrupted(final_message)
             }
@@ -1149,7 +1080,11 @@ impl AgentControl {
             },
         };
         let mut state = self.inner.state.lock().await;
-        if !state.finish_turn(root_id, agent_id, completed, is_followup) {
+        let settled = state
+            .trees
+            .get_mut(&root_id)
+            .is_some_and(|tree| tree.settle_turn(agent_id, terminal));
+        if !settled {
             return;
         }
         drop(state);
@@ -1220,13 +1155,14 @@ fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
 }
 
 fn agent_path_matches(record: &ChildRecord, path_prefix: Option<&str>) -> bool {
+    let path = record.task_path.as_str();
     path_prefix.is_none_or(|prefix| {
         let prefix = prefix.trim_matches('/');
         if prefix.is_empty() {
             return true;
         }
         let prefix = format!("/{prefix}");
-        record.task_name == prefix || record.task_name.starts_with(&format!("{prefix}/"))
+        path == prefix || path.starts_with(&format!("{prefix}/"))
     })
 }
 
@@ -1252,9 +1188,9 @@ fn resolve_target_mut<'a>(
         .agents
         .values_mut()
         .filter(|record| {
-            record.task_name == target
-                || record.task_name == relative_path
-                || record.task_name.rsplit('/').next() == Some(target)
+            record.task_path.as_str() == target
+                || record.task_path.as_str() == relative_path
+                || record.task_path.segments().last() == Some(target)
         })
         .collect::<Vec<_>>();
     match matches.len() {
@@ -1453,7 +1389,7 @@ mod tests {
     fn make_control(
         model: Arc<dyn ModelClient>,
         max_turns: u32,
-    ) -> (AgentControl, tempfile::TempDir) {
+    ) -> (AgentControl, tempfile::TempDir, Runtime) {
         // Keep test session files out of the real data directory
         // (`~/.local/share/ash/sessions`); the returned TempDir stays alive for
         // the whole test so spawned sub-agents keep a valid store.
@@ -1464,12 +1400,62 @@ mod tests {
         let agent = make_agent().with_max_turns(max_turns);
         let options = make_options();
         let spawner = Arc::new(InheritedAgentSpawner {
-            runtime,
+            runtime: runtime.clone(),
             system_prompt: agent.system_prompt().map(str::to_string),
             definition: agent,
             scope: options,
         });
-        (AgentControl::new(None, spawner), directory)
+        (AgentControl::new(None, spawner), directory, runtime)
+    }
+
+    /// Start a real child session under `root_id` so state-only tests hold a
+    /// live `Session` handle.
+    async fn start_child_session(
+        runtime: &Runtime,
+        root_id: SessionId,
+        task_name: &str,
+    ) -> Session {
+        runtime
+            .start_child(
+                &make_agent(),
+                &make_options(),
+                &SessionIdentity::root(root_id),
+                task_name,
+                Vec::new(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Insert a child record backed by a live session into the tree.
+    async fn insert_child(
+        control: &AgentControl,
+        runtime: &Runtime,
+        root_id: SessionId,
+        task_name: &str,
+        role: AgentRole,
+        terminal: Option<ChildState>,
+        completion_revision: Option<u64>,
+    ) -> Session {
+        let session = start_child_session(runtime, root_id, task_name).await;
+        let task_path = AgentPath::root().join(task_name).unwrap();
+        let mut state = control.inner.state.lock().await;
+        state.trees.entry(root_id).or_default().agents.insert(
+            session.id(),
+            ChildRecord {
+                id: session.id(),
+                task_path,
+                role,
+                session: session.clone(),
+                active_turns: 0,
+                active_cancel: None,
+                terminal,
+                completion_revision,
+                last_task_message: "initial".to_string(),
+            },
+        );
+        drop(state);
+        session
     }
 
     #[test]
@@ -1692,96 +1678,71 @@ mod tests {
         assert!(error.to_string().contains("task name already exists"));
     }
 
-    #[test]
-    fn multiple_queued_followups_publish_completion_only_after_the_last_turn() {
-        let agent_id = SessionId::new();
-        let (command_tx, _command_rx) = mpsc::channel(2);
-        let mut record = ChildRecord {
-            id: agent_id,
-            task_name: "/root/inspect".to_string(),
-            role: AgentRole::Explorer,
-            state: ChildState::Running(CancellationToken::new()),
-            pending_followups: 0,
-            completion_revision: None,
-            last_task_message: "initial".to_string(),
-            command_tx,
-        };
-        record.prepare_delivery(MessageDelivery::Followup, "first follow-up");
-        record.prepare_delivery(MessageDelivery::Followup, "second follow-up");
-        let mut tree = AgentTreeState::default();
-        tree.agents.insert(agent_id, record);
+    #[tokio::test]
+    async fn settlement_waits_for_every_accepted_followup_before_going_terminal() {
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
+        let root_id = SessionId::new();
+        let session = insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "inspect",
+            AgentRole::Explorer,
+            None,
+            None,
+        )
+        .await;
+        let agent_id = session.id();
+        let mut tree = control.inner.state.lock().await;
+        let tree = tree.trees.get_mut(&root_id).unwrap();
 
-        assert!(tree.finish_turn(
+        // Initial turn plus two accepted follow-ups are all unsettled.
+        let record = tree.agents.get_mut(&agent_id).unwrap();
+        record.active_turns = 3;
+        // Intermediate settlements never surface as terminal: the first two
+        // complete turns keep the agent busy.
+        assert!(!tree.settle_turn(
             agent_id,
             ChildState::Completed(Some("initial result".to_string())),
-            false,
         ));
-        let record = tree.agents.get_mut(&agent_id).unwrap();
-        assert_eq!(record.pending_followups, 2);
-        assert!(matches!(record.state, ChildState::Pending));
-        assert_eq!(record.completion_revision, None);
-
-        record.state = ChildState::Running(CancellationToken::new());
-        assert!(tree.finish_turn(
+        assert!(!tree.settle_turn(
             agent_id,
-            ChildState::Completed(Some("first result".to_string())),
-            true,
+            ChildState::Completed(Some("first follow-up".to_string())),
         ));
-        let record = tree.agents.get_mut(&agent_id).unwrap();
-        assert_eq!(record.pending_followups, 1);
-        assert!(matches!(record.state, ChildState::Pending));
-        assert_eq!(record.completion_revision, None);
-
-        record.state = ChildState::Running(CancellationToken::new());
-        assert!(tree.finish_turn(
+        assert!(tree.settle_turn(
             agent_id,
             ChildState::Completed(Some("final result".to_string())),
-            true,
         ));
+
         let record = tree.agents.get(&agent_id).unwrap();
-        assert_eq!(record.pending_followups, 0);
+        assert_eq!(record.active_turns, 0);
         assert!(matches!(
-            &record.state,
-            ChildState::Completed(Some(message)) if message == "final result"
+            &record.terminal,
+            Some(ChildState::Completed(message)) if message.as_deref() == Some("final result")
         ));
         assert_eq!(record.completion_revision, Some(1));
     }
 
     #[tokio::test]
-    async fn failed_delivery_does_not_change_the_agent_lifecycle() {
-        let control = state_only_control();
+    async fn message_agent_rejects_an_unknown_target() {
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
         let root_id = SessionId::new();
-        let agent_id = SessionId::new();
-        let (command_tx, command_rx) = mpsc::channel(1);
-        drop(command_rx);
-        control
-            .inner
-            .state
-            .lock()
-            .await
-            .trees
-            .entry(root_id)
-            .or_default()
-            .agents
-            .insert(
-                agent_id,
-                ChildRecord {
-                    id: agent_id,
-                    task_name: "/root/inspect".to_string(),
-                    role: AgentRole::Explorer,
-                    state: ChildState::Completed(Some("done".to_string())),
-                    pending_followups: 0,
-                    completion_revision: None,
-                    last_task_message: "original".to_string(),
-                    command_tx,
-                },
-            );
+        insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "inspect",
+            AgentRole::Explorer,
+            Some(ChildState::Completed(Some("done".to_string()))),
+            Some(1),
+        )
+        .await;
 
         let result = control
             .message_agent(
                 &make_context(SessionIdentity::root(root_id)),
                 MessageAgentArgs {
-                    target: "/root/inspect".to_string(),
+                    target: "/root/missing".to_string(),
                     message: "follow up".to_string(),
                     start_turn: Some(true),
                 },
@@ -1791,37 +1752,23 @@ mod tests {
         assert!(result.is_err());
         let agents = control.snapshots(root_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
-        assert_eq!(agents[0].last_task_message, "original");
+        assert_eq!(agents[0].last_task_message, "initial");
     }
 
     #[tokio::test]
     async fn message_agent_can_queue_guidance_without_starting_a_turn() {
-        let control = state_only_control();
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
         let root_id = SessionId::new();
-        let agent_id = SessionId::new();
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        control
-            .inner
-            .state
-            .lock()
-            .await
-            .trees
-            .entry(root_id)
-            .or_default()
-            .agents
-            .insert(
-                agent_id,
-                ChildRecord {
-                    id: agent_id,
-                    task_name: "/root/inspect".to_string(),
-                    role: AgentRole::Explorer,
-                    state: ChildState::Completed(Some("done".to_string())),
-                    pending_followups: 0,
-                    completion_revision: Some(1),
-                    last_task_message: "original".to_string(),
-                    command_tx,
-                },
-            );
+        let session = insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "inspect",
+            AgentRole::Explorer,
+            Some(ChildState::Completed(Some("done".to_string()))),
+            Some(1),
+        )
+        .await;
 
         let result = control
             .message_agent(
@@ -1837,10 +1784,8 @@ mod tests {
 
         let result: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(!result["turn_triggered"].as_bool().unwrap());
-        assert!(matches!(
-            command_rx.recv().await.unwrap(),
-            ChildCommand::Queue(message) if message == "keep this in mind"
-        ));
+        // Notify stages guidance but must not start a turn.
+        assert!(session.view().await.unwrap().messages.is_empty());
         let agents = control.snapshots(root_id, None).await;
         assert_eq!(agents[0].status, AgentStatus::Completed);
         assert_eq!(agents[0].last_task_message, "keep this in mind");
@@ -1907,33 +1852,19 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_agent_trees_by_root_session() {
-        let control = state_only_control();
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
         let root = SessionId::new();
         let other_root = SessionId::new();
-        let agent_id = SessionId::new();
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        control
-            .inner
-            .state
-            .lock()
-            .await
-            .trees
-            .entry(root)
-            .or_default()
-            .agents
-            .insert(
-                agent_id,
-                ChildRecord {
-                    id: agent_id,
-                    task_name: "/root/inspect".to_string(),
-                    role: AgentRole::Explorer,
-                    state: ChildState::Completed(Some("done".to_string())),
-                    pending_followups: 0,
-                    completion_revision: None,
-                    last_task_message: "inspect".to_string(),
-                    command_tx,
-                },
-            );
+        insert_child(
+            &control,
+            &runtime,
+            root,
+            "inspect",
+            AgentRole::Explorer,
+            Some(ChildState::Completed(Some("done".to_string()))),
+            None,
+        )
+        .await;
 
         assert_eq!(control.snapshots(root, None).await.len(), 1);
         assert!(control.snapshots(other_root, None).await.is_empty());
@@ -1941,42 +1872,34 @@ mod tests {
 
     #[tokio::test]
     async fn wait_returns_each_completion_only_once() {
-        let control = state_only_control();
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
         let root_id = SessionId::new();
-        let completed_id = SessionId::new();
-        let running_id = SessionId::new();
-        let (completed_tx, _completed_rx) = mpsc::channel(1);
-        let (running_tx, _running_rx) = mpsc::channel(1);
+        insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "completed",
+            AgentRole::Explorer,
+            Some(ChildState::Completed(Some("first result".to_string()))),
+            Some(1),
+        )
+        .await;
+        let running_id = insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "running",
+            AgentRole::Worker,
+            None,
+            None,
+        )
+        .await
+        .id();
         {
             let mut state = control.inner.state.lock().await;
-            let tree = state.trees.entry(root_id).or_default();
+            let tree = state.trees.get_mut(&root_id).unwrap();
             tree.next_completion_revision = 1;
-            tree.agents.insert(
-                completed_id,
-                ChildRecord {
-                    id: completed_id,
-                    task_name: "/root/completed".to_string(),
-                    role: AgentRole::Explorer,
-                    state: ChildState::Completed(Some("first result".to_string())),
-                    pending_followups: 0,
-                    completion_revision: Some(1),
-                    last_task_message: "first task".to_string(),
-                    command_tx: completed_tx,
-                },
-            );
-            tree.agents.insert(
-                running_id,
-                ChildRecord {
-                    id: running_id,
-                    task_name: "/root/running".to_string(),
-                    role: AgentRole::Worker,
-                    state: ChildState::Running(CancellationToken::new()),
-                    pending_followups: 0,
-                    completion_revision: None,
-                    last_task_message: "second task".to_string(),
-                    command_tx: running_tx,
-                },
-            );
+            tree.agents.get_mut(&running_id).unwrap().active_turns = 1;
             drop(state);
         }
 
@@ -2015,11 +1938,9 @@ mod tests {
 
         {
             let mut state = control.inner.state.lock().await;
-            assert!(state.finish_turn(
-                root_id,
+            assert!(state.trees.get_mut(&root_id).unwrap().settle_turn(
                 running_id,
                 ChildState::Completed(Some("second result".to_string())),
-                false,
             ));
             drop(state);
         }
@@ -2037,27 +1958,22 @@ mod tests {
 
     #[tokio::test]
     async fn zero_timeout_wait_lists_without_advancing_completion_cursor() {
-        let control = state_only_control();
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
         let root_id = SessionId::new();
-        let agent_id = SessionId::new();
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "completed",
+            AgentRole::Explorer,
+            Some(ChildState::Completed(Some("result".to_string()))),
+            Some(1),
+        )
+        .await;
         {
             let mut state = control.inner.state.lock().await;
-            let tree = state.trees.entry(root_id).or_default();
+            let tree = state.trees.get_mut(&root_id).unwrap();
             tree.next_completion_revision = 1;
-            tree.agents.insert(
-                agent_id,
-                ChildRecord {
-                    id: agent_id,
-                    task_name: "/root/completed".to_string(),
-                    role: AgentRole::Explorer,
-                    state: ChildState::Completed(Some("result".to_string())),
-                    pending_followups: 0,
-                    completion_revision: Some(1),
-                    last_task_message: "task".to_string(),
-                    command_tx,
-                },
-            );
             drop(state);
         }
 
@@ -2092,9 +2008,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupt_cancels_only_the_active_turn_and_keeps_the_session_usable() {
+        let (control, _directory, runtime) = make_control(make_model(None), 1);
+        let root_id = SessionId::new();
+        let session = insert_child(
+            &control,
+            &runtime,
+            root_id,
+            "inspect",
+            AgentRole::Explorer,
+            None,
+            None,
+        )
+        .await;
+        let token = CancellationToken::new();
+        {
+            let mut state = control.inner.state.lock().await;
+            let record = state
+                .trees
+                .get_mut(&root_id)
+                .unwrap()
+                .agents
+                .get_mut(&session.id())
+                .unwrap();
+            record.active_turns = 1;
+            record.active_cancel = Some(token.clone());
+            drop(state);
+        }
+
+        let result = control
+            .interrupt(
+                &make_context(SessionIdentity::root(root_id)),
+                InterruptAgentArgs {
+                    target: "/root/inspect".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["previous_status"], "running");
+        assert!(token.is_cancelled());
+
+        // Interrupt must not close the session: a follow-up still lands.
+        control
+            .message_agent(
+                &make_context(SessionIdentity::root(root_id)),
+                MessageAgentArgs {
+                    target: "/root/inspect".to_string(),
+                    message: "continue".to_string(),
+                    start_turn: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn runs_a_spawned_agent_and_captures_its_final_message() {
         let (base_url, server) = mock_model_server(&["child done", "followup done"]).await;
-        let (control, _directory) = make_control(make_model(Some(base_url)), 2);
+        let (control, _directory, _runtime) = make_control(make_model(Some(base_url)), 2);
         let root_id = SessionId::new();
         let context = ToolContext {
             session_id: root_id,
@@ -2236,7 +2208,7 @@ mod tests {
     #[tokio::test]
     async fn subscribers_receive_subagent_snapshot_updates() {
         let (base_url, _server) = mock_model_server(&["child done"]).await;
-        let (control, _directory) = make_control(make_model(Some(base_url)), 1);
+        let (control, _directory, _runtime) = make_control(make_model(Some(base_url)), 1);
         let root_id = SessionId::new();
         let mut snapshots = control.subscribe();
         let context = ToolContext {
@@ -2284,7 +2256,7 @@ mod tests {
     #[tokio::test]
     async fn default_configuration_allows_more_than_three_concurrent_subagents() {
         let (base_url, _server) = mock_model_server(&["a", "b", "c", "d"]).await;
-        let (control, _directory) = make_control(make_model(Some(base_url)), 1);
+        let (control, _directory, _runtime) = make_control(make_model(Some(base_url)), 1);
         let root_id = SessionId::new();
         let context = ToolContext {
             session_id: root_id,
