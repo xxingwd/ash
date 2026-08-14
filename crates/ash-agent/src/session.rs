@@ -67,7 +67,7 @@ enum Command {
 }
 
 impl Session {
-    pub(crate) fn spawn(state: SessionState) -> Self {
+    pub(crate) fn spawn(state: SessionActorState) -> Self {
         let id = state.id();
         let identity = state.identity().clone();
         let (commands, command_rx) = mpsc::channel(64);
@@ -278,7 +278,7 @@ impl Turn {
 }
 
 async fn run_session(
-    mut state: SessionState,
+    mut state: SessionActorState,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<SessionEvent>,
 ) {
@@ -305,7 +305,7 @@ async fn run_session(
 }
 
 async fn run_turn(
-    state: &mut SessionState,
+    state: &mut SessionActorState,
     turn: QueuedTurn,
     queues: &mut ActorQueues,
     commands: &mut mpsc::Receiver<Command>,
@@ -386,7 +386,7 @@ async fn run_turn(
     }
 }
 
-/// Route a command while a turn is active. Never touches `SessionState` (the
+/// Route a command while a turn is active. Never touches `SessionActorState` (the
 /// turn's execution already borrows it), so this stays synchronous.
 fn dispatch_active_command(
     command: Command,
@@ -417,7 +417,7 @@ fn dispatch_active_command(
 /// Route a command while the session is idle.
 async fn dispatch_idle_command(
     command: Command,
-    state: &mut SessionState,
+    state: &mut SessionActorState,
     queues: &mut ActorQueues,
 ) {
     match command {
@@ -541,19 +541,19 @@ pub struct ContextCompaction {
     pub dropped_messages: usize,
 }
 
-pub struct SessionState {
+pub struct SessionActorState {
     identity: SessionIdentity,
     config: RunConfig,
     runtime: Runtime,
     log: SessionLog,
     store: SharedSessionStore,
     /// Open append-only handle to this session's file. Initialized lazily so
-    /// `SessionState::new` stays synchronous; every write goes through it
+    /// `SessionActorState::new` stays synchronous; every write goes through it
     /// without re-scanning or re-reading the file.
     writer: Option<Arc<tokio::sync::Mutex<Box<dyn SessionAppender>>>>,
 }
 
-impl SessionState {
+impl SessionActorState {
     pub(crate) fn new(mut config: RunConfig, runtime: Runtime) -> Self {
         let identity = SessionIdentity::root(SessionId::new());
         config.identity = identity.clone();
@@ -694,7 +694,7 @@ impl SessionState {
             if let Some(key) = input.idempotency_key.as_deref() {
                 if self.log.contains_idempotency_key(key) || !keys.insert(key.to_string()) {
                     return Err(ash_core::AshError::Config(format!(
-                        "duplicate agent input idempotency key: {key}"
+                        "duplicate session input idempotency key: {key}"
                     )));
                 }
             }
@@ -1022,8 +1022,8 @@ mod tests {
         config: RunConfig,
         runtime: Runtime,
         messages: &[Message],
-    ) -> SessionState {
-        let mut state = SessionState::new(config, runtime);
+    ) -> SessionActorState {
+        let mut state = SessionActorState::new(config, runtime);
         state.seed(messages.to_vec()).await.unwrap();
         state
     }
@@ -1053,7 +1053,7 @@ mod tests {
         let tool_id = ToolCallId::from_provider("call");
         let first = Message::user("first");
         let second = Message::user("second\nline");
-        let mut state = SessionState::new(config(), runtime());
+        let mut state = SessionActorState::new(config(), runtime());
         state.log = SessionLog::from_messages(vec![
             first.clone(),
             Message::assistant_text("answer"),
@@ -1127,7 +1127,7 @@ mod tests {
     async fn resume_keeps_the_current_runtime_configuration() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(), runtime.clone());
+        let mut state = SessionActorState::new(config(), runtime.clone());
         let saved_id = SessionId::new();
         let saved_message = Message::user("saved question");
         create_session(
@@ -1154,7 +1154,7 @@ mod tests {
     async fn resume_rejects_child_sessions() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(), runtime.clone());
+        let mut state = SessionActorState::new(config(), runtime.clone());
         let root_id = SessionId::new();
         let root = SessionIdentity::root(root_id);
         let child = root.child(SessionId::new(), "research").unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
         let parent = SessionIdentity::root(SessionId::new());
-        let state = SessionState::new_child(config(), runtime, &parent, "research").unwrap();
+        let state = SessionActorState::new_child(config(), runtime, &parent, "research").unwrap();
 
         assert_ne!(state.id(), parent.id);
         assert_eq!(state.identity().root_id, parent.id);
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_keeps_memory_when_persistence_fails() {
-        let mut state = SessionState::new(config(), runtime());
+        let mut state = SessionActorState::new(config(), runtime());
         let message = Message::user("unpersisted");
         state.log.push(LogEntry::Message(message));
 
@@ -1227,7 +1227,7 @@ mod tests {
         tokio::fs::write(&blocked_parent, b"file").await.unwrap();
         let config = config();
         let runtime = runtime_in(&blocked_parent);
-        let mut state = SessionState::new(config, runtime);
+        let mut state = SessionActorState::new(config, runtime);
         let (events, mut received) = mpsc::channel(4);
         let (_, steering) = mpsc::unbounded_channel();
 
@@ -1307,7 +1307,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
 
         let first = session.submit("first").await.unwrap();
         let second = session.submit("second").await.unwrap();
@@ -1336,7 +1336,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let turn = session.submit("work").await.unwrap();
         started.notified().await;
 
@@ -1373,7 +1373,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
 
         let submit_error = session.submit("").await.err().unwrap();
         let enqueue_error = session.enqueue("").await.unwrap_err();
@@ -1394,7 +1394,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(Arc::new(FailingAdapter), "test")
             .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let mut events = session.events();
 
         let waited = session.submit("work").await.unwrap().wait().await.unwrap();
@@ -1425,7 +1425,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let mut events = session.events();
 
         session.submit("work").await.unwrap().wait().await.unwrap();
@@ -1457,7 +1457,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
 
         session
             .notify(Input::from_text(crate::InputSource::Agent, "note"))
@@ -1490,7 +1490,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
 
         let first = session.submit("first").await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1526,7 +1526,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let mut events = session.events();
 
         let turn_id = session
@@ -1559,7 +1559,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let turn = session.submit("first").await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1588,7 +1588,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(), runtime));
+        let session = Session::spawn(SessionActorState::new(config(), runtime));
         let mut events = session.events();
         let turn = session.submit("first").await.unwrap();
 
@@ -1611,7 +1611,7 @@ mod tests {
     async fn duplicate_keys_in_one_turn_are_rejected_before_persistence() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(), runtime);
+        let mut state = SessionActorState::new(config(), runtime);
         let mut first = Input::user("first");
         first.idempotency_key = Some("same".to_string());
         let mut second = Input::user("second");
@@ -1630,7 +1630,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("duplicate agent input"));
+        assert!(error.to_string().contains("duplicate session input"));
         assert!(state.log.entries().is_empty());
         assert!(state.store.open(state.id()).await.unwrap().is_none());
     }

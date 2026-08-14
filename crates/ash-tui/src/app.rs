@@ -18,7 +18,7 @@ use crate::{
     inline::{RenderPlan, TerminalUi, TerminalView},
     input::InputState,
     menu::ComposerMenuState,
-    operation::{AgentStart, BackgroundAction, OperationState, SubmissionPolicy},
+    operation::{BackgroundAction, OperationState, SubmissionPolicy, TurnStartOutcome},
     session_picker::SessionPickerState,
     slash_command::{self, CommandCompletionState, ParsedInput, SlashCommand},
     SubagentView,
@@ -478,12 +478,12 @@ fn handle_session_event(
                 return Ok(LoopAction::Continue);
             }
             terminal.track_turn(turn_id);
-            let start = state.operation.agent_started();
-            let effect = terminal.agent_started();
+            let start = state.operation.turn_started();
+            let effect = terminal.turn_started();
             state.apply(terminal, effect)?;
             Ok(match start {
-                AgentStart::StartedTurn => LoopAction::ResetTimers,
-                AgentStart::TurnAlreadyTracked => LoopAction::Continue,
+                TurnStartOutcome::StartedTurn => LoopAction::ResetTimers,
+                TurnStartOutcome::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
         SessionEventKind::Live(_) if turn_id.is_none() || terminal.current_turn_id() != turn_id => {

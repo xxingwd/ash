@@ -592,7 +592,7 @@ impl TerminalUi {
         RenderPlan::REDRAW
     }
 
-    pub const fn agent_started(&self) -> RenderPlan {
+    pub const fn turn_started(&self) -> RenderPlan {
         RenderPlan::REDRAW
     }
 

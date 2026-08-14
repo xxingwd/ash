@@ -185,8 +185,8 @@ pub(crate) enum AgentStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AgentSnapshot {
-    pub agent_id: SessionId,
+pub(crate) struct SessionSnapshot {
+    pub session_id: SessionId,
     pub task_name: String,
     pub agent_type: &'static str,
     pub status: AgentStatus,
@@ -197,8 +197,8 @@ pub(crate) struct AgentSnapshot {
     pub error: Option<String>,
 }
 
-impl From<AgentSnapshot> for SubagentSnapshot {
-    fn from(snapshot: AgentSnapshot) -> Self {
+impl From<SessionSnapshot> for SubagentSnapshot {
+    fn from(snapshot: SessionSnapshot) -> Self {
         Self {
             task_name: snapshot.task_name,
             agent_type: snapshot.agent_type.to_string(),
@@ -418,9 +418,9 @@ impl ChildState {
 }
 
 impl ChildRecord {
-    fn snapshot(&self) -> AgentSnapshot {
-        AgentSnapshot {
-            agent_id: self.id,
+    fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: self.id,
             task_name: self.task_path.to_string(),
             agent_type: self.profile.name,
             status: self.status(),
@@ -471,7 +471,7 @@ impl MessageDelivery {
     }
 }
 
-fn sorted_snapshots<'a>(records: impl Iterator<Item = &'a ChildRecord>) -> Vec<AgentSnapshot> {
+fn sorted_snapshots<'a>(records: impl Iterator<Item = &'a ChildRecord>) -> Vec<SessionSnapshot> {
     let mut agents = records.map(ChildRecord::snapshot).collect::<Vec<_>>();
     agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
     agents
@@ -484,7 +484,7 @@ impl ControlState {
             .map_or(0, AgentTreeState::active_count)
     }
 
-    fn snapshots(&self, root_id: SessionId, path_prefix: Option<&str>) -> Vec<AgentSnapshot> {
+    fn snapshots(&self, root_id: SessionId, path_prefix: Option<&str>) -> Vec<SessionSnapshot> {
         sorted_snapshots(
             self.trees
                 .get(&root_id)
@@ -571,8 +571,8 @@ impl AgentTreeState {
     /// state (and bumps the completion revision) only after every accepted
     /// turn, including queued follow-ups, has settled, so waiters never
     /// observe an intermediate completion. Returns whether it went terminal.
-    fn settle_turn(&mut self, agent_id: SessionId, terminal: ChildState) -> bool {
-        let Some(record) = self.agents.get_mut(&agent_id) else {
+    fn settle_turn(&mut self, session_id: SessionId, terminal: ChildState) -> bool {
+        let Some(record) = self.agents.get_mut(&session_id) else {
             return false;
         };
         record.active_turns = record.active_turns.saturating_sub(1);
@@ -588,7 +588,7 @@ impl AgentTreeState {
 }
 
 struct WaitSnapshot {
-    agents: Vec<AgentSnapshot>,
+    agents: Vec<SessionSnapshot>,
     has_update: bool,
 }
 
@@ -1039,7 +1039,7 @@ impl AgentControl {
         &self,
         root_id: SessionId,
         path_prefix: Option<&str>,
-    ) -> Vec<AgentSnapshot> {
+    ) -> Vec<SessionSnapshot> {
         self.inner
             .state
             .lock()
@@ -1083,9 +1083,9 @@ impl AgentControl {
             drop(state);
         }
         let watcher = self.clone();
-        let agent_id = session.id();
+        let session_id = session.id();
         tokio::spawn(async move {
-            watcher.observe_turn(root_id, agent_id, turn).await;
+            watcher.observe_turn(root_id, session_id, turn).await;
         });
         Ok(())
     }
@@ -1093,7 +1093,7 @@ impl AgentControl {
     /// Observe one submitted turn to its settlement and fold the outcome into
     /// the child's projection. The session actor owns the turn lifecycle; this
     /// task only reports it.
-    async fn observe_turn(&self, root_id: SessionId, agent_id: SessionId, turn: Turn) {
+    async fn observe_turn(&self, root_id: SessionId, session_id: SessionId, turn: Turn) {
         let result = turn.wait().await;
         let (result, final_message) = match result {
             Ok(view) => {
@@ -1120,7 +1120,7 @@ impl AgentControl {
         let settled = state
             .trees
             .get_mut(&root_id)
-            .is_some_and(|tree| tree.settle_turn(agent_id, terminal));
+            .is_some_and(|tree| tree.settle_turn(session_id, terminal));
         if !settled {
             return;
         }
@@ -1209,10 +1209,10 @@ fn resolve_target_mut<'a>(
     let tree = state.trees.get_mut(&root_id).ok_or_else(|| {
         ToolError::Execution("no sub-agents exist in the current session".to_string())
     })?;
-    if let Ok(agent_id) = SessionId::from_str(target) {
+    if let Ok(session_id) = SessionId::from_str(target) {
         return tree
             .agents
-            .get_mut(&agent_id)
+            .get_mut(&session_id)
             .ok_or_else(|| ToolError::Execution(format!("sub-agent not found: {target}")));
     }
 
@@ -1435,7 +1435,7 @@ mod tests {
         max_turns: u32,
     ) -> (AgentControl, tempfile::TempDir, Runtime) {
         // Keep test session files out of the real data directory
-        // (`~/.local/share/ash/sessions`); the returned TempDir stays alive for
+        // (`~/.ash/sessions`); the returned TempDir stays alive for
         // the whole test so spawned sub-agents keep a valid store.
         let directory = tempfile::TempDir::new().expect("create temp session directory");
         let runtime = Runtime::new(model, "test").with_session_store(Arc::new(

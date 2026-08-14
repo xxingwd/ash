@@ -25,7 +25,7 @@ pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, SessionLog};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use prompt::build_system_prompt;
 pub use runtime::Runtime;
-pub(crate) use session::SessionState;
+pub(crate) use session::SessionActorState;
 pub use session::{ContextCompaction, ForkedSession, Session, Turn};
 pub use skill::{tool as skill_tool, Skill};
 pub use store::{OpenedSession, SessionAppender, SessionStore, StoredSession};

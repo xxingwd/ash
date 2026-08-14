@@ -37,7 +37,7 @@ pub enum TurnCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AgentStart {
+pub enum TurnStartOutcome {
     StartedTurn,
     TurnAlreadyTracked,
 }
@@ -114,12 +114,12 @@ impl OperationState {
         self.current = Operation::Turn(TurnOperation::Running);
     }
 
-    pub(crate) const fn agent_started(&mut self) -> AgentStart {
+    pub(crate) const fn turn_started(&mut self) -> TurnStartOutcome {
         if self.is_busy() {
-            AgentStart::TurnAlreadyTracked
+            TurnStartOutcome::TurnAlreadyTracked
         } else {
             self.start_turn();
-            AgentStart::StartedTurn
+            TurnStartOutcome::StartedTurn
         }
     }
 
@@ -203,8 +203,8 @@ mod tests {
     fn agent_start_reports_whether_the_turn_was_already_tracked() {
         let mut state = OperationState::default();
 
-        assert_eq!(state.agent_started(), AgentStart::StartedTurn);
-        assert_eq!(state.agent_started(), AgentStart::TurnAlreadyTracked);
+        assert_eq!(state.turn_started(), TurnStartOutcome::StartedTurn);
+        assert_eq!(state.turn_started(), TurnStartOutcome::TurnAlreadyTracked);
     }
 
     #[test]

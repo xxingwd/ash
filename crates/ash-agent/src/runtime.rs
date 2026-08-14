@@ -4,14 +4,14 @@ use ash_core::{Message, ModelClient, SessionId, SessionIdentity, SessionSummary}
 
 use crate::agent::RunConfig;
 use crate::store::SharedSessionStore;
-use crate::{Agent, JsonlSessionStore, Session, SessionOptions, SessionState, SessionStore};
+use crate::{Agent, JsonlSessionStore, Session, SessionActorState, SessionOptions, SessionStore};
 
 /// Provider-neutral dependencies and the only entry point for creating sessions.
 #[derive(Clone)]
 pub struct Runtime {
     model: Arc<dyn ModelClient>,
     model_backend: Arc<str>,
-    sessions: SharedSessionStore,
+    session_store: SharedSessionStore,
 }
 
 impl Runtime {
@@ -19,19 +19,19 @@ impl Runtime {
         Self {
             model,
             model_backend: Arc::from(model_backend.into()),
-            sessions: Arc::new(JsonlSessionStore::default()),
+            session_store: Arc::new(JsonlSessionStore::default()),
         }
     }
 
     #[must_use]
-    pub fn with_session_store(mut self, sessions: Arc<dyn SessionStore>) -> Self {
-        self.sessions = sessions;
+    pub fn with_session_store(mut self, session_store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = session_store;
         self
     }
 
     #[must_use]
     pub fn start(&self, agent: &Agent, options: &SessionOptions) -> Session {
-        Session::spawn(SessionState::new(
+        Session::spawn(SessionActorState::new(
             RunConfig::new(agent, options),
             self.clone(),
         ))
@@ -52,7 +52,7 @@ impl Runtime {
         task_name: &str,
         history: Vec<Message>,
     ) -> Result<Session, ash_core::AshError> {
-        let mut state = SessionState::new_child(
+        let mut state = SessionActorState::new_child(
             RunConfig::new(agent, options),
             self.clone(),
             parent,
@@ -74,7 +74,7 @@ impl Runtime {
         options: &SessionOptions,
         session_id: SessionId,
     ) -> Result<Option<Session>, ash_core::AshError> {
-        let mut state = SessionState::new(RunConfig::new(agent, options), self.clone());
+        let mut state = SessionActorState::new(RunConfig::new(agent, options), self.clone());
         if !state.resume(session_id).await? {
             return Ok(None);
         }
@@ -90,7 +90,7 @@ impl Runtime {
         &self,
         excluded: Option<SessionId>,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        let mut sessions = self.sessions.list_roots().await?;
+        let mut sessions = self.session_store.list_roots().await?;
         if let Some(excluded) = excluded {
             sessions.retain(|summary| summary.session_id != excluded);
         }
@@ -106,7 +106,7 @@ impl Runtime {
         &self,
         root_id: SessionId,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.sessions.tree(root_id).await
+        self.session_store.tree(root_id).await
     }
 
     #[must_use]
@@ -124,6 +124,6 @@ impl Runtime {
     }
 
     pub(crate) fn session_store_handle(&self) -> SharedSessionStore {
-        Arc::clone(&self.sessions)
+        Arc::clone(&self.session_store)
     }
 }
