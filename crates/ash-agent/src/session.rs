@@ -1,6 +1,5 @@
 use std::{
     collections::{HashSet, VecDeque},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -63,7 +62,7 @@ enum Command {
     ForkPoints(oneshot::Sender<Result<Vec<ForkPoint>, ash_core::AshError>>),
     Fork {
         message_id: MessageId,
-        reply: oneshot::Sender<Result<Option<Fork>, ash_core::AshError>>,
+        reply: oneshot::Sender<Result<Option<ForkedSession>, ash_core::AshError>>,
     },
 }
 
@@ -202,7 +201,10 @@ impl Session {
     /// # Errors
     ///
     /// Returns `AshError` when the session runtime has stopped.
-    pub async fn fork_at(&self, message_id: MessageId) -> Result<Option<Fork>, ash_core::AshError> {
+    pub async fn fork_at(
+        &self,
+        message_id: MessageId,
+    ) -> Result<Option<ForkedSession>, ash_core::AshError> {
         self.ask(|reply| Command::Fork { message_id, reply }).await
     }
 
@@ -436,13 +438,9 @@ async fn dispatch_idle_command(
         }
         Command::Fork { message_id, reply } => {
             let result = state.fork_at(message_id).await.map(|forked| {
-                forked.map(|(state, data)| Fork {
+                forked.map(|(state, prompt)| ForkedSession {
                     session: Session::spawn(state),
-                    messages: data.messages,
-                    model: data.model,
-                    protocol: data.protocol,
-                    working_dir: data.working_dir,
-                    prompt: data.prompt,
+                    prompt,
                 })
             });
             let _ = reply.send(result);
@@ -530,12 +528,9 @@ fn queued_turn(
     }
 }
 
-pub struct Fork {
+/// A new root session forked before a selected prompt.
+pub struct ForkedSession {
     pub session: Session,
-    pub messages: Vec<Message>,
-    pub model: ash_core::ModelId,
-    pub protocol: String,
-    pub working_dir: PathBuf,
     pub prompt: String,
 }
 
@@ -651,7 +646,7 @@ impl SessionState {
     async fn fork_at(
         &self,
         message_id: MessageId,
-    ) -> Result<Option<(Self, ForkData)>, ash_core::AshError> {
+    ) -> Result<Option<(Self, String)>, ash_core::AshError> {
         let Some((turn_start, prompt)) =
             self.log
                 .messages()
@@ -668,21 +663,11 @@ impl SessionState {
         let messages = self.log.messages()[..turn_start].to_vec();
         let config = self.config.clone();
         let runtime = self.runtime.clone();
-        let model = config.model.clone();
-        let protocol = runtime.model_backend().to_string();
-        let working_dir = config.working_dir.clone();
 
         let mut state = Self::new(config, runtime);
-        state.seed(messages.clone()).await?;
+        state.seed(messages).await?;
 
-        let details = ForkData {
-            messages,
-            model,
-            protocol,
-            working_dir,
-            prompt,
-        };
-        Ok(Some((state, details)))
+        Ok(Some((state, prompt)))
     }
 
     fn restore(&mut self, opened: OpenedSession) {
@@ -896,14 +881,6 @@ impl SessionState {
     }
 }
 
-struct ForkData {
-    messages: Vec<Message>,
-    model: ash_core::ModelId,
-    protocol: String,
-    working_dir: PathBuf,
-    prompt: String,
-}
-
 fn last_user_turn(messages: &[Message]) -> Option<(usize, String)> {
     messages
         .iter()
@@ -996,13 +973,12 @@ mod tests {
         }
     }
 
-    fn config(working_dir: PathBuf) -> RunConfig {
+    fn config() -> RunConfig {
         RunConfig {
             system_prompt: Some("current prompt".to_string()),
             tools: Vec::new(),
             model: ModelId::new("current-model"),
             max_turns: 10,
-            working_dir,
             max_context_tokens: 1000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(5),
@@ -1077,7 +1053,7 @@ mod tests {
         let tool_id = ToolCallId::from_provider("call");
         let first = Message::user("first");
         let second = Message::user("second\nline");
-        let mut state = SessionState::new(config(PathBuf::from(".")), runtime());
+        let mut state = SessionState::new(config(), runtime());
         state.log = SessionLog::from_messages(vec![
             first.clone(),
             Message::assistant_text("answer"),
@@ -1103,7 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn fork_creates_a_new_session_before_the_selected_prompt() {
         let directory = TempDir::new().unwrap();
-        let config = config(directory.path().to_path_buf());
+        let config = config();
         let runtime = runtime_in(directory.path());
         let first = Message::user("first");
         let answer = Message::assistant_text("first answer");
@@ -1118,6 +1094,10 @@ mod tests {
 
         assert_eq!(state.id(), original_id);
         assert_ne!(fork_state.id(), original_id);
+        // A fork is a fresh root session with its own lineage.
+        assert!(fork_state.identity().is_root());
+        assert_eq!(fork_state.identity().root_id, fork_state.id());
+        assert_eq!(fork_state.identity().path.as_str(), "/root");
         assert_eq!(fork_state.log.messages().len(), 2);
         assert_eq!(
             fork_state
@@ -1128,15 +1108,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_ids
         );
-        assert_eq!(
-            forked
-                .messages
-                .iter()
-                .map(|message| message.id)
-                .collect::<Vec<_>>(),
-            expected_ids
-        );
-        assert_eq!(forked.prompt, "try another direction");
+        assert_eq!(forked, "try another direction");
         let original = stored_session(&runtime.session_store_handle(), original_id).await;
         assert_eq!(original.log.messages().len(), 4);
         let stored_fork = stored_session(&fork_state.store, fork_state.id()).await;
@@ -1154,10 +1126,8 @@ mod tests {
     #[tokio::test]
     async fn resume_keeps_the_current_runtime_configuration() {
         let directory = TempDir::new().unwrap();
-        let current_dir = directory.path().join("current");
-        tokio::fs::create_dir(&current_dir).await.unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(current_dir.clone()), runtime.clone());
+        let mut state = SessionState::new(config(), runtime.clone());
         let saved_id = SessionId::new();
         let saved_message = Message::user("saved question");
         create_session(
@@ -1177,7 +1147,6 @@ mod tests {
             state.config.system_prompt.as_deref(),
             Some("current prompt")
         );
-        assert_eq!(state.config.working_dir, current_dir);
         assert_eq!(state.log.messages().len(), 1);
     }
 
@@ -1185,7 +1154,7 @@ mod tests {
     async fn resume_rejects_child_sessions() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(directory.path().to_path_buf()), runtime.clone());
+        let mut state = SessionState::new(config(), runtime.clone());
         let root_id = SessionId::new();
         let root = SessionIdentity::root(root_id);
         let child = root.child(SessionId::new(), "research").unwrap();
@@ -1205,13 +1174,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
         let parent = SessionIdentity::root(SessionId::new());
-        let state = SessionState::new_child(
-            config(directory.path().to_path_buf()),
-            runtime,
-            &parent,
-            "research",
-        )
-        .unwrap();
+        let state = SessionState::new_child(config(), runtime, &parent, "research").unwrap();
 
         assert_ne!(state.id(), parent.id);
         assert_eq!(state.identity().root_id, parent.id);
@@ -1246,8 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_keeps_memory_when_persistence_fails() {
-        let directory = TempDir::new().unwrap();
-        let mut state = SessionState::new(config(directory.path().to_path_buf()), runtime());
+        let mut state = SessionState::new(config(), runtime());
         let message = Message::user("unpersisted");
         state.log.push(LogEntry::Message(message));
 
@@ -1263,7 +1225,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let blocked_parent = directory.path().join("not-a-directory");
         tokio::fs::write(&blocked_parent, b"file").await.unwrap();
-        let config = config(directory.path().to_path_buf());
+        let config = config();
         let runtime = runtime_in(&blocked_parent);
         let mut state = SessionState::new(config, runtime);
         let (events, mut received) = mpsc::channel(4);
@@ -1288,7 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn manual_compaction_preserves_full_history_and_updates_model_context() {
         let directory = TempDir::new().unwrap();
-        let config = config(directory.path().to_path_buf());
+        let config = config();
         let runtime = runtime_in(directory.path());
         let messages = vec![
             Message::user(&format!("old request {}", "x".repeat(10_000))),
@@ -1345,7 +1307,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
 
         let first = session.submit("first").await.unwrap();
         let second = session.submit("second").await.unwrap();
@@ -1374,7 +1336,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let turn = session.submit("work").await.unwrap();
         started.notified().await;
 
@@ -1411,7 +1373,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
 
         let submit_error = session.submit("").await.err().unwrap();
         let enqueue_error = session.enqueue("").await.unwrap_err();
@@ -1432,7 +1394,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = Runtime::new(Arc::new(FailingAdapter), "test")
             .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let mut events = session.events();
 
         let waited = session.submit("work").await.unwrap().wait().await.unwrap();
@@ -1463,7 +1425,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let mut events = session.events();
 
         session.submit("work").await.unwrap().wait().await.unwrap();
@@ -1495,7 +1457,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
 
         session
             .notify(Input::from_text(crate::InputSource::Agent, "note"))
@@ -1528,7 +1490,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
 
         let first = session.submit("first").await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1564,7 +1526,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let mut events = session.events();
 
         let turn_id = session
@@ -1597,7 +1559,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let turn = session.submit("first").await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1626,7 +1588,7 @@ mod tests {
             "test",
         )
         .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
-        let session = Session::spawn(SessionState::new(config(directory.path().into()), runtime));
+        let session = Session::spawn(SessionState::new(config(), runtime));
         let mut events = session.events();
         let turn = session.submit("first").await.unwrap();
 
@@ -1649,7 +1611,7 @@ mod tests {
     async fn duplicate_keys_in_one_turn_are_rejected_before_persistence() {
         let directory = TempDir::new().unwrap();
         let runtime = runtime_in(directory.path());
-        let mut state = SessionState::new(config(directory.path().into()), runtime);
+        let mut state = SessionState::new(config(), runtime);
         let mut first = Input::user("first");
         first.idempotency_key = Some("same".to_string());
         let mut second = Input::user("second");
