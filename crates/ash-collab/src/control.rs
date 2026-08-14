@@ -8,8 +8,8 @@ use std::{
 use crate::snapshot::{SubagentSnapshot, SubagentState};
 use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions, Turn};
 use ash_core::{
-    define_tool, AgentPath, CancellationToken, ContentBlock, Message, MessageContent, SessionId,
-    SessionIdentity, StopReason, Tool, ToolContext, ToolError, TurnResult,
+    define_tool, AgentPath, CancellationToken, ContentBlock, Message, MessageContent, ModelId,
+    SessionId, SessionIdentity, StopReason, Tool, ToolContext, ToolError, TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -107,12 +107,16 @@ impl ToolPolicy {
 /// description for the parent's tool documentation, a prompt overlay, and a
 /// tool policy. The session execution engine stays untouched when a new
 /// profile is added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentProfile {
     pub name: &'static str,
     pub description: &'static str,
     pub prompt_overlay: &'static str,
     pub tool_policy: ToolPolicy,
+    /// Optional model override; `None` inherits the parent's model.
+    pub model: Option<ModelId>,
+    /// Optional turn limit; `None` inherits the parent's limit.
+    pub max_turns: Option<u32>,
 }
 
 impl AgentProfile {
@@ -127,6 +131,8 @@ impl AgentProfile {
             description,
             prompt_overlay,
             tool_policy,
+            model: None,
+            max_turns: None,
         }
     }
 
@@ -808,7 +814,7 @@ impl AgentControl {
         let messages = fork_messages(&context.session.messages, fork_mode);
         let session = match self
             .prepare_child(ChildSessionRequest {
-                profile,
+                profile: profile.clone(),
                 parent: parent.clone(),
                 segment: args.task_name.clone(),
                 messages,
@@ -827,7 +833,7 @@ impl AgentControl {
             parent.root_id,
             id,
             task_path.clone(),
-            profile,
+            profile.clone(),
             args.message.clone(),
             session.clone(),
         )
@@ -851,7 +857,7 @@ impl AgentControl {
     /// touched, so the caller decides how to release the spawn reservation on
     /// failure.
     async fn prepare_child(&self, request: ChildSessionRequest) -> Result<Session, ToolError> {
-        let profile = request.profile;
+        let profile = request.profile.clone();
         let parent = request.parent.clone();
         let segment = request.segment.clone();
         let child = self.inner.spawner.spawn(request)?;
@@ -1299,14 +1305,23 @@ fn complete_history_end(messages: &[Message]) -> usize {
     }
 }
 
-/// Apply a profile's tool policy to a child agent's inherited definition.
-/// The collaboration tools are installed only by the `Inherit` policy.
+/// Apply a profile's tool policy and overrides to a child agent's inherited
+/// definition. The collaboration tools are installed only by the `Inherit`
+/// policy.
 fn apply_profile(
     agent: Agent,
     profile: AgentProfile,
     collaboration_tools: Vec<Arc<dyn Tool>>,
 ) -> Agent {
-    profile.tool_policy.apply(agent, collaboration_tools)
+    let agent = profile.tool_policy.apply(agent, collaboration_tools);
+    let agent = match profile.model {
+        Some(model) => agent.with_model(model),
+        None => agent,
+    };
+    match profile.max_turns {
+        Some(max_turns) => agent.with_max_turns(max_turns),
+        None => agent,
+    }
 }
 
 fn subagent_system_prompt(
@@ -1554,6 +1569,20 @@ mod tests {
     }
 
     #[test]
+    fn profile_model_and_turn_overrides_apply_without_touching_the_engine() {
+        let profile = AgentProfile {
+            model: Some(ModelId::new("override-model")),
+            max_turns: Some(7),
+            ..AgentProfile::default()
+        };
+
+        let agent = apply_profile(make_agent().with_max_turns(100), profile, Vec::new());
+
+        assert_eq!(agent.model().as_str(), "override-model");
+        assert_eq!(agent.max_turns(), 7);
+    }
+
+    #[test]
     fn default_and_worker_keep_inherited_and_collaboration_tools() {
         for profile in [AgentProfile::default(), AgentProfile::worker()] {
             let inherited = ["read", "write", "custom_tool"]
@@ -1564,7 +1593,11 @@ mod tests {
                 .into_iter()
                 .map(named_tool)
                 .collect();
-            let agent = apply_profile(make_agent().with_tools(inherited), profile, collaboration);
+            let agent = apply_profile(
+                make_agent().with_tools(inherited),
+                profile.clone(),
+                collaboration,
+            );
 
             assert_eq!(
                 tool_names(&agent),
