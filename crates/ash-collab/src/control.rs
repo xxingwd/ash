@@ -24,22 +24,10 @@ const EXPOSED_COLLABORATION_TOOL_NAMES: [&str; 4] = [
     "wait_agent",
 ];
 
-const LEGACY_COLLABORATION_TOOL_NAMES: [&str; 3] = ["send_message", "followup_task", "list_agents"];
-
 /// Tools whose public contracts are read-only. Explorer projection is an
 /// allowlist: unknown custom and MCP tools are excluded unless their behavior
 /// is represented by one of these canonical tool names.
 const EXPLORER_TOOL_NAMES: [&str; 5] = ["read", "glob", "grep", "webfetch", "skill"];
-
-/// Every collaboration tool name, derived from the exposed and legacy sets so
-/// that adding a new tool touches exactly one place.
-fn all_collaboration_tool_names() -> Vec<&'static str> {
-    EXPOSED_COLLABORATION_TOOL_NAMES
-        .iter()
-        .chain(LEGACY_COLLABORATION_TOOL_NAMES.iter())
-        .copied()
-        .collect()
-}
 
 const MULTI_AGENT_INSTRUCTIONS: &str = r"<multi_agent_mode>
 You are one agent in a team that shares the same workspace and tools. Split work where parallelism pays; keep tightly coupled work local.
@@ -1153,16 +1141,13 @@ pub fn install_subagent_tools(
     runtime: Runtime,
     max_concurrent_children: Option<usize>,
 ) -> Result<(Agent, Option<Arc<AgentControl>>), ToolError> {
-    let has_exposed_tools = EXPOSED_COLLABORATION_TOOL_NAMES
+    let already_installed = EXPOSED_COLLABORATION_TOOL_NAMES
         .iter()
         .all(|name| agent.tools().iter().any(|tool| tool.name() == *name));
-    let has_legacy_tools = LEGACY_COLLABORATION_TOOL_NAMES
-        .iter()
-        .any(|name| agent.tools().iter().any(|tool| tool.name() == *name));
-    if has_exposed_tools && !has_legacy_tools {
+    if already_installed {
         return Ok((with_multi_agent_instructions(agent), None));
     }
-    let agent = agent.without_tools(&all_collaboration_tool_names());
+    let agent = agent.without_tools(&EXPOSED_COLLABORATION_TOOL_NAMES);
     let agent = with_multi_agent_instructions(agent);
     let spawner = Arc::new(InheritedSessionFactory {
         runtime,
