@@ -158,7 +158,7 @@ AgentControl queue -> ChildCommand -> run_child -> Session queue -> Turn
 
 ### 当前问题
 
-子代理角色目前是写死的 enum，并分别编码名称、描述、prompt 和工具删减规则。根代理使用 `Agent`，子代理使用 `Agent + AgentRole` 特殊构造，仍不是完全统一的数据模型。
+子代理角色目前是写死的 enum，并分别编码名称、描述、prompt 和工具删减规则。根代理和子代理应使用相同的 `Agent` 执行定义，角色只提供有限覆盖。
 
 ### 任务
 
@@ -170,11 +170,11 @@ AgentControl queue -> ChildCommand -> run_child -> Session queue -> Turn
   - [x] 可选 model override
   - [x] 可选 turn/深度限制
 - [x] 内置 `default`、`explorer`、`worker` profile。
-- [x] 根 Session 也显式使用 profile，不让 profile 成为“仅子代理”概念。
+- [x] 根与子 Session 使用相同的 `Agent` 类型和执行路径。
 - [x] 工具策略使用 allow/deny 数据结构，不在 match 中硬编码删工具。
 - [x] `ChildAgent` 改名为 `ChildSessionSpec`。
 - [x] `AgentSpawner` 改名为 `ChildSessionFactory`。
-- [x] `SpawnRequest` 改名为 `ChildSessionRequest`。
+- [x] 删除多余的 spawn request 包装，由 factory 直接接收 profile 和 history。
 - [x] profile 解析、工具过滤和 prompt overlay 各自保持单一实现。
 
 ### 验收

@@ -153,6 +153,9 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 - `interrupt_agent`：只中断目标 Agent 当前一轮，之后仍可继续复用
 - `wait_agent`：等待状态变化；`timeout_ms: 0` 立即返回当前 Agent、状态和最终结果
 
+这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，只追加所选类型的工作
+指令，不继承协作工具或主 Agent 的编排提示。
+
 内置类型与 Codex CLI `0.144.3` 对齐：
 
 - `default`：继承当前配置的通用 Agent

@@ -133,13 +133,13 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     }
     let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
     let max_concurrent_agents = env_usize("ASH_MAX_CONCURRENT_AGENTS")?;
-    let (agent, control) = ash_collab::install_subagent_tools(
+    let (agent, control) = ash_collab::install_collaboration(
         agent,
         options.clone(),
         runtime.clone(),
         max_concurrent_agents,
     )?;
-    let subagent_monitor = control.map(|control| map_subagent_monitor(control.subscribe()));
+    let subagent_monitor = Some(map_subagent_monitor(control.subscribe()));
 
     Ok(AgentSetup {
         agent,

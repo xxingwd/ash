@@ -161,12 +161,15 @@ role/content combinations and system images fail locally as invalid requests.
 
 `ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
 `spawn_agent`, `message_agent`, `interrupt_agent`, and `wait_agent` tools. Child construction uses
-the internal `ChildSessionFactory`, `ChildSessionRequest`, and `ChildSessionSpec` contracts. Built-in
-`AgentProfile` values (`default`, `explorer`, and `worker`) apply prompt, tool, model, and turn-limit
-overrides without changing the session engine.
+the internal `ChildSessionFactory` and `ChildSessionSpec` contracts. Built-in `AgentProfile` values
+(`default`, `explorer`, and `worker`) apply prompt, tool, model, and turn-limit overrides without
+changing the session engine.
 
-Every child gets its own `Session` and executes through the same runtime path as a root agent.
-Tree identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
+The child factory retains the unmodified base `Agent`. Only the main agent receives the collaboration
+tools and `<multi_agent_mode>` instructions; every child derives from the clean base and therefore
+cannot delegate further. Child prompts contain only the base prompt and selected profile instructions.
+Every child gets its own `Session` and executes through the same runtime path as the main agent. Tree
+identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
 through `ToolContext.session`. Collaboration state does not leak into terminal state or create a
 second execution queue.
 

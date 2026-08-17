@@ -18,13 +18,6 @@ use tokio::sync::{watch, Mutex, Notify};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
-const EXPOSED_COLLABORATION_TOOL_NAMES: [&str; 4] = [
-    "spawn_agent",
-    "message_agent",
-    "interrupt_agent",
-    "wait_agent",
-];
-
 /// Tools whose public contracts are read-only. Explorer projection is an
 /// allowlist: unknown custom and MCP tools are excluded unless their behavior
 /// is represented by one of these canonical tool names.
@@ -81,16 +74,16 @@ impl std::str::FromStr for ProfileName {
 /// How a profile filters the inherited tool set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolPolicy {
-    /// Keep inherited tools and add the collaboration tools.
+    /// Keep every inherited business tool.
     Inherit,
-    /// Keep only the named tools; collaboration tools are not installed.
+    /// Keep only the named inherited tools.
     Allow(&'static [&'static str]),
 }
 
 impl ToolPolicy {
-    fn apply(self, agent: Agent, collaboration_tools: Vec<Arc<dyn Tool>>) -> Agent {
+    fn apply(self, agent: Agent) -> Agent {
         match self {
-            Self::Inherit => agent.pushing_tools(collaboration_tools),
+            Self::Inherit => agent,
             Self::Allow(names) => {
                 let tools = agent
                     .tools()
@@ -141,7 +134,7 @@ impl AgentProfile {
         Self::builtin(
             "default",
             "General-purpose agent for a self-contained task that inherits the current configuration.",
-            "Handle the assigned task directly. Stay within its scope, delegate independent subparts when that creates real parallel progress, and return a concise, evidence-backed result to the parent agent.",
+            "Handle the assigned task directly. Stay within its scope and return a concise, evidence-backed result to the parent agent.",
             ToolPolicy::Inherit,
         )
     }
@@ -159,7 +152,7 @@ impl AgentProfile {
         Self::builtin(
             "worker",
             "Prefer for bounded implementation and production work such as features, fixes, tests, and refactors. Assign explicit file or module ownership, keep write scopes disjoint, and remind workers that the workspace is shared.",
-            "Execute the assigned implementation or production task. Respect the stated file or module ownership, preserve unrelated workspace changes, coordinate independent side questions through sub-agents when useful, verify your work, and report changed files plus validation results.",
+            "Execute the assigned implementation or production task. Respect the stated file or module ownership, preserve unrelated workspace changes, verify your work, and report changed files plus validation results.",
             ToolPolicy::Inherit,
         )
     }
@@ -278,15 +271,6 @@ impl Drop for SpawnReservation {
     }
 }
 
-pub(crate) struct ChildSessionRequest {
-    pub profile: AgentProfile,
-    /// Identity of the parent session that spawns this child.
-    pub parent: SessionIdentity,
-    /// One validated path segment naming this child under the parent.
-    pub segment: String,
-    pub messages: Vec<Message>,
-}
-
 pub(crate) struct ChildSessionSpec {
     pub runtime: Runtime,
     pub agent: Agent,
@@ -295,41 +279,37 @@ pub(crate) struct ChildSessionSpec {
 }
 
 pub(crate) trait ChildSessionFactory: Send + Sync {
-    fn spawn(&self, request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError>;
+    fn create(
+        &self,
+        profile: &AgentProfile,
+        history: Vec<Message>,
+    ) -> Result<ChildSessionSpec, ToolError>;
 }
 
 struct InheritedSessionFactory {
     runtime: Runtime,
-    system_prompt: Option<String>,
     definition: Agent,
     scope: SessionOptions,
 }
 
 impl ChildSessionFactory for InheritedSessionFactory {
-    fn spawn(&self, request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError> {
-        let task_path = request
-            .parent
-            .path
-            .join(&request.segment)
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+    fn create(
+        &self,
+        profile: &AgentProfile,
+        history: Vec<Message>,
+    ) -> Result<ChildSessionSpec, ToolError> {
         let definition = self
             .definition
             .clone()
-            .with_system_prompt(subagent_system_prompt(
-                self.system_prompt.as_deref(),
-                request.profile,
-                request.parent.path.as_str(),
-                task_path.as_str(),
+            .with_system_prompt(profile_system_prompt(
+                self.definition.system_prompt(),
+                profile,
             ));
-        let scope = SessionOptions {
-            working_dir: self.scope.working_dir.clone(),
-            tool_timeout: self.scope.tool_timeout,
-        };
         Ok(ChildSessionSpec {
             runtime: self.runtime.clone(),
             agent: definition,
-            options: scope,
-            history: request.messages,
+            options: self.scope.clone(),
+            history,
         })
     }
 }
@@ -792,12 +772,7 @@ impl AgentControl {
         };
         let messages = fork_messages(&context.session.messages, fork_mode);
         let session = match self
-            .prepare_child(ChildSessionRequest {
-                profile: profile.clone(),
-                parent: parent.clone(),
-                segment: args.task_name.clone(),
-                messages,
-            })
+            .prepare_child(profile.clone(), &parent, args.task_name.as_str(), messages)
             .await
         {
             Ok(session) => session,
@@ -835,15 +810,18 @@ impl AgentControl {
     /// Build the child agent and start its runtime. Controller state is not
     /// touched, so the caller decides how to release the spawn reservation on
     /// failure.
-    async fn prepare_child(&self, request: ChildSessionRequest) -> Result<Session, ToolError> {
-        let profile = request.profile.clone();
-        let parent = request.parent.clone();
-        let segment = request.segment.clone();
-        let child = self.inner.spawner.spawn(request)?;
-        let agent = apply_profile(child.agent, profile, self.tools()?);
+    async fn prepare_child(
+        &self,
+        profile: AgentProfile,
+        parent: &SessionIdentity,
+        segment: &str,
+        history: Vec<Message>,
+    ) -> Result<Session, ToolError> {
+        let child = self.inner.spawner.create(&profile, history)?;
+        let agent = apply_profile(child.agent, profile);
         child
             .runtime
-            .start_child(&agent, &child.options, &parent, &segment, child.history)
+            .start_child(&agent, &child.options, parent, segment, child.history)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))
     }
@@ -1115,45 +1093,36 @@ impl AgentControl {
     }
 }
 
-/// Install the collaboration tools on an agent and return the controller.
+/// Add collaboration capabilities to the main agent and return the controller.
 ///
 /// # Errors
 ///
 /// Returns `ToolError` when a tool cannot be defined.
-pub fn install_subagent_tools(
-    agent: Agent,
+pub fn install_collaboration(
+    base: Agent,
     options: SessionOptions,
     runtime: Runtime,
     max_concurrent_children: Option<usize>,
-) -> Result<(Agent, Option<Arc<AgentControl>>), ToolError> {
-    let already_installed = EXPOSED_COLLABORATION_TOOL_NAMES
-        .iter()
-        .all(|name| agent.tools().iter().any(|tool| tool.name() == *name));
-    if already_installed {
-        return Ok((with_multi_agent_instructions(agent), None));
-    }
-    let agent = agent.without_tools(&EXPOSED_COLLABORATION_TOOL_NAMES);
-    let agent = with_multi_agent_instructions(agent);
+) -> Result<(Agent, AgentControl), ToolError> {
     let spawner = Arc::new(InheritedSessionFactory {
         runtime,
-        system_prompt: agent.system_prompt().map(str::to_string),
-        definition: agent.clone(),
+        definition: base.clone(),
         scope: options,
     });
     let control = AgentControl::new(max_concurrent_children, spawner);
-    let agent = agent.pushing_tools(control.tools()?);
-    Ok((agent, Some(Arc::new(control))))
+    let agent = with_multi_agent_instructions(base).pushing_tools(control.tools()?);
+    Ok((agent, control))
 }
 
 fn with_multi_agent_instructions(agent: Agent) -> Agent {
-    let mut prompt = agent.system_prompt().unwrap_or_default().to_string();
-    if prompt.contains("<multi_agent_mode>") {
-        return agent;
-    }
-    if !prompt.trim().is_empty() {
-        prompt.push_str("\n\n");
-    }
-    prompt.push_str(MULTI_AGENT_INSTRUCTIONS);
+    let prompt = agent
+        .system_prompt()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map_or_else(
+            || MULTI_AGENT_INSTRUCTIONS.to_string(),
+            |prompt| format!("{prompt}\n\n{MULTI_AGENT_INSTRUCTIONS}"),
+        );
     agent.with_system_prompt(prompt)
 }
 
@@ -1274,15 +1243,9 @@ fn complete_history_end(messages: &[Message]) -> usize {
     }
 }
 
-/// Apply a profile's tool policy and overrides to a child agent's inherited
-/// definition. The collaboration tools are installed only by the `Inherit`
-/// policy.
-fn apply_profile(
-    agent: Agent,
-    profile: AgentProfile,
-    collaboration_tools: Vec<Arc<dyn Tool>>,
-) -> Agent {
-    let agent = profile.tool_policy.apply(agent, collaboration_tools);
+/// Apply a profile's tool policy and overrides to an inherited agent.
+fn apply_profile(agent: Agent, profile: AgentProfile) -> Agent {
+    let agent = profile.tool_policy.apply(agent);
     let agent = match profile.model {
         Some(model) => agent.with_model(model),
         None => agent,
@@ -1293,24 +1256,13 @@ fn apply_profile(
     }
 }
 
-fn subagent_system_prompt(
-    base_prompt: Option<&str>,
-    profile: AgentProfile,
-    parent_path: &str,
-    task_name: &str,
-) -> String {
-    let context = format!(
-        "<subagent_context>\nYou are `{task_name}`, a `{}` sub-agent spawned by `{parent_path}`. You share the same workspace with the parent and other agents.\n\n{}\n</subagent_context>",
-        profile.name,
-        profile.prompt_overlay
-    );
-    match base_prompt
+fn profile_system_prompt(base_prompt: Option<&str>, profile: &AgentProfile) -> String {
+    [base_prompt.unwrap_or_default(), profile.prompt_overlay]
+        .into_iter()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
-    {
-        Some(base_prompt) => format!("{base_prompt}\n\n{context}"),
-        None => context,
-    }
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn final_assistant_message(messages: &[Message]) -> Option<String> {
@@ -1350,7 +1302,11 @@ mod tests {
     struct RejectingFactory;
 
     impl ChildSessionFactory for RejectingFactory {
-        fn spawn(&self, _request: ChildSessionRequest) -> Result<ChildSessionSpec, ToolError> {
+        fn create(
+            &self,
+            _profile: &AgentProfile,
+            _history: Vec<Message>,
+        ) -> Result<ChildSessionSpec, ToolError> {
             Err(ToolError::Execution(
                 "spawn is not used by this test".to_string(),
             ))
@@ -1429,7 +1385,6 @@ mod tests {
         let options = make_options();
         let spawner = Arc::new(InheritedSessionFactory {
             runtime: runtime.clone(),
-            system_prompt: agent.system_prompt().map(str::to_string),
             definition: agent,
             scope: options,
         });
@@ -1519,15 +1474,7 @@ mod tests {
         .into_iter()
         .map(named_tool)
         .collect();
-        let collaboration = EXPOSED_COLLABORATION_TOOL_NAMES
-            .into_iter()
-            .map(named_tool)
-            .collect();
-        let agent = apply_profile(
-            make_agent().with_tools(inherited),
-            AgentProfile::explorer(),
-            collaboration,
-        );
+        let agent = apply_profile(make_agent().with_tools(inherited), AgentProfile::explorer());
 
         assert_eq!(
             tool_names(&agent),
@@ -1545,52 +1492,34 @@ mod tests {
             ..AgentProfile::default()
         };
 
-        let agent = apply_profile(make_agent().with_max_turns(100), profile, Vec::new());
+        let agent = apply_profile(make_agent().with_max_turns(100), profile);
 
         assert_eq!(agent.model().as_str(), "override-model");
         assert_eq!(agent.max_turns(), 7);
     }
 
     #[test]
-    fn default_and_worker_keep_inherited_and_collaboration_tools() {
+    fn default_and_worker_keep_only_inherited_tools() {
         for profile in [AgentProfile::default(), AgentProfile::worker()] {
             let inherited = ["read", "write", "custom_tool"]
                 .into_iter()
                 .map(named_tool)
                 .collect();
-            let collaboration = EXPOSED_COLLABORATION_TOOL_NAMES
-                .into_iter()
-                .map(named_tool)
-                .collect();
-            let agent = apply_profile(
-                make_agent().with_tools(inherited),
-                profile.clone(),
-                collaboration,
-            );
+            let agent = apply_profile(make_agent().with_tools(inherited), profile.clone());
 
             assert_eq!(
                 tool_names(&agent),
-                [
-                    "read",
-                    "write",
-                    "custom_tool",
-                    "spawn_agent",
-                    "message_agent",
-                    "interrupt_agent",
-                    "wait_agent",
-                ],
+                ["read", "write", "custom_tool"],
                 "{profile:?}"
             );
         }
     }
 
     #[test]
-    fn installs_the_codex_style_collaboration_tools_and_prompt() {
+    fn installs_collaboration_tools_and_prompt_on_the_main_agent() {
         let options = make_options();
         let runtime = Runtime::new(make_model(None), "test");
-        let (agent, _) =
-            install_subagent_tools(make_agent(), options.clone(), runtime.clone(), None).unwrap();
-        let (agent, _) = install_subagent_tools(agent, options, runtime, None).unwrap();
+        let (agent, _) = install_collaboration(make_agent(), options, runtime, None).unwrap();
         let names = agent
             .tools()
             .iter()
@@ -1633,14 +1562,47 @@ mod tests {
             .system_prompt()
             .unwrap()
             .contains("Delegation is available"));
+    }
+
+    #[test]
+    fn spawned_agents_derive_from_the_clean_base() {
+        let base = make_agent().with_tools(vec![named_tool("read"), named_tool("write")]);
+        let options = make_options();
+        let runtime = Runtime::new(make_model(None), "test");
+        let (main, control) = install_collaboration(base, options, runtime, None).unwrap();
+
+        let child = control
+            .inner
+            .spawner
+            .create(&AgentProfile::default(), Vec::new())
+            .unwrap();
+        let child = apply_profile(child.agent, AgentProfile::default());
+
         assert_eq!(
-            agent
-                .system_prompt()
-                .unwrap()
-                .matches("<multi_agent_mode>")
-                .count(),
-            1
+            tool_names(&main),
+            [
+                "read",
+                "write",
+                "spawn_agent",
+                "message_agent",
+                "interrupt_agent",
+                "wait_agent",
+            ]
         );
+        assert_eq!(tool_names(&child), ["read", "write"]);
+        assert!(main.system_prompt().unwrap().contains("<multi_agent_mode>"));
+        assert!(!child
+            .system_prompt()
+            .unwrap()
+            .contains("<multi_agent_mode>"));
+        assert!(!child
+            .system_prompt()
+            .unwrap()
+            .contains("<subagent_context>"));
+        assert!(child
+            .system_prompt()
+            .unwrap()
+            .contains("Handle the assigned task directly"));
     }
 
     #[test]
@@ -2187,8 +2149,8 @@ mod tests {
         );
 
         let requests = server.await.unwrap();
-        assert!(requests[0].contains("<subagent_context>"));
-        assert!(requests[0].contains("explorer"));
+        assert!(!requests[0].contains("<subagent_context>"));
+        assert!(requests[0].contains("read-only inspection"));
         assert!(requests[0].contains("Inspect the parser."));
         assert!(requests[1].contains("child done"));
         assert!(requests[1].contains("Confirm the finding."));
