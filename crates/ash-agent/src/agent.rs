@@ -1,10 +1,11 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use ash_core::{ModelId, SessionId, SessionIdentity, Tool, ToolDefinition};
+use ash_core::{ModelId, Tool, ToolDefinition};
 
 use crate::ContextPolicy;
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
+pub const DEFAULT_MAX_TURNS: u32 = 100;
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
 
 /// Immutable behavior shared by every session that runs this agent.
@@ -25,7 +26,7 @@ impl Agent {
             system_prompt: None,
             tools: deduplicate_tools(tools),
             model: model.into(),
-            max_turns: 100,
+            max_turns: DEFAULT_MAX_TURNS,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             context_policy: Arc::new(crate::DefaultContextPolicy),
         }
@@ -201,9 +202,6 @@ pub struct RunConfig {
     pub max_context_tokens: usize,
     pub context_policy: Arc<dyn ContextPolicy>,
     pub max_tool_duration: Duration,
-    /// Identity of the executing session. Set by the session state when the
-    /// session id exists; `RunConfig::new` fills a root placeholder.
-    pub identity: SessionIdentity,
     /// How many times a single model call may be retried after a safe,
     /// retryable failure (network error, upstream 5xx, rate limit, or a
     /// truncated stream). Retries only happen before any tool call has been
@@ -224,7 +222,6 @@ impl RunConfig {
             max_context_tokens: agent.max_context_tokens(),
             context_policy: Arc::clone(&agent.context_policy),
             max_tool_duration: options.tool_timeout,
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 5,
             retry_backoff: RetryBackoff::default(),
         }

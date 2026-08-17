@@ -1,6 +1,6 @@
 use ash_core::{
     CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent, ModelRequest,
-    ModelStream, SessionEventKind, SessionId, SessionToolContext, StopReason, ToolCallId,
+    ModelStream, SessionEventKind, SessionIdentity, SessionToolContext, StopReason, ToolCallId,
     ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
 };
 use futures::StreamExt;
@@ -12,7 +12,7 @@ use crate::agent::RetryBackoff;
 use crate::store::SessionPersistence;
 use crate::{
     context::count_output_tokens,
-    context_policy::{ContextRequest, DefaultContextPolicy},
+    context_policy::{CompactedContext, ContextRequest, DefaultContextPolicy},
     log::{ContextCheckpoint, LogEntry},
     AcceptedInput, Input, RunConfig,
 };
@@ -67,11 +67,27 @@ enum OpenResponseBlock {
     Text,
 }
 
-pub struct CompactedHistory {
-    pub(crate) messages: Vec<Message>,
-    pub(crate) before_tokens: usize,
-    pub(crate) after_tokens: usize,
-    pub(crate) dropped_messages: usize,
+pub async fn compact_with_adapter(
+    config: &RunConfig,
+    messages: &[Message],
+    model: &dyn ModelClient,
+    cancel: &CancellationToken,
+) -> Result<Option<CompactedContext>, ash_core::AshError> {
+    let tools = config.tool_definitions();
+    DefaultContextPolicy
+        .compact(
+            ContextRequest {
+                model: config.model.clone(),
+                system_prompt: config.system_prompt.clone(),
+                messages: messages.to_vec(),
+                ephemeral_context: Vec::new(),
+                tools,
+                max_context_tokens: config.max_context_tokens,
+            },
+            model,
+            cancel,
+        )
+        .await
 }
 
 #[derive(Default)]
@@ -85,7 +101,8 @@ struct AgentTurnRunner<'config, 'store> {
     config: &'config RunConfig,
     tx: mpsc::Sender<SessionEventKind>,
     cancel: CancellationToken,
-    ids: ExecutionIds,
+    identity: SessionIdentity,
+    turn_id: TurnId,
     model: &'config dyn ModelClient,
     persistence: Option<&'store mut SessionPersistence>,
     steering: mpsc::UnboundedReceiver<Input>,
@@ -93,32 +110,20 @@ struct AgentTurnRunner<'config, 'store> {
     tool_defs: Vec<ToolDefinition>,
 }
 
-#[derive(Clone, Copy)]
-pub struct ExecutionIds {
-    pub session_id: SessionId,
-    pub turn_id: TurnId,
-}
-
+/// Everything one turn execution needs beyond the run config: who is
+/// executing (`identity`), which turn, and how to report and cancel it.
 pub struct TurnExecution {
-    ids: ExecutionIds,
+    identity: SessionIdentity,
+    turn_id: TurnId,
     tx: mpsc::Sender<SessionEventKind>,
     cancel: CancellationToken,
     steering: mpsc::UnboundedReceiver<Input>,
     ephemeral_context: Vec<Message>,
 }
 
-impl ExecutionIds {
-    const fn new(session_id: SessionId, turn_id: TurnId) -> Self {
-        Self {
-            session_id,
-            turn_id,
-        }
-    }
-}
-
 impl TurnExecution {
-    pub(crate) const fn new(
-        session_id: SessionId,
+    pub(crate) fn new(
+        identity: SessionIdentity,
         turn_id: TurnId,
         tx: mpsc::Sender<SessionEventKind>,
         cancel: CancellationToken,
@@ -126,7 +131,8 @@ impl TurnExecution {
         ephemeral_context: Vec<Message>,
     ) -> Self {
         Self {
-            ids: ExecutionIds::new(session_id, turn_id),
+            identity,
+            turn_id,
             tx,
             cancel,
             steering,
@@ -163,35 +169,6 @@ impl UsageAccumulator {
     }
 }
 
-pub async fn compact_with_adapter(
-    config: &RunConfig,
-    messages: &[Message],
-    model: &dyn ModelClient,
-    cancel: &CancellationToken,
-) -> Result<Option<CompactedHistory>, ash_core::AshError> {
-    let tools = config.tool_definitions();
-    let update = DefaultContextPolicy
-        .compact(
-            ContextRequest {
-                model: config.model.clone(),
-                system_prompt: config.system_prompt.clone(),
-                messages: messages.to_vec(),
-                ephemeral_context: Vec::new(),
-                tools,
-                max_context_tokens: config.max_context_tokens,
-            },
-            model,
-            cancel,
-        )
-        .await?;
-    Ok(update.map(|compacted| CompactedHistory {
-        messages: compacted.messages,
-        before_tokens: compacted.update.before_tokens,
-        after_tokens: compacted.update.after_tokens,
-        dropped_messages: compacted.update.dropped_messages,
-    }))
-}
-
 pub async fn run_agent_turn_persisted(
     model: &dyn ModelClient,
     config: &RunConfig,
@@ -226,7 +203,8 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             config,
             tx: execution.tx,
             cancel: execution.cancel,
-            ids: execution.ids,
+            identity: execution.identity,
+            turn_id: execution.turn_id,
             model,
             persistence,
             steering: execution.steering,
@@ -470,7 +448,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 .iter()
                 .map(|(input, message)| {
                     LogEntry::Input(AcceptedInput {
-                        turn_id: self.ids.turn_id,
+                        turn_id: self.turn_id,
                         input: input.clone(),
                         message: message.clone(),
                     })
@@ -539,12 +517,12 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             return Err(ToolError::Execution(format!("unknown tool: {name}")));
         };
         let context = ToolContext {
-            session_id: self.ids.session_id,
-            turn_id: self.ids.turn_id,
+            session_id: self.identity.id,
+            turn_id: self.turn_id,
             cancellation: self.cancel.clone(),
             deadline: Instant::now() + self.config.max_tool_duration,
             session: SessionToolContext {
-                identity: self.config.identity.clone(),
+                identity: self.identity.clone(),
                 messages: self.request_messages(messages),
             },
         };
@@ -873,8 +851,8 @@ mod tests {
     };
 
     use ash_core::{
-        Content, MessageContent, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, Tool,
-        ToolCallId, ToolContext, ToolError,
+        Content, MessageContent, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
+        SessionId, Tool, ToolCallId, ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
@@ -882,7 +860,6 @@ mod tests {
     use crate::context_policy::COMPACTION_SYSTEM_PROMPT;
     use crate::store::{SharedSessionStore, StoredSession};
     use crate::JsonlSessionStore;
-    use ash_core::SessionIdentity;
 
     async fn run_with_adapter(
         config: &RunConfig,
@@ -894,8 +871,14 @@ mod tests {
         persistence: Option<&mut SessionPersistence>,
     ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
         let (_, steering) = mpsc::unbounded_channel();
-        let execution =
-            TurnExecution::new(session_id, TurnId::new(), tx, cancel, steering, Vec::new());
+        let execution = TurnExecution::new(
+            metadata(session_id),
+            TurnId::new(),
+            tx,
+            cancel,
+            steering,
+            Vec::new(),
+        );
         run_agent_turn_inner(model, config, messages, execution, persistence).await
     }
 
@@ -1037,7 +1020,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1099,7 +1081,6 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1183,7 +1164,6 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1250,7 +1230,6 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1270,7 +1249,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let (_, steering) = mpsc::unbounded_channel();
         let execution = TurnExecution::new(
-            session_id,
+            metadata(session_id),
             TurnId::new(),
             tx,
             CancellationToken::new(),
@@ -1327,7 +1306,6 @@ mod tests {
             max_context_tokens: 1_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1371,7 +1349,6 @@ mod tests {
             max_context_tokens: 120_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1454,7 +1431,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1519,7 +1495,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1606,7 +1581,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1655,7 +1629,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1712,7 +1685,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1811,7 +1783,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -1871,7 +1842,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -1935,7 +1905,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2001,7 +1970,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 1,
             retry_backoff: RetryBackoff {
                 base: Duration::from_millis(1),
@@ -2062,7 +2030,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(30),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         };
@@ -2203,7 +2170,6 @@ mod tests {
             max_context_tokens: 200_000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(1),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 5,
             retry_backoff: RetryBackoff {
                 base: Duration::from_secs(1),

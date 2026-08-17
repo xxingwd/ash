@@ -1,16 +1,19 @@
+use std::collections::BTreeMap;
+
 use ash_core::{ContentBlock, ProtocolError, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    base64_image, model_config,
+    base64_image, message_groups, model_config,
     pending_calls::stop_reason,
-    pending_calls::{build_usage, PendingCall, PendingCallAccumulator},
-    project_request_messages, sse, MessageGroup, MessageGroupIter, ProviderConfig,
+    pending_calls::{build_usage, PendingCall},
+    project_request_messages, sse, MessageGroup, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 fn anthropic_image_block(media_type: &str, data: &[u8]) -> Value {
@@ -37,14 +40,10 @@ impl AnthropicAdapter {
         }
     }
 
-    fn base_url(&self) -> &str {
-        self.config.base_url("https://api.anthropic.com")
-    }
-
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let mut messages = Vec::new();
-        for group in MessageGroupIter::new(&projected.messages) {
+        for group in message_groups(&projected.messages) {
             match group {
                 MessageGroup::User(contents) => {
                     messages.push(json!({
@@ -150,7 +149,10 @@ impl ModelClient for AnthropicAdapter {
         let body = Self::build_request(&req)?;
         let request = self
             .client
-            .post(format!("{}/v1/messages", self.base_url()))
+            .post(format!(
+                "{}/v1/messages",
+                self.config.base_url(DEFAULT_BASE_URL)
+            ))
             .header("x-api-key", self.config.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .json(&body);
@@ -159,9 +161,10 @@ impl ModelClient for AnthropicAdapter {
 }
 
 #[derive(Default)]
-struct AnthropicDecoder {
-    calls: PendingCallAccumulator<u64>,
+pub(crate) struct AnthropicDecoder {
+    calls: BTreeMap<u64, PendingCall>,
     stop: Option<StopReason>,
+    completed: Option<StopReason>,
 }
 
 impl AnthropicDecoder {
@@ -188,11 +191,18 @@ impl sse::Decoder for AnthropicDecoder {
             "content_block_delta" => self.content_block_delta(&event, &mut items)?,
             "content_block_stop" => self.content_block_stop(&event, &mut items)?,
             "message_delta" => self.message_delta(&event, &mut items),
-            "message_stop" => return self.message_stop(&mut items),
+            "message_stop" => {
+                self.message_stop()?;
+                return Ok(sse::DecodeResult::Close(items));
+            }
             "error" => return Err(Self::stream_error_message(&event)),
             _ => {}
         }
-        Ok(sse::DecodeResult::continuing(items))
+        Ok(sse::DecodeResult::Continue(items))
+    }
+
+    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
+        Ok((Vec::new(), self.completed.unwrap_or(StopReason::Truncated)))
     }
 }
 
@@ -286,10 +296,7 @@ impl AnthropicDecoder {
         }
     }
 
-    fn message_stop(
-        &mut self,
-        items: &mut Vec<ModelEvent>,
-    ) -> Result<sse::DecodeResult, ProtocolError> {
+    fn message_stop(&mut self) -> Result<(), ProtocolError> {
         if !self.calls.is_empty() {
             return Err(ProtocolError::InvalidResponse(
                 "Anthropic message stopped with an unfinished tool call".to_string(),
@@ -300,8 +307,8 @@ impl AnthropicDecoder {
                 "Anthropic message stopped without a stop reason".to_string(),
             )
         })?;
-        items.push(ModelEvent::Stop(stop));
-        Ok(sse::DecodeResult::finished(std::mem::take(items)))
+        self.completed = Some(stop);
+        Ok(())
     }
 
     fn stream_error_message(event: &Value) -> ProtocolError {
@@ -339,10 +346,12 @@ mod tests {
                 r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"README.md\"}"}}"#,
             )
             .unwrap();
-        let items = decoder
+        let result = decoder
             .decode(r#"{"type":"content_block_stop","index":1}"#)
-            .unwrap()
-            .into_items();
+            .unwrap();
+        let sse::DecodeResult::Continue(items) = result else {
+            panic!("expected the stream to continue");
+        };
 
         assert_eq!(
             items,
@@ -374,10 +383,8 @@ mod tests {
 
         let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
-        assert_eq!(
-            result.into_items(),
-            vec![ModelEvent::Stop(StopReason::EndTurn)]
-        );
+        assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
+        assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
     }
 
     #[test]

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use ash_core::{ModelEvent, ProtocolError, StopReason, ToolCallId, Usage};
 use serde_json::{json, Value};
 
@@ -144,46 +142,6 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Tool calls keyed by the provider's own call identifier (a block index, a
-/// delta index, or an item key).
-pub struct PendingCallAccumulator<K: Ord> {
-    calls: BTreeMap<K, PendingCall>,
-}
-
-impl<K: Ord> Default for PendingCallAccumulator<K> {
-    fn default() -> Self {
-        Self {
-            calls: BTreeMap::new(),
-        }
-    }
-}
-
-impl<K: Ord> PendingCallAccumulator<K> {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.calls.is_empty()
-    }
-
-    pub(crate) fn entry(&mut self, key: K) -> &mut PendingCall {
-        self.calls.entry(key).or_default()
-    }
-
-    pub(crate) fn insert(&mut self, key: K, call: PendingCall) -> Option<PendingCall> {
-        self.calls.insert(key, call)
-    }
-
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut PendingCall> {
-        self.calls.get_mut(key)
-    }
-
-    pub(crate) fn remove(&mut self, key: &K) -> Option<PendingCall> {
-        self.calls.remove(key)
-    }
-
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (K, PendingCall)> + '_ {
-        std::mem::take(&mut self.calls).into_iter()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,20 +280,6 @@ mod tests {
                 arguments: json!({"path": "new"}),
             }
         );
-    }
-
-    #[test]
-    fn accumulator_drains_calls_in_key_order() {
-        let mut accumulator = PendingCallAccumulator::default();
-        accumulator.entry(1).set_name("second");
-        accumulator.entry(0).set_name("first");
-
-        let names = accumulator
-            .drain()
-            .map(|(_, call)| call.name.unwrap_or_default())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["first", "second"]);
     }
 
     #[test]

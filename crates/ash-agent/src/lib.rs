@@ -14,7 +14,7 @@ mod skill;
 mod store;
 
 pub(crate) use agent::RunConfig;
-pub use agent::{Agent, SessionOptions, DEFAULT_MAX_CONTEXT_TOKENS};
+pub use agent::{Agent, SessionOptions, DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_TURNS};
 pub use ash_core::SessionEvent;
 pub use context_policy::{
     ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
@@ -26,6 +26,6 @@ pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
 pub use prompt::build_system_prompt;
 pub use runtime::Runtime;
 pub(crate) use session::SessionActorState;
-pub use session::{ContextCompaction, ForkedSession, Session, Turn};
+pub use session::{ForkedSession, Session, Turn};
 pub use skill::{tool as skill_tool, Skill};
 pub use store::{OpenedSession, SessionAppender, SessionStore, StoredSession};

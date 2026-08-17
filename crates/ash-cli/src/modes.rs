@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use crate::message_history::MessageHistoryStore;
 use anyhow::{Context, Result};
 use ash_agent::{
@@ -18,9 +16,6 @@ use secrecy::SecretString;
 use tokio::io::AsyncBufReadExt;
 
 use crate::{Cli, Command};
-
-const DEFAULT_MAX_TURNS: u32 = 100;
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct InteractiveController {
     session: Session,
@@ -128,11 +123,10 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     };
     let mut agent = Agent::new(ModelId::new(model), tools)
         .with_system_prompt(system_prompt)
-        .with_max_turns(DEFAULT_MAX_TURNS)
         .with_max_context_tokens(max_context_tokens);
     let options = SessionOptions {
         working_dir,
-        tool_timeout: DEFAULT_TOOL_TIMEOUT,
+        ..SessionOptions::default()
     };
     if let Some(skill) = active_skill {
         agent = skill.apply_overrides(agent);
@@ -528,8 +522,6 @@ impl InteractiveController {
         self.send_ui_event(event).await;
     }
 
-    /// Estimate the model-context size for a given message history, using the
-    /// same estimator the runtime uses when the API does not report usage.
     async fn resume_session(&mut self, session_id: SessionId) {
         let event = match self
             .runtime

@@ -48,6 +48,7 @@ pub struct PreparedContext {
     pub estimated_input_tokens: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextUpdate {
     pub before_tokens: usize,
     pub after_tokens: usize,

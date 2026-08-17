@@ -8,8 +8,9 @@ use std::{
 use crate::snapshot::{SubagentSnapshot, SubagentState};
 use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions, Turn};
 use ash_core::{
-    define_tool, AgentPath, CancellationToken, ContentBlock, Message, MessageContent, ModelId,
-    SessionId, SessionIdentity, StopReason, Tool, ToolContext, ToolError, TurnResult,
+    define_tool, is_valid_segment, AgentPath, CancellationToken, ContentBlock, Message,
+    MessageContent, ModelId, SessionId, SessionIdentity, StopReason, Tool, ToolContext, ToolError,
+    TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -180,22 +181,12 @@ worker: Prefer for bounded implementation and production work such as features, 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum AgentStatus {
-    Pending,
-    Running,
-    Completed,
-    Interrupted,
-    Errored,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SessionSnapshot {
     pub session_id: SessionId,
     pub task_name: String,
     pub agent_type: &'static str,
-    pub status: AgentStatus,
+    pub status: SubagentState,
     pub last_task_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
@@ -208,20 +199,8 @@ impl From<SessionSnapshot> for SubagentSnapshot {
         Self {
             task_name: snapshot.task_name,
             agent_type: snapshot.agent_type.to_string(),
-            state: snapshot.status.into(),
+            state: snapshot.status,
             last_task_message: snapshot.last_task_message,
-        }
-    }
-}
-
-impl From<AgentStatus> for SubagentState {
-    fn from(status: AgentStatus) -> Self {
-        match status {
-            AgentStatus::Pending => Self::Pending,
-            AgentStatus::Running => Self::Running,
-            AgentStatus::Completed => Self::Completed,
-            AgentStatus::Interrupted => Self::Interrupted,
-            AgentStatus::Errored => Self::Errored,
         }
     }
 }
@@ -400,11 +379,11 @@ enum ChildState {
 }
 
 impl ChildState {
-    const fn status(&self) -> AgentStatus {
+    const fn status(&self) -> SubagentState {
         match self {
-            Self::Completed(_) => AgentStatus::Completed,
-            Self::Interrupted(_) => AgentStatus::Interrupted,
-            Self::Errored { .. } => AgentStatus::Errored,
+            Self::Completed(_) => SubagentState::Completed,
+            Self::Interrupted(_) => SubagentState::Interrupted,
+            Self::Errored { .. } => SubagentState::Errored,
         }
     }
 
@@ -444,13 +423,13 @@ impl ChildRecord {
         }
     }
 
-    fn status(&self) -> AgentStatus {
+    fn status(&self) -> SubagentState {
         if self.active_turns > 0 {
-            AgentStatus::Running
+            SubagentState::Running
         } else {
             self.terminal
                 .as_ref()
-                .map_or(AgentStatus::Pending, ChildState::status)
+                .map_or(SubagentState::Pending, ChildState::status)
         }
     }
 
@@ -1179,12 +1158,7 @@ fn with_multi_agent_instructions(agent: Agent) -> Agent {
 }
 
 fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
-    let valid = !task_name.is_empty()
-        && task_name.len() <= 64
-        && task_name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-    if valid {
+    if is_valid_segment(task_name) {
         Ok(())
     } else {
         Err(ToolError::Execution(
@@ -1195,14 +1169,9 @@ fn validate_task_name(task_name: &str) -> Result<(), ToolError> {
 }
 
 fn agent_path_matches(record: &ChildRecord, path_prefix: Option<&str>) -> bool {
-    let path = record.task_path.as_str();
     path_prefix.is_none_or(|prefix| {
-        let prefix = prefix.trim_matches('/');
-        if prefix.is_empty() {
-            return true;
-        }
-        let prefix = format!("/{prefix}");
-        path == prefix || path.starts_with(&format!("{prefix}/"))
+        let prefix = format!("/{}", prefix.trim_matches('/'));
+        record.task_path.under(&prefix)
     })
 }
 
@@ -1830,7 +1799,7 @@ mod tests {
 
         assert!(result.is_err());
         let agents = control.snapshots(root_id, None).await;
-        assert_eq!(agents[0].status, AgentStatus::Completed);
+        assert_eq!(agents[0].status, SubagentState::Completed);
         assert_eq!(agents[0].last_task_message, "initial");
     }
 
@@ -1866,7 +1835,7 @@ mod tests {
         // Notify stages guidance but must not start a turn.
         assert!(session.view().await.unwrap().messages.is_empty());
         let agents = control.snapshots(root_id, None).await;
-        assert_eq!(agents[0].status, AgentStatus::Completed);
+        assert_eq!(agents[0].status, SubagentState::Completed);
         assert_eq!(agents[0].last_task_message, "keep this in mind");
     }
 
@@ -2176,7 +2145,7 @@ mod tests {
                 let agents = control.snapshots(root_id, None).await;
                 if agents
                     .first()
-                    .is_some_and(|agent| agent.status == AgentStatus::Completed)
+                    .is_some_and(|agent| agent.status == SubagentState::Completed)
                 {
                     break agents;
                 }
@@ -2202,7 +2171,7 @@ mod tests {
             loop {
                 let agents = control.snapshots(root_id, None).await;
                 if agents.first().is_some_and(|agent| {
-                    agent.status == AgentStatus::Completed
+                    agent.status == SubagentState::Completed
                         && agent.final_message.as_deref() == Some("followup done")
                 }) {
                     break agents;
@@ -2368,7 +2337,7 @@ mod tests {
                 if agents.len() == 4
                     && agents
                         .iter()
-                        .all(|agent| agent.status == AgentStatus::Completed)
+                        .all(|agent| agent.status == SubagentState::Completed)
                 {
                     break;
                 }

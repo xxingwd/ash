@@ -5,80 +5,14 @@ use reqwest::RequestBuilder;
 
 pub enum DecodeResult {
     Continue(Vec<ModelEvent>),
-    /// A provider-level terminal marker was observed, but more wire events may
-    /// follow (for example Chat Completions sends usage after `finish_reason`).
-    Terminal(Vec<ModelEvent>),
-    /// A provider-level terminal marker was observed and the wire can stop.
-    Finished(Vec<ModelEvent>),
-    /// The wire ended without a provider-level terminal marker.
-    WireDone(Vec<ModelEvent>),
-}
-
-pub struct DecodedParts {
-    pub(crate) items: Vec<ModelEvent>,
-    /// A provider-level terminal marker was observed.
-    pub(crate) terminal: bool,
-    /// The wire can stop after this event.
-    pub(crate) wire_done: bool,
-}
-
-impl DecodeResult {
-    pub(crate) const fn continuing(items: Vec<ModelEvent>) -> Self {
-        Self::Continue(items)
-    }
-
-    pub(crate) const fn terminal(items: Vec<ModelEvent>) -> Self {
-        Self::Terminal(items)
-    }
-
-    pub(crate) const fn finished(items: Vec<ModelEvent>) -> Self {
-        Self::Finished(items)
-    }
-
-    pub(crate) const fn wire_done(items: Vec<ModelEvent>) -> Self {
-        Self::WireDone(items)
-    }
-
-    fn into_parts(self) -> DecodedParts {
-        match self {
-            Self::Continue(items) => DecodedParts {
-                items,
-                terminal: false,
-                wire_done: false,
-            },
-            Self::Terminal(items) => DecodedParts {
-                items,
-                terminal: true,
-                wire_done: false,
-            },
-            Self::Finished(items) => DecodedParts {
-                items,
-                terminal: true,
-                wire_done: true,
-            },
-            Self::WireDone(items) => DecodedParts {
-                items,
-                terminal: false,
-                wire_done: true,
-            },
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_items(self) -> Vec<ModelEvent> {
-        self.into_parts().items
-    }
+    Close(Vec<ModelEvent>),
 }
 
 pub trait Decoder: Send + 'static {
     fn decode(&mut self, data: &str) -> Result<DecodeResult, ProtocolError>;
 
-    /// Emit events buffered until the wire closes. Most protocols emit their
-    /// stop event directly; Chat Completions delays it so trailing usage stays
-    /// before the terminal `ModelEvent::Stop`.
-    fn finish(&mut self) -> Result<Vec<ModelEvent>, ProtocolError> {
-        Ok(Vec::new())
-    }
+    /// Consume all decoder state after EOF or a provider-specific wire close.
+    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError>;
 }
 
 #[derive(Default)]
@@ -117,67 +51,45 @@ where
             Err(map_status(status))?;
         }
         let mut source = response.bytes_stream().eventsource();
-        // Whether the decoder observed a protocol-level terminal marker
-        // (`finish_reason`, `message_stop`, or `response.completed`). Wire-only
-        // delimiters such as `[DONE]` do not make an incomplete response clean.
-        // A stream that ends without one is a truncated response, not a
-        // normal stop.
-        let mut terminated = false;
-        let mut saw_stop = false;
-        let mut wire_done = false;
+        let mut wire_closed = false;
         let mut counts = StreamEventCounts::default();
         while let Some(event) = source.next().await {
-            match event {
-                Ok(event) => {
-                    counts.frames += 1;
-                    let result = decoder.decode(&event.data).map_err(|error| {
-                        tracing::warn!(%error, data = %event.data, "sse decode failed");
-                        error
-                    })?;
-                    let parts = result.into_parts();
-                    tracing::debug!(
-                        terminal = parts.terminal,
-                        wire_done = parts.wire_done,
-                        data = %event.data,
-                        "sse event"
-                    );
-                    terminated |= parts.terminal;
-                    for item in parts.items {
-                        log_model_event(&item);
-                        record_stop(&item, &mut saw_stop)?;
-                        counts.observe(&item);
-                        yield item;
-                    }
-                    if parts.wire_done {
-                        wire_done = true;
-                        break;
-                    }
-                }
-                Err(error) => {
-                    Err(ProtocolError::Request(error.to_string()))?;
-                }
-            }
-        }
-        if terminated {
-            tracing::debug!("sse stream terminated by provider marker");
-            for item in decoder.finish()? {
-                record_stop(&item, &mut saw_stop)?;
+            let event = event.map_err(|error| ProtocolError::Request(error.to_string()))?;
+            counts.frames += 1;
+            let result = decoder.decode(&event.data).map_err(|error| {
+                tracing::warn!(%error, data = %event.data, "sse decode failed");
+                error
+            })?;
+            let (items, closes_wire) = match result {
+                DecodeResult::Continue(items) => (items, false),
+                DecodeResult::Close(items) => (items, true),
+            };
+            tracing::debug!(closes_wire, data = %event.data, "sse event");
+            for item in items {
+                validate_nonterminal(&item)?;
+                log_model_event(&item);
                 counts.observe(&item);
                 yield item;
             }
-            if !saw_stop {
-                Err(ProtocolError::InvalidResponse(
-                    "provider terminal marker did not produce a stop event".into(),
-                ))?;
+            if closes_wire {
+                wire_closed = true;
+                break;
             }
-        } else {
-            tracing::debug!("sse stream ended without provider terminal marker");
-            // EOF (or a wire-only marker) without a provider terminal means
-            // the response was truncated, even if partial output was emitted.
-            let stop = ModelEvent::Stop(StopReason::Truncated);
-            counts.observe(&stop);
-            yield stop;
         }
+
+        let (items, stop) = decoder.finalize()?;
+        let provider_terminated = stop != StopReason::Truncated;
+        for item in items {
+            validate_nonterminal(&item)?;
+            log_model_event(&item);
+            counts.observe(&item);
+            yield item;
+        }
+        let stop = ModelEvent::Stop(stop);
+        log_model_event(&stop);
+        counts.observe(&stop);
+        yield stop;
+
         tracing::debug!(
             frames = counts.frames,
             text_deltas = counts.text_deltas,
@@ -185,8 +97,8 @@ where
             tool_calls = counts.tool_calls,
             usage_reports = counts.usage_reports,
             stop_events = counts.stop_events,
-            provider_terminated = terminated,
-            wire_done,
+            provider_terminated,
+            wire_closed,
             "sse stream summary"
         );
     })
@@ -203,16 +115,12 @@ fn log_model_event(item: &ModelEvent) {
     }
 }
 
-/// Record one streamed item, rejecting a second stop event: a provider
-/// stream must emit exactly one `Stop`, so anything else is malformed.
-fn record_stop(item: &ModelEvent, saw_stop: &mut bool) -> Result<(), ProtocolError> {
+/// Only the shared stream boundary may emit the terminal `ModelEvent::Stop`.
+fn validate_nonterminal(item: &ModelEvent) -> Result<(), ProtocolError> {
     if matches!(item, ModelEvent::Stop(_)) {
-        if *saw_stop {
-            return Err(ProtocolError::InvalidResponse(
-                "provider stream emitted more than one stop event".into(),
-            ));
-        }
-        *saw_stop = true;
+        return Err(ProtocolError::InvalidResponse(
+            "protocol decoder emitted a stop event before finalization".into(),
+        ));
     }
     Ok(())
 }
@@ -252,6 +160,15 @@ mod tests {
             body,
             "/v1/responses",
             crate::responses::ResponsesDecoder::default(),
+        )
+        .await
+    }
+
+    async fn run_anthropic_stream(body: &str) -> Vec<ModelEvent> {
+        run_stream(
+            body,
+            "/v1/messages",
+            crate::anthropic::AnthropicDecoder::default(),
         )
         .await
     }
@@ -353,6 +270,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_finish_reason_with_usage_is_accepted() {
+        let events = run_completions_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n\
+             data: [DONE]\n\n\
+             data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::Text("hi".into()),
+                ModelEvent::Usage(ash_core::Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    generation_ms: 0,
+                    estimated: false,
+                }),
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn content_after_finish_reason_is_accumulated_and_last_reason_wins() {
+        let events = run_completions_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::Text("hi".into()),
+                ModelEvent::Text(" there".into()),
+                ModelEvent::Stop(StopReason::MaxTokens),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn responses_done_without_completed_is_truncated() {
         let events = run_responses_stream(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
@@ -366,6 +327,45 @@ mod tests {
                 ModelEvent::Text("hi".into()),
                 ModelEvent::Stop(StopReason::Truncated),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_completed_produces_one_shared_stop() {
+        let events = run_responses_stream(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+             data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::Text("hi".into()),
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_requires_message_stop_for_clean_completion() {
+        let without_message_stop = run_anthropic_stream(
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        )
+        .await;
+        let with_message_stop = run_anthropic_stream(
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+             data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .await;
+
+        assert_eq!(
+            without_message_stop,
+            vec![ModelEvent::Stop(StopReason::Truncated)]
+        );
+        assert_eq!(
+            with_message_stop,
+            vec![ModelEvent::Stop(StopReason::EndTurn)]
         );
     }
 }

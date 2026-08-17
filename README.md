@@ -118,8 +118,8 @@ Review the relevant code and report concrete findings.
 
 ## 会话历史
 
-交互会话按“一会话一文件”保存为 JSONL。Linux 默认目录为
-`~/.local/share/ash/sessions/`，文件名就是 Session ID：
+交互会话按“一会话一文件”保存为 JSONL。默认目录为 `~/.ash/sessions/`，文件名就是
+Session ID：
 
 ```text
 <session-id>.jsonl
@@ -142,7 +142,7 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 通过 `/new` 或 `/clear` 建立的 Session 会立即获得 ID，但在第一条用户消息发出前不会
 创建文件；会话列表中的创建时间取第一次持久化记录，会话名称取第一条有效用户消息。
 `/resume` 和 `/fork` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
-历史单独保存在 `~/.local/share/ash/history.jsonl`。
+历史单独保存在 `~/.ash/history.jsonl`。
 
 ## 子 Agent
 

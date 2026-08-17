@@ -64,6 +64,12 @@ pub trait SessionStore: Send + Sync {
     /// first. Children are durable history: they are discoverable here but
     /// never resumable as root sessions.
     async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError>;
+
+    /// Delete one session tree and return the number of removed sessions.
+    /// The id must identify a root session; zero is returned when it does not
+    /// exist. Implementations must reject deletion while any session in the
+    /// tree is open for writing; unreadable sessions are skipped.
+    async fn delete_tree(&self, root_id: SessionId) -> Result<usize, ash_core::AshError>;
 }
 
 pub(crate) type SharedSessionStore = Arc<dyn SessionStore>;
@@ -89,10 +95,6 @@ impl SessionPersistence {
     /// and the file catches up at the next commit point.
     pub(crate) fn stage(&mut self, entries: &[LogEntry]) {
         self.pending.extend(entries.iter().cloned());
-    }
-
-    pub(crate) fn pending(&self) -> &[LogEntry] {
-        &self.pending
     }
 
     /// Number of buffered entries. Used to snapshot the buffer before a model

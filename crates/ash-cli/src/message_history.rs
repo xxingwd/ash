@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ash_core::SessionId;
+use ash_core::{ash_data_dir, SessionId};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -54,10 +54,7 @@ pub struct MessageHistoryStore {
 impl Default for MessageHistoryStore {
     fn default() -> Self {
         Self {
-            path: directories::ProjectDirs::from("", "", "ash").map_or_else(
-                || PathBuf::from(".ash/history.jsonl"),
-                |dirs| dirs.data_dir().join("history.jsonl"),
-            ),
+            path: ash_data_dir().join("history.jsonl"),
         }
     }
 }
@@ -144,6 +141,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn default_history_path_is_under_the_ash_data_dir() {
+        assert_eq!(
+            MessageHistoryStore::default().path,
+            ash_data_dir().join("history.jsonl")
+        );
+    }
 
     #[tokio::test]
     async fn persists_and_loads_prompt_history_as_jsonl() {

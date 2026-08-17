@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ash_core::{
-    parse_agent_path, AgentPath, Content, Message, MessageContent, MessageId, SessionId,
+    ash_data_dir, parse_agent_path, AgentPath, Content, Message, MessageContent, SessionId,
     SessionIdentity, SessionSummary, TurnId, TurnResult, Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
@@ -114,12 +114,6 @@ struct StoredHeader {
     title: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ContextCompactedRecord {
-    summary: Message,
-    tail_start_id: Option<MessageId>,
-}
-
 /// One durable entry on disk. Messages are split by role so a session file is
 /// readable at a glance; `from_entry`/`into_entry` map them to `LogEntry`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,7 +133,7 @@ enum FileRecord {
         usage: Option<Usage>,
     },
     Rollback,
-    ContextCompacted(ContextCompactedRecord),
+    ContextCompacted(ContextCheckpoint),
 }
 
 impl FileRecord {
@@ -157,10 +151,7 @@ impl FileRecord {
                 };
                 variant(message)
             }
-            LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(ContextCompactedRecord {
-                summary: checkpoint.summary,
-                tail_start_id: checkpoint.tail_start_id,
-            }),
+            LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(checkpoint),
             LogEntry::TurnEnd { id, result, usage } => Self::TurnEnd {
                 turn_id: id,
                 result,
@@ -177,10 +168,7 @@ impl FileRecord {
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
             | Self::ToolResult(message) => Some(LogEntry::Message(message)),
-            Self::ContextCompacted(record) => Some(LogEntry::Checkpoint(ContextCheckpoint {
-                summary: record.summary,
-                tail_start_id: record.tail_start_id,
-            })),
+            Self::ContextCompacted(checkpoint) => Some(LogEntry::Checkpoint(checkpoint)),
             Self::TurnEnd {
                 turn_id,
                 result,
@@ -401,10 +389,8 @@ pub struct JsonlSessionStore {
 
 impl Default for JsonlSessionStore {
     fn default() -> Self {
-        let data_dir =
-            directories::ProjectDirs::from("", "", "ash").map(|dirs| dirs.data_dir().to_path_buf());
         Self {
-            directory: session_dir_from_data_dir(data_dir),
+            directory: ash_data_dir().join("sessions"),
         }
     }
 }
@@ -465,6 +451,40 @@ impl JsonlSessionStore {
         }
         Ok(summaries)
     }
+
+    /// Lock every session in `root_id`'s tree except the already-locked
+    /// root. Each candidate is re-read under its lock so a file swapped
+    /// between the scan and the lock cannot be deleted by mistake.
+    /// Unreadable sessions are skipped with a warning.
+    async fn lock_tree_children(
+        &self,
+        root_id: SessionId,
+        root_path: &Path,
+    ) -> Result<Vec<(PathBuf, tokio::fs::File)>, ash_core::AshError> {
+        let mut children = Vec::new();
+        for path in self.session_paths().await? {
+            if path == root_path {
+                continue;
+            }
+            let identity = match read_identity(&path).await {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "skipping unreadable session during tree deletion");
+                    continue;
+                }
+            };
+            if identity.root_id != root_id {
+                continue;
+            }
+
+            let mut file = open_locked_session(&path).await?;
+            let locked_identity = read_locked_identity(&mut file, &path).await?;
+            if locked_identity.root_id == root_id {
+                children.push((path, file));
+            }
+        }
+        Ok(children)
+    }
 }
 #[async_trait::async_trait]
 impl SessionStore for JsonlSessionStore {
@@ -513,6 +533,33 @@ impl SessionStore for JsonlSessionStore {
     async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         self.read_summaries(SummaryScope::Tree(root_id)).await
     }
+
+    async fn delete_tree(&self, root_id: SessionId) -> Result<usize, ash_core::AshError> {
+        let Some(root_path) = self.find_session(root_id).await? else {
+            return Ok(0);
+        };
+        let root_identity = read_identity(&root_path).await?;
+        ensure_root_identity(&root_identity, root_id)?;
+
+        // Lock the root first. A live root owns this lock, and therefore
+        // cannot create more durable children while deletion is being
+        // prepared.
+        let mut root_file = open_locked_session(&root_path).await?;
+        let locked_root_identity = read_locked_identity(&mut root_file, &root_path).await?;
+        ensure_root_identity(&locked_root_identity, root_id)?;
+
+        let children = self.lock_tree_children(root_id, &root_path).await?;
+
+        // All locks are acquired before the first removal. Children go first
+        // so an I/O failure cannot remove the root while leaving descendants.
+        let deleted = children.len() + 1;
+        for (path, _file) in children {
+            tokio::fs::remove_file(path).await?;
+        }
+        tokio::fs::remove_file(root_path).await?;
+        drop(root_file);
+        Ok(deleted)
+    }
 }
 
 /// Which sessions a summary query should surface.
@@ -540,13 +587,6 @@ fn push_line(data: &mut String, record: FileRecord) -> Result<(), ash_core::AshE
     );
     data.push('\n');
     Ok(())
-}
-
-fn session_dir_from_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
-    data_dir.map_or_else(
-        || PathBuf::from(".ash").join("sessions"),
-        |dir| dir.join("sessions"),
-    )
 }
 
 fn session_filename(session_id: SessionId) -> String {
@@ -601,6 +641,21 @@ async fn read_session(path: &Path) -> Result<StoredFile, ash_core::AshError> {
     replay_session(&mut tokio::io::BufReader::new(file), path).await
 }
 
+async fn read_identity(path: &Path) -> Result<SessionIdentity, ash_core::AshError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    read_locked_identity(&mut file, path).await
+}
+
+async fn read_locked_identity(
+    file: &mut tokio::fs::File,
+    path: &Path,
+) -> Result<SessionIdentity, ash_core::AshError> {
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    read_header(&mut tokio::io::BufReader::new(file), path)
+        .await
+        .map(|header| header.identity)
+}
+
 async fn replay_session<R>(reader: &mut R, path: &Path) -> Result<StoredFile, ash_core::AshError>
 where
     R: AsyncBufRead + Unpin,
@@ -628,15 +683,7 @@ async fn read_summary(
 ) -> Result<Option<SessionSummary>, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     let mut reader = tokio::io::BufReader::new(file);
-    let Some(first) = read_first_record(&mut reader, path).await? else {
-        return Err(missing_header(path));
-    };
-    let mut header =
-        stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
-    ensure_canonical_path(&header, path)?;
-    if let Some(session_id) = canonical_session_id(path) {
-        ensure_session_id(header.identity.id, session_id, path)?;
-    }
+    let mut header = read_header(&mut reader, path).await?;
     if !scope.includes(&header.identity) {
         return Ok(None);
     }
@@ -648,6 +695,38 @@ async fn read_summary(
         title,
         created_at: display_created_at(&header.created_at),
     }))
+}
+
+async fn read_header<R>(reader: &mut R, path: &Path) -> Result<StoredHeader, ash_core::AshError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let Some(first) = read_first_record(reader, path).await? else {
+        return Err(missing_header(path));
+    };
+    let header =
+        stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
+    ensure_canonical_path(&header, path)?;
+    if let Some(session_id) = canonical_session_id(path) {
+        ensure_session_id(header.identity.id, session_id, path)?;
+    }
+    Ok(header)
+}
+
+fn ensure_root_identity(
+    identity: &SessionIdentity,
+    expected_id: SessionId,
+) -> Result<(), ash_core::AshError> {
+    if identity.id == expected_id
+        && identity.root_id == expected_id
+        && identity.parent_id.is_none()
+        && identity.path == AgentPath::root()
+    {
+        return Ok(());
+    }
+    Err(ash_core::AshError::Config(format!(
+        "session {expected_id} is not a root session"
+    )))
 }
 
 fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
@@ -1149,6 +1228,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletes_an_entire_session_tree_without_touching_other_roots() {
+        let directory = TempDir::new().unwrap();
+        let root_id = SessionId::new();
+        let other_root_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
+        let child_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id),
+            "research",
+            &[LogEntry::Message(Message::user("subagent"))],
+        )
+        .await;
+        let grandchild_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id)
+                .child(child_id, "research")
+                .unwrap(),
+            "scan",
+            &[LogEntry::Message(Message::user("deep"))],
+        )
+        .await;
+        create_session(
+            &store,
+            other_root_id,
+            &[LogEntry::Message(Message::user("other"))],
+        )
+        .await;
+
+        assert_eq!(store.delete_tree(root_id).await.unwrap(), 3);
+        assert!(store.load(root_id).await.unwrap().is_none());
+        assert!(store.load(child_id).await.unwrap().is_none());
+        assert!(store.load(grandchild_id).await.unwrap().is_none());
+        assert!(store.load(other_root_id).await.unwrap().is_some());
+        assert!(store.tree(root_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_session_tree_is_a_noop() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+
+        assert_eq!(store.delete_tree(SessionId::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_child_session_as_a_tree_root() {
+        let directory = TempDir::new().unwrap();
+        let root_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
+        let child_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id),
+            "research",
+            &[LogEntry::Message(Message::user("subagent"))],
+        )
+        .await;
+
+        let error = store.delete_tree(child_id).await.unwrap_err();
+        assert!(error.to_string().contains("is not a root session"));
+        assert!(store.load(root_id).await.unwrap().is_some());
+        assert!(store.load(child_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn refuses_partial_deletion_while_a_child_session_is_open() {
+        let directory = TempDir::new().unwrap();
+        let root_id = SessionId::new();
+        let store = JsonlSessionStore::new(directory.path());
+        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
+        let child_id = create_child_session(
+            &store,
+            SessionIdentity::root(root_id),
+            "research",
+            &[LogEntry::Message(Message::user("subagent"))],
+        )
+        .await;
+        let opened_child = store.open(child_id).await.unwrap().unwrap();
+
+        let error = store.delete_tree(root_id).await.unwrap_err();
+        assert!(error.to_string().contains("already open"));
+        assert!(store.load(root_id).await.unwrap().is_some());
+        assert!(store.load(child_id).await.unwrap().is_some());
+
+        drop(opened_child);
+        assert_eq!(store.delete_tree(root_id).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn child_sessions_persist_and_restore_their_lineage() {
         let directory = TempDir::new().unwrap();
         let root_id = SessionId::new();
@@ -1269,19 +1438,10 @@ mod tests {
     }
 
     #[test]
-    fn default_session_dir_appends_sessions_to_the_platform_data_dir() {
-        let data_dir = PathBuf::from("var/lib/ash");
+    fn default_session_dir_is_under_the_ash_data_dir() {
         assert_eq!(
-            session_dir_from_data_dir(Some(data_dir.clone())),
-            data_dir.join("sessions")
-        );
-    }
-
-    #[test]
-    fn default_session_dir_falls_back_to_a_relative_dot_ash_dir() {
-        assert_eq!(
-            session_dir_from_data_dir(None),
-            PathBuf::from(".ash").join("sessions")
+            JsonlSessionStore::default().directory,
+            ash_data_dir().join("sessions")
         );
     }
 

@@ -61,8 +61,10 @@ impl std::fmt::Display for AgentPath {
     }
 }
 
-/// One validated path segment: lowercase letters, digits, or underscores.
-fn is_valid_segment(segment: &str) -> bool {
+/// Whether `segment` is a valid task name: lowercase letters, digits, or
+/// underscores, at most `MAX_SEGMENT_CHARS` characters.
+#[must_use]
+pub fn is_valid_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.chars().count() <= MAX_SEGMENT_CHARS
         && segment

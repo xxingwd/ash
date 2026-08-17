@@ -24,15 +24,17 @@ The stable execution vocabulary is deliberately small:
 
 - `Agent` is immutable behavior: model, prompt, tools, limits, and context policy.
 - `Runtime` owns injected capabilities: model client and session store.
-- `SessionOptions` is per-session scope: working directory, timeout, agent path, tree ID,
-  and typed `SessionKind`.
+- `SessionOptions` is per-session execution scope: working directory and tool timeout.
+- `SessionIdentity` is durable lineage: session ID, root ID, optional parent ID, and a typed
+  canonical `AgentPath`.
 - `Session` is the durable concurrent conversation boundary and the sole input-queue owner.
 - `Turn` is one submitted unit of execution. It can be awaited, interrupted, or steered.
 - `Input` carries content, source, metadata, and an optional idempotency key.
-- `Event` routes an `EventKind` with session ID, optional turn ID, sequence, and timestamp.
+- `SessionEvent` routes a `SessionEventKind` with session ID, optional turn ID, sequence, and
+  timestamp.
 
-`Runtime::start`, `start_with_history`, and `resume` are the only session construction paths.
-All products and child agents execute through the `Session` input APIs.
+`Runtime::start`, `start_child`, and `resume` are the session construction paths. Root and child
+sessions execute through the same `Session` input APIs.
 
 ## Session Ownership
 
@@ -88,26 +90,29 @@ is written.
 `SessionStore` is the only public persistence boundary:
 
 ```text
-create(metadata, entries)
-load(session_id) -> stored session
+open_new(identity) -> locked appender
 open(session_id) -> stored session + locked writer
-open_writer(metadata) -> locked writer for a new session
-list(excluded_session) -> summaries
+load(session_id) -> stored session
+list_roots() -> root summaries
+tree(root_id) -> root and child summaries
+delete_tree(root_id) -> deleted session count
 ```
 
 Locked writers are exposed through the storage-neutral `SessionAppender` capability. A backend may
 hold a file lock, database transaction, or remote lease in that handle; runtime code never depends
 on the JSONL writer type.
 
-The default `JsonlSessionStore` writes sessions to the platform data directory's `sessions/`
+The default `JsonlSessionStore` writes sessions to its configured data directory's `sessions/`
 subdirectory as `{session_id}.jsonl`. New records use `session_header` / `session_id`; old storage
-formats are not read. Its compact first record contains only list metadata, so listing does not
-replay session logs. Loading addresses files directly by id and only replays the selected session.
-The header must be valid; later malformed records are skipped with a warning so valid records after
-a damaged line can still be recovered.
+formats are not read. The strict header persists the complete `SessionIdentity`, so roots and
+children remain attributable after restart. Its compact first record contains only list metadata,
+so listing does not replay session logs. Loading addresses files directly by id and only replays the
+selected session. The header must be valid; later malformed records are skipped with a warning so
+valid records after a damaged line can still be recovered.
 
-`SessionMetadata` carries the typed `SessionKind` (`Root` or `Subagent`) used by persistence and
-session listing. Runtime code derives that value from `SessionOptions.kind`.
+Root listings select `parent_id == None`; tree listings select a shared `root_id`. Durable children
+are available as tree history but cannot be resumed as root sessions. Tree deletion accepts only a
+root ID, locks every valid session in the tree before removing anything, and removes the root last.
 
 The runtime's hot write path keeps one exclusively locked `SessionAppender` per active session. Resume
 replays the selected file through that same handle, so later appends are a single write+flush with
@@ -118,19 +123,23 @@ before that commit point leaves a turn without `TurnEnd`, which the projection r
 
 ## Events And Projection
 
-`EventKind` distinguishes live deltas from durable facts and derived views:
+`SessionEventKind` contains only runtime events emitted by the session actor:
 
+- `TurnStarted` marks the accepted turn beginning execution.
 - `Live(LiveEvent)` carries ephemeral streaming deltas for the active turn's preview only.
-- `Turn(TurnView)` is emitted when a turn settles and carries its canonical messages, result,
+- `TurnCompleted(TurnView)` is emitted when a turn settles and carries its canonical messages, result,
   and usage; clients use it to commit scrollback.
-- `Restored(SessionView)` / `SessionForked` carry the full projection after resume or fork.
-- `Compacted` reports a context-checkpoint change; `TurnRolledBack` reports a rollback.
+- `ContextCompacted` reports an automatic context-checkpoint change.
+
+Product command results are separate `UiEvent` values owned by the CLI/TUI boundary, including
+session lists, restore/fork results, rollback results, and command failures. They never masquerade
+as session runtime events.
 
 All memory state is derived from the log through one reducer direction:
 `LogEntry -> SessionView -> messages / context / turns -> transcript blocks`. The TUI draws
-live deltas as a preview and replaces them with the canonical projection on `Turn`. `SessionLog`
-maintains that projection incrementally as entries arrive, and session events obtain settled turn
-views from the same reducer rather than assembling a parallel view in the execution path.
+live deltas as a preview and replaces them with the canonical projection on `TurnCompleted`.
+`SessionLog` maintains that projection incrementally as entries arrive, and `Turn::wait` and the
+settled session event receive the same canonical `TurnView` rather than assembling parallel views.
 
 ## Context And Memory
 
@@ -150,16 +159,16 @@ role/content combinations and system images fail locally as invalid requests.
 
 ## Collaboration
 
-`ash-collab` is optional. Its public control vocabulary is:
-
-- `AgentControl` for child-agent lifecycle and communication;
-- `AgentSpawner` for constructing a child agent;
-- `SpawnRequest` for the typed spawn contract;
-- `ChildAgent` for the runtime, agent definition, options, and inherited history.
+`ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
+`spawn_agent`, `message_agent`, `interrupt_agent`, and `wait_agent` tools. Child construction uses
+the internal `ChildSessionFactory`, `ChildSessionRequest`, and `ChildSessionSpec` contracts. Built-in
+`AgentProfile` values (`default`, `explorer`, and `worker`) apply prompt, tool, model, and turn-limit
+overrides without changing the session engine.
 
 Every child gets its own `Session` and executes through the same runtime path as a root agent.
-Tree identity and canonical agent path live in `SessionOptions` and `ToolContext`; collaboration
-state does not leak into `ash-core` or terminal state.
+Tree identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
+through `ToolContext.session`. Collaboration state does not leak into terminal state or create a
+second execution queue.
 
 The controller counts every accepted follow-up until it settles. A child with queued follow-ups
 stays active and receives no completion revision until the final queued turn finishes, so waiters
@@ -214,7 +223,7 @@ created for the request remains durable across failed attempts.
 The TUI owns drafts, menus, viewport state, and interaction feedback. While idle, Enter submits a
 new turn; while a turn is running, Enter steers that exact turn. Escape discards unfinished streamed
 output and cancels the active turn. The TUI does not decide whether that turn is kept: after the
-canonical `Turn` event arrives, a completed tool result commits the interrupted turn; otherwise the
+canonical `TurnCompleted` event arrives, a completed tool result commits the interrupted turn; otherwise the
 controller requests an ordinary rollback so the original prompt returns to the composer. Commands
 remain visible while work is active, but session-mutating commands are silently rejected locally
 and remain in the composer; `/status` and invalid commands are also rejected while a turn is

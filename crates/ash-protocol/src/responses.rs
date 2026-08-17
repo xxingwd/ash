@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ash_core::{ContentBlock, ProtocolError};
+use ash_core::{ContentBlock, ProtocolError, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    content_value, image_data_url, model_config,
+    content_value, image_data_url, message_groups, model_config,
     pending_calls::stop_reason,
-    pending_calls::{build_usage, PendingCallAccumulator},
-    project_request_messages, sse, MessageGroup, MessageGroupIter, ProviderConfig,
+    pending_calls::{build_usage, PendingCall},
+    project_request_messages, sse, text_tool_result, MessageGroup, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
+
+const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
 pub struct ResponsesAdapter {
     config: ProviderConfig,
@@ -26,14 +28,10 @@ impl ResponsesAdapter {
         }
     }
 
-    fn base_url(&self) -> &str {
-        self.config.base_url("https://api.openai.com")
-    }
-
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
         let projected = project_request_messages(req)?;
         let mut input = Vec::new();
-        for group in MessageGroupIter::new(&projected.messages) {
+        for group in message_groups(&projected.messages) {
             match group {
                 MessageGroup::User(contents) => {
                     input.push(json!({"role": "user", "content": responses_content(contents)}));
@@ -138,14 +136,6 @@ fn responses_attachments(contents: &[&ash_core::Content]) -> Value {
     )
 }
 
-fn text_tool_result(output: &str, is_error: bool) -> std::borrow::Cow<'_, str> {
-    if is_error {
-        format!("Error: {output}").into()
-    } else {
-        output.into()
-    }
-}
-
 fn responses_content(contents: &[ash_core::Content]) -> Value {
     content_value(contents, "input_text", |media_type, data| {
         json!({
@@ -160,7 +150,10 @@ impl ModelClient for ResponsesAdapter {
         let body = Self::build_request(&req)?;
         let request = self
             .client
-            .post(format!("{}/v1/responses", self.base_url()))
+            .post(format!(
+                "{}/v1/responses",
+                self.config.base_url(DEFAULT_BASE_URL)
+            ))
             .bearer_auth(self.config.api_key.expose_secret())
             .json(&body);
         Ok(sse::stream(request, ResponsesDecoder::default()))
@@ -169,10 +162,11 @@ impl ModelClient for ResponsesAdapter {
 
 #[derive(Default)]
 pub struct ResponsesDecoder {
-    calls: PendingCallAccumulator<ResponseItemKey>,
+    calls: BTreeMap<ResponseItemKey, PendingCall>,
     emitted_calls: BTreeSet<ResponseItemKey>,
     output_keys: BTreeMap<u64, ResponseItemKey>,
     streamed_reasoning_summaries: BTreeSet<u64>,
+    completed: Option<StopReason>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -226,7 +220,7 @@ impl ResponsesDecoder {
             return;
         }
         if let Some(call) = self.calls.remove(&old_key) {
-            self.calls.entry(key.clone()).merge(call);
+            self.calls.entry(key.clone()).or_default().merge(call);
         }
         if self.emitted_calls.remove(&old_key) {
             self.emitted_calls.insert(key);
@@ -258,7 +252,7 @@ impl ResponsesDecoder {
 impl sse::Decoder for ResponsesDecoder {
     fn decode(&mut self, data: &str) -> Result<sse::DecodeResult, ProtocolError> {
         if data == "[DONE]" {
-            return Ok(sse::DecodeResult::wire_done(Vec::new()));
+            return Ok(sse::DecodeResult::Close(Vec::new()));
         }
         let event: Value = serde_json::from_str(data)
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
@@ -282,11 +276,18 @@ impl sse::Decoder for ResponsesDecoder {
                 self.function_call_arguments_done(&event, &mut items)?;
             }
             "response.output_item.done" => self.output_item_done(&event, &mut items)?,
-            "response.completed" => return self.completed(&event, &mut items),
+            "response.completed" => {
+                self.completed(&event, &mut items)?;
+                return Ok(sse::DecodeResult::Close(items));
+            }
             "response.failed" => return Err(Self::stream_error_message(&event)),
             _ => {}
         }
-        Ok(sse::DecodeResult::continuing(items))
+        Ok(sse::DecodeResult::Continue(items))
+    }
+
+    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
+        Ok((Vec::new(), self.completed.unwrap_or(StopReason::Truncated)))
     }
 }
 
@@ -333,7 +334,7 @@ impl ResponsesDecoder {
             self.streamed_reasoning_summaries.clear();
         } else if item["type"].as_str() == Some("function_call") {
             let key = self.item_key(event)?;
-            self.calls.entry(key).apply_item(item, false);
+            self.calls.entry(key).or_default().apply_item(item, false);
         }
         Ok(())
     }
@@ -341,7 +342,7 @@ impl ResponsesDecoder {
     fn function_call_arguments_delta(&mut self, event: &Value) -> Result<(), ProtocolError> {
         let key = self.key(event)?;
         if let Some(delta) = event["delta"].as_str() {
-            self.calls.entry(key).append_arguments(delta);
+            self.calls.entry(key).or_default().append_arguments(delta);
         }
         Ok(())
     }
@@ -352,7 +353,7 @@ impl ResponsesDecoder {
         items: &mut Vec<ModelEvent>,
     ) -> Result<(), ProtocolError> {
         let key = self.key(event)?;
-        let call = self.calls.entry(key.clone());
+        let call = self.calls.entry(key.clone()).or_default();
         if let Some(arguments) = event["arguments"].as_str() {
             call.set_arguments(arguments);
         }
@@ -376,7 +377,10 @@ impl ResponsesDecoder {
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
             let key = self.item_key(event)?;
-            self.calls.entry(key.clone()).apply_item(item, true);
+            self.calls
+                .entry(key.clone())
+                .or_default()
+                .apply_item(item, true);
             if let Some(call) = self.emit_call(&key)? {
                 items.push(call);
             }
@@ -385,10 +389,10 @@ impl ResponsesDecoder {
     }
 
     fn completed(
-        &self,
+        &mut self,
         event: &Value,
         items: &mut Vec<ModelEvent>,
-    ) -> Result<sse::DecodeResult, ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         if !self.calls.is_empty() {
             return Err(ProtocolError::InvalidResponse(
                 "Responses API completed with an unfinished tool call".to_string(),
@@ -402,12 +406,12 @@ impl ResponsesDecoder {
                 usage["output_tokens"].as_u64().unwrap_or(0),
             )));
         }
-        items.push(ModelEvent::Stop(stop_reason(
+        self.completed = Some(stop_reason(
             response["incomplete_details"]["reason"]
                 .as_str()
                 .unwrap_or(""),
-        )));
-        Ok(sse::DecodeResult::finished(std::mem::take(items)))
+        ));
+        Ok(())
     }
 
     fn stream_error_message(event: &Value) -> ProtocolError {
@@ -445,12 +449,14 @@ mod tests {
                 r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\"Cargo.toml\"}"}"#,
             )
             .unwrap();
-        let items = decoder
+        let result = decoder
             .decode(
                 r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"path\":\"Cargo.toml\"}"}"#,
             )
-            .unwrap()
-            .into_items();
+            .unwrap();
+        let sse::DecodeResult::Continue(items) = result else {
+            panic!("expected the stream to continue");
+        };
 
         assert_eq!(
             items,
@@ -465,9 +471,8 @@ mod tests {
             .decode(
                 r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
             )
-            .unwrap()
-            .into_items();
-        assert!(duplicate.is_empty());
+            .unwrap();
+        assert!(matches!(duplicate, sse::DecodeResult::Continue(items) if items.is_empty()));
     }
 
     #[test]
@@ -483,12 +488,14 @@ mod tests {
                 r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"Cargo.toml\"}"}"#,
             )
             .unwrap();
-        let items = decoder
+        let result = decoder
             .decode(
                 r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"Cargo.toml\"}"}"#,
             )
-            .unwrap()
-            .into_items();
+            .unwrap();
+        let sse::DecodeResult::Continue(items) = result else {
+            panic!("expected the stream to continue");
+        };
 
         assert_eq!(
             items,
@@ -507,28 +514,32 @@ mod tests {
             .decode(
                 r#"{"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"checking"}"#,
             )
-            .unwrap()
-            .into_items();
+            .unwrap();
         let done = decoder
             .decode(
                 r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"checking"}"#,
             )
-            .unwrap()
-            .into_items();
+            .unwrap();
 
-        assert_eq!(delta, vec![ModelEvent::Reasoning("checking".into())]);
-        assert!(done.is_empty());
+        assert!(matches!(
+            delta,
+            sse::DecodeResult::Continue(items)
+                if items == vec![ModelEvent::Reasoning("checking".into())]
+        ));
+        assert!(matches!(done, sse::DecodeResult::Continue(items) if items.is_empty()));
     }
 
     #[test]
     fn emits_atomic_reasoning_summaries_when_no_deltas_arrive() {
         let mut decoder = ResponsesDecoder::default();
-        let items = decoder
+        let result = decoder
             .decode(
                 r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"checked"}"#,
             )
-            .unwrap()
-            .into_items();
+            .unwrap();
+        let sse::DecodeResult::Continue(items) = result else {
+            panic!("expected the stream to continue");
+        };
 
         assert_eq!(items, vec![ModelEvent::Reasoning("checked".into())]);
     }
@@ -541,7 +552,8 @@ mod tests {
             .decode(r#"{"type":"response.completed","response":{}}"#)
             .unwrap();
 
-        assert!(matches!(result, sse::DecodeResult::Finished(_)));
+        assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
+        assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
     }
 
     #[test]

@@ -109,6 +109,21 @@ impl Runtime {
         self.session_store.tree(root_id).await
     }
 
+    /// Delete a root session and every durable child session in its tree.
+    /// Returns the number of removed sessions, or zero when the root does not
+    /// exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AshError` when the id belongs to a child session, any session
+    /// in the tree is still open, or the store cannot complete the deletion.
+    pub async fn delete_session_tree(
+        &self,
+        root_id: SessionId,
+    ) -> Result<usize, ash_core::AshError> {
+        self.session_store.delete_tree(root_id).await
+    }
+
     #[must_use]
     pub fn model_client(&self) -> Arc<dyn ModelClient> {
         Arc::clone(&self.model)

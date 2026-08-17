@@ -5,13 +5,13 @@ mod pending_calls;
 mod responses;
 mod sse;
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, ToolCallId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use strum::EnumString;
+use strum::{AsRefStr, Display, EnumString};
 
 /// Provider protocols supported by the adapters.
 ///
@@ -20,7 +20,7 @@ use strum::EnumString;
 /// Both serde and `strum::EnumString` accept exactly those serialized forms, so
 /// `Protocol` round-trips through JSON, `ASH_PROTOCOL`, and the `--protocol` flag
 /// with the same vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
 pub enum Protocol {
     /// Anthropic Messages API.
     #[serde(rename = "anthropic")]
@@ -36,26 +36,14 @@ pub enum Protocol {
     Responses,
 }
 
-impl std::fmt::Display for Protocol {
-    /// Same vocabulary as serde, `EnumString`, and `as_cli_name`: the stable
-    /// configuration values (`anthropic`, `openai`, `openai-responses`).
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_cli_name())
-    }
-}
-
 /// Default model for protocols that have a sensible built-in.
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 
 impl Protocol {
     /// Stable configuration name used by the CLI and `ASH_PROTOCOL`.
     #[must_use]
-    pub const fn as_cli_name(&self) -> &'static str {
-        match self {
-            Self::AnthropicMessages => "anthropic",
-            Self::Completions => "openai",
-            Self::Responses => "openai-responses",
-        }
+    pub fn as_cli_name(&self) -> &str {
+        self.as_ref()
     }
 
     /// Built-in default model for this protocol, if one exists. Protocols
@@ -126,6 +114,14 @@ pub(crate) fn content_value(
             Content::Image { media_type, data } => image_block(media_type, data),
         })
         .collect::<Vec<_>>())
+}
+
+pub(crate) fn text_tool_result(output: &str, is_error: bool) -> Cow<'_, str> {
+    if is_error {
+        format!("Error: {output}").into()
+    } else {
+        output.into()
+    }
 }
 
 /// Provider-neutral model client and stream vocabulary, re-exported for adapter code.
@@ -237,45 +233,32 @@ pub(crate) enum MessageGroup<'a> {
     ToolResults(ToolResultGroup<'a>),
 }
 
-/// Iterates `MessageGroup`s over the projected messages, merging consecutive
-/// tool-result messages into a single group. Both request-building adapters
-/// share this walk so their per-message grouping never diverges.
-pub(crate) struct MessageGroupIter<'a> {
+/// Iterate over the projected history, merging consecutive tool results.
+pub(crate) fn message_groups<'a>(
     messages: &'a [&'a Message],
-    index: usize,
-}
-
-impl<'a> MessageGroupIter<'a> {
-    pub(crate) const fn new(messages: &'a [&'a Message]) -> Self {
-        Self { messages, index: 0 }
-    }
-}
-
-impl<'a> Iterator for MessageGroupIter<'a> {
-    type Item = MessageGroup<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let message = *self.messages.get(self.index)?;
-            let group = match &message.content {
-                MessageContent::User(contents) => MessageGroup::User(contents.as_slice()),
-                MessageContent::Assistant(blocks) => MessageGroup::Assistant(blocks.as_slice()),
-                MessageContent::System(_) => {
-                    self.index += 1;
-                    continue;
-                }
-                MessageContent::ToolResult { .. } => {
-                    let group = consecutive_tool_results(self.messages, self.index);
-                    self.index += group.results.len();
-                    MessageGroup::ToolResults(group)
-                }
-            };
-            if !matches!(group, MessageGroup::ToolResults(_)) {
-                self.index += 1;
+) -> impl Iterator<Item = MessageGroup<'a>> + 'a {
+    let mut index = 0;
+    std::iter::from_fn(move || loop {
+        let message = *messages.get(index)?;
+        match &message.content {
+            MessageContent::User(contents) => {
+                index += 1;
+                return Some(MessageGroup::User(contents));
             }
-            return Some(group);
+            MessageContent::Assistant(blocks) => {
+                index += 1;
+                return Some(MessageGroup::Assistant(blocks));
+            }
+            MessageContent::System(_) => {
+                index += 1;
+            }
+            MessageContent::ToolResult { .. } => {
+                let group = consecutive_tool_results(messages, index);
+                index += group.results.len();
+                return Some(MessageGroup::ToolResults(group));
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]

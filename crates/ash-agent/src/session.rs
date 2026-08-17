@@ -5,7 +5,7 @@ use std::{
 
 use ash_core::{
     CancellationToken, ForkPoint, Message, MessageId, SessionEvent, SessionEventKind, SessionId,
-    SessionIdentity, SessionView, TurnId, TurnResult, TurnView, Usage,
+    SessionIdentity, SessionView, TurnId, TurnResult, TurnView,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
@@ -14,8 +14,8 @@ use crate::context::estimate_request_tokens;
 use crate::engine::{compact_with_adapter, run_agent_turn_persisted, TurnExecution};
 use crate::store::{OpenedSession, SharedSessionStore};
 use crate::{
-    AcceptedInput, ContextCheckpoint, Input, LogEntry, RunConfig, Runtime, SessionAppender,
-    SessionLog,
+    AcceptedInput, ContextCheckpoint, ContextUpdate, Input, LogEntry, RunConfig, Runtime,
+    SessionAppender, SessionLog,
 };
 
 const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
@@ -57,7 +57,7 @@ enum Command {
         reply: oneshot::Sender<Result<(), ash_core::AshError>>,
     },
     Rollback(oneshot::Sender<Result<Option<String>, ash_core::AshError>>),
-    Compact(oneshot::Sender<Result<ContextCompaction, ash_core::AshError>>),
+    Compact(oneshot::Sender<Result<ContextUpdate, ash_core::AshError>>),
     View(oneshot::Sender<Result<SessionView, ash_core::AshError>>),
     ForkPoints(oneshot::Sender<Result<Vec<ForkPoint>, ash_core::AshError>>),
     Fork {
@@ -213,7 +213,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns `AshError` when the session runtime has stopped.
-    pub async fn compact(&self) -> Result<ContextCompaction, ash_core::AshError> {
+    pub async fn compact(&self) -> Result<ContextUpdate, ash_core::AshError> {
         self.ask(Command::Compact).await
     }
 
@@ -534,13 +534,6 @@ pub struct ForkedSession {
     pub prompt: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ContextCompaction {
-    pub before_tokens: usize,
-    pub after_tokens: usize,
-    pub dropped_messages: usize,
-}
-
 pub struct SessionActorState {
     identity: SessionIdentity,
     config: RunConfig,
@@ -554,9 +547,8 @@ pub struct SessionActorState {
 }
 
 impl SessionActorState {
-    pub(crate) fn new(mut config: RunConfig, runtime: Runtime) -> Self {
+    pub(crate) fn new(config: RunConfig, runtime: Runtime) -> Self {
         let identity = SessionIdentity::root(SessionId::new());
-        config.identity = identity.clone();
         let store = runtime.session_store_handle();
         Self {
             identity,
@@ -575,13 +567,12 @@ impl SessionActorState {
     ///
     /// Returns `AshError` when the task name is not a valid path segment.
     pub(crate) fn new_child(
-        mut config: RunConfig,
+        config: RunConfig,
         runtime: Runtime,
         parent: &SessionIdentity,
         task_name: &str,
     ) -> Result<Self, ash_core::AshError> {
         let identity = parent.child(SessionId::new(), task_name)?;
-        config.identity = identity.clone();
         let store = runtime.session_store_handle();
         Ok(Self {
             identity,
@@ -672,7 +663,6 @@ impl SessionActorState {
 
     fn restore(&mut self, opened: OpenedSession) {
         self.identity = opened.session.identity;
-        self.config.identity = self.identity.clone();
         self.log = opened.session.log;
         self.writer = Some(Arc::new(tokio::sync::Mutex::new(opened.writer)));
     }
@@ -715,7 +705,7 @@ impl SessionActorState {
         let writer = self.writer().await?;
         let mut persistence = crate::store::SessionPersistence::new(writer);
         let execution = TurnExecution::new(
-            self.identity.id,
+            self.identity.clone(),
             turn_id,
             events.clone(),
             cancel,
@@ -735,18 +725,14 @@ impl SessionActorState {
             Err(error) => (TurnResult::Failed(error.to_string()), None),
         };
         let context_tokens = self.estimate_context_tokens(&model_context);
-        // Project the turn's terminal entry to compute the committed view,
-        // without mutating the log before the commit point.
-        let view =
-            self.project_terminal_view(turn_id, &persistence, turn_result, usage, context_tokens)?;
         // Commit point: buffer the turn's terminal entry, then write all
         // buffered messages plus the turn end in one write+flush. On crash
         // before this point the turn has no `TurnEnd`, so the projection
         // marks it `Interrupted` and its partial output is never exposed.
         persistence.stage(&[LogEntry::TurnEnd {
             id: turn_id,
-            result: view.result.clone(),
-            usage: view.usage,
+            result: turn_result,
+            usage,
         }]);
         let appended = match persistence.commit().await {
             Ok(appended) => appended,
@@ -782,7 +768,7 @@ impl SessionActorState {
         Ok(Some(prompt))
     }
 
-    pub async fn compact(&mut self) -> Result<ContextCompaction, ash_core::AshError> {
+    pub async fn compact(&mut self) -> Result<ContextUpdate, ash_core::AshError> {
         let model = self.runtime.model_client();
         self.compact_using(model.as_ref(), &CancellationToken::new())
             .await
@@ -792,7 +778,7 @@ impl SessionActorState {
         &mut self,
         model: &dyn ash_core::ModelClient,
         cancel: &CancellationToken,
-    ) -> Result<ContextCompaction, ash_core::AshError> {
+    ) -> Result<ContextUpdate, ash_core::AshError> {
         let tools = self.config.tool_definitions();
         let model_context = self.log.model_context();
         let before_tokens =
@@ -800,7 +786,7 @@ impl SessionActorState {
         let Some(compacted) =
             compact_with_adapter(&self.config, &model_context, model, cancel).await?
         else {
-            return Ok(ContextCompaction {
+            return Ok(ContextUpdate {
                 before_tokens,
                 after_tokens: before_tokens,
                 dropped_messages: 0,
@@ -808,11 +794,7 @@ impl SessionActorState {
         };
         let checkpoint = ContextCheckpoint::from_model_context(&compacted.messages)?;
         self.append(&[LogEntry::Checkpoint(checkpoint)]).await?;
-        Ok(ContextCompaction {
-            before_tokens: compacted.before_tokens,
-            after_tokens: compacted.after_tokens,
-            dropped_messages: compacted.dropped_messages,
-        })
+        Ok(compacted.update)
     }
 
     async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
@@ -836,35 +818,6 @@ impl SessionActorState {
             &self.config.tool_definitions(),
         ))
         .ok()
-    }
-
-    /// Project the turn's terminal entry onto a clone of the durable log to
-    /// compute the committed view, without mutating the log before the commit
-    /// point.
-    fn project_terminal_view(
-        &self,
-        turn_id: TurnId,
-        persistence: &crate::store::SessionPersistence,
-        turn_result: TurnResult,
-        usage: Option<Usage>,
-        context_tokens: Option<u64>,
-    ) -> Result<TurnView, ash_core::AshError> {
-        let mut projected = self.log.clone();
-        for entry in persistence.pending() {
-            projected.push(entry.clone());
-        }
-        projected.push(LogEntry::TurnEnd {
-            id: turn_id,
-            result: turn_result,
-            usage,
-        });
-        let mut view = projected.turn_view(turn_id).ok_or_else(|| {
-            ash_core::AshError::Config(format!(
-                "projected turn {turn_id} is missing after its terminal entry"
-            ))
-        })?;
-        view.context_tokens = context_tokens;
-        Ok(view)
     }
 
     async fn writer(
@@ -982,7 +935,6 @@ mod tests {
             max_context_tokens: 1000,
             context_policy: Arc::new(crate::DefaultContextPolicy),
             max_tool_duration: Duration::from_secs(5),
-            identity: SessionIdentity::root(SessionId::new()),
             max_retries: 0,
             retry_backoff: RetryBackoff::default(),
         }
@@ -1180,7 +1132,7 @@ mod tests {
         assert_eq!(state.identity().root_id, parent.id);
         assert_eq!(state.identity().parent_id, Some(parent.id));
         assert_eq!(state.identity().path.as_str(), "/root/research");
-        assert_eq!(state.config.identity.id, state.id());
+        assert_eq!(state.identity.id, state.id());
     }
 
     #[tokio::test]
