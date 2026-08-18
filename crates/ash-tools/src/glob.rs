@@ -102,11 +102,10 @@ fn find_files(
     if files.is_empty() {
         return Ok("No files found".into());
     }
-    let mut output = files
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut output = format!("Found {} files", files.len());
+    for path in &files {
+        let _ = write!(output, "\n{}", path.display());
+    }
     if truncated {
         let _ = write!(
             output,
@@ -139,6 +138,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(output.contains("Found 2 files"));
         assert!(output.contains("src/lib.rs"));
         assert!(output.contains("src/nested/mod.rs"));
         assert!(!output.contains("ignored.rs"));
@@ -175,6 +175,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(output.starts_with("Found 100 files"));
         assert_eq!(
             output
                 .lines()

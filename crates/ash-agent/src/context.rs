@@ -103,7 +103,8 @@ pub fn estimate_request_tokens(
     let system_tokens = system_prompt.map_or(0, estimate_tokens);
     let tool_tokens = serde_json::to_string(tools)
         .ok()
-        .map_or(0, |tools| estimate_tokens(&tools));
+        .as_deref()
+        .map_or(0, estimate_tokens);
     count_tokens(messages)
         .saturating_add(system_tokens)
         .saturating_add(tool_tokens)
@@ -176,13 +177,12 @@ pub fn prune_tool_outputs(messages: &[Message]) -> Option<Vec<Message>> {
 fn protected_tool_calls(messages: &[Message]) -> HashSet<ToolCallId> {
     messages
         .iter()
-        .filter_map(|message| match &message.content {
-            MessageContent::Assistant(blocks) => Some(blocks),
+        .flat_map(|message| match &message.content {
+            MessageContent::Assistant(blocks) => blocks.as_slice(),
             MessageContent::User(_)
             | MessageContent::System(_)
-            | MessageContent::ToolResult { .. } => None,
+            | MessageContent::ToolResult { .. } => &[],
         })
-        .flatten()
         .filter_map(|block| match block {
             ContentBlock::ToolCall { id, name, .. } if name == SKILL_TOOL_NAME => Some(id.clone()),
             ContentBlock::Text(_)

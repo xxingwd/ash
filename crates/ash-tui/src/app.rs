@@ -88,11 +88,7 @@ pub enum UiEvent {
     RollbackCompleted {
         prompt: String,
     },
-    CompactionCompleted {
-        before: u64,
-        after: u64,
-        dropped: u64,
-    },
+    CompactionCompleted(ash_core::ContextUpdate),
     SessionsListed {
         sessions: Vec<SessionSummary>,
     },
@@ -399,13 +395,13 @@ fn handle_ui_event(
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
-        UiEvent::CompactionCompleted {
-            before,
-            after,
-            dropped,
-        } => {
+        UiEvent::CompactionCompleted(update) => {
             state.operation.finish();
-            let effect = terminal.finish_compaction(before, after, dropped);
+            let effect = terminal.finish_compaction(
+                update.before_tokens,
+                update.after_tokens,
+                update.dropped_messages,
+            );
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -531,13 +527,13 @@ fn handle_session_event(
                 return Ok(LoopAction::Continue);
             }
             terminal.track_turn(view.id);
-            let _ = state.operation.complete_turn();
+            state.operation.complete_turn();
             let effect = terminal.commit_turn(&view);
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
-        SessionEventKind::ContextCompacted { after, .. } => {
-            let effect = terminal.record_automatic_compaction(after);
+        SessionEventKind::ContextCompacted(update) => {
+            let effect = terminal.record_automatic_compaction(update.after_tokens);
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -1001,8 +997,7 @@ async fn run_command(
 
 const fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
     match (policy, input) {
-        (SubmissionPolicy::Start, _) => false,
-        (SubmissionPolicy::Steer, ParsedInput::Message) => false,
+        (SubmissionPolicy::Start, _) | (SubmissionPolicy::Steer, ParsedInput::Message) => false,
         (SubmissionPolicy::Steer, ParsedInput::Command(command)) => !command.can_run_while_busy(),
         (SubmissionPolicy::Steer, ParsedInput::Invalid(_)) => true,
     }
@@ -1018,8 +1013,6 @@ fn inserts_newline(key: &KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::operation::TurnCompletion;
-
     use super::*;
 
     #[test]
@@ -1044,7 +1037,7 @@ mod tests {
         state.operation.start_turn();
         assert!(state.operation.begin_cancellation());
 
-        assert_eq!(state.operation.complete_turn(), TurnCompletion::Cancelled);
+        state.operation.complete_turn();
         assert!(!state.operation.is_busy());
         assert!(state.input.is_empty());
     }

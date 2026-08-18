@@ -6,6 +6,7 @@ use crate::ContextPolicy;
 
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
 pub const DEFAULT_MAX_TURNS: u32 = 100;
+pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 pub const COMPACTION_TRIGGER_PERCENT: usize = 80;
 
 /// Immutable behavior shared by every session that runs this agent.
@@ -45,13 +46,13 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn with_max_turns(mut self, max_turns: u32) -> Self {
+    pub const fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
         self
     }
 
     #[must_use]
-    pub fn with_max_context_tokens(mut self, max_context_tokens: usize) -> Self {
+    pub const fn with_max_context_tokens(mut self, max_context_tokens: usize) -> Self {
         self.max_context_tokens = max_context_tokens;
         self
     }
@@ -72,17 +73,9 @@ impl Agent {
     /// name in place, so the model and executor always share one definition.
     #[must_use]
     pub fn pushing_tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        for tool in tools {
-            if let Some(existing) = self
-                .tools
-                .iter_mut()
-                .find(|existing| existing.name() == tool.name())
-            {
-                *existing = tool;
-            } else {
-                self.tools.push(tool);
-            }
-        }
+        tools
+            .into_iter()
+            .for_each(|tool| upsert_tool(&mut self.tools, tool));
         self
     }
 
@@ -103,7 +96,7 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn model(&self) -> &ModelId {
+    pub const fn model(&self) -> &ModelId {
         &self.model
     }
 
@@ -119,18 +112,21 @@ impl Agent {
 }
 
 fn deduplicate_tools(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
-    let mut unique: Vec<Arc<dyn Tool>> = Vec::new();
-    for tool in tools {
-        if let Some(existing) = unique
-            .iter_mut()
-            .find(|existing| existing.name() == tool.name())
-        {
-            *existing = tool;
-        } else {
-            unique.push(tool);
-        }
+    tools.into_iter().fold(Vec::new(), |mut unique, tool| {
+        upsert_tool(&mut unique, tool);
+        unique
+    })
+}
+
+fn upsert_tool(tools: &mut Vec<Arc<dyn Tool>>, tool: Arc<dyn Tool>) {
+    if let Some(existing) = tools
+        .iter_mut()
+        .find(|existing| existing.name() == tool.name())
+    {
+        *existing = tool;
+    } else {
+        tools.push(tool);
     }
-    unique
 }
 
 /// Per-session execution scope. Identity and lineage live on the session
@@ -145,7 +141,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             working_dir: PathBuf::from("."),
-            tool_timeout: Duration::from_mins(2),
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
         }
     }
 }
@@ -157,7 +153,7 @@ mod tests {
     use super::*;
 
     fn named_tool(name: &str, description: &str) -> Arc<dyn Tool> {
-        define_tool(name, description, |_, _: ()| async { Ok("ok") }).unwrap()
+        define_tool(name, description, |_, ()| async { Ok("ok") }).unwrap()
     }
 
     #[test]
@@ -203,7 +199,7 @@ pub struct RunConfig {
     pub context_policy: Arc<dyn ContextPolicy>,
     pub max_tool_duration: Duration,
     /// How many times a single model call may be retried after a safe,
-    /// retryable failure (network error, upstream 5xx, rate limit, or a
+    /// retryable failure (network error, selected upstream statuses, rate limit, or a
     /// truncated stream). Retries only happen before any tool call has been
     /// executed, so they never repeat side effects. Between attempts the
     /// runner waits an exponential backoff (`RetryBackoff`), cancellable.

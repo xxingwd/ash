@@ -47,7 +47,7 @@ fn environment_context(working_dir: &Path) -> String {
         "<environment_context>\n  <cwd>{}</cwd>\n  <shell>{}</shell>\n  \
          <current_date>{}</current_date>\n  <timezone>{}</timezone>\n  <os>{}</os>\n  \
          <arch>{}</arch>\n</environment_context>",
-        escape_xml(&working_dir.display().to_string()),
+        escape_xml(&working_dir.to_string_lossy()),
         escape_xml(&shell),
         now.format("%Y-%m-%d"),
         now.format("%:z"),
@@ -87,11 +87,7 @@ fn skills_context(skills: &[Skill], active_skill: Option<&Skill>) -> Option<Stri
         return None;
     }
 
-    let mut output = String::from(
-        "<skills>\nSkills provide specialized instructions and workflows for specific tasks.\n\
-         Use the `skill` tool to load a skill when a task matches its description.\n\n\
-         ## Available skills\n",
-    );
+    let mut output = String::from("<skills>\n## Available skills\n");
     if skills.is_empty() {
         output.push_str("- None discovered.\n");
     } else {
@@ -168,7 +164,7 @@ mod tests {
         assert!(!prompt.contains("outside rules"));
         assert!(!prompt.contains("ignored override"));
         assert!(prompt.find("project rules") < prompt.find("nested rules"));
-        assert!(prompt.contains("Use the `skill` tool to load a skill"));
+        assert!(!prompt.contains("Use the `skill` tool to load a skill"));
         assert!(prompt.contains("`review`: review description"));
         assert!(!prompt.contains(".agents/skills/review/SKILL.md"));
         assert!(prompt.contains("## Active skill: review"));

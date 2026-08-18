@@ -15,10 +15,8 @@ mod store;
 
 pub(crate) use agent::RunConfig;
 pub use agent::{Agent, SessionOptions, DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_TURNS};
-pub use ash_core::SessionEvent;
-pub use context_policy::{
-    ContextPolicy, ContextRequest, ContextUpdate, DefaultContextPolicy, PreparedContext,
-};
+pub use ash_core::{ContextUpdate, SessionEvent};
+pub use context_policy::{ContextPolicy, ContextRequest, DefaultContextPolicy, PreparedContext};
 pub use input::{Input, InputSource};
 pub use jsonl::JsonlSessionStore;
 pub use log::{AcceptedInput, ContextCheckpoint, LogEntry, SessionLog};

@@ -126,11 +126,11 @@ fn serializes_event_usage_with_the_stable_contract() {
 
 #[test]
 fn serializes_event_context_compacted_with_the_stable_contract() {
-    let event = SessionEventKind::ContextCompacted {
-        before: 180_000,
-        after: 12_000,
-        dropped: 42,
-    };
+    let event = SessionEventKind::ContextCompacted(ContextUpdate {
+        before_tokens: 180_000,
+        after_tokens: 12_000,
+        dropped_messages: 42,
+    });
     assert_json_snapshot!("event_context_compacted", event);
 }
 

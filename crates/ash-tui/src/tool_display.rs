@@ -48,18 +48,36 @@ pub enum ToolRenderer {
     Bash,
     Edit,
     Write,
-    Generic { show_output: bool },
+    Generic(OutputPresentation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputPresentation {
+    Hidden,
+    Summary,
+    Preview,
 }
 
 pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
     let kind = ToolKind::from_name(name);
     match (kind, is_error) {
         (ToolKind::Bash, _) => ToolRenderer::Bash,
-        (_, true) => ToolRenderer::Generic { show_output: true },
         (ToolKind::Edit, false) => ToolRenderer::Edit,
         (ToolKind::Write, false) => ToolRenderer::Write,
-        (ToolKind::Read, false) => ToolRenderer::Generic { show_output: false },
-        _ => ToolRenderer::Generic { show_output: true },
+        (_, true) => ToolRenderer::Generic(OutputPresentation::Preview),
+        (ToolKind::Glob | ToolKind::Grep, false) => {
+            ToolRenderer::Generic(OutputPresentation::Summary)
+        }
+        (
+            ToolKind::Read
+            | ToolKind::Skill
+            | ToolKind::SpawnAgent
+            | ToolKind::MessageAgent
+            | ToolKind::InterruptAgent
+            | ToolKind::WaitAgent,
+            false,
+        ) => ToolRenderer::Generic(OutputPresentation::Hidden),
+        _ => ToolRenderer::Generic(OutputPresentation::Preview),
     }
 }
 
@@ -67,19 +85,25 @@ pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
     (ToolKind::from_name(name) == ToolKind::Read).then(|| short_path_argument(arguments))
 }
 
-pub fn tool_call_summary(name: &str, arguments: &Value, is_error: bool) -> (String, String) {
-    let phrase = tool_phrase(name, arguments);
-    let (action, detail) = if is_error {
-        ("Failed", join_parts(phrase.running, &phrase.detail))
-    } else {
-        (phrase.completed, phrase.detail)
-    };
-    (action.to_string(), detail)
+/// One tool call's title label and detail. The label is the exact tool
+/// name; presentation (label casing, state colors) happens at the render
+/// layer.
+pub fn tool_call_summary(name: &str, arguments: &Value) -> (String, String) {
+    (name.to_string(), tool_detail(name, arguments))
 }
 
-pub fn running_tool_call_summary(name: &str, arguments: &Value) -> (String, String) {
-    let phrase = tool_phrase(name, arguments);
-    (sentence_case(phrase.running), phrase.detail)
+fn tool_detail(name: &str, arguments: &Value) -> String {
+    match ToolKind::from_name(name) {
+        ToolKind::Read => short_path_argument(arguments),
+        ToolKind::Write | ToolKind::Edit => raw_path_argument(arguments),
+        ToolKind::Glob | ToolKind::Grep => string_argument(arguments, "pattern"),
+        ToolKind::WebFetch => url_argument(arguments),
+        ToolKind::Bash => string_argument(arguments, "command"),
+        ToolKind::Skill => string_argument(arguments, "name"),
+        ToolKind::SpawnAgent => string_argument(arguments, "task_name"),
+        ToolKind::MessageAgent | ToolKind::InterruptAgent => string_argument(arguments, "target"),
+        ToolKind::WaitAgent | ToolKind::Other => String::new(),
+    }
 }
 
 pub fn read_group_summary(details: &[String]) -> (String, String) {
@@ -98,80 +122,7 @@ pub fn read_group_summary(details: &[String]) -> (String, String) {
     if hidden > 0 {
         let _ = write!(detail, " +{hidden}");
     }
-    ("Read".to_string(), detail)
-}
-
-struct ToolPhrase {
-    completed: &'static str,
-    running: &'static str,
-    detail: String,
-}
-
-fn tool_phrase(name: &str, arguments: &Value) -> ToolPhrase {
-    match ToolKind::from_name(name) {
-        ToolKind::Read => phrase("Read", "reading", short_path_argument(arguments)),
-        ToolKind::Write => phrase("Wrote", "writing", raw_path_argument(arguments)),
-        ToolKind::Edit => phrase("Edited", "editing", raw_path_argument(arguments)),
-        ToolKind::Glob => phrase("Found", "finding", string_argument(arguments, "pattern")),
-        ToolKind::Grep => phrase(
-            "Searched",
-            "searching",
-            string_argument(arguments, "pattern"),
-        ),
-        ToolKind::WebFetch => phrase("Fetched", "fetching", url_argument(arguments)),
-        ToolKind::Bash => phrase("Ran", "running", string_argument(arguments, "command")),
-        ToolKind::Skill => phrase("Loaded", "loading", string_argument(arguments, "name")),
-        ToolKind::SpawnAgent => phrase(
-            "Spawned",
-            "spawning",
-            string_argument(arguments, "task_name"),
-        ),
-        ToolKind::MessageAgent => {
-            if arguments
-                .get("start_turn")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                phrase(
-                    "Continued",
-                    "continuing",
-                    string_argument(arguments, "target"),
-                )
-            } else {
-                phrase(
-                    "Messaged",
-                    "messaging",
-                    string_argument(arguments, "target"),
-                )
-            }
-        }
-        ToolKind::InterruptAgent => phrase(
-            "Interrupted",
-            "interrupting",
-            string_argument(arguments, "target"),
-        ),
-        ToolKind::WaitAgent => phrase("Waited", "waiting", "for agents".to_string()),
-        ToolKind::Other => phrase(
-            "Ran",
-            "running",
-            collapse_whitespace(name).replace('_', " "),
-        ),
-    }
-}
-
-const fn phrase(completed: &'static str, running: &'static str, detail: String) -> ToolPhrase {
-    ToolPhrase {
-        completed,
-        running,
-        detail,
-    }
-}
-
-fn sentence_case(value: &str) -> String {
-    let mut chars = value.chars();
-    chars.next().map_or_else(String::new, |first| {
-        format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
-    })
+    ("read".to_string(), detail)
 }
 
 fn raw_path_argument(arguments: &Value) -> String {
@@ -235,33 +186,24 @@ fn collapse_whitespace(value: &str) -> String {
         .join(" ")
 }
 
-fn join_parts(action: &str, detail: &str) -> String {
-    if detail.is_empty() {
-        action.to_string()
-    } else {
-        format!("{action} {detail}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn renders_builtin_tools_as_semantic_summaries() {
+    fn labels_tools_by_name_with_argument_details() {
         assert_eq!(
-            tool_call_summary("bash", &json!({"command": "cargo test"}), false),
-            ("Ran".to_string(), "cargo test".to_string())
+            tool_call_summary("bash", &json!({"command": "cargo test"})),
+            ("bash".to_string(), "cargo test".to_string())
         );
         assert_eq!(
             tool_call_summary(
                 "bash",
                 &json!({"command": "rg reasoning /work/ash/crates/ash-tui/src"}),
-                false,
             ),
             (
-                "Ran".to_string(),
+                "bash".to_string(),
                 "rg reasoning /work/ash/crates/ash-tui/src".to_string()
             )
         );
@@ -269,36 +211,38 @@ mod tests {
             tool_call_summary(
                 "webfetch",
                 &json!({"url": "https://user:secret@example.com/docs?q=token#section"}),
-                false,
             ),
             (
-                "Fetched".to_string(),
+                "webfetch".to_string(),
                 "https://example.com/docs".to_string()
             )
         );
         assert_eq!(
-            tool_call_summary("glob", &json!({"pattern": "**/*.rs"}), false),
-            ("Found".to_string(), "**/*.rs".to_string())
+            tool_call_summary("glob", &json!({"pattern": "**/*.rs"})),
+            ("glob".to_string(), "**/*.rs".to_string())
         );
         assert_eq!(
-            tool_call_summary("grep", &json!({"pattern": "TODO|FIXME"}), false),
-            ("Searched".to_string(), "TODO|FIXME".to_string())
+            tool_call_summary("grep", &json!({"pattern": "TODO|FIXME"})),
+            ("grep".to_string(), "TODO|FIXME".to_string())
         );
         assert_eq!(
-            tool_call_summary("skill", &json!({"name": "review"}), false),
-            ("Loaded".to_string(), "review".to_string())
+            tool_call_summary("skill", &json!({"name": "review"})),
+            ("skill".to_string(), "review".to_string())
         );
     }
 
     #[test]
-    fn renders_running_calls_in_the_present_tense() {
+    fn collaboration_tool_names_read_as_labels() {
         assert_eq!(
-            running_tool_call_summary("bash", &json!({"command": "cargo test"})),
-            ("Running".to_string(), "cargo test".to_string())
+            tool_call_summary(
+                "message_agent",
+                &json!({"target": "research", "message": "hi", "start_turn": true}),
+            ),
+            ("message_agent".to_string(), "research".to_string())
         );
         assert_eq!(
-            running_tool_call_summary("read", &json!({"path": "/work/ash/src/main.rs"})),
-            ("Reading".to_string(), "main.rs".to_string())
+            tool_call_summary("custom_tool", &json!({"payload": "x"})),
+            ("custom_tool".to_string(), String::new())
         );
     }
 
@@ -311,50 +255,35 @@ mod tests {
                 "old": "many lines of old content",
                 "new": "many lines of new content"
             }),
-            false,
         );
         let write = tool_call_summary(
             "write",
             &json!({"path": "crates/ash-tui/src/new.rs", "content": "content"}),
-            false,
         );
         let read = tool_call_summary(
             "read",
             &json!({"path": "/home/user/work/ash/crates/ash-tui/src/inline.rs"}),
-            false,
         );
 
         assert_eq!(
             edit,
             (
-                "Edited".to_string(),
+                "edit".to_string(),
                 "/home/user/work/ash/crates/ash-tui/src/inline.rs".to_string()
             )
         );
         assert_eq!(
             write,
-            ("Wrote".to_string(), "crates/ash-tui/src/new.rs".to_string())
+            ("write".to_string(), "crates/ash-tui/src/new.rs".to_string())
         );
-        assert_eq!(read, ("Read".to_string(), "inline.rs".to_string()));
-    }
-
-    #[test]
-    fn renders_failed_calls_without_dumping_arguments() {
-        assert_eq!(
-            tool_call_summary(
-                "write",
-                &json!({"path": "/tmp/report.md", "content": "one\ntwo"}),
-                true,
-            ),
-            ("Failed".to_string(), "writing /tmp/report.md".to_string())
-        );
+        assert_eq!(read, ("read".to_string(), "inline.rs".to_string()));
     }
 
     #[test]
     fn groups_matching_tools_behind_one_action() {
         assert_eq!(
             read_group_summary(&["inline.rs".to_string(), "viewport.rs".to_string()]),
-            ("Read".to_string(), "inline.rs, viewport.rs".to_string())
+            ("read".to_string(), "inline.rs, viewport.rs".to_string())
         );
     }
 
@@ -364,7 +293,7 @@ mod tests {
 
         assert_eq!(
             read_group_summary(&details),
-            ("Read".to_string(), "a, b, c, d +2".to_string())
+            ("read".to_string(), "a, b, c, d +2".to_string())
         );
     }
 
@@ -372,7 +301,7 @@ mod tests {
     fn group_summaries_deduplicate_details() {
         assert_eq!(
             read_group_summary(&["app.rs".to_string(), "app.rs".to_string()]),
-            ("Read".to_string(), "app.rs".to_string())
+            ("read".to_string(), "app.rs".to_string())
         );
     }
 
@@ -382,12 +311,40 @@ mod tests {
         assert_eq!(tool_renderer("edit", false), ToolRenderer::Edit);
         assert_eq!(tool_renderer("write", false), ToolRenderer::Write);
         assert_eq!(
+            tool_renderer("read", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
+            tool_renderer("grep", false),
+            ToolRenderer::Generic(OutputPresentation::Summary)
+        );
+        assert_eq!(
+            tool_renderer("glob", false),
+            ToolRenderer::Generic(OutputPresentation::Summary)
+        );
+        assert_eq!(
+            tool_renderer("skill", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
+            tool_renderer("spawn_agent", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
+            tool_renderer("wait_agent", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
             tool_renderer("read", true),
-            ToolRenderer::Generic { show_output: true }
+            ToolRenderer::Generic(OutputPresentation::Preview)
+        );
+        assert_eq!(
+            tool_renderer("wait_agent", true),
+            ToolRenderer::Generic(OutputPresentation::Preview)
         );
         assert_eq!(
             tool_renderer("custom_tool", false),
-            ToolRenderer::Generic { show_output: true }
+            ToolRenderer::Generic(OutputPresentation::Preview)
         );
     }
 }

@@ -16,8 +16,8 @@ use crate::{
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::{sanitize_terminal_text, wrap_text},
     tool_display::{
-        read_group_detail, read_group_summary, running_tool_call_summary, tool_call_summary,
-        tool_renderer, ToolRenderer,
+        read_group_detail, read_group_summary, tool_call_summary, tool_renderer,
+        OutputPresentation, ToolRenderer,
     },
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
@@ -551,7 +551,7 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
 
 fn render_read_group(details: &[String], width: u16) -> Buffer {
     let (action, detail) = read_group_summary(details);
-    render_tool_title(action, detail, false, width)
+    render_tool_title(&action, &detail, false, width)
 }
 
 fn render_welcome(width: u16, working_dir: &std::path::Path) -> Buffer {
@@ -713,7 +713,7 @@ fn render_tool(
     width: u16,
     expanded: bool,
 ) -> Buffer {
-    let show_output = match tool_renderer(name, is_error) {
+    let output_presentation = match tool_renderer(name, is_error) {
         ToolRenderer::Bash => {
             return render_bash_tool(name, arguments, output, is_error, width, expanded);
         }
@@ -721,39 +721,67 @@ fn render_tool(
             if let Some(rendered) = render_edit_tool(arguments, width) {
                 return rendered;
             }
-            true
+            OutputPresentation::Preview
         }
         ToolRenderer::Write => {
             if let Some(rendered) = render_write_tool(arguments, width) {
                 return rendered;
             }
-            true
+            OutputPresentation::Preview
         }
-        ToolRenderer::Generic { show_output } => show_output,
+        ToolRenderer::Generic(presentation) => presentation,
     };
-    let (action, detail) = tool_call_summary(name, arguments, is_error);
-    let title = render_tool_title(action, detail, is_error, width);
+    let (action, detail) = tool_call_summary(name, arguments);
+    let title = render_tool_title(&action, &detail, is_error, width);
     if output.is_empty() {
         return title;
     }
     let mut rows = vec![title];
-    if show_output {
-        rows.push(render_tool_output(output, width, expanded));
+    if let Some(output) = render_presented_tool_output(output, output_presentation, width, expanded)
+    {
+        rows.push(output);
     }
     stack_rows(&rows, width)
 }
 
+fn render_presented_tool_output(
+    output: &str,
+    presentation: OutputPresentation,
+    width: u16,
+    expanded: bool,
+) -> Option<Buffer> {
+    match presentation {
+        OutputPresentation::Hidden => None,
+        OutputPresentation::Summary if !expanded => render_tool_output_summary(output, width),
+        OutputPresentation::Summary | OutputPresentation::Preview => {
+            Some(render_tool_output(output, width, expanded))
+        }
+    }
+}
+
+fn render_tool_output_summary(output: &str, width: u16) -> Option<Buffer> {
+    let first = output.lines().find(|line| !line.trim().is_empty())?;
+    let truncation = output
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[Results truncated"));
+    let summary = truncation.map_or_else(
+        || first.to_string(),
+        |truncation| format!("{first}\n{truncation}"),
+    );
+    Some(render_tool_output(&summary, width, false))
+}
+
 fn render_running_tool(name: &str, arguments: &Value, width: u16, expanded: bool) -> Buffer {
+    let (action, detail) = tool_call_summary(name, arguments);
     if matches!(tool_renderer(name, false), ToolRenderer::Bash) {
-        let (action, _) = running_tool_call_summary(name, arguments);
         let (title, continuation, _) =
-            render_bash_command_line_with_action(arguments, action, Color::Cyan, width, expanded);
+            render_bash_command_line_with_action(arguments, &action, Color::Cyan, width, expanded);
         return continuation.map_or(title.clone(), |continuation| {
             stack_rows(&[title, continuation], width)
         });
     }
-    let (action, detail) = running_tool_call_summary(name, arguments);
-    render_tool_title_with_color(action, detail, Color::Cyan, width)
+    render_tool_title_with_color(&action, &detail, Color::Cyan, width)
 }
 
 /// Render a bash tool call: the highlighted command (the "input") inline on
@@ -782,7 +810,7 @@ fn render_bash_tool(
 }
 
 /// Build the title row with the highlighted command merged inline (like
-/// codex: `• Ran <command>` on one line), plus a separate row for the
+/// codex: `• bash <command>` on one line), plus a separate row for the
 /// continuation lines of a multi-line command.
 fn render_bash_command_line(
     name: &str,
@@ -791,14 +819,14 @@ fn render_bash_command_line(
     width: u16,
     expanded: bool,
 ) -> (Buffer, Option<Buffer>, u16) {
-    let (action, _) = tool_call_summary(name, arguments, is_error);
+    let (action, _) = tool_call_summary(name, arguments);
     let color = if is_error { Color::Red } else { Color::Green };
-    render_bash_command_line_with_action(arguments, action, color, width, expanded)
+    render_bash_command_line_with_action(arguments, &action, color, width, expanded)
 }
 
 fn render_bash_command_line_with_action(
     arguments: &Value,
-    action: String,
+    action: &str,
     color: Color,
     width: u16,
     expanded: bool,
@@ -808,7 +836,7 @@ fn render_bash_command_line_with_action(
     let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let mut header_spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
     header_spans.push(Span::styled(
-        action,
+        display_label(action),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     header_spans.push(Span::raw(" "));
@@ -943,26 +971,32 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     buffer
 }
 
-fn render_tool_title(action: String, detail: String, is_error: bool, width: u16) -> Buffer {
+fn render_tool_title(action: &str, detail: &str, is_error: bool, width: u16) -> Buffer {
     let color = if is_error { Color::Red } else { Color::Green };
     render_tool_title_with_color(action, detail, color, width)
 }
 
-fn render_tool_title_with_color(
-    action: String,
-    detail: String,
-    color: Color,
-    width: u16,
-) -> Buffer {
+/// How a tool name is shown in a title: underscores become spaces and the
+/// first character is uppercase. Tool names themselves stay lowercase
+/// everywhere; this is presentation only.
+fn display_label(label: &str) -> String {
+    let label = label.replace('_', " ");
+    let mut chars = label.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+    })
+}
+
+fn render_tool_title_with_color(action: &str, detail: &str, color: Color, width: u16) -> Buffer {
     let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
     spans.push(Span::styled(
-        action,
+        display_label(action),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     if !detail.is_empty() {
         spans.push(Span::raw(" "));
-        spans.push(Span::raw(detail));
+        spans.push(Span::raw(detail.to_string()));
     }
     let line = Line::from(spans);
     // Wrap long titles (e.g. a long grep pattern or path) instead of letting
@@ -995,7 +1029,7 @@ fn render_edit_tool(arguments: &Value, width: u16) -> Option<Buffer> {
     }
     let (added, removed) = changed_line_counts(&lines);
     Some(render_file_change(
-        "Edited", &path, added, removed, lines, width,
+        "edit", &path, added, removed, &lines, width,
     ))
 }
 
@@ -1005,7 +1039,7 @@ fn render_write_tool(arguments: &Value, width: u16) -> Option<Buffer> {
     let mut lines = Vec::new();
     extend_change_lines(&mut lines, '+', &content);
     let added = lines.len();
-    Some(render_file_change("Wrote", &path, added, 0, lines, width))
+    Some(render_file_change("write", &path, added, 0, &lines, width))
 }
 
 fn tool_argument(arguments: &Value, name: &str) -> Option<String> {
@@ -1017,11 +1051,11 @@ fn extend_change_lines(lines: &mut Vec<String>, prefix: char, text: &str) {
 }
 
 fn render_file_change(
-    action: &'static str,
+    tool_name: &str,
     path: &str,
     added: usize,
     removed: usize,
-    lines: Vec<String>,
+    lines: &[String],
     width: u16,
 ) -> Buffer {
     let title = Line::from(vec![
@@ -1032,7 +1066,10 @@ fn render_file_change(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(action, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            display_label(tool_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::raw(path.to_string()),
         Span::raw(" ("),
@@ -1041,7 +1078,7 @@ fn render_file_change(
         Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
         Span::raw(")"),
     ]);
-    render_change_block(title, lines, width)
+    render_change_block(&title, lines, width)
 }
 
 fn changed_line_counts(lines: &[String]) -> (usize, usize) {
@@ -1056,8 +1093,8 @@ fn changed_line_counts(lines: &[String]) -> (usize, usize) {
     })
 }
 
-fn render_change_block(title: Line<'static>, lines: Vec<String>, width: u16) -> Buffer {
-    let title_rows = crate::ansi::wrap_highlighted_line(&title, usize::from(width.max(1)));
+fn render_change_block(title: &Line<'static>, lines: &[String], width: u16) -> Buffer {
+    let title_rows = crate::ansi::wrap_highlighted_line(title, usize::from(width.max(1)));
     let content_x = if width > BULLET_PREFIX_COLUMNS {
         BULLET_PREFIX_COLUMNS
     } else {
@@ -1065,7 +1102,7 @@ fn render_change_block(title: Line<'static>, lines: Vec<String>, width: u16) -> 
     };
     let content_width = width.saturating_sub(content_x).max(1);
     let mut rendered = Vec::new();
-    for line in &lines {
+    for line in lines {
         let style = change_line_style(line);
         for row in wrap_text(line, content_width) {
             rendered.push((row, style));
@@ -1265,13 +1302,13 @@ mod tests {
         .with_turn(Some(test_turn(7)));
 
         let running = block.render(60, false);
-        assert_eq!(row_text(&running, 0), "• Running cargo test");
+        assert_eq!(row_text(&running, 0), "• Bash cargo test");
         assert!(block.is_running_tool(&call_id));
         assert!(block.is_unfinished_response_for_turn(test_turn(7)));
 
         assert!(block.finish_tool(&call_id, "ok".to_string(), false));
         let finished = block.render(60, false);
-        assert_eq!(row_text(&finished, 0), "• Ran cargo test");
+        assert_eq!(row_text(&finished, 0), "• Bash cargo test");
         assert_eq!(row_text(&finished, 1), "  └ ok");
         assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
     }
@@ -1292,7 +1329,7 @@ mod tests {
             false,
         ));
         assert!(block.is_running_tool(&call_id));
-        assert_eq!(row_text(&block.render(40, false), 0), "• Running pwd");
+        assert_eq!(row_text(&block.render(40, false), 0), "• Bash pwd");
     }
 
     #[test]
@@ -1499,11 +1536,8 @@ mod tests {
         )
         .render(60, false);
 
-        assert_eq!(
-            row_text(&edit, 0),
-            "• Edited /workspace/src/main.rs (+1 -1)"
-        );
-        assert_eq!(row_text(&write, 0), "• Wrote /workspace/src/new.rs (+2 -0)");
+        assert_eq!(row_text(&edit, 0), "• Edit /workspace/src/main.rs (+1 -1)");
+        assert_eq!(row_text(&write, 0), "• Write /workspace/src/new.rs (+2 -0)");
         assert_eq!(edit.cell((2, 1)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 2)).expect("added line").fg, Color::Green);
         assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);
@@ -1534,7 +1568,7 @@ mod tests {
 
         let rendered = block.render(60, false);
 
-        assert_eq!(row_text(&rendered, 0), "• Edited markers.txt (+1 -1)");
+        assert_eq!(row_text(&rendered, 0), "• Edit markers.txt (+1 -1)");
         assert_eq!(row_text(&rendered, 1), "  --- before");
         assert_eq!(row_text(&rendered, 2), "  +++ after");
     }
@@ -1577,7 +1611,7 @@ mod tests {
         let rendered = block.render(60, false);
 
         assert_eq!(rendered.area.height, 2);
-        assert_eq!(row_text(&rendered, 0), "• Wrote same.txt");
+        assert_eq!(row_text(&rendered, 0), "• Write same.txt");
         assert_eq!(row_text(&rendered, 1), "  └ Wrote 5 bytes");
     }
 
@@ -1684,12 +1718,12 @@ mod generic_output_tests {
         );
         let rendered = block.render(40, false);
         assert_eq!(rendered.area.height, 2);
-        assert!(row_text(&rendered, 0).contains("Failed"), "title");
+        assert!(row_text(&rendered, 0).contains("Grep"), "title");
         assert!(row_text(&rendered, 1).contains("invalid regular"));
     }
 
     #[test]
-    fn bash_error_title_says_failed_and_shows_output() {
+    fn bash_error_title_is_red_and_shows_output() {
         let block = LiveBlock::tool(
             1,
             "bash".to_string(),
@@ -1699,28 +1733,95 @@ mod generic_output_tests {
         );
         let rendered = block.render(40, false);
         assert!(
-            row_text(&rendered, 0).contains("Failed"),
+            row_text(&rendered, 0).contains("Bash false"),
             "title: {:?}",
             row_text(&rendered, 0)
+        );
+        assert!(
+            (0..rendered.area.width).any(|x| rendered[(x, 0)].style().fg == Some(Color::Red)),
+            "title is red"
         );
         assert!(row_text(&rendered, 1).contains("exit code 1"));
     }
 
     #[test]
-    fn grep_tool_shows_output_preview() {
-        let output = "src/main.rs:\n  Line 12: let x = 1;\n  Line 34: let y = 2;";
-        let block = LiveBlock::tool(
+    fn successful_searches_summarize_and_expand_while_failures_show_the_error() {
+        let search_output = "Found 2 matching lines\n\nsrc/main.rs:\n  Line 12: let x = 1;";
+        let found = LiveBlock::tool(
             1,
             "grep".to_string(),
             serde_json::json!({"pattern": "let x", "path": "src"}),
-            output.to_string(),
+            search_output.to_string(),
             false,
         );
-        let rendered = block.render(50, false);
-        assert_eq!(rendered.area.height, 1 + 3);
-        assert!(row_text(&rendered, 0).contains("Searched"));
-        assert!(row_text(&rendered, 1).contains("src/main.rs"));
-        assert!(row_text(&rendered, 2).contains("Line 12"));
+        let rendered = found.render(50, false);
+        assert_eq!(rendered.area.height, 2);
+        assert!(row_text(&rendered, 0).contains("Grep"));
+        assert!(row_text(&rendered, 1).contains("Found 2 matching lines"));
+        assert!(!rendered_to_string(&rendered).contains("Line 12"));
+
+        let expanded = found.render(50, true);
+        assert!(rendered_to_string(&expanded).contains("Line 12"));
+
+        let failed = LiveBlock::tool(
+            1,
+            "grep".to_string(),
+            serde_json::json!({"pattern": "[", "path": "src"}),
+            "invalid regular expression".to_string(),
+            true,
+        );
+        let rendered = failed.render(50, false);
+        assert!(rendered_to_string(&rendered).contains("invalid regular"));
+    }
+
+    #[test]
+    fn collapsed_glob_summary_keeps_the_truncation_notice() {
+        let block = LiveBlock::tool(
+            1,
+            "glob".to_string(),
+            serde_json::json!({"pattern": "**/*.rs"}),
+            "Found 100 files\nsrc/first.rs\n\n[Results truncated at 100 files. Use a narrower path or pattern.]"
+                .to_string(),
+            false,
+        );
+
+        let rendered = block.render(80, false);
+        let text = rendered_to_string(&rendered);
+        assert!(text.contains("Found 100 files"));
+        assert!(text.contains("Results truncated at 100 files"));
+        assert!(!text.contains("src/first.rs"));
+    }
+
+    fn rendered_to_string(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|row| row_text(buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn wait_agent_success_is_silent_but_errors_surface() {
+        let snapshot = r#"{"agents":[{"session_id":"…","status":"Completed"}],"timed_out":false}"#;
+        let done = LiveBlock::tool(
+            1,
+            "wait_agent".to_string(),
+            serde_json::json!({"timeout_ms": 0}),
+            snapshot.to_string(),
+            false,
+        );
+        let rendered = done.render(50, false);
+        assert_eq!(rendered.area.height, 1);
+        assert!(row_text(&rendered, 0).contains("Wait agent"));
+
+        let failed = LiveBlock::tool(
+            1,
+            "wait_agent".to_string(),
+            serde_json::json!({"timeout_ms": 0}),
+            "wait queue is unavailable".to_string(),
+            true,
+        );
+        let rendered = failed.render(50, false);
+        assert!(rendered_to_string(&rendered).contains("wait queue"));
     }
 }
 

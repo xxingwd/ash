@@ -31,12 +31,6 @@ pub enum SubmissionPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TurnCompletion {
-    Commit,
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TurnStartOutcome {
     StartedTurn,
     TurnAlreadyTracked,
@@ -135,15 +129,10 @@ impl OperationState {
         true
     }
 
-    pub(crate) fn complete_turn(&mut self) -> TurnCompletion {
+    pub(crate) fn complete_turn(&mut self) {
         let current = std::mem::take(&mut self.current);
-        match current {
-            current @ Operation::Background(_) => {
-                self.current = current;
-                TurnCompletion::Commit
-            }
-            Operation::Turn(TurnOperation::Cancelling) => TurnCompletion::Cancelled,
-            Operation::Idle | Operation::Turn(TurnOperation::Running) => TurnCompletion::Commit,
+        if let Operation::Background(action) = current {
+            self.current = Operation::Background(action);
         }
     }
 
@@ -225,7 +214,7 @@ mod tests {
         state.start_turn();
         assert!(state.begin_cancellation());
 
-        assert_eq!(state.complete_turn(), TurnCompletion::Cancelled);
+        state.complete_turn();
         assert!(!state.is_busy());
     }
 
@@ -237,7 +226,7 @@ mod tests {
         assert!(state.begin_cancellation());
         assert!(!state.accepts_live_output());
 
-        assert_eq!(state.complete_turn(), TurnCompletion::Cancelled);
+        state.complete_turn();
         assert!(!state.is_busy());
     }
 
@@ -247,7 +236,7 @@ mod tests {
         state.start_background(BackgroundAction::ListSessions);
 
         assert!(!state.shows_activity());
-        assert_eq!(state.complete_turn(), TurnCompletion::Commit);
+        state.complete_turn();
         assert!(state.is_busy());
         state.finish();
         assert!(!state.is_busy());

@@ -83,15 +83,10 @@ struct AgentSetup {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    match &cli.command {
-        Some(Command::Run { prompt, .. }) => {
-            let setup = build_config(&cli)?;
-            run_print(setup, prompt.clone()).await
-        }
-        None => {
-            let setup = build_config(&cli)?;
-            run_interactive(setup).await
-        }
+    let setup = build_config(&cli)?;
+    match cli.command {
+        Some(Command::Run { prompt, .. }) => run_print(setup, prompt).await,
+        None => run_interactive(setup).await,
     }
 }
 
@@ -114,7 +109,9 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
             .as_ref()
             .and_then(|skill| skill.tools.as_deref()),
     )?;
-    tools.push(skill_tool(skills)?);
+    if !skills.is_empty() {
+        tools.push(skill_tool(skills)?);
+    }
 
     let provider = ProviderConfig {
         protocol: protocol.clone(),
@@ -176,10 +173,9 @@ fn subagent_views(snapshots: &[SubagentSnapshot]) -> Vec<SubagentView> {
     snapshots
         .iter()
         .map(|snapshot| SubagentView {
-            task_name: snapshot.task_name.clone(),
+            task_path: snapshot.task_path.clone(),
             agent_type: snapshot.agent_type.clone(),
             state: match snapshot.state {
-                SubagentState::Pending => SubagentViewState::Pending,
                 SubagentState::Running => SubagentViewState::Running,
                 SubagentState::Completed => SubagentViewState::Completed,
                 SubagentState::Interrupted => SubagentViewState::Interrupted,
@@ -496,11 +492,7 @@ impl InteractiveController {
 
     async fn compact_session(&self) {
         let event = match self.session.compact().await {
-            Ok(result) => UiEvent::CompactionCompleted {
-                before: u64::try_from(result.before_tokens).unwrap_or(u64::MAX),
-                after: u64::try_from(result.after_tokens).unwrap_or(u64::MAX),
-                dropped: u64::try_from(result.dropped_messages).unwrap_or(u64::MAX),
-            },
+            Ok(result) => UiEvent::CompactionCompleted(result),
             Err(error) => UiEvent::CommandFailed(format!("Failed to compact context: {error}")),
         };
         self.send_ui_event(event).await;

@@ -488,7 +488,7 @@ fn publish(
     let _ = events.send(event);
 }
 
-fn session_closed() -> ash_core::AshError {
+const fn session_closed() -> ash_core::AshError {
     ash_core::AshError::Session(ash_core::SessionError::Closed)
 }
 
@@ -501,11 +501,11 @@ fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
-fn inactive_turn() -> ash_core::AshError {
+const fn inactive_turn() -> ash_core::AshError {
     ash_core::AshError::Session(ash_core::SessionError::InactiveTurn)
 }
 
-fn busy_session() -> ash_core::AshError {
+const fn busy_session() -> ash_core::AshError {
     ash_core::AshError::Session(ash_core::SessionError::Busy)
 }
 
@@ -787,8 +787,8 @@ impl SessionActorState {
             compact_with_adapter(&self.config, &model_context, model, cancel).await?
         else {
             return Ok(ContextUpdate {
-                before_tokens,
-                after_tokens: before_tokens,
+                before_tokens: u64::try_from(before_tokens).unwrap_or(u64::MAX),
+                after_tokens: u64::try_from(before_tokens).unwrap_or(u64::MAX),
                 dropped_messages: 0,
             });
         };

@@ -295,7 +295,7 @@ fn read_line(
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |index| index + 1);
-        let content = newline.map_or(consumed, |index| index);
+        let content = newline.unwrap_or(consumed);
         let remaining = MAX_SEARCH_LINE_BYTES.saturating_sub(output.len());
         output.extend_from_slice(&available[..content.min(remaining)]);
         truncated |= content > remaining;

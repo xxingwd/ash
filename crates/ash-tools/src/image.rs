@@ -30,8 +30,8 @@ enum PreparedImage {
     },
 }
 
-pub fn tool_output(media_type: &str, bytes: Vec<u8>) -> Result<ToolOutput, ToolError> {
-    match prepare(&bytes, media_type, DEFAULT_LIMITS)? {
+pub fn tool_output(media_type: &str, bytes: &[u8]) -> Result<ToolOutput, ToolError> {
+    match prepare(bytes, media_type, DEFAULT_LIMITS)? {
         PreparedImage::Inline {
             media_type,
             data,
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn keeps_small_supported_images() {
         let bytes = png_bytes(8, 4);
-        let output = tool_output("image/png", bytes.clone()).unwrap();
+        let output = tool_output("image/png", &bytes).unwrap();
 
         assert_eq!(output.text, "Read image file [image/png]");
         assert!(matches!(
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn converts_bmp_even_when_small() {
-        let output = tool_output("image/bmp", bmp_bytes(4, 4)).unwrap();
+        let output = tool_output("image/bmp", &bmp_bytes(4, 4)).unwrap();
 
         assert!(output.text.contains("Read image file [image/jpeg]"));
         assert!(output
@@ -266,7 +266,8 @@ mod tests {
         match prepared {
             PreparedImage::Omitted { reason } => {
                 assert!(
-                    reason.contains("could not be resized below the 1B inline image size limit")
+                    reason.contains("could not be resized below the 1B inline image size limit"),
+                    "unexpected reason: {reason}"
                 );
             }
             PreparedImage::Inline { .. } => panic!("oversized image was kept"),
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn rejects_undecodable_bytes() {
-        let error = tool_output("image/png", b"not-an-image".to_vec()).unwrap_err();
+        let error = tool_output("image/png", b"not-an-image").unwrap_err();
         assert!(matches!(
             error,
             ToolError::Execution(message) if message.contains("cannot decode image")

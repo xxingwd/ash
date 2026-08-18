@@ -181,7 +181,7 @@ async fn read_file(
                 &cancellation,
                 deadline,
             )?;
-            return crate::image::tool_output(media_type, bytes);
+            return crate::image::tool_output(media_type, &bytes);
         }
         render_reader(file, offset, limit, &cancellation, deadline).map(Into::into)
     })

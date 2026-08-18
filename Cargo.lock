@@ -131,13 +131,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "smart-default",
  "tempfile",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -171,16 +168,12 @@ dependencies = [
  "ash-agent",
  "ash-core",
  "ash-protocol",
- "async-trait",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
- "tokio-util",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -209,7 +202,6 @@ version = "0.1.0"
 dependencies = [
  "ash-core",
  "async-stream",
- "async-trait",
  "base64 0.23.0",
  "eventsource-stream",
  "futures",
@@ -218,9 +210,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
- "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -254,10 +244,8 @@ dependencies = [
  "futures",
  "pulldown-cmark",
  "ratatui",
- "serde",
  "serde_json",
  "tokio",
- "tracing",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -2792,17 +2780,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "smart-default"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0eb01866308440fc64d6c44d9e86c5cc17adfe33c4d6eed55da9145044d0ffc1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "socket2"

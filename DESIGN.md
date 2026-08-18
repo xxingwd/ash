@@ -161,11 +161,11 @@ role/content combinations and system images fail locally as invalid requests.
 
 `ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
 `spawn_agent`, `message_agent`, `interrupt_agent`, and `wait_agent` tools. Child construction uses
-the internal `ChildSessionFactory` and `ChildSessionSpec` contracts. Built-in `AgentProfile` values
-(`default`, `explorer`, and `worker`) apply prompt, tool, model, and turn-limit overrides without
-changing the session engine.
+the clean base `Agent`, `Runtime`, and `SessionOptions` held directly by the controller. Built-in
+`AgentProfile` values (`default`, `explorer`, and `worker`) apply prompt and tool-policy overrides
+without changing the session engine.
 
-The child factory retains the unmodified base `Agent`. Only the main agent receives the collaboration
+The controller retains the unmodified base `Agent`. Only the main agent receives the collaboration
 tools and `<multi_agent_mode>` instructions; every child derives from the clean base and therefore
 cannot delegate further. Child prompts contain only the base prompt and selected profile instructions.
 Every child gets its own `Session` and executes through the same runtime path as the main agent. Tree
@@ -173,9 +173,17 @@ identity and canonical agent path live in `SessionIdentity`; tools receive a rea
 through `ToolContext.session`. Collaboration state does not leak into terminal state or create a
 second execution queue.
 
+Collaboration is an assembly result, not a permission system. `install_collaboration` takes a clean
+base `Agent` and is the only assembly path; an already-enhanced agent is rejected. There is no
+`AgentScope`, no configurable delegation depth, and children cannot spawn grandchildren — nested
+collaboration would get a new design instead of prebuilt abstractions.
+
 The controller counts every accepted follow-up until it settles. A child with queued follow-ups
 stays active and receives no completion revision until the final queued turn finishes, so waiters
 cannot observe an intermediate result as the agent's terminal state.
+Spawns and follow-ups for idle children reserve concurrency capacity before awaiting session
+delivery; failures and cancellation release the reservation, while successful delivery converts it
+to tracked work under the same controller lock.
 
 ## Stream Integrity And Error Handling
 
@@ -203,7 +211,7 @@ Retries follow a strict safety policy. A single model call may be re-issued up
  to `RunConfig::max_retries` times (default 5), and only when:
 
 - the failure is transport-level and retryable: `Request` (network/EOF),
-  upstream 5xx, or `RateLimited`; or the stream was `Truncated`; and
+  upstream 500/502/503/504/520-524/529, or `RateLimited`; or the stream was `Truncated`; and
 - no tool call has been executed yet in this call, so re-issuing the request
   cannot repeat side effects.
 
@@ -211,8 +219,8 @@ Between attempts the runner waits an exponential backoff (`RetryBackoff`,
 base 1s doubling to a 10s cap, i.e. 1s, 2s, 4s, 8s, 10s), and a cancellation
 during the wait aborts the turn instead of retrying.
 
-Non-retryable failures (`Auth`, `InvalidRequest`, `ContextTooLong`,
-`InvalidResponse`, upstream 4xx) fail the turn immediately and surface as
+Non-retryable failures (`Auth`, `InvalidRequest`, `InvalidResponse`, other upstream
+statuses) fail the turn immediately and surface as
 `TurnResult::Failed`. On retry, the partial assistant message is discarded both
 from memory and from the staged log (`SessionPersistence::rollback_to`), so a
 successful retry leaves no trace of the failed attempt; when the retry budget

@@ -42,17 +42,6 @@ impl AgentPath {
     pub fn segments(&self) -> impl Iterator<Item = &str> {
         self.0.trim_start_matches('/').split('/').skip(1)
     }
-
-    /// Whether this path sits inside `prefix` on a segment boundary, so
-    /// `/root/a/b` matches the prefix `/root/a` but not `/root/ab`.
-    #[must_use]
-    pub fn under(&self, prefix: &str) -> bool {
-        let prefix = prefix.trim_end_matches('/');
-        if prefix.is_empty() {
-            return true;
-        }
-        self.0 == prefix || self.0.starts_with(&format!("{prefix}/"))
-    }
 }
 
 impl std::fmt::Display for AgentPath {
@@ -120,6 +109,10 @@ impl SessionIdentity {
 
 /// Restore a path from persisted storage, rejecting anything that could not
 /// have been produced by `AgentPath::join`.
+///
+/// # Errors
+///
+/// Returns `AshError::Config` when the path is not a valid canonical agent path.
 pub fn parse_agent_path(value: &str) -> Result<AgentPath, AshError> {
     let invalid = || AshError::Config(format!("invalid agent path in session header: {value}"));
     let body = value.strip_prefix('/').ok_or_else(invalid)?;
@@ -172,22 +165,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_matching_honors_segment_boundaries() {
-        let path = AgentPath::root().join("ab").unwrap();
-        assert!(path.under("/root"));
-        assert!(path.under("/root/ab"));
-        assert!(!path.under("/root/a"));
-        assert!(path.under(""));
-    }
-
-    #[test]
     fn child_identity_derives_lineage_from_the_parent() {
         let root = SessionIdentity::root(SessionId::new());
         let child = root.child(SessionId::new(), "research").unwrap();
         assert_eq!(child.root_id, root.id);
         assert_eq!(child.parent_id, Some(root.id));
         assert_eq!(child.path.as_str(), "/root/research");
-        assert!(child.path.under(root.path.as_str()));
 
         let grandchild = child.child(SessionId::new(), "scan").unwrap();
         assert_eq!(grandchild.root_id, root.id);

@@ -430,7 +430,7 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                subagent.task_name.as_str(),
+                subagent.task_path.as_str(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(" (", Style::default().add_modifier(Modifier::DIM)),
@@ -473,7 +473,6 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
 
 const fn subagent_state_symbol(state: SubagentViewState) -> &'static str {
     match state {
-        SubagentViewState::Pending => "○",
         SubagentViewState::Running => "●",
         SubagentViewState::Completed => "✓",
         SubagentViewState::Interrupted => "⏸",
@@ -483,7 +482,6 @@ const fn subagent_state_symbol(state: SubagentViewState) -> &'static str {
 
 const fn subagent_state_label(state: SubagentViewState) -> &'static str {
     match state {
-        SubagentViewState::Pending => "pending",
         SubagentViewState::Running => "running",
         SubagentViewState::Completed => "done",
         SubagentViewState::Interrupted => "interrupted",
@@ -493,7 +491,7 @@ const fn subagent_state_label(state: SubagentViewState) -> &'static str {
 
 const fn subagent_state_color(state: SubagentViewState) -> Color {
     match state {
-        SubagentViewState::Pending | SubagentViewState::Interrupted => Color::Yellow,
+        SubagentViewState::Interrupted => Color::Yellow,
         SubagentViewState::Running => Color::Cyan,
         SubagentViewState::Completed => Color::Green,
         SubagentViewState::Errored => Color::Red,
@@ -990,15 +988,15 @@ mod tests {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [
             SubagentView {
-                task_name: "inspect_glob".to_string(),
+                task_path: "/root/inspect_glob".to_string(),
                 agent_type: "explorer".to_string(),
                 state: SubagentViewState::Running,
                 last_task_message: "Inspect the glob API".to_string(),
             },
             SubagentView {
-                task_name: "fix_bash".to_string(),
+                task_path: "/root/fix_bash".to_string(),
                 agent_type: "worker".to_string(),
-                state: SubagentViewState::Pending,
+                state: SubagentViewState::Running,
                 last_task_message: "Add cwd to bash".to_string(),
             },
         ];
@@ -1034,14 +1032,14 @@ mod tests {
         assert!(row_text(&frame.buffer, 6).contains("running"));
         assert!(row_text(&frame.buffer, 7).contains("fix_bash"));
         assert!(row_text(&frame.buffer, 7).contains("worker"));
-        assert!(row_text(&frame.buffer, 7).contains("pending"));
+        assert!(row_text(&frame.buffer, 7).contains("running"));
     }
 
     #[test]
     fn completed_subagents_do_not_occupy_a_row() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [SubagentView {
-            task_name: "inspect_glob".to_string(),
+            task_path: "/root/inspect_glob".to_string(),
             agent_type: "explorer".to_string(),
             state: SubagentViewState::Completed,
             last_task_message: "Inspect the glob API".to_string(),

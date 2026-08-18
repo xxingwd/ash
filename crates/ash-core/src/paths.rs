@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 /// Sessions, message history and other platform-owned data live below this
 /// directory. Falls back to a relative `.ash` directory when the current
 /// user's home directory cannot be determined.
+#[must_use]
 pub fn ash_data_dir() -> PathBuf {
     let base_dirs = directories::BaseDirs::new();
-    ash_data_dir_from_home(base_dirs.as_ref().map(|dirs| dirs.home_dir()))
+    ash_data_dir_from_home(base_dirs.as_ref().map(directories::BaseDirs::home_dir))
 }
 
 fn ash_data_dir_from_home(home_dir: Option<&Path>) -> PathBuf {

@@ -102,6 +102,17 @@ pub struct ForkPoint {
     pub prompt: String,
 }
 
+/// Observable result of a model-context compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUpdate {
+    #[serde(rename = "before")]
+    pub before_tokens: u64,
+    #[serde(rename = "after")]
+    pub after_tokens: u64,
+    #[serde(rename = "dropped")]
+    pub dropped_messages: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEventKind {
     /// A turn started executing; its input was already accepted.
@@ -111,11 +122,7 @@ pub enum SessionEventKind {
     /// A turn settled: the canonical boundary for committing scrollback.
     TurnCompleted(TurnView),
     /// The model context was compacted while a turn was executing.
-    ContextCompacted {
-        before: u64,
-        after: u64,
-        dropped: u64,
-    },
+    ContextCompacted(ContextUpdate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display)]

@@ -1,7 +1,7 @@
 /// Presentation-only snapshot of a child agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentView {
-    pub task_name: String,
+    pub task_path: String,
     pub agent_type: String,
     pub state: SubagentViewState,
     pub last_task_message: String,
@@ -9,7 +9,6 @@ pub struct SubagentView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentViewState {
-    Pending,
     Running,
     Completed,
     Interrupted,
@@ -19,6 +18,6 @@ pub enum SubagentViewState {
 impl SubagentViewState {
     #[must_use]
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running)
+        matches!(self, Self::Running)
     }
 }

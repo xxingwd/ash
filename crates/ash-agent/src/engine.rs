@@ -413,11 +413,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         }
         let _ = self
             .tx
-            .send(SessionEventKind::ContextCompacted {
-                before: u64::try_from(update.before_tokens).unwrap_or(u64::MAX),
-                after: u64::try_from(update.after_tokens).unwrap_or(u64::MAX),
-                dropped: u64::try_from(update.dropped_messages).unwrap_or(u64::MAX),
-            })
+            .send(SessionEventKind::ContextCompacted(update))
             .await;
         Ok(estimated_input_tokens)
     }
@@ -479,15 +475,9 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 self.execute_tool(messages, &call.name, call.arguments.clone())
                     .await,
             );
-            let (output, is_error, result, attachments) = match result {
-                Ok(output) => {
-                    let ToolOutput { text, attachments } = output;
-                    (text.clone(), false, Ok(text), attachments)
-                }
-                Err(error) => {
-                    let text = error.to_string();
-                    (text.clone(), true, Err(text), Vec::new())
-                }
+            let (output, is_error, attachments) = match result {
+                Ok(ToolOutput { text, attachments }) => (text, false, attachments),
+                Err(error) => (error.to_string(), true, Vec::new()),
             };
             send_live(
                 &self.tx,
@@ -495,11 +485,12 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                     id: call.id.clone(),
                     name: call.name,
                     arguments: call.arguments,
-                    output,
+                    output: output.clone(),
                     is_error,
                 }),
             )
             .await;
+            let result = if is_error { Err(output) } else { Ok(output) };
             let message = Message::tool_result(call.id, result, attachments);
             self.persist_message(&message)?;
             messages.push(message);
@@ -743,16 +734,19 @@ fn response_action(
 }
 
 /// Error classification for the retry path. Only transport-level failures are
-/// retried: request/network errors, upstream 5xx, and rate limits. Auth,
-/// request-shaping, and response-shaping errors are never retried because
-/// re-issuing them cannot succeed.
+/// retried: request/network errors, explicitly retryable upstream statuses,
+/// and rate limits. Auth, request-shaping, and response-shaping errors are
+/// never retried because re-issuing them cannot succeed.
 const fn retryable(error: &ash_core::ProtocolError) -> bool {
     matches!(
         error,
         ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited
     ) || matches!(
         error,
-        ash_core::ProtocolError::Upstream { status, .. } if *status >= 500
+        ash_core::ProtocolError::Upstream {
+            status: 500 | 502 | 503 | 504 | 520..=524 | 529,
+            ..
+        }
     )
 }
 
@@ -1135,8 +1129,12 @@ mod tests {
             ));
             drop(requests);
         }
-        assert!(std::iter::from_fn(|| rx.try_recv().ok())
-            .any(|event| matches!(event, SessionEventKind::ContextCompacted { dropped: 2, .. })));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+                event,
+                SessionEventKind::ContextCompacted(update) if update.dropped_messages == 2
+            ))
+        );
     }
 
     #[tokio::test]
@@ -2145,6 +2143,22 @@ mod tests {
         // 16s would exceed the cap; clamped to 10s.
         assert_eq!(retry_delay(4, backoff), Duration::from_secs(10));
         assert_eq!(retry_delay(9, backoff), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn retries_only_explicitly_allowed_upstream_statuses() {
+        for status in [500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
+            assert!(retryable(&ash_core::ProtocolError::Upstream {
+                status,
+                message: "temporary failure".into(),
+            }));
+        }
+        for status in [501, 505, 599] {
+            assert!(!retryable(&ash_core::ProtocolError::Upstream {
+                status,
+                message: "permanent or unknown failure".into(),
+            }));
+        }
     }
 
     #[tokio::test]

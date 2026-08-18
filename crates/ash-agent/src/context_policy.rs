@@ -1,5 +1,6 @@
 use ash_core::{
-    CancellationToken, Message, ModelClient, ModelEvent, ModelId, ModelRequest, ToolDefinition,
+    CancellationToken, ContextUpdate, Message, ModelClient, ModelEvent, ModelId, ModelRequest,
+    ToolDefinition,
 };
 use futures::StreamExt;
 
@@ -46,13 +47,6 @@ pub struct PreparedContext {
     /// Token estimate for the prepared messages (system + tools + history),
     /// computed once by the policy so the engine does not re-tokenize.
     pub estimated_input_tokens: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ContextUpdate {
-    pub before_tokens: usize,
-    pub after_tokens: usize,
-    pub dropped_messages: usize,
 }
 
 pub struct CompactedContext {
@@ -151,9 +145,9 @@ impl DefaultContextPolicy {
         Ok(Some(CompactedContext {
             messages,
             update: ContextUpdate {
-                before_tokens,
-                after_tokens,
-                dropped_messages: plan.compacted_messages,
+                before_tokens: u64::try_from(before_tokens).unwrap_or(u64::MAX),
+                after_tokens: u64::try_from(after_tokens).unwrap_or(u64::MAX),
+                dropped_messages: u64::try_from(plan.compacted_messages).unwrap_or(u64::MAX),
             },
         }))
     }
@@ -178,7 +172,8 @@ impl ContextPolicy for DefaultContextPolicy {
             return Ok(request.into_prepared(estimated_tokens));
         };
         Ok(PreparedContext {
-            estimated_input_tokens: compacted.update.after_tokens,
+            estimated_input_tokens: usize::try_from(compacted.update.after_tokens)
+                .unwrap_or(usize::MAX),
             messages: compacted.messages,
             ephemeral_context: request.ephemeral_context,
             update: Some(compacted.update),

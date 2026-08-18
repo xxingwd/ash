@@ -108,32 +108,41 @@ impl StreamingMarkdownCache {
 
 /// Total combined row count: stable lines, an optional blank gap row between
 /// the stable and streaming tail, then the tail lines.
-pub fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
-    stable
-        .len()
-        .saturating_add(usize::from(!stable.is_empty() && !tail.is_empty()))
-        .saturating_add(tail.len())
+#[must_use]
+pub const fn combined_line_count(stable: &[RenderedLine], tail: &[RenderedLine]) -> usize {
+    let gap = if !stable.is_empty() && !tail.is_empty() {
+        1
+    } else {
+        0
+    };
+    stable.len().saturating_add(gap).saturating_add(tail.len())
 }
 
 /// Maps a combined row index (stable lines, then the optional blank gap row,
 /// then the streaming tail lines) to the underlying line. Returns `None` for
 /// the gap row and for out-of-range indices.
-pub fn combined_line<'a>(
+#[must_use]
+pub const fn combined_line<'a>(
     stable: &'a [RenderedLine],
     tail: &'a [RenderedLine],
     index: usize,
 ) -> Option<&'a RenderedLine> {
     if index < stable.len() {
-        return stable.get(index);
+        return Some(&stable[index]);
     }
     let has_gap = !stable.is_empty() && !tail.is_empty();
     if has_gap && index == stable.len() {
         return None;
     }
+    let gap_offset = if has_gap { 1 } else { 0 };
     let tail_index = index
         .saturating_sub(stable.len())
-        .saturating_sub(usize::from(has_gap));
-    tail.get(tail_index)
+        .saturating_sub(gap_offset);
+    if tail_index < tail.len() {
+        Some(&tail[tail_index])
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default)]

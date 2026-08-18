@@ -53,20 +53,10 @@ impl<'de> Deserialize<'de> for SessionHeader {
         if !parent_present {
             return Err(D::Error::custom("missing required field `parent_id`"));
         }
-        fn take<T, E>(map: &mut BTreeMap<String, serde_json::Value>, name: &str) -> Result<T, E>
-        where
-            T: serde::de::DeserializeOwned,
-            E: serde::de::Error,
-        {
-            let value = map
-                .remove(name)
-                .ok_or_else(|| E::custom(format!("missing required field `{name}`")))?;
-            serde_json::from_value(value).map_err(E::custom)
-        }
-        let format_version: u32 = take(&mut map, "format_version")?;
-        let session_id: SessionId = take(&mut map, "session_id")?;
-        let root_id: SessionId = take(&mut map, "root_id")?;
-        let path: AgentPath = take(&mut map, "path")?;
+        let format_version: u32 = take_field(&mut map, "format_version")?;
+        let session_id: SessionId = take_field(&mut map, "session_id")?;
+        let root_id: SessionId = take_field(&mut map, "root_id")?;
+        let path: AgentPath = take_field(&mut map, "path")?;
         let title: Option<String> = map
             .remove("title")
             .map(serde_json::from_value::<Option<String>>)
@@ -82,6 +72,20 @@ impl<'de> Deserialize<'de> for SessionHeader {
             title,
         })
     }
+}
+
+fn take_field<T, E>(
+    map: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    name: &str,
+) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::Error,
+{
+    let value = map
+        .remove(name)
+        .ok_or_else(|| E::custom(format!("missing required field `{name}`")))?;
+    serde_json::from_value(value).map_err(E::custom)
 }
 
 impl SessionHeader {

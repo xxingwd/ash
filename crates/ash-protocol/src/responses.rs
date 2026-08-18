@@ -37,36 +37,35 @@ impl ResponsesAdapter {
                     input.push(json!({"role": "user", "content": responses_content(contents)}));
                 }
                 MessageGroup::Assistant(blocks) => {
-                    let text = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text(text) => Some(text.as_str()),
-                            ContentBlock::Thought { .. } | ContentBlock::ToolCall { .. } => None,
-                        })
-                        .collect::<String>();
+                    let mut text = String::new();
+                    let mut extra = Vec::new();
+                    for block in blocks {
+                        match block {
+                            ContentBlock::Text(t) => text.push_str(t),
+                            ContentBlock::Thought { text, .. } => {
+                                extra.push(json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": text}],
+                                }));
+                            }
+                            ContentBlock::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                extra.push(json!({
+                                    "type": "function_call",
+                                    "call_id": id.as_str(),
+                                    "name": name,
+                                    "arguments": arguments.to_string(),
+                                }));
+                            }
+                        }
+                    }
                     if !text.is_empty() {
                         input.push(json!({"role": "assistant", "content": text}));
                     }
-                    input.extend(blocks.iter().filter_map(|block| match block {
-                        ContentBlock::Thought { text, .. } => Some(json!({
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": text}],
-                        })),
-                        ContentBlock::Text(_) | ContentBlock::ToolCall { .. } => None,
-                    }));
-                    input.extend(blocks.iter().filter_map(|block| match block {
-                        ContentBlock::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        } => Some(json!({
-                            "type": "function_call",
-                            "call_id": id.as_str(),
-                            "name": name,
-                            "arguments": arguments.to_string(),
-                        })),
-                        ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
-                    }));
+                    input.extend(extra);
                 }
                 MessageGroup::ToolResults(group) => {
                     for result in &group.results {
@@ -280,7 +279,7 @@ impl sse::Decoder for ResponsesDecoder {
                 self.completed(&event, &mut items)?;
                 return Ok(sse::DecodeResult::Close(items));
             }
-            "response.failed" => return Err(Self::stream_error_message(&event)),
+            "error" | "response.failed" => return Err(Self::stream_error(&event)),
             _ => {}
         }
         Ok(sse::DecodeResult::Continue(items))
@@ -414,13 +413,22 @@ impl ResponsesDecoder {
         Ok(())
     }
 
-    fn stream_error_message(event: &Value) -> ProtocolError {
-        ProtocolError::InvalidResponse(
-            event["response"]["error"]["message"]
-                .as_str()
-                .unwrap_or("Responses API stream failed")
-                .to_string(),
-        )
+    fn stream_error(event: &Value) -> ProtocolError {
+        let error = event["response"].get("error").unwrap_or(event);
+        let code = error["code"].as_str();
+        let message = error["message"]
+            .as_str()
+            .unwrap_or("Responses API stream failed");
+        match code {
+            Some("server_is_overloaded") => ProtocolError::Upstream {
+                status: 503,
+                message: message.to_string(),
+            },
+            Some("rate_limit_exceeded" | "rate_limit_error") => ProtocolError::RateLimited,
+            _ => ProtocolError::InvalidResponse(
+                code.map_or_else(|| message.to_string(), |code| format!("{code}: {message}")),
+            ),
+        }
     }
 }
 
@@ -554,6 +562,45 @@ mod tests {
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
         assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn maps_server_overload_to_a_retryable_upstream_error() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result = decoder.decode(
+            r#"{"type":"error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProtocolError::Upstream { status: 503, message })
+                if message == "Our servers are currently overloaded. Please try again later."
+        ));
+    }
+
+    #[test]
+    fn maps_rate_limit_stream_errors_to_the_retryable_category() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result = decoder
+            .decode(r#"{"type":"error","code":"rate_limit_exceeded","message":"Slow down"}"#);
+
+        assert!(matches!(result, Err(ProtocolError::RateLimited)));
+    }
+
+    #[test]
+    fn preserves_unknown_stream_error_details_without_retrying() {
+        let mut decoder = ResponsesDecoder::default();
+
+        let result = decoder
+            .decode(r#"{"type":"error","code":"unexpected_error","message":"something failed"}"#);
+
+        assert!(matches!(
+            result,
+            Err(ProtocolError::InvalidResponse(message))
+                if message == "unexpected_error: something failed"
+        ));
     }
 
     #[test]

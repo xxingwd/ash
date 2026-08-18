@@ -40,35 +40,24 @@ impl CompletionsAdapter {
                     messages.push(json!({"role": "user", "content": chat_content(contents)}));
                 }
                 MessageGroup::Assistant(blocks) => {
-                    let text = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text(text) => Some(text.as_str()),
-                            ContentBlock::Thought { .. } | ContentBlock::ToolCall { .. } => None,
-                        })
-                        .collect::<String>();
-                    let reasoning = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Thought { text, .. } => Some(text.as_str()),
-                            ContentBlock::Text(_) | ContentBlock::ToolCall { .. } => None,
-                        })
-                        .collect::<String>();
-                    let calls: Vec<Value> = blocks
-                        .iter()
-                        .filter_map(|block| match block {
+                    let mut text = String::new();
+                    let mut reasoning = String::new();
+                    let mut calls = Vec::new();
+                    for block in blocks {
+                        match block {
+                            ContentBlock::Text(t) => text.push_str(t),
+                            ContentBlock::Thought { text: r, .. } => reasoning.push_str(r),
                             ContentBlock::ToolCall {
                                 id,
                                 name,
                                 arguments,
-                            } => Some(json!({
+                            } => calls.push(json!({
                                 "id": id.as_str(),
                                 "type": "function",
                                 "function": {"name": name, "arguments": arguments.to_string()},
                             })),
-                            ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
-                        })
-                        .collect();
+                        }
+                    }
                     let mut value = json!({"role": "assistant", "content": text});
                     if !reasoning.is_empty() {
                         value["reasoning_content"] = json!(reasoning);

@@ -163,8 +163,10 @@ impl ModelClient for AnthropicAdapter {
 #[derive(Default)]
 pub(crate) struct AnthropicDecoder {
     calls: BTreeMap<u64, PendingCall>,
-    stop: Option<StopReason>,
-    completed: Option<StopReason>,
+    /// Stop reason announced by `message_delta`; not yet a terminal state.
+    announced_stop: Option<StopReason>,
+    /// Stop reason confirmed by `message_stop`; drives `finalize`.
+    completed_stop: Option<StopReason>,
 }
 
 impl AnthropicDecoder {
@@ -195,14 +197,17 @@ impl sse::Decoder for AnthropicDecoder {
                 self.message_stop()?;
                 return Ok(sse::DecodeResult::Close(items));
             }
-            "error" => return Err(Self::stream_error_message(&event)),
+            "error" => return Err(Self::stream_error(&event)),
             _ => {}
         }
         Ok(sse::DecodeResult::Continue(items))
     }
 
     fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
-        Ok((Vec::new(), self.completed.unwrap_or(StopReason::Truncated)))
+        Ok((
+            Vec::new(),
+            self.completed_stop.unwrap_or(StopReason::Truncated),
+        ))
     }
 }
 
@@ -292,7 +297,7 @@ impl AnthropicDecoder {
             .as_str()
             .filter(|reason| !reason.trim().is_empty())
         {
-            self.stop = Some(stop_reason(reason));
+            self.announced_stop = Some(stop_reason(reason));
         }
     }
 
@@ -302,22 +307,41 @@ impl AnthropicDecoder {
                 "Anthropic message stopped with an unfinished tool call".to_string(),
             ));
         }
-        let stop = self.stop.take().ok_or_else(|| {
+        let stop = self.announced_stop.take().ok_or_else(|| {
             ProtocolError::InvalidResponse(
                 "Anthropic message stopped without a stop reason".to_string(),
             )
         })?;
-        self.completed = Some(stop);
+        self.completed_stop = Some(stop);
         Ok(())
     }
 
-    fn stream_error_message(event: &Value) -> ProtocolError {
-        ProtocolError::InvalidResponse(
-            event["error"]["message"]
-                .as_str()
-                .unwrap_or("Anthropic stream error")
-                .to_string(),
-        )
+    fn stream_error(event: &Value) -> ProtocolError {
+        let error = &event["error"];
+        let error_type = error["type"].as_str();
+        let message = error["message"]
+            .as_str()
+            .unwrap_or("Anthropic stream error");
+        match error_type {
+            Some("authentication_error" | "permission_error") => ProtocolError::Auth,
+            Some("rate_limit_error") => ProtocolError::RateLimited,
+            Some("api_error") => ProtocolError::Upstream {
+                status: 500,
+                message: message.to_string(),
+            },
+            Some("overloaded_error") => ProtocolError::Upstream {
+                status: 529,
+                message: message.to_string(),
+            },
+            Some(
+                error_type @ ("invalid_request_error"
+                | "request_too_large"
+                | "not_found_error"
+                | "billing_error"),
+            ) => ProtocolError::InvalidRequest(format!("{error_type}: {message}")),
+            Some(error_type) => ProtocolError::InvalidResponse(format!("{error_type}: {message}")),
+            None => ProtocolError::InvalidResponse(message.to_string()),
+        }
     }
 }
 
@@ -385,6 +409,41 @@ mod tests {
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
         assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn maps_overload_and_rate_limit_stream_errors_to_retryable_categories() {
+        let overloaded = AnthropicDecoder::default().decode(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let rate_limited = AnthropicDecoder::default().decode(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down"}}"#,
+        );
+
+        assert!(matches!(
+            overloaded,
+            Err(ProtocolError::Upstream { status: 529, message }) if message == "Overloaded"
+        ));
+        assert!(matches!(rate_limited, Err(ProtocolError::RateLimited)));
+    }
+
+    #[test]
+    fn maps_non_retryable_stream_errors_without_losing_details() {
+        let invalid = AnthropicDecoder::default().decode(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#,
+        );
+        let unknown = AnthropicDecoder::default()
+            .decode(r#"{"type":"error","error":{"type":"new_error","message":"New failure"}}"#);
+
+        assert!(matches!(
+            invalid,
+            Err(ProtocolError::InvalidRequest(message))
+                if message == "invalid_request_error: Bad request"
+        ));
+        assert!(matches!(
+            unknown,
+            Err(ProtocolError::InvalidResponse(message)) if message == "new_error: New failure"
+        ));
     }
 
     #[test]

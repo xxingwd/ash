@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Display-oriented snapshot of a sub-agent, published for UI consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
-    pub task_name: String,
+    pub task_path: String,
     pub agent_type: String,
     pub state: SubagentState,
     pub last_task_message: String,
@@ -12,7 +12,6 @@ pub struct SubagentSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentState {
-    Pending,
     Running,
     Completed,
     Interrupted,
@@ -22,6 +21,6 @@ pub enum SubagentState {
 impl SubagentState {
     #[must_use]
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running)
+        matches!(self, Self::Running)
     }
 }
