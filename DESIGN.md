@@ -174,6 +174,8 @@ keeps its own history for later `message_agent` calls.
 The controller retains the unmodified base `Agent`. Only the main agent receives collaboration
 tools and brief orchestration instructions; every child derives from the clean base and therefore
 cannot delegate further. Child prompts contain only the base prompt and selected profile instructions.
+The main instructions require an independence check before non-trivial work and favor
+`agent(wait=false)` when useful work can continue in parallel.
 Every child gets its own `Session` and executes through the same runtime path as the main agent. Tree
 identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
 through `ToolContext.session`. Collaboration state does not leak into terminal state or create a

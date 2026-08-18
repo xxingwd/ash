@@ -21,7 +21,7 @@ const COLLABORATION_TOOL_NAMES: [&str; 3] = ["agent", "message_agent", "wait_age
 /// tools are not assumed to be read-only.
 const EXPLORER_TOOL_NAMES: [&str; 5] = ["read", "glob", "grep", "webfetch", "skill"];
 
-const COLLABORATION_INSTRUCTIONS: &str = "You are the main agent. Use `agent` for concrete, independent work and `message_agent` for follow-up work with an existing agent. Set `wait=false` when tasks can run independently, continue useful work while they run, then use `wait_agent` when their results are needed. Child agents share the workspace, cannot delegate further, and their results must be reviewed before use.";
+const COLLABORATION_INSTRUCTIONS: &str = "You are the main agent. Before non-trivial work, identify independent workstreams. Delegate concrete, bounded work that can proceed without blocking your current path; use `agent(wait=false)` for parallel work and continue useful non-overlapping work while it runs. Keep simple tasks, immediate blockers, and tightly coupled work local. Reuse an existing agent with `message_agent` for related follow-ups. Review agent results before using them. Child agents share the workspace and cannot delegate further.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -78,20 +78,20 @@ impl AgentProfile {
         match name {
             ProfileName::Default => Self {
                 name,
-                description: "General-purpose agent that inherits the main agent's tools.",
-                prompt: "Handle the assigned task directly and return a concise, evidence-backed result.",
+                description: "General-purpose agent for self-contained work.",
+                prompt: "Handle the assignment directly and return a concise, evidence-backed result.",
                 tools: ToolPolicy::Inherit,
             },
             ProfileName::Explorer => Self {
                 name,
-                description: "Read-only agent for focused codebase investigation.",
+                description: "Use for focused, independent, read-only codebase investigation.",
                 prompt: "Answer through read-only inspection. Return concrete findings with relevant paths and symbols.",
                 tools: ToolPolicy::Allow(&EXPLORER_TOOL_NAMES),
             },
             ProfileName::Worker => Self {
                 name,
-                description: "Agent for bounded implementation, testing, and refactoring.",
-                prompt: "Execute the assigned implementation task, preserve unrelated changes, verify the result, and report changed files.",
+                description: "Use for bounded implementation, testing, and refactoring.",
+                prompt: "Execute the assignment, preserve unrelated changes, verify the result, and report changed files.",
                 tools: ToolPolicy::Inherit,
             },
         }
@@ -288,7 +288,7 @@ impl AgentControl {
     pub fn tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let create = self.clone();
         let description = format!(
-            "Create a named leaf agent and send its initial message. Names remain available for follow-up messages. Use `wait=false` for independent work that should run in the background.\n\nAvailable profiles:\n{}",
+            "Create a named leaf agent and send its initial message. Use this proactively for a concrete, bounded workstream that can be investigated or implemented independently. Set `wait=false` when other work can continue in parallel; keep `wait=true` when the result is required before proceeding. Include enough context and the expected output. Names remain available for follow-up messages.\n\nAvailable profiles:\n{}",
             AgentProfile::descriptions()
         );
         let agent = define_tool("agent", &description, move |context, args: AgentArgs| {
@@ -789,10 +789,12 @@ mod tests {
             ["agent", "message_agent", "wait_agent"]
         );
         assert_eq!(tool_names(&control.inner.definition), Vec::<&str>::new());
-        assert!(installed
-            .system_prompt()
-            .unwrap()
-            .contains("Set `wait=false`"));
+        let prompt = installed.system_prompt().unwrap();
+        assert!(prompt.contains("Before non-trivial work"));
+        assert!(prompt.contains("`agent(wait=false)`"));
+        assert!(installed.tools()[0]
+            .description()
+            .contains("Use this proactively"));
     }
 
     #[test]
