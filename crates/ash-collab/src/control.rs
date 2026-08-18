@@ -21,7 +21,7 @@ const COLLABORATION_TOOL_NAMES: [&str; 3] = ["agent", "message_agent", "wait_age
 /// tools are not assumed to be read-only.
 const EXPLORER_TOOL_NAMES: [&str; 5] = ["read", "glob", "grep", "webfetch", "skill"];
 
-const COLLABORATION_INSTRUCTIONS: &str = "You are the main agent. Before non-trivial work, identify independent workstreams. Delegate concrete, bounded work that can proceed without blocking your current path; use `agent(wait=false)` for parallel work and continue useful non-overlapping work while it runs. Keep simple tasks, immediate blockers, and tightly coupled work local. Reuse an existing agent with `message_agent` for related follow-ups. Review agent results before using them. Child agents share the workspace and cannot delegate further.";
+const COLLABORATION_INSTRUCTIONS: &str = "You are the main agent. Before non-trivial work, identify independent workstreams. Delegate concrete, bounded work that benefits from separate execution. Keep simple tasks, immediate blockers, and tightly coupled work local. Reuse an existing agent with `message_agent` for related follow-ups. Review agent results before using them. Child agents share the workspace and cannot delegate further.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -288,7 +288,7 @@ impl AgentControl {
     pub fn tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let create = self.clone();
         let description = format!(
-            "Create a named leaf agent and send its initial message. Use this proactively for a concrete, bounded workstream that can be investigated or implemented independently. Set `wait=false` when other work can continue in parallel; keep `wait=true` when the result is required before proceeding. Include enough context and the expected output. Names remain available for follow-up messages.\n\nAvailable profiles:\n{}",
+            "Create a named leaf agent and send its initial message. Use this proactively for a concrete, bounded workstream that can be investigated or implemented independently. With `wait=true`, return the result in this call; with `wait=false`, submit it in the background for a later `wait_agent` call. Include enough context and the expected output. Names remain available for follow-up messages.\n\nAvailable profiles:\n{}",
             AgentProfile::descriptions()
         );
         let agent = define_tool("agent", &description, move |context, args: AgentArgs| {
@@ -299,7 +299,7 @@ impl AgentControl {
         let message = self.clone();
         let message_agent = define_tool(
             "message_agent",
-            "Send a follow-up message to an existing named agent. Busy agents queue turns in submission order. Set `interrupt=true` to cancel unfinished work first, or `wait=false` to return immediately.",
+            "Send a follow-up message to an existing named agent. Busy agents queue turns in submission order. Set `interrupt=true` to cancel unfinished work first. With `wait=true`, return the result in this call; with `wait=false`, submit it in the background for `wait_agent`.",
             move |context, args: MessageAgentArgs| {
                 let control = message.clone();
                 async move { control.message(context, args).await }
@@ -791,10 +791,13 @@ mod tests {
         assert_eq!(tool_names(&control.inner.definition), Vec::<&str>::new());
         let prompt = installed.system_prompt().unwrap();
         assert!(prompt.contains("Before non-trivial work"));
-        assert!(prompt.contains("`agent(wait=false)`"));
+        assert!(!prompt.contains("wait=false"));
         assert!(installed.tools()[0]
             .description()
             .contains("Use this proactively"));
+        assert!(installed.tools()[0]
+            .description()
+            .contains("With `wait=true`"));
     }
 
     #[test]
