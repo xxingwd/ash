@@ -146,8 +146,8 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 默认交互链路提供三个协作工具：
 
-- `agent`：创建命名 Agent 并提交初始任务
-- `message_agent`：向现有命名 Agent 提交后续任务；`interrupt: true` 会先取消未完成工作
+- `agent`：创建命名 Agent 并发送初始 `message`
+- `message_agent`：向现有命名 Agent 发送后续 `message`；`interrupt: true` 会先取消未完成工作
 - `wait_agent`：等待并消费后台任务的未读结果；`timeout_ms: 0` 立即返回当前快照
 
 `agent` 和 `message_agent` 默认使用 `wait: true`，这一轮完成后直接返回结果。独立任务可

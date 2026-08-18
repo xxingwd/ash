@@ -161,8 +161,8 @@ role/content combinations and system images fail locally as invalid requests.
 
 `ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
 `agent`, `message_agent`, and `wait_agent` tools. `agent` creates one named child with its initial
-task; `message_agent` submits a new turn to an existing child. Both wait for that turn by default and
-return its `TurnResult` plus final response. With `wait=false` they return immediately, and
+message; `message_agent` submits a new message to an existing child. Both wait for that turn by
+default and return its `TurnResult` plus final response. With `wait=false` they return immediately, and
 `wait_agent` later drains unread background completions. A synchronous result is consumed once; if
 its caller is cancelled or times out, the result falls back to the unread completion queue.
 
@@ -185,7 +185,7 @@ configurable delegation depth, collaboration concurrency limit, history fork, mo
 ID, list operation, or removal operation. Named agents live for their root session. Their display
 state is only `idle` or `running`; completion, failure, and interruption belong to `TurnResult`.
 `message_agent(interrupt=true)` cancels unfinished child turns before submitting the replacement
-task. The controller mirrors Turn handles for waiting and cancellation, while the child `Session`
+message. The controller mirrors Turn handles for waiting and cancellation, while the child `Session`
 remains the sole execution-queue owner.
 
 ## Stream Integrity And Error Handling

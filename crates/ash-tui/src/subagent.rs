@@ -4,7 +4,7 @@ pub struct SubagentView {
     pub name: String,
     pub profile: String,
     pub state: SubagentViewState,
-    pub last_task: String,
+    pub last_message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

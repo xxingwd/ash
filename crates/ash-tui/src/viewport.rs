@@ -421,7 +421,7 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let message = sanitize_single_line(&subagent.last_task);
+        let message = sanitize_single_line(&subagent.last_message);
         let line = Line::from(vec![
             Span::styled(
                 format!("{state_symbol} "),
@@ -982,13 +982,13 @@ mod tests {
                 name: "inspect_glob".to_string(),
                 profile: "explorer".to_string(),
                 state: SubagentViewState::Running,
-                last_task: "Inspect the glob API".to_string(),
+                last_message: "Inspect the glob API".to_string(),
             },
             SubagentView {
                 name: "fix_bash".to_string(),
                 profile: "worker".to_string(),
                 state: SubagentViewState::Running,
-                last_task: "Add cwd to bash".to_string(),
+                last_message: "Add cwd to bash".to_string(),
             },
         ];
         let frame = render(ViewportInput {
@@ -1033,7 +1033,7 @@ mod tests {
             name: "inspect_glob".to_string(),
             profile: "explorer".to_string(),
             state: SubagentViewState::Idle,
-            last_task: "Inspect the glob API".to_string(),
+            last_message: "Inspect the glob API".to_string(),
         }];
         let frame = render(ViewportInput {
             terminal_width: 80,

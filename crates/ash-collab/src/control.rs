@@ -147,13 +147,13 @@ struct AgentEntry {
     profile: ProfileName,
     session: Session,
     turns: VecDeque<TrackedTurn>,
-    last_task: String,
+    last_message: String,
 }
 
 struct TrackedTurn {
     id: TurnId,
     cancellation: CancellationToken,
-    task: String,
+    message: String,
     waiter: Option<oneshot::Sender<AgentCompletion>>,
 }
 
@@ -161,7 +161,7 @@ struct TrackedTurn {
 struct AgentCompletion {
     name: String,
     profile: ProfileName,
-    task: String,
+    message: String,
     result: TurnResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_message: Option<String>,
@@ -177,7 +177,7 @@ impl AgentEntry {
             } else {
                 SubagentState::Running
             },
-            last_task: self.last_task.clone(),
+            last_message: self.last_message.clone(),
         }
     }
 
@@ -221,8 +221,8 @@ impl ControlState {
 struct AgentArgs {
     /// Stable name using lowercase letters, digits, and underscores.
     name: String,
-    /// Initial task for the new agent.
-    task: String,
+    /// Initial message for the new agent.
+    message: String,
     /// Optional profile: default, explorer, or worker.
     profile: Option<ProfileName>,
     /// Wait for this turn and return its result. Defaults to true.
@@ -234,7 +234,7 @@ struct AgentArgs {
 struct MessageAgentArgs {
     /// Name of an existing agent.
     name: String,
-    /// Follow-up task for the agent.
+    /// Follow-up message for the agent.
     message: String,
     /// Cancel all unfinished turns before submitting this message.
     #[serde(default)]
@@ -288,7 +288,7 @@ impl AgentControl {
     pub fn tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let create = self.clone();
         let description = format!(
-            "Create a named leaf agent and give it an initial task. Names remain available for follow-up messages. Use `wait=false` for independent work that should run in the background.\n\nAvailable profiles:\n{}",
+            "Create a named leaf agent and send its initial message. Names remain available for follow-up messages. Use `wait=false` for independent work that should run in the background.\n\nAvailable profiles:\n{}",
             AgentProfile::descriptions()
         );
         let agent = define_tool("agent", &description, move |context, args: AgentArgs| {
@@ -299,7 +299,7 @@ impl AgentControl {
         let message = self.clone();
         let message_agent = define_tool(
             "message_agent",
-            "Send a follow-up task to an existing named agent. Busy agents queue turns in submission order. Set `interrupt=true` to cancel unfinished work first, or `wait=false` to return immediately.",
+            "Send a follow-up message to an existing named agent. Busy agents queue turns in submission order. Set `interrupt=true` to cancel unfinished work first, or `wait=false` to return immediately.",
             move |context, args: MessageAgentArgs| {
                 let control = message.clone();
                 async move { control.message(context, args).await }
@@ -321,7 +321,7 @@ impl AgentControl {
 
     async fn create(&self, context: ToolContext, args: AgentArgs) -> Result<String, ToolError> {
         validate_name(&args.name)?;
-        validate_task(&args.task)?;
+        validate_message(&args.message)?;
 
         let identity = context.session.identity;
         let path = identity
@@ -355,7 +355,7 @@ impl AgentControl {
                 )
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
-            let (turn, tracked, result) = submit(&session, args.task.clone(), args.wait).await?;
+            let (turn, tracked, result) = submit(&session, args.message.clone(), args.wait).await?;
             tree.agents.insert(
                 path.clone(),
                 AgentEntry {
@@ -363,7 +363,7 @@ impl AgentControl {
                     profile,
                     session,
                     turns: VecDeque::from([tracked]),
-                    last_task: args.task,
+                    last_message: args.message,
                 },
             );
             (turn, result)
@@ -380,7 +380,7 @@ impl AgentControl {
         args: MessageAgentArgs,
     ) -> Result<String, ToolError> {
         validate_name(&args.name)?;
-        validate_task(&args.message)?;
+        validate_message(&args.message)?;
 
         let identity = context.session.identity;
         let path = identity
@@ -400,7 +400,7 @@ impl AgentControl {
             let (turn, tracked, result) =
                 submit(&entry.session, args.message.clone(), args.wait).await?;
             entry.turns.push_back(tracked);
-            entry.last_task = args.message;
+            entry.last_message = args.message;
             (turn, entry.profile, result)
         };
 
@@ -505,7 +505,7 @@ impl AgentControl {
             let completion = AgentCompletion {
                 name: entry.name.clone(),
                 profile: entry.profile,
-                task: tracked.task,
+                message: tracked.message,
                 result,
                 final_message,
             };
@@ -533,7 +533,7 @@ impl AgentControl {
 
 async fn submit(
     session: &Session,
-    task: String,
+    message: String,
     wait: bool,
 ) -> Result<
     (
@@ -544,7 +544,7 @@ async fn submit(
     ToolError,
 > {
     let turn = session
-        .submit(Input::from_text(InputSource::Agent, task.clone()))
+        .submit(Input::from_text(InputSource::Agent, message.clone()))
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?;
     let (waiter, result) = if wait {
@@ -556,7 +556,7 @@ async fn submit(
     let tracked = TrackedTurn {
         id: turn.id(),
         cancellation: turn.cancellation_token(),
-        task,
+        message,
         waiter,
     };
     Ok((turn, tracked, result))
@@ -611,9 +611,9 @@ fn validate_name(name: &str) -> Result<(), ToolError> {
     }
 }
 
-fn validate_task(task: &str) -> Result<(), ToolError> {
-    if task.trim().is_empty() {
-        Err(ToolError::Execution("task cannot be empty".to_string()))
+fn validate_message(message: &str) -> Result<(), ToolError> {
+    if message.trim().is_empty() {
+        Err(ToolError::Execution("message cannot be empty".to_string()))
     } else {
         Ok(())
     }
@@ -802,7 +802,8 @@ mod tests {
         let create = tools[0].definition().parameters_schema;
         let message = tools[1].definition().parameters_schema;
 
-        assert!(create["properties"].get("task").is_some());
+        assert!(create["properties"].get("message").is_some());
+        assert!(create["properties"].get("task").is_none());
         assert!(create["properties"].get("profile").is_some());
         assert!(create["properties"].get("interrupt").is_none());
         assert!(message["properties"].get("message").is_some());
@@ -811,7 +812,7 @@ mod tests {
 
         let args: AgentArgs = serde_json::from_value(serde_json::json!({
             "name": "research",
-            "task": "inspect"
+            "message": "inspect"
         }))
         .unwrap();
         assert!(args.wait);
@@ -827,7 +828,7 @@ mod tests {
                 context(identity.clone()),
                 AgentArgs {
                     name: "research".to_string(),
-                    task: "inspect".to_string(),
+                    message: "inspect".to_string(),
                     profile: Some(ProfileName::Explorer),
                     wait: true,
                 },
@@ -854,7 +855,7 @@ mod tests {
                 context(identity.clone()),
                 AgentArgs {
                     name: "research".to_string(),
-                    task: "inspect".to_string(),
+                    message: "inspect".to_string(),
                     profile: None,
                     wait: false,
                 },
@@ -886,7 +887,7 @@ mod tests {
                 context(identity.clone()),
                 AgentArgs {
                     name: "worker".to_string(),
-                    task: "first".to_string(),
+                    message: "first".to_string(),
                     profile: None,
                     wait: true,
                 },
@@ -917,7 +918,7 @@ mod tests {
         let identity = SessionIdentity::root(SessionId::new());
         let args = || AgentArgs {
             name: "same".to_string(),
-            task: "work".to_string(),
+            message: "work".to_string(),
             profile: None,
             wait: true,
         };
@@ -953,7 +954,7 @@ mod tests {
                 context(identity.clone()),
                 AgentArgs {
                     name: "worker".to_string(),
-                    task: "old direction".to_string(),
+                    message: "old direction".to_string(),
                     profile: None,
                     wait: false,
                 },

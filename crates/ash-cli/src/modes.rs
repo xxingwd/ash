@@ -173,7 +173,7 @@ fn subagent_views(snapshots: &[SubagentSnapshot]) -> Vec<SubagentView> {
                 SubagentState::Idle => SubagentViewState::Idle,
                 SubagentState::Running => SubagentViewState::Running,
             },
-            last_task: snapshot.last_task.clone(),
+            last_message: snapshot.last_message.clone(),
         })
         .collect()
 }

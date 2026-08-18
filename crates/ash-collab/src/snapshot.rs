@@ -6,7 +6,7 @@ pub struct SubagentSnapshot {
     pub name: String,
     pub profile: String,
     pub state: SubagentState,
-    pub last_task: String,
+    pub last_message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
