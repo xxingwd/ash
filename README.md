@@ -19,8 +19,6 @@ export ASH_MODEL=gpt-5
 export ASH_BASE_URL=https://api.example.com
 export ASH_API_KEY=...
 export ASH_MODEL_CONFIG='reasoning.effort=high;temperature=0.2'
-# 子代理并发上限（默认不限制）；设置后超过上限的并发派发会被拒绝
-export ASH_MAX_CONCURRENT_AGENTS=8
 cargo run -p ash-cli
 ```
 
@@ -146,12 +144,15 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 ## 子 Agent
 
-默认交互链路提供四个协作工具：
+默认交互链路提供三个协作工具：
 
-- `spawn_agent`：启动一个有独立上下文的后台 Agent
-- `message_agent`：向现有 Agent 发送消息；`start_turn: false` 只追加指导，`start_turn: true` 复用上下文并开启后续任务
-- `interrupt_agent`：只中断目标 Agent 当前一轮，之后仍可继续复用
-- `wait_agent`：等待状态变化；`timeout_ms: 0` 立即返回当前 Agent、状态和最终结果
+- `agent`：创建命名 Agent 并提交初始任务
+- `message_agent`：向现有命名 Agent 提交后续任务；`interrupt: true` 会先取消未完成工作
+- `wait_agent`：等待并消费后台任务的未读结果；`timeout_ms: 0` 立即返回当前快照
+
+`agent` 和 `message_agent` 默认使用 `wait: true`，这一轮完成后直接返回结果。独立任务可
+设置 `wait: false` 后台执行，父 Agent 继续处理其他工作，等需要结果时再调用
+`wait_agent`。同步返回的结果不会再次出现；父调用被取消或超时则自动转入未读结果队列。
 
 这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，只追加所选类型的工作
 指令，不继承协作工具或主 Agent 的编排提示。
@@ -164,15 +165,13 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临时移除，因此 Ash
 也不对外暴露它。子 Agent 继承当前模型、协议、工作目录、工具、AGENTS.md 和 Skills
-上下文，并通过与父 Agent 相同的 `Runtime -> Session -> Turn` 流水线运行。
-`ASH_MAX_CONCURRENT_AGENTS` 可选地限制同时活跃的子 Agent 数量；不设置时不施加额外
-子 Agent 上限。`fork_turns` 支持 `none`、`all` 或最近 N 轮。子 Agent 树按根 Session ID 隔离，执行 `/new` 或
-`/clear` 后不会混入旧会话的 Agent。
+配置，但从空会话历史开始，并通过与父 Agent 相同的 `Runtime -> Session -> Turn`
+流水线运行。名字在当前根 Session 内保持稳定，后续消息复用同一子 Session。
 
 ASH 支持多个子 Agent 并行，但这只是能力而不是强制流程：只有独立问题或清晰边界的
 工作流才适合拆给 explorer/worker。简单任务和紧耦合的即时阻塞仍由当前 Agent 自己
-完成；父 Agent 可以继续处理不重叠的工作，也可以用 `interrupt_agent` 主动停止
-已经过时或方向错误的子 Agent。
+完成。当前不向模型提供 list/remove：Agent 随根 Session 统一释放，避免为少用的管理
+动作引入额外生命周期协议。
 
 ## 终端行为
 
@@ -201,7 +200,7 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 头尾加省略号）。按 `Ctrl-O` 可全局展开到 50 行预算，再次按恢复折叠；展开状态跨会话
 保持。
 
-- `Enter`：空闲时提交新一轮；任务运行时向当前轮追加 steer 指令
+- `Enter`：空闲时提交新一轮；任务运行时向同一 Session 队列提交下一轮
 - 输入 `/`：显示斜杠命令补全；继续输入会按命令名或别名过滤
 - 补全菜单中 `↑` / `↓`（或 `Ctrl-P` / `Ctrl-N`）：切换选择
 - 补全菜单中 `Tab`：补全命令；`Enter`：执行当前选择；空闲时 `Esc`：关闭菜单
@@ -210,15 +209,15 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
 - `Ctrl-O`：在所有工具输出与思考区之间切换折叠（5 行预览）与展开（50 行）
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
-- 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；只有已完成的工具结果会
-  保留本轮，否则撤销整轮并把原问题恢复到输入框
+- 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；没有后续排队任务时，只有
+  已完成的工具结果会保留本轮，否则撤销整轮并把原问题恢复到输入框
 - 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求
 - 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出
 
-运行中提交的 steer 指令会在当前轮的下一次模型迭代前生效，不会创建独立的排队轮次；
-如果当前轮恰好已经结束，指令会恢复到输入框并显示失败原因。`Esc` 不会反向撤销已经由
+运行中提交的消息会创建独立 Turn，由 Session 按接收顺序执行。排队输入只在对应 Turn
+真正开始时进入终端历史，不会切断当前流式回答。`Esc` 不会反向撤销已经由
 工具写入文件系统的修改。斜杠命令始终显示；运行中输入 `/new`、`/clear`、`/resume`、
 `/undo`、`/fork` 或 `/compact` 时，命令不会发出，输入会保留，界面不显示额外状态。
 `/status` 仍可查看状态，`/exit` 会直接结束程序。`/undo` 会移除最近一轮并恢复其输入，

@@ -27,7 +27,7 @@ pub enum BackgroundAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmissionPolicy {
     Start,
-    Steer,
+    Queue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +67,7 @@ impl OperationState {
     pub(crate) const fn submission_policy(&self) -> Option<SubmissionPolicy> {
         match self.current {
             Operation::Idle => Some(SubmissionPolicy::Start),
-            Operation::Turn(TurnOperation::Running) => Some(SubmissionPolicy::Steer),
+            Operation::Turn(TurnOperation::Running) => Some(SubmissionPolicy::Queue),
             Operation::Turn(TurnOperation::Cancelling) | Operation::Background(_) => None,
         }
     }
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(state.submission_policy(), Some(SubmissionPolicy::Start));
 
         state.start_turn();
-        assert_eq!(state.submission_policy(), Some(SubmissionPolicy::Steer));
+        assert_eq!(state.submission_policy(), Some(SubmissionPolicy::Queue));
 
         assert!(state.begin_cancellation());
         assert_eq!(state.submission_policy(), None);

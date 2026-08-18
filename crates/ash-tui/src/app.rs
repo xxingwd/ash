@@ -1,6 +1,4 @@
-use std::fmt;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::VecDeque, fmt, path::PathBuf, time::Duration};
 
 #[cfg(test)]
 use ash_core::SessionError;
@@ -60,10 +58,6 @@ pub enum UiCommand {
         input: String,
         reply: tokio::sync::oneshot::Sender<Result<TurnId, UiError>>,
     },
-    Steer {
-        input: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), UiError>>,
-    },
     Cancel,
     Rollback,
     Compact,
@@ -111,6 +105,7 @@ struct AppState {
     subagents: Vec<SubagentView>,
     session_id: Option<SessionId>,
     last_sequence: u64,
+    queued_inputs: VecDeque<(TurnId, String)>,
 }
 
 enum LoopAction {
@@ -171,6 +166,7 @@ impl AppState {
             subagents: Vec::new(),
             session_id: None,
             last_sequence: 0,
+            queued_inputs: VecDeque::new(),
         }
     }
 
@@ -201,6 +197,19 @@ impl AppState {
     fn select_session(&mut self, session_id: SessionId) {
         self.session_id = Some(session_id);
         self.last_sequence = 0;
+        self.queued_inputs.clear();
+    }
+
+    fn queue_input(&mut self, turn_id: TurnId, input: String) {
+        self.queued_inputs.push_back((turn_id, input));
+    }
+
+    fn take_queued_input(&mut self, turn_id: TurnId) -> Option<String> {
+        let index = self
+            .queued_inputs
+            .iter()
+            .position(|(queued, _)| *queued == turn_id)?;
+        self.queued_inputs.remove(index).map(|(_, input)| input)
     }
 
     fn finish_command_failure(&mut self) {
@@ -473,9 +482,13 @@ fn handle_session_event(
             {
                 return Ok(LoopAction::Continue);
             }
+            let queued_input = state.take_queued_input(turn_id);
+            let input_effect = queued_input.as_deref().map_or(RenderPlan::NONE, |input| {
+                terminal.commit_input(turn_id, input)
+            });
             terminal.track_turn(turn_id);
             let start = state.operation.turn_started();
-            let effect = terminal.turn_started();
+            let effect = terminal.turn_started().merge(input_effect);
             state.apply(terminal, effect)?;
             Ok(match start {
                 TurnStartOutcome::StartedTurn => LoopAction::ResetTimers,
@@ -858,8 +871,8 @@ async fn submit_input(
         (SubmissionPolicy::Start, ParsedInput::Message) => {
             start_message(state, terminal, commands, input).await
         }
-        (SubmissionPolicy::Steer, ParsedInput::Message) => {
-            steer_message(state, terminal, commands, input).await
+        (SubmissionPolicy::Queue, ParsedInput::Message) => {
+            queue_message(state, terminal, commands, input).await
         }
         (_, ParsedInput::Invalid(error)) => {
             let effect = terminal.command_error(&error);
@@ -895,25 +908,25 @@ async fn start_message(
     }
 }
 
-async fn steer_message(
+async fn queue_message(
     state: &mut AppState,
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
     input: String,
 ) -> anyhow::Result<LoopAction> {
     let (reply, result) = tokio::sync::oneshot::channel();
-    let command = UiCommand::Steer {
+    let command = UiCommand::Submit {
         input: input.clone(),
         reply,
     };
     match send_confirmed(commands, command, result).await {
-        Ok(()) => {
-            let effect = terminal.commit_steer(&input);
+        Ok(turn_id) => {
+            state.queue_input(turn_id, input.clone());
             state.input.record_submission(&input);
-            state.apply(terminal, effect)?;
+            state.apply(terminal, RenderPlan::REDRAW)?;
             Ok(LoopAction::Continue)
         }
-        Err(error) => reject_input(state, terminal, input, "steer", &error),
+        Err(error) => reject_input(state, terminal, input, "queue", &error),
     }
 }
 
@@ -997,9 +1010,9 @@ async fn run_command(
 
 const fn submission_is_blocked(policy: SubmissionPolicy, input: &ParsedInput) -> bool {
     match (policy, input) {
-        (SubmissionPolicy::Start, _) | (SubmissionPolicy::Steer, ParsedInput::Message) => false,
-        (SubmissionPolicy::Steer, ParsedInput::Command(command)) => !command.can_run_while_busy(),
-        (SubmissionPolicy::Steer, ParsedInput::Invalid(_)) => true,
+        (SubmissionPolicy::Start, _) | (SubmissionPolicy::Queue, ParsedInput::Message) => false,
+        (SubmissionPolicy::Queue, ParsedInput::Command(command)) => !command.can_run_while_busy(),
+        (SubmissionPolicy::Queue, ParsedInput::Invalid(_)) => true,
     }
 }
 
@@ -1071,6 +1084,19 @@ mod tests {
     }
 
     #[test]
+    fn queued_inputs_are_displayed_by_their_turn_id() {
+        let mut state = AppState::new(Vec::new());
+        let first = TurnId::new();
+        let second = TurnId::new();
+        state.queue_input(first, "first".to_string());
+        state.queue_input(second, "second".to_string());
+
+        assert_eq!(state.take_queued_input(first).as_deref(), Some("first"));
+        assert_eq!(state.take_queued_input(second).as_deref(), Some("second"));
+        assert!(state.queued_inputs.is_empty());
+    }
+
+    #[test]
     fn escape_cancels_a_running_turn_even_with_a_draft() {
         let mut state = AppState::new(Vec::new());
         state.operation.start_turn();
@@ -1110,7 +1136,7 @@ mod tests {
         let parsed = slash_command::parse("/missing");
         assert!(submission_is_blocked(policy, &parsed));
 
-        let parsed = slash_command::parse("steer this turn");
+        let parsed = slash_command::parse("queue another turn");
         assert!(!submission_is_blocked(policy, &parsed));
 
         let parsed = slash_command::parse("/exit");
@@ -1128,7 +1154,7 @@ mod tests {
             let (reply, result) = tokio::sync::oneshot::channel();
             send_confirmed(
                 &commands,
-                UiCommand::Steer {
+                UiCommand::Submit {
                     input: "change direction".into(),
                     reply,
                 },
@@ -1137,8 +1163,8 @@ mod tests {
             .await
         });
 
-        let Some(UiCommand::Steer { input, reply }) = incoming.recv().await else {
-            panic!("expected steer command");
+        let Some(UiCommand::Submit { input, reply }) = incoming.recv().await else {
+            panic!("expected submit command");
         };
         assert_eq!(input, "change direction");
         reply

@@ -16,9 +16,8 @@ enum ToolKind {
     WebFetch,
     Bash,
     Skill,
-    SpawnAgent,
+    Agent,
     MessageAgent,
-    InterruptAgent,
     WaitAgent,
     Other,
 }
@@ -34,9 +33,8 @@ impl ToolKind {
             "webfetch" => Self::WebFetch,
             "bash" => Self::Bash,
             "skill" => Self::Skill,
-            "spawn_agent" => Self::SpawnAgent,
+            "agent" => Self::Agent,
             "message_agent" => Self::MessageAgent,
-            "interrupt_agent" => Self::InterruptAgent,
             "wait_agent" => Self::WaitAgent,
             _ => Self::Other,
         }
@@ -71,9 +69,8 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
         (
             ToolKind::Read
             | ToolKind::Skill
-            | ToolKind::SpawnAgent
+            | ToolKind::Agent
             | ToolKind::MessageAgent
-            | ToolKind::InterruptAgent
             | ToolKind::WaitAgent,
             false,
         ) => ToolRenderer::Generic(OutputPresentation::Hidden),
@@ -100,8 +97,7 @@ fn tool_detail(name: &str, arguments: &Value) -> String {
         ToolKind::WebFetch => url_argument(arguments),
         ToolKind::Bash => string_argument(arguments, "command"),
         ToolKind::Skill => string_argument(arguments, "name"),
-        ToolKind::SpawnAgent => string_argument(arguments, "task_name"),
-        ToolKind::MessageAgent | ToolKind::InterruptAgent => string_argument(arguments, "target"),
+        ToolKind::Agent | ToolKind::MessageAgent => string_argument(arguments, "name"),
         ToolKind::WaitAgent | ToolKind::Other => String::new(),
     }
 }
@@ -236,7 +232,7 @@ mod tests {
         assert_eq!(
             tool_call_summary(
                 "message_agent",
-                &json!({"target": "research", "message": "hi", "start_turn": true}),
+                &json!({"name": "research", "message": "hi", "wait": false}),
             ),
             ("message_agent".to_string(), "research".to_string())
         );
@@ -327,7 +323,7 @@ mod tests {
             ToolRenderer::Generic(OutputPresentation::Hidden)
         );
         assert_eq!(
-            tool_renderer("spawn_agent", false),
+            tool_renderer("agent", false),
             ToolRenderer::Generic(OutputPresentation::Hidden)
         );
         assert_eq!(

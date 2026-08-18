@@ -167,7 +167,7 @@ version = "0.1.0"
 dependencies = [
  "ash-agent",
  "ash-core",
- "ash-protocol",
+ "futures",
  "schemars",
  "serde",
  "serde_json",

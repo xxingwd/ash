@@ -1,18 +1,16 @@
 /// Presentation-only snapshot of a child agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentView {
-    pub task_path: String,
-    pub agent_type: String,
+    pub name: String,
+    pub profile: String,
     pub state: SubagentViewState,
-    pub last_task_message: String,
+    pub last_task: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentViewState {
+    Idle,
     Running,
-    Completed,
-    Interrupted,
-    Errored,
 }
 
 impl SubagentViewState {

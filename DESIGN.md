@@ -11,7 +11,7 @@ scheduler, or service own transport and presentation; Ash owns agent execution s
 | `ash-protocol` | Model-provider protocol adapters and streaming translation |
 | `ash-tools` | Sandboxed file, process, search, and web tools |
 | `ash-agent` | Agent definition, runtime, sessions, turns, input, context, and persistence |
-| `ash-collab` | Optional child-agent spawning, messaging, lifecycle, and collaboration tools |
+| `ash-collab` | Optional named child agents and collaboration tools |
 | `ash-tui` | Terminal rendering and interaction only |
 | `ash-cli` | Binary composition and product command routing |
 
@@ -160,13 +160,19 @@ role/content combinations and system images fail locally as invalid requests.
 ## Collaboration
 
 `ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
-`spawn_agent`, `message_agent`, `interrupt_agent`, and `wait_agent` tools. Child construction uses
-the clean base `Agent`, `Runtime`, and `SessionOptions` held directly by the controller. Built-in
-`AgentProfile` values (`default`, `explorer`, and `worker`) apply prompt and tool-policy overrides
-without changing the session engine.
+`agent`, `message_agent`, and `wait_agent` tools. `agent` creates one named child with its initial
+task; `message_agent` submits a new turn to an existing child. Both wait for that turn by default and
+return its `TurnResult` plus final response. With `wait=false` they return immediately, and
+`wait_agent` later drains unread background completions. A synchronous result is consumed once; if
+its caller is cancelled or times out, the result falls back to the unread completion queue.
 
-The controller retains the unmodified base `Agent`. Only the main agent receives the collaboration
-tools and `<multi_agent_mode>` instructions; every child derives from the clean base and therefore
+Child construction uses the clean base `Agent`, `Runtime`, and `SessionOptions` held directly by the
+controller. Built-in profiles (`default`, `explorer`, and `worker`) apply prompt and tool-policy
+overrides without changing the session engine. A child starts with empty conversation history and
+keeps its own history for later `message_agent` calls.
+
+The controller retains the unmodified base `Agent`. Only the main agent receives collaboration
+tools and brief orchestration instructions; every child derives from the clean base and therefore
 cannot delegate further. Child prompts contain only the base prompt and selected profile instructions.
 Every child gets its own `Session` and executes through the same runtime path as the main agent. Tree
 identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
@@ -175,15 +181,12 @@ second execution queue.
 
 Collaboration is an assembly result, not a permission system. `install_collaboration` takes a clean
 base `Agent` and is the only assembly path; an already-enhanced agent is rejected. There is no
-`AgentScope`, no configurable delegation depth, and children cannot spawn grandchildren — nested
-collaboration would get a new design instead of prebuilt abstractions.
-
-The controller counts every accepted follow-up until it settles. A child with queued follow-ups
-stays active and receives no completion revision until the final queued turn finishes, so waiters
-cannot observe an intermediate result as the agent's terminal state.
-Spawns and follow-ups for idle children reserve concurrency capacity before awaiting session
-delivery; failures and cancellation release the reservation, while successful delivery converts it
-to tracked work under the same controller lock.
+configurable delegation depth, collaboration concurrency limit, history fork, model-visible session
+ID, list operation, or removal operation. Named agents live for their root session. Their display
+state is only `idle` or `running`; completion, failure, and interruption belong to `TurnResult`.
+`message_agent(interrupt=true)` cancels unfinished child turns before submitting the replacement
+task. The controller mirrors Turn handles for waiting and cancellation, while the child `Session`
+remains the sole execution-queue owner.
 
 ## Stream Integrity And Error Handling
 
@@ -232,14 +235,17 @@ created for the request remains durable across failed attempts.
 ## Product Boundary
 
 The TUI owns drafts, menus, viewport state, and interaction feedback. While idle, Enter submits a
-new turn; while a turn is running, Enter steers that exact turn. Escape discards unfinished streamed
-output and cancels the active turn. The TUI does not decide whether that turn is kept: after the
-canonical `TurnCompleted` event arrives, a completed tool result commits the interrupted turn; otherwise the
-controller requests an ordinary rollback so the original prompt returns to the composer. Commands
+new turn; while a turn is running, Enter submits another turn to the same Session queue. Pending
+prompts are mirrored only for display and enter the transcript when their `TurnStarted` event
+arrives. Escape discards unfinished streamed output and cancels the active Turn. When no later Turn
+is queued, an interrupted turn with no completed tool result is rolled back and its prompt returns
+to the composer. When later work is already queued, the interrupted result is committed so execution
+can advance without attempting a rollback against a busy Session. Commands
 remain visible while work is active, but session-mutating commands are silently rejected locally
 and remain in the composer; `/status` and invalid commands are also rejected while a turn is
-running. The CLI retains the active `Turn` handle, routes UI commands, and continuously forwards
-session events. Cancellation only cancels that handle. Neither layer owns execution order.
+running. The CLI retains accepted `Turn` handles in submission order, routes UI commands, and
+continuously forwards session events. Cancellation targets the queue head. Neither layer owns
+execution order.
 
 A chat integration follows the same pattern:
 

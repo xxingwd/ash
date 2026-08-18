@@ -421,7 +421,7 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let message = sanitize_single_line(&subagent.last_task_message);
+        let message = sanitize_single_line(&subagent.last_task);
         let line = Line::from(vec![
             Span::styled(
                 format!("{state_symbol} "),
@@ -430,14 +430,11 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                subagent.task_path.as_str(),
+                subagent.name.as_str(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(" (", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(
-                subagent.agent_type.as_str(),
-                Style::default().fg(state_color),
-            ),
+            Span::styled(subagent.profile.as_str(), Style::default().fg(state_color)),
             Span::styled(")", Style::default().add_modifier(Modifier::DIM)),
             Span::styled(" · ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(message),
@@ -473,28 +470,22 @@ fn render_subagents(area: Rect, subagents: &[&SubagentView], buffer: &mut Buffer
 
 const fn subagent_state_symbol(state: SubagentViewState) -> &'static str {
     match state {
+        SubagentViewState::Idle => "○",
         SubagentViewState::Running => "●",
-        SubagentViewState::Completed => "✓",
-        SubagentViewState::Interrupted => "⏸",
-        SubagentViewState::Errored => "✗",
     }
 }
 
 const fn subagent_state_label(state: SubagentViewState) -> &'static str {
     match state {
+        SubagentViewState::Idle => "idle",
         SubagentViewState::Running => "running",
-        SubagentViewState::Completed => "done",
-        SubagentViewState::Interrupted => "interrupted",
-        SubagentViewState::Errored => "error",
     }
 }
 
 const fn subagent_state_color(state: SubagentViewState) -> Color {
     match state {
-        SubagentViewState::Interrupted => Color::Yellow,
+        SubagentViewState::Idle => Color::DarkGray,
         SubagentViewState::Running => Color::Cyan,
-        SubagentViewState::Completed => Color::Green,
-        SubagentViewState::Errored => Color::Red,
     }
 }
 
@@ -988,16 +979,16 @@ mod tests {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [
             SubagentView {
-                task_path: "/root/inspect_glob".to_string(),
-                agent_type: "explorer".to_string(),
+                name: "inspect_glob".to_string(),
+                profile: "explorer".to_string(),
                 state: SubagentViewState::Running,
-                last_task_message: "Inspect the glob API".to_string(),
+                last_task: "Inspect the glob API".to_string(),
             },
             SubagentView {
-                task_path: "/root/fix_bash".to_string(),
-                agent_type: "worker".to_string(),
+                name: "fix_bash".to_string(),
+                profile: "worker".to_string(),
                 state: SubagentViewState::Running,
-                last_task_message: "Add cwd to bash".to_string(),
+                last_task: "Add cwd to bash".to_string(),
             },
         ];
         let frame = render(ViewportInput {
@@ -1036,13 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn completed_subagents_do_not_occupy_a_row() {
+    fn idle_subagents_do_not_occupy_a_row() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [SubagentView {
-            task_path: "/root/inspect_glob".to_string(),
-            agent_type: "explorer".to_string(),
-            state: SubagentViewState::Completed,
-            last_task_message: "Inspect the glob API".to_string(),
+            name: "inspect_glob".to_string(),
+            profile: "explorer".to_string(),
+            state: SubagentViewState::Idle,
+            last_task: "Inspect the glob API".to_string(),
         }];
         let frame = render(ViewportInput {
             terminal_width: 80,

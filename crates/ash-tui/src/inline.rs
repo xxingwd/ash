@@ -573,12 +573,6 @@ impl TerminalUi {
         self.commit_user_message(input)
     }
 
-    pub fn commit_steer(&mut self, input: &str) -> RenderPlan {
-        self.finish_live_output();
-        self.scroll_top = None;
-        self.commit_user_message(input)
-    }
-
     pub fn commit_exit(&mut self, input: &str) {
         self.finish_live_output();
         self.current_turn_id = None;
@@ -1045,8 +1039,7 @@ impl TerminalUi {
     /// Project one settled turn's canonical messages into transcript blocks.
     /// When `render_user` is set (restored sessions) the user input is
     /// committed as a block; during a live turn it is skipped because the
-    /// composer already committed it when the turn started (or when steering
-    /// was accepted).
+    /// composer already committed it when the turn started.
     fn push_turn_messages(&mut self, messages: &[Message]) {
         let tool_results = tool_results_map(messages);
         for message in messages {

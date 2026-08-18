@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::message_history::MessageHistoryStore;
 use anyhow::{Context, Result};
 use ash_agent::{
@@ -9,7 +11,7 @@ use ash_core::{
     LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult, Usage,
 };
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
-use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiError, UiEvent};
+use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiEvent};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
@@ -29,50 +31,47 @@ struct InteractiveController {
 
 #[derive(Default)]
 struct TurnState {
-    active: Option<Turn>,
+    turns: VecDeque<Turn>,
     cancelled: Option<TurnId>,
 }
 
 impl TurnState {
     fn track(&mut self, turn: Turn) {
-        self.active = Some(turn);
+        self.turns.push_back(turn);
     }
 
-    fn finish(&mut self, id: Option<TurnId>) -> bool {
+    fn finish(&mut self, id: Option<TurnId>) -> CancelledTurn {
         let Some(id) = id else {
-            return false;
+            return CancelledTurn::No;
         };
-        if self.active.as_ref().map(Turn::id) == Some(id) {
-            self.active = None;
+        if self.turns.front().map(Turn::id) == Some(id) {
+            self.turns.pop_front();
         }
         if self.cancelled == Some(id) {
             self.cancelled = None;
-            true
+            CancelledTurn::Yes {
+                has_queued: !self.turns.is_empty(),
+            }
         } else {
-            false
+            CancelledTurn::No
         }
     }
 
     fn cancel_active(&mut self) {
-        if let Some(turn) = &self.active {
+        if let Some(turn) = self.turns.front() {
             self.cancelled = Some(turn.id());
             turn.cancellation_token().cancel();
         }
     }
 
-    async fn steer_active(&self, input: String) -> Result<(), UiError> {
-        let turn = self
-            .active
-            .as_ref()
-            .ok_or(UiError::Agent(ash_core::AshError::Session(
-                ash_core::SessionError::InactiveTurn,
-            )))?;
-        turn.steer(input).await.map_err(UiError::from)
-    }
-
     fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+enum CancelledTurn {
+    No,
+    Yes { has_queued: bool },
 }
 
 struct AgentSetup {
@@ -129,13 +128,8 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         agent = skill.apply_overrides(agent);
     }
     let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
-    let max_concurrent_agents = env_usize("ASH_MAX_CONCURRENT_AGENTS")?;
-    let (agent, control) = ash_collab::install_collaboration(
-        agent,
-        options.clone(),
-        runtime.clone(),
-        max_concurrent_agents,
-    )?;
+    let (agent, control) =
+        ash_collab::install_collaboration(agent, options.clone(), runtime.clone())?;
     let subagent_monitor = Some(map_subagent_monitor(control.subscribe()));
 
     Ok(AgentSetup {
@@ -173,15 +167,13 @@ fn subagent_views(snapshots: &[SubagentSnapshot]) -> Vec<SubagentView> {
     snapshots
         .iter()
         .map(|snapshot| SubagentView {
-            task_path: snapshot.task_path.clone(),
-            agent_type: snapshot.agent_type.clone(),
+            name: snapshot.name.clone(),
+            profile: snapshot.profile.clone(),
             state: match snapshot.state {
+                SubagentState::Idle => SubagentViewState::Idle,
                 SubagentState::Running => SubagentViewState::Running,
-                SubagentState::Completed => SubagentViewState::Completed,
-                SubagentState::Interrupted => SubagentViewState::Interrupted,
-                SubagentState::Errored => SubagentViewState::Errored,
             },
-            last_task_message: snapshot.last_task_message.clone(),
+            last_task: snapshot.last_task.clone(),
         })
         .collect()
 }
@@ -381,9 +373,9 @@ impl InteractiveController {
                         let cancelled = if matches!(event.kind, SessionEventKind::TurnCompleted(_)) {
                             turns.finish(event.turn_id)
                         } else {
-                            false
+                            CancelledTurn::No
                         };
-                        if cancelled
+                        if matches!(cancelled, CancelledTurn::Yes { has_queued: false })
                             && matches!(&event.kind, SessionEventKind::TurnCompleted(view) if !turn_has_completed_tool(view))
                         {
                             let rollback = self.rollback_last_turn_event().await;
@@ -413,13 +405,6 @@ impl InteractiveController {
                                 }
                                 Err(error) => Err(error.into()),
                             };
-                            let _ = reply.send(result);
-                        }
-                        UiCommand::Steer { input, reply } => {
-                            let result = turns.steer_active(input.clone()).await;
-                            if result.is_ok() {
-                                self.record_input(&input).await;
-                            }
                             let _ = reply.send(result);
                         }
                         UiCommand::Cancel => {
