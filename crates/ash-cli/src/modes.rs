@@ -6,7 +6,7 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, Runtime, Session, SessionOptions, Skill, Turn,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_collab::{SubagentSnapshot, SubagentState};
+use ash_collab::{SubagentState, SubagentTreeSnapshot};
 use ash_core::{
     LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult, Usage,
 };
@@ -147,7 +147,7 @@ fn turn_has_completed_tool(view: &ash_core::TurnView) -> bool {
 }
 
 fn map_subagent_monitor(
-    mut source: tokio::sync::watch::Receiver<Vec<SubagentSnapshot>>,
+    mut source: tokio::sync::watch::Receiver<Vec<SubagentTreeSnapshot>>,
 ) -> tokio::sync::watch::Receiver<Vec<SubagentView>> {
     let (target, receiver) = tokio::sync::watch::channel(subagent_views(&source.borrow()));
     tokio::spawn(async move {
@@ -163,17 +163,20 @@ fn map_subagent_monitor(
     receiver
 }
 
-fn subagent_views(snapshots: &[SubagentSnapshot]) -> Vec<SubagentView> {
-    snapshots
+fn subagent_views(trees: &[SubagentTreeSnapshot]) -> Vec<SubagentView> {
+    trees
         .iter()
-        .map(|snapshot| SubagentView {
-            name: snapshot.name.clone(),
-            profile: snapshot.profile.clone(),
-            state: match snapshot.state {
-                SubagentState::Idle => SubagentViewState::Idle,
-                SubagentState::Running => SubagentViewState::Running,
-            },
-            last_message: snapshot.last_message.clone(),
+        .flat_map(|tree| {
+            tree.agents.iter().map(|snapshot| SubagentView {
+                root_id: tree.root_id,
+                name: snapshot.name.clone(),
+                profile: snapshot.profile.clone(),
+                state: match snapshot.state {
+                    SubagentState::Idle => SubagentViewState::Idle,
+                    SubagentState::Running => SubagentViewState::Running,
+                },
+                last_message: snapshot.last_message.clone(),
+            })
         })
         .collect()
 }

@@ -176,8 +176,8 @@ impl AppState {
         };
         match receiver.has_changed() {
             Ok(true) => {
-                self.subagents.clone_from(&receiver.borrow_and_update());
-                true
+                let subagents = visible_subagents(&receiver.borrow_and_update(), self.session_id);
+                self.replace_subagents(subagents)
             }
             Ok(false) => false,
             // The monitor channel closed: no further snapshots will arrive, so
@@ -194,10 +194,23 @@ impl AppState {
         }
     }
 
-    fn select_session(&mut self, session_id: SessionId) {
+    fn select_session(&mut self, session_id: SessionId) -> bool {
         self.session_id = Some(session_id);
         self.last_sequence = 0;
         self.queued_inputs.clear();
+        let subagents = self.subagent_rx.as_ref().map_or_else(Vec::new, |receiver| {
+            visible_subagents(&receiver.borrow(), self.session_id)
+        });
+        self.replace_subagents(subagents)
+    }
+
+    fn replace_subagents(&mut self, subagents: Vec<SubagentView>) -> bool {
+        if self.subagents == subagents {
+            false
+        } else {
+            self.subagents = subagents;
+            true
+        }
     }
 
     fn queue_input(&mut self, turn_id: TurnId, input: String) {
@@ -258,6 +271,14 @@ impl AppState {
         self.sync_menu();
         terminal.resize_view(self.view(), width, height)
     }
+}
+
+fn visible_subagents(subagents: &[SubagentView], root_id: Option<SessionId>) -> Vec<SubagentView> {
+    subagents
+        .iter()
+        .filter(|subagent| Some(subagent.root_id) == root_id)
+        .cloned()
+        .collect()
 }
 
 pub struct App {
@@ -386,7 +407,8 @@ fn handle_ui_event(
             handle_session_event(state, terminal, event)
         }
         UiEvent::SessionChanged { session_id } => {
-            state.select_session(session_id);
+            let effect = select_session(state, terminal, session_id);
+            state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
         UiEvent::CommandFailed(error) => {
@@ -415,10 +437,10 @@ fn handle_ui_event(
             Ok(LoopAction::Continue)
         }
         UiEvent::SessionRestored { session_id, view } => {
-            state.select_session(session_id);
+            let subagents = select_session(state, terminal, session_id);
             state.menu.close_picker();
             state.operation.finish();
-            let effect = terminal.restore_session(&view);
+            let effect = terminal.restore_session(&view).merge(subagents);
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -453,14 +475,26 @@ fn handle_ui_event(
             view,
             prompt,
         } => {
-            state.select_session(session_id);
+            let subagents = select_session(state, terminal, session_id);
             state.menu.close_picker();
             state.operation.finish_background(BackgroundAction::Fork);
-            let effect = terminal.restore_session(&view);
+            let effect = terminal.restore_session(&view).merge(subagents);
             state.input.set_text(prompt);
             state.apply(terminal, effect.merge(RenderPlan::REDRAW))?;
             Ok(LoopAction::Continue)
         }
+    }
+}
+
+fn select_session(
+    state: &mut AppState,
+    terminal: &mut TerminalUi,
+    session_id: SessionId,
+) -> RenderPlan {
+    if state.select_session(session_id) {
+        terminal.set_subagents(state.subagents.clone())
+    } else {
+        RenderPlan::NONE
     }
 }
 
@@ -1026,6 +1060,8 @@ fn inserts_newline(key: &KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::SubagentViewState;
+
     use super::*;
 
     #[test]
@@ -1081,6 +1117,35 @@ mod tests {
         assert!(!state.accept_session_event(current, 1));
         assert!(!state.accept_session_event(other, 2));
         assert!(state.accept_session_event(current, 2));
+    }
+
+    #[test]
+    fn session_selection_filters_subagents_by_root() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let (_, receiver) = tokio::sync::watch::channel(vec![
+            SubagentView {
+                root_id: first,
+                name: "first".to_string(),
+                profile: "default".to_string(),
+                state: SubagentViewState::Running,
+                last_message: "one".to_string(),
+            },
+            SubagentView {
+                root_id: second,
+                name: "second".to_string(),
+                profile: "default".to_string(),
+                state: SubagentViewState::Running,
+                last_message: "two".to_string(),
+            },
+        ]);
+        let mut state = AppState::new(Vec::new());
+        state.subagent_rx = Some(receiver);
+
+        assert!(state.select_session(first));
+        assert_eq!(state.subagents[0].name, "first");
+        assert!(state.select_session(second));
+        assert_eq!(state.subagents[0].name, "second");
     }
 
     #[test]

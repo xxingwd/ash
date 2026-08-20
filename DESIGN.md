@@ -164,7 +164,8 @@ role/content combinations and system images fail locally as invalid requests.
 message; `message_agent` submits a new message to an existing child. Both wait for that turn by
 default and return its `TurnResult` plus final response. With `wait=false` they return immediately, and
 `wait_agent` later drains unread background completions. A synchronous result is consumed once; if
-its caller is cancelled or times out, the result falls back to the unread completion queue.
+its caller is cancelled or times out before acknowledging delivery, the result falls back to the
+unread completion queue.
 
 Child construction uses the clean base `Agent`, `Runtime`, and `SessionOptions` held directly by the
 controller. Built-in profiles (`default`, `explorer`, and `worker`) apply prompt and tool-policy
@@ -179,16 +180,19 @@ versus background execution to each tool call.
 Every child gets its own `Session` and executes through the same runtime path as the main agent. Tree
 identity and canonical agent path live in `SessionIdentity`; tools receive a read-only snapshot
 through `ToolContext.session`. Collaboration state does not leak into terminal state or create a
-second execution queue.
+second execution queue. One completion pump per child awaits its Turns in submission order and is the
+single handoff point for synchronous and unread results.
 
 Collaboration is an assembly result, not a permission system. `install_collaboration` takes a clean
 base `Agent` and is the only assembly path; an already-enhanced agent is rejected. There is no
 configurable delegation depth, collaboration concurrency limit, history fork, model-visible session
-ID, list operation, or removal operation. Named agents live for their root session. Their display
-state is only `idle` or `running`; completion, failure, and interruption belong to `TurnResult`.
+ID, list operation, or removal operation. The controller retains named agents for its own lifetime,
+partitioned by root session; host projections preserve that root boundary while model tools only see
+their current root. Display state is only `idle` or `running`; completion, failure, and interruption
+belong to `TurnResult`.
 `message_agent(interrupt=true)` cancels unfinished child turns before submitting the replacement
-message. The controller mirrors Turn handles for waiting and cancellation, while the child `Session`
-remains the sole execution-queue owner.
+message. The controller mirrors cancellation handles and observes Turn results, while the child
+`Session` remains the sole execution-queue owner.
 
 ## Stream Integrity And Error Handling
 

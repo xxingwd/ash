@@ -170,8 +170,9 @@ Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临
 
 ASH 支持多个子 Agent 并行，但这只是能力而不是强制流程：只有独立问题或清晰边界的
 工作流才适合拆给 explorer/worker。简单任务和紧耦合的即时阻塞仍由当前 Agent 自己
-完成。当前不向模型提供 list/remove：Agent 随根 Session 统一释放，避免为少用的管理
-动作引入额外生命周期协议。
+完成。当前不向模型提供 list/remove：Agent 由进程内 controller 持有，并按根 Session
+隔离；切换会话时 TUI 只展示当前根的 Agent，切回原会话仍可继续使用原有 Agent。整个
+controller 退出时统一释放，避免为少用的管理动作引入额外生命周期协议。
 
 ## 终端行为
 

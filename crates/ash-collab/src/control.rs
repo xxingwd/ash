@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use crate::snapshot::{SubagentSnapshot, SubagentState};
+use crate::snapshot::{SubagentSnapshot, SubagentState, SubagentTreeSnapshot};
 use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions, Turn};
 use ash_core::{
     define_tool, is_valid_segment, AgentPath, CancellationToken, ContentBlock, Message,
@@ -12,7 +12,7 @@ use ash_core::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, watch, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
@@ -125,10 +125,17 @@ pub struct AgentControl {
 struct ControlInner {
     state: Mutex<ControlState>,
     updates: Notify,
+    shutdown: CancellationToken,
     runtime: Runtime,
     definition: Agent,
     options: SessionOptions,
-    subagent_tx: watch::Sender<Vec<SubagentSnapshot>>,
+    subagent_tx: watch::Sender<Vec<SubagentTreeSnapshot>>,
+}
+
+impl Drop for ControlInner {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 #[derive(Default)]
@@ -147,6 +154,7 @@ struct AgentEntry {
     profile: ProfileName,
     session: Session,
     turns: VecDeque<TrackedTurn>,
+    completion_tx: mpsc::UnboundedSender<TurnObservation>,
     last_message: String,
 }
 
@@ -154,7 +162,16 @@ struct TrackedTurn {
     id: TurnId,
     cancellation: CancellationToken,
     message: String,
-    waiter: Option<oneshot::Sender<AgentCompletion>>,
+}
+
+struct TurnObservation {
+    turn: Turn,
+    response: Option<oneshot::Sender<CompletionDelivery>>,
+}
+
+struct CompletionDelivery {
+    completion: AgentCompletion,
+    acknowledge: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,8 +205,11 @@ impl AgentEntry {
     }
 
     fn finish(&mut self, turn_id: TurnId) -> Option<TrackedTurn> {
-        let index = self.turns.iter().position(|turn| turn.id == turn_id)?;
-        self.turns.remove(index)
+        if self.turns.front()?.id == turn_id {
+            self.turns.pop_front()
+        } else {
+            None
+        }
     }
 }
 
@@ -206,14 +226,17 @@ impl AgentTree {
 }
 
 impl ControlState {
-    fn snapshots(&self) -> Vec<SubagentSnapshot> {
-        let mut agents = self
+    fn snapshots(&self) -> Vec<SubagentTreeSnapshot> {
+        let mut trees = self
             .trees
-            .values()
-            .flat_map(AgentTree::snapshots)
+            .iter()
+            .map(|(root_id, tree)| SubagentTreeSnapshot {
+                root_id: *root_id,
+                agents: tree.snapshots(),
+            })
             .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.name.cmp(&right.name));
-        agents
+        trees.sort_by_key(|tree| tree.root_id.to_string());
+        trees
     }
 }
 
@@ -261,6 +284,7 @@ impl AgentControl {
             inner: Arc::new(ControlInner {
                 state: Mutex::new(ControlState::default()),
                 updates: Notify::new(),
+                shutdown: CancellationToken::new(),
                 runtime,
                 definition,
                 options,
@@ -269,15 +293,15 @@ impl AgentControl {
         }
     }
 
-    /// Subscribe to presentation snapshots of all live child agents.
+    /// Subscribe to root-scoped projections of all agents owned by this controller.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<Vec<SubagentSnapshot>> {
+    pub fn subscribe(&self) -> watch::Receiver<Vec<SubagentTreeSnapshot>> {
         self.inner.subagent_tx.subscribe()
     }
 
     async fn publish(&self) {
         let snapshots = self.inner.state.lock().await.snapshots();
-        let _ = self.inner.subagent_tx.send(snapshots);
+        self.inner.subagent_tx.send_replace(snapshots);
     }
 
     /// Build the model-visible collaboration tools.
@@ -309,7 +333,7 @@ impl AgentControl {
         let wait = self.clone();
         let wait_agent = define_tool(
             "wait_agent",
-            "Wait for unread results from background agent turns. Returns every result completed since the previous wait, plus the current idle/running snapshot.",
+            "Wait for unread agent-turn results. Returns every result completed since the previous wait, plus the current idle/running snapshot.",
             move |context, args: WaitAgentArgs| {
                 let control = wait.clone();
                 async move { control.wait(context, args).await }
@@ -329,7 +353,7 @@ impl AgentControl {
             .join(&args.name)
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let profile = args.profile.unwrap_or(ProfileName::Default);
-        let (turn, result) = {
+        let result = {
             // Holding this lock across child construction is intentional: it is
             // the creation reservation, and keeps duplicate names impossible
             // without a second reservation state machine.
@@ -355,21 +379,30 @@ impl AgentControl {
                 )
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
-            let (turn, tracked, result) = submit(&session, args.message.clone(), args.wait).await?;
+            let (completion_tx, observations) = mpsc::unbounded_channel();
+            let Submission {
+                tracked,
+                observation,
+                result,
+            } = submit(&session, args.message.clone(), args.wait).await?;
+            self.spawn_completion_pump(identity.root_id, path.clone(), observations);
+            completion_tx
+                .send(observation)
+                .map_err(|_| ToolError::Execution("agent completion pump stopped".to_string()))?;
             tree.agents.insert(
-                path.clone(),
+                path,
                 AgentEntry {
                     name: args.name.clone(),
                     profile,
                     session,
                     turns: VecDeque::from([tracked]),
+                    completion_tx,
                     last_message: args.message,
                 },
             );
-            (turn, result)
+            result
         };
 
-        self.watch_turn(identity.root_id, path, turn);
         self.publish().await;
         self.submission_result(&args.name, profile, result).await
     }
@@ -387,7 +420,7 @@ impl AgentControl {
             .path
             .join(&args.name)
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let (turn, profile, result) = {
+        let (profile, result) = {
             let mut state = self.inner.state.lock().await;
             let entry = state
                 .trees
@@ -397,14 +430,16 @@ impl AgentControl {
             if args.interrupt {
                 entry.cancel_pending();
             }
-            let (turn, tracked, result) =
-                submit(&entry.session, args.message.clone(), args.wait).await?;
-            entry.turns.push_back(tracked);
+            let submission = submit(&entry.session, args.message.clone(), args.wait).await?;
+            entry.turns.push_back(submission.tracked);
+            entry
+                .completion_tx
+                .send(submission.observation)
+                .map_err(|_| ToolError::Execution("agent completion pump stopped".to_string()))?;
             entry.last_message = args.message;
-            (turn, entry.profile, result)
+            (entry.profile, submission.result)
         };
 
-        self.watch_turn(identity.root_id, path, turn);
         self.publish().await;
         self.submission_result(&args.name, profile, result).await
     }
@@ -413,13 +448,17 @@ impl AgentControl {
         &self,
         name: &str,
         profile: ProfileName,
-        result: Option<oneshot::Receiver<AgentCompletion>>,
+        result: Option<oneshot::Receiver<CompletionDelivery>>,
     ) -> Result<String, ToolError> {
         match result {
-            Some(result) => result
-                .await
-                .map_err(|_| ToolError::Execution(format!("agent stopped before replying: {name}")))
-                .and_then(|completion| json_output(&completion)),
+            Some(result) => {
+                let delivery = result.await.map_err(|_| {
+                    ToolError::Execution(format!("agent stopped before replying: {name}"))
+                })?;
+                let output = json_output(&delivery.completion)?;
+                let _ = delivery.acknowledge.send(());
+                Ok(output)
+            }
             None => json_output(&serde_json::json!({
                 "name": name,
                 "profile": profile,
@@ -477,30 +516,60 @@ impl AgentControl {
         }
     }
 
-    fn watch_turn(&self, root_id: SessionId, path: AgentPath, turn: Turn) {
-        let control = self.clone();
+    fn spawn_completion_pump(
+        &self,
+        root_id: SessionId,
+        path: AgentPath,
+        mut observations: mpsc::UnboundedReceiver<TurnObservation>,
+    ) {
+        let control = Arc::downgrade(&self.inner);
+        let shutdown = self.inner.shutdown.clone();
         tokio::spawn(async move {
-            control.observe_turn(root_id, path, turn).await;
+            while let Some(observation) = observations.recv().await {
+                let TurnObservation { turn, response } = observation;
+                let turn_id = turn.id();
+                let settled = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    result = turn.wait() => result,
+                };
+                let (result, final_message) = match settled {
+                    Ok(view) => (view.result, final_assistant_message(&view.messages)),
+                    Err(error) => (TurnResult::Failed(error.to_string()), None),
+                };
+                let Some(inner) = control.upgrade() else {
+                    break;
+                };
+                let control = Self { inner };
+                if !control
+                    .settle_turn(root_id, &path, turn_id, result, final_message, response)
+                    .await
+                {
+                    break;
+                }
+            }
         });
     }
 
-    async fn observe_turn(&self, root_id: SessionId, path: AgentPath, turn: Turn) {
-        let turn_id = turn.id();
-        let (result, final_message) = match turn.wait().await {
-            Ok(view) => (view.result, final_assistant_message(&view.messages)),
-            Err(error) => (TurnResult::Failed(error.to_string()), None),
-        };
-
-        let queued = {
+    async fn settle_turn(
+        &self,
+        root_id: SessionId,
+        path: &AgentPath,
+        turn_id: TurnId,
+        result: TurnResult,
+        final_message: Option<String>,
+        response: Option<oneshot::Sender<CompletionDelivery>>,
+    ) -> bool {
+        let delivery = {
             let mut state = self.inner.state.lock().await;
             let Some(tree) = state.trees.get_mut(&root_id) else {
-                return;
+                return false;
             };
-            let Some(entry) = tree.agents.get_mut(&path) else {
-                return;
+            let Some(entry) = tree.agents.get_mut(path) else {
+                return false;
             };
             let Some(tracked) = entry.finish(turn_id) else {
-                return;
+                tracing::error!(%turn_id, agent = %entry.name, "agent turns settled out of order");
+                return false;
             };
             let completion = AgentCompletion {
                 name: entry.name.clone(),
@@ -509,45 +578,68 @@ impl AgentControl {
                 result,
                 final_message,
             };
-            match tracked.waiter {
-                Some(waiter) => match waiter.send(completion) {
-                    Ok(()) => false,
-                    Err(completion) => {
-                        tree.completions.push_back(completion);
-                        true
-                    }
-                },
+            match response {
+                Some(response) => Some((completion, response)),
                 None => {
                     tree.completions.push_back(completion);
-                    true
+                    None
                 }
             }
         };
 
-        if queued {
+        self.publish().await;
+        if let Some((completion, response)) = delivery {
+            self.deliver_completion(root_id, completion, response).await;
+        } else {
             self.inner.updates.notify_waiters();
         }
-        self.publish().await;
+        true
+    }
+
+    async fn deliver_completion(
+        &self,
+        root_id: SessionId,
+        completion: AgentCompletion,
+        response: oneshot::Sender<CompletionDelivery>,
+    ) {
+        let fallback = completion.clone();
+        let (acknowledge, consumed) = oneshot::channel();
+        if response
+            .send(CompletionDelivery {
+                completion,
+                acknowledge,
+            })
+            .is_ok()
+            && consumed.await.is_ok()
+        {
+            return;
+        }
+        self.queue_completion(root_id, fallback).await;
+    }
+
+    async fn queue_completion(&self, root_id: SessionId, completion: AgentCompletion) {
+        let mut state = self.inner.state.lock().await;
+        let Some(tree) = state.trees.get_mut(&root_id) else {
+            return;
+        };
+        tree.completions.push_back(completion);
+        drop(state);
+        self.inner.updates.notify_waiters();
     }
 }
 
-async fn submit(
-    session: &Session,
-    message: String,
-    wait: bool,
-) -> Result<
-    (
-        Turn,
-        TrackedTurn,
-        Option<oneshot::Receiver<AgentCompletion>>,
-    ),
-    ToolError,
-> {
+struct Submission {
+    tracked: TrackedTurn,
+    observation: TurnObservation,
+    result: Option<oneshot::Receiver<CompletionDelivery>>,
+}
+
+async fn submit(session: &Session, message: String, wait: bool) -> Result<Submission, ToolError> {
     let turn = session
         .submit(Input::from_text(InputSource::Agent, message.clone()))
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?;
-    let (waiter, result) = if wait {
+    let (response, result) = if wait {
         let (sender, receiver) = oneshot::channel();
         (Some(sender), Some(receiver))
     } else {
@@ -557,9 +649,12 @@ async fn submit(
         id: turn.id(),
         cancellation: turn.cancellation_token(),
         message,
-        waiter,
     };
-    Ok((turn, tracked, result))
+    Ok(Submission {
+        tracked,
+        observation: TurnObservation { turn, response },
+        result,
+    })
 }
 
 /// Install collaboration on the main agent. Children derive from the clean
@@ -884,6 +979,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_projections_remain_isolated() {
+        let (control, _directory, _) = control();
+        let first = SessionIdentity::root(SessionId::new());
+        let second = SessionIdentity::root(SessionId::new());
+
+        for (identity, name) in [(&first, "first"), (&second, "second")] {
+            control
+                .create(
+                    context(identity.clone()),
+                    AgentArgs {
+                        name: name.to_string(),
+                        message: "inspect".to_string(),
+                        profile: None,
+                        wait: true,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshots = control.subscribe();
+        let trees = snapshots.borrow();
+        assert_eq!(trees.len(), 2);
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.root_id == first.root_id)
+                .unwrap()
+                .agents[0]
+                .name,
+            "first"
+        );
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.root_id == second.root_id)
+                .unwrap()
+                .agents[0]
+                .name,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_results_preserve_agent_submission_order() {
+        let (control, _directory, _) = control();
+        let identity = SessionIdentity::root(SessionId::new());
+        control
+            .create(
+                context(identity.clone()),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "initial".to_string(),
+                    profile: None,
+                    wait: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        for message in ["first", "second"] {
+            control
+                .message(
+                    context(identity.clone()),
+                    MessageAgentArgs {
+                        name: "worker".to_string(),
+                        message: message.to_string(),
+                        interrupt: false,
+                        wait: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut completed = Vec::new();
+        for _ in 0..2 {
+            if completed.len() == 2 {
+                break;
+            }
+            let output = control
+                .wait(
+                    context(identity.clone()),
+                    WaitAgentArgs {
+                        timeout_ms: Some(1_000),
+                    },
+                )
+                .await
+                .unwrap();
+            let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+            completed.extend(
+                output["completions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|completion| completion["message"].as_str().unwrap().to_string()),
+            );
+        }
+
+        assert_eq!(completed, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_synchronous_delivery_becomes_unread() {
+        let (control, _directory, _) = control();
+        let root_id = SessionId::new();
+        control
+            .inner
+            .state
+            .lock()
+            .await
+            .trees
+            .insert(root_id, AgentTree::default());
+        let completion = AgentCompletion {
+            name: "worker".to_string(),
+            profile: ProfileName::Default,
+            message: "inspect".to_string(),
+            result: TurnResult::Completed(StopReason::EndTurn),
+            final_message: Some("done".to_string()),
+        };
+        let (response, result) = oneshot::channel();
+        let delivery = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .deliver_completion(root_id, completion, response)
+                    .await;
+            })
+        };
+
+        let delivered = result.await.unwrap();
+        drop(delivered);
+        delivery.await.unwrap();
+
+        let state = control.inner.state.lock().await;
+        assert_eq!(state.trees[&root_id].completions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_controller_stops_idle_completion_pumps() {
+        let (control, _directory, _) = control();
+        let identity = SessionIdentity::root(SessionId::new());
+        control
+            .create(
+                context(identity),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "inspect".to_string(),
+                    profile: None,
+                    wait: true,
+                },
+            )
+            .await
+            .unwrap();
+        let inner = Arc::downgrade(&control.inner);
+
+        drop(control);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion pump retained the controller");
+    }
+
+    #[tokio::test]
     async fn follow_up_reuses_the_agents_session() {
         let (control, _directory, requests) = control();
         let identity = SessionIdentity::root(SessionId::new());
@@ -918,7 +1181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_names_are_rejected() {
+    async fn concurrent_duplicate_names_are_rejected_atomically() {
         let (control, _directory, _) = control();
         let identity = SessionIdentity::root(SessionId::new());
         let args = || AgentArgs {
@@ -928,13 +1191,17 @@ mod tests {
             wait: true,
         };
 
-        control
-            .create(context(identity.clone()), args())
-            .await
-            .unwrap();
-        let error = control.create(context(identity), args()).await.unwrap_err();
+        let (first, second) = tokio::join!(
+            control.create(context(identity.clone()), args()),
+            control.create(context(identity), args()),
+        );
+        let outcomes = [first, second];
 
-        assert!(error.to_string().contains("agent already exists: same"));
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(outcomes
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .any(|error| error.to_string().contains("agent already exists: same")));
     }
 
     #[tokio::test]

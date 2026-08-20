@@ -979,12 +979,14 @@ mod tests {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [
             SubagentView {
+                root_id: ash_core::SessionId::new(),
                 name: "inspect_glob".to_string(),
                 profile: "explorer".to_string(),
                 state: SubagentViewState::Running,
                 last_message: "Inspect the glob API".to_string(),
             },
             SubagentView {
+                root_id: ash_core::SessionId::new(),
                 name: "fix_bash".to_string(),
                 profile: "worker".to_string(),
                 state: SubagentViewState::Running,
@@ -1030,6 +1032,7 @@ mod tests {
     fn idle_subagents_do_not_occupy_a_row() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
         let subagents = [SubagentView {
+            root_id: ash_core::SessionId::new(),
             name: "inspect_glob".to_string(),
             profile: "explorer".to_string(),
             state: SubagentViewState::Idle,

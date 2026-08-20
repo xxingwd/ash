@@ -1,6 +1,9 @@
+use ash_core::SessionId;
+
 /// Presentation-only snapshot of a child agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentView {
+    pub root_id: SessionId,
     pub name: String,
     pub profile: String,
     pub state: SubagentViewState,
