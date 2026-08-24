@@ -529,6 +529,19 @@ fn handle_session_event(
                 TurnStartOutcome::TurnAlreadyTracked => LoopAction::Continue,
             })
         }
+        SessionEventKind::TurnProgress(_)
+            if turn_id.is_none() || terminal.current_turn_id() != turn_id =>
+        {
+            Ok(LoopAction::Continue)
+        }
+        SessionEventKind::TurnProgress(_) if !state.operation.accepts_live_output() => {
+            Ok(LoopAction::Continue)
+        }
+        SessionEventKind::TurnProgress(stats) => {
+            let effect = terminal.turn_progress(stats);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
         SessionEventKind::Live(_) if turn_id.is_none() || terminal.current_turn_id() != turn_id => {
             Ok(LoopAction::Continue)
         }
@@ -581,6 +594,11 @@ fn handle_session_event(
         }
         SessionEventKind::ContextCompacted(update) => {
             let effect = terminal.record_automatic_compaction(update.after_tokens);
+            state.apply(terminal, effect)?;
+            Ok(LoopAction::Continue)
+        }
+        SessionEventKind::ContextChanged { tokens } => {
+            let effect = terminal.set_context_tokens(tokens);
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -1129,6 +1147,7 @@ mod tests {
                 name: "first".to_string(),
                 profile: "default".to_string(),
                 state: SubagentViewState::Running,
+                usage: ash_core::Usage::default(),
                 last_message: "one".to_string(),
             },
             SubagentView {
@@ -1136,6 +1155,7 @@ mod tests {
                 name: "second".to_string(),
                 profile: "default".to_string(),
                 state: SubagentViewState::Running,
+                usage: ash_core::Usage::default(),
                 last_message: "two".to_string(),
             },
         ]);

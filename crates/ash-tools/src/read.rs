@@ -134,9 +134,10 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Images are resized to 2000px / 5MB. Supported images: jpg, png, gif, webp, and bmp.",
         move |ctx, args: ReadArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 read_file(
                     &working_dir,
                     &args.path,

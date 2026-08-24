@@ -118,7 +118,7 @@ fn serializes_event_usage_with_the_stable_contract() {
     let usage = Usage {
         input_tokens: 100,
         output_tokens: 50,
-        generation_ms: 1_250,
+        tool_calls: 2,
         estimated: false,
     };
     assert_json_snapshot!("event_usage", usage);

@@ -27,9 +27,10 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Write complete content to a file. Creates missing parent directories and overwrites an existing file; use edit for local changes.",
         move |ctx, args: WriteArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 let result =
                     write_file(&working_dir, &args.path, &args.content, cancellation, deadline)
                         .await?;

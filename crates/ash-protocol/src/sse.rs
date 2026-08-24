@@ -258,11 +258,9 @@ mod tests {
             events,
             vec![
                 ModelEvent::Text("hi".into()),
-                ModelEvent::Usage(ash_core::Usage {
+                ModelEvent::Usage(ash_core::ModelUsage {
                     input_tokens: 12,
                     output_tokens: 3,
-                    generation_ms: 0,
-                    estimated: false,
                 }),
                 ModelEvent::Stop(StopReason::EndTurn),
             ]
@@ -283,11 +281,9 @@ mod tests {
             events,
             vec![
                 ModelEvent::Text("hi".into()),
-                ModelEvent::Usage(ash_core::Usage {
+                ModelEvent::Usage(ash_core::ModelUsage {
                     input_tokens: 12,
                     output_tokens: 3,
-                    generation_ms: 0,
-                    estimated: false,
                 }),
                 ModelEvent::Stop(StopReason::EndTurn),
             ]

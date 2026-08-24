@@ -23,7 +23,7 @@ impl AgentPath {
     ///
     /// # Errors
     ///
-    /// Returns `AshError::Config` when the segment is not a valid task name.
+    /// Returns `AshError::Config` when the segment is not a valid agent name.
     pub fn join(&self, segment: &str) -> Result<Self, AshError> {
         if !is_valid_segment(segment) {
             return Err(AshError::Config(format!(
@@ -50,15 +50,15 @@ impl std::fmt::Display for AgentPath {
     }
 }
 
-/// Whether `segment` is a valid task name: lowercase letters, digits, or
-/// underscores, at most `MAX_SEGMENT_CHARS` characters.
+/// Whether `segment` is a stable agent identifier: lowercase ASCII letters,
+/// digits, underscores, or hyphens, with a bounded persisted length.
 #[must_use]
 pub fn is_valid_segment(segment: &str) -> bool {
     !segment.is_empty()
-        && segment.chars().count() <= MAX_SEGMENT_CHARS
-        && segment
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && segment.len() <= MAX_SEGMENT_CHARS
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// The durable identity of one session inside its collaboration tree.
@@ -86,18 +86,18 @@ impl SessionIdentity {
         }
     }
 
-    /// The identity of a child session spawned by `self` for `task_name`.
+    /// The identity of a child session spawned by `self` for `agent_name`.
     ///
     /// # Errors
     ///
-    /// Returns `AshError::Config` when the task name is not a valid path
+    /// Returns `AshError::Config` when the agent name is not a valid path
     /// segment.
-    pub fn child(&self, id: SessionId, task_name: &str) -> Result<Self, AshError> {
+    pub fn child(&self, id: SessionId, agent_name: &str) -> Result<Self, AshError> {
         Ok(Self {
             id,
             root_id: self.root_id,
             parent_id: Some(self.id),
-            path: self.path.join(task_name)?,
+            path: self.path.join(agent_name)?,
         })
     }
 
@@ -142,23 +142,31 @@ mod tests {
     fn joining_builds_nested_paths() {
         let path = AgentPath::root().join("research").unwrap();
         assert_eq!(path.as_str(), "/root/research");
-        let nested = path.join("deep_dive").unwrap();
-        assert_eq!(nested.as_str(), "/root/research/deep_dive");
+        let nested = path.join("deep-dive").unwrap();
+        assert_eq!(nested.as_str(), "/root/research/deep-dive");
         assert_eq!(
             nested.segments().collect::<Vec<_>>(),
-            ["research", "deep_dive"]
+            ["research", "deep-dive"]
         );
     }
 
     #[test]
-    fn joining_rejects_invalid_segments() {
+    fn joining_accepts_stable_slug_names_with_hyphens() {
+        for segment in ["be-resource-product", "research_agent", "worker2"] {
+            assert!(AgentPath::root().join(segment).is_ok(), "{segment:?}");
+        }
+    }
+
+    #[test]
+    fn joining_rejects_noncanonical_segments() {
+        let long_name = "a".repeat(MAX_SEGMENT_CHARS + 1);
         for segment in [
             "",
             "/x",
-            "Task",
-            "a-b",
-            "a b",
-            &"a".repeat(MAX_SEGMENT_CHARS + 1),
+            "a/b",
+            "Resource Product",
+            "资源梳理",
+            long_name.as_str(),
         ] {
             assert!(AgentPath::root().join(segment).is_err(), "{segment:?}");
         }
@@ -182,14 +190,16 @@ mod tests {
     fn parsing_accepts_only_canonical_paths() {
         assert_eq!(parse_agent_path("/root").unwrap(), AgentPath::root());
         assert!(parse_agent_path("/root/research").is_ok());
+        assert!(parse_agent_path("/root/resource-product").is_ok());
         for value in [
             "",
             "root",
             "/",
             "/home/user",
-            "/root/Task",
+            "/root/Resource Product",
             "/root//x",
             "/root/a/b/",
+            "/root/two\nlines",
         ] {
             assert!(parse_agent_path(value).is_err(), "{value:?}");
         }

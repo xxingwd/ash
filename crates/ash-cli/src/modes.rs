@@ -7,9 +7,7 @@ use ash_agent::{
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_collab::{SubagentState, SubagentTreeSnapshot};
-use ash_core::{
-    LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult, Usage,
-};
+use ash_core::{LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiEvent};
 use futures::StreamExt;
@@ -175,6 +173,7 @@ fn subagent_views(trees: &[SubagentTreeSnapshot]) -> Vec<SubagentView> {
                     SubagentState::Idle => SubagentViewState::Idle,
                     SubagentState::Running => SubagentViewState::Running,
                 },
+                usage: snapshot.usage,
                 last_message: snapshot.last_message.clone(),
             })
         })
@@ -269,7 +268,7 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
             result = &mut completion => {
                 let completed = result?;
                 println!();
-                print_usage(completed.usage);
+                print_usage(completed.stats);
                 return Ok(());
             }
         }
@@ -280,15 +279,14 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
 
 /// Print the completed turn's token usage to stderr, mirroring the tool
 /// diagnostics already shown there. Useful when diagnosing a run.
-fn print_usage(usage: Option<Usage>) {
-    let Some(usage) = usage else {
-        return;
-    };
+fn print_usage(stats: ash_core::TurnStats) {
+    let usage = stats.usage;
     eprintln!(
-        "[usage: {} in / {} out tokens, {} ms{}]",
+        "[usage: {} in / {} out tokens, {} tools, {} ms{}]",
         usage.input_tokens,
         usage.output_tokens,
-        usage.generation_ms,
+        usage.tool_calls,
+        stats.generation_ms,
         if usage.estimated { " (estimated)" } else { "" }
     );
 }

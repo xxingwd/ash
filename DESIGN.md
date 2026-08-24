@@ -75,11 +75,12 @@ history, compacted model context, and turn views. Its entries are:
 - `Input`;
 - model and tool-result messages;
 - context checkpoints;
-- `TurnEnd { result, usage }`;
+- `TurnEnd { result, stats }`;
+- compaction usage records;
 - rollback markers.
 
 A turn is the scrollback/replay boundary: `TurnEnd` carries the terminal `TurnResult`
-(completed, failed, or interrupted) plus the optional aggregated `Usage`. A turn left open
+(completed, failed, or interrupted) plus its final `TurnStats`. A turn left open
 when a session ends is projected as `Interrupted` and never exposed as normal history.
 Live streaming deltas are never persisted.
 
@@ -127,8 +128,11 @@ before that commit point leaves a turn without `TurnEnd`, which the projection r
 
 - `TurnStarted` marks the accepted turn beginning execution.
 - `Live(LiveEvent)` carries ephemeral streaming deltas for the active turn's preview only.
+- `TurnProgress(TurnStats)` carries a replaceable active-turn snapshot. It is not persisted or
+  replayed and may be dropped under event-channel backpressure.
+- `ContextChanged` carries the current prepared-context token gauge.
 - `TurnCompleted(TurnView)` is emitted when a turn settles and carries its canonical messages, result,
-  and usage; clients use it to commit scrollback.
+  and final stats; clients use it to commit scrollback.
 - `ContextCompacted` reports an automatic context-checkpoint change.
 
 Product command results are separate `UiEvent` values owned by the CLI/TUI boundary, including
@@ -140,6 +144,17 @@ All memory state is derived from the log through one reducer direction:
 live deltas as a preview and replaces them with the canonical projection on `TurnCompleted`.
 `SessionLog` maintains that projection incrementally as entries arrive, and `Turn::wait` and the
 settled session event receive the same canonical `TurnView` rather than assembling parallel views.
+
+Usage follows one aggregation path. Provider chunks are reconciled within one request; all attempted
+requests, retries, tool starts, and automatic compactions are accumulated once by the turn engine.
+Only a durably appended `TurnEnd` enters the `SessionLog` projector's settled usage. The Session actor
+also owns a replaceable active-turn snapshot: it starts the snapshot on `TurnStarted`, replaces it on
+`TurnProgress`, and clears it after the durable turn commit. `Session::stats()` and
+`Session::subscribe_stats()` expose this single `SessionStats { settled_usage, active_turn,
+context_tokens }` projection; consumers derive total usage through `SessionStats::total_usage()` and
+never maintain a second accumulator. Usage is additive, while context tokens are a separately
+recomputed gauge that may decrease after compaction or rollback. TPS exists only at Turn scope and is
+derived from output tokens and summed generation windows.
 
 ## Context And Memory
 
@@ -160,12 +175,17 @@ role/content combinations and system images fail locally as invalid requests.
 ## Collaboration
 
 `ash-collab` is optional. `AgentControl` owns the collaboration tree projection and exposes the
-`agent`, `message_agent`, and `wait_agent` tools. `agent` creates one named child with its initial
+`agent`, `message_agent`, `list_agents`, `remove_agent`, and `wait_agent` tools. `agent` creates one named child with its initial
 message; `message_agent` submits a new message to an existing child. Both wait for that turn by
 default and return its `TurnResult` plus final response. With `wait=false` they return immediately, and
 `wait_agent` later drains unread background completions. A synchronous result is consumed once; if
 its caller is cancelled or times out before acknowledging delivery, the result falls back to the
 unread completion queue.
+
+The waiting-capable `agent`, `message_agent`, and `wait_agent` tools opt out of the session's outer
+tool timeout, because a child turn may legitimately run longer than a normal tool call. Parent-turn
+cancellation still aborts the call. `wait_agent.timeout_ms` independently bounds one polling window;
+it defaults to 10 seconds and is capped at one hour.
 
 Child construction uses the clean base `Agent`, `Runtime`, and `SessionOptions` held directly by the
 controller. Built-in profiles (`default`, `explorer`, and `worker`) apply prompt and tool-policy
@@ -183,13 +203,21 @@ through `ToolContext.session`. Collaboration state does not leak into terminal s
 second execution queue. One completion pump per child awaits its Turns in submission order and is the
 single handoff point for synchronous and unread results.
 
+Collaboration subscribes to each child Session's stats watch and republishes its host-facing snapshot
+when total usage changes. It does not consume `TurnProgress`, track a settled baseline, or perform
+usage arithmetic. The Session actor owns the transition from active progress to durable settled usage,
+so independently scheduled completion and display updates cannot double-count a turn.
+
 Collaboration is an assembly result, not a permission system. `install_collaboration` takes a clean
 base `Agent` and is the only assembly path; an already-enhanced agent is rejected. There is no
-configurable delegation depth, collaboration concurrency limit, history fork, model-visible session
-ID, list operation, or removal operation. The controller retains named agents for its own lifetime,
-partitioned by root session; host projections preserve that root boundary while model tools only see
-their current root. Display state is only `idle` or `running`; completion, failure, and interruption
-belong to `TurnResult`.
+configurable delegation depth, collaboration concurrency limit, history fork, or model-visible
+session ID. `list_agents` reads active snapshots without consuming completion results.
+`remove_agent` detaches an entry, cancels unfinished turns, removes unread completions for its path,
+and records a path tombstone so the name cannot be reused in that root tree. It never deletes the
+child Session log. Completion routing requires the path to remain active, so late results cannot
+reappear after removal. Trees remain partitioned by root session; host projections preserve that
+boundary while model tools only see their current root. Display state is only `idle` or `running`;
+completion, failure, and interruption belong to `TurnResult`.
 `message_agent(interrupt=true)` cancels unfinished child turns before submitting the replacement
 message. The controller mirrors cancellation handles and observes Turn results, while the child
 `Session` remains the sole execution-queue owner.

@@ -7,12 +7,10 @@ use std::{
 
 use ash_core::{
     Content, ContentBlock, ForkPoint, Message, MessageContent, MessageId, SessionSummary,
-    SessionView, StopReason, ToolCallId, TurnId, TurnResult, TurnView, Usage,
+    SessionView, StopReason, ToolCallId, TurnId, TurnResult, TurnStats, TurnView,
 };
 use crossterm::terminal;
 use serde_json::Value;
-#[cfg(test)]
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
     history_block::HistoryBlock,
@@ -49,13 +47,6 @@ impl SessionUiInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TurnUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    generation_ms: u64,
-}
-
 #[derive(Debug, Default)]
 struct UsageState {
     /// Current model-context size, always a local estimate from the agent
@@ -66,16 +57,6 @@ struct UsageState {
 }
 
 impl UsageState {
-    /// Record the settled turn's usage for the worked summary block. The
-    /// context size is updated separately from `view.context_tokens`.
-    fn commit_turn_usage(usage: Option<&Usage>) -> TurnUsage {
-        usage.map_or_else(TurnUsage::default, |usage| TurnUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            generation_ms: usage.generation_ms,
-        })
-    }
-
     /// Record the current model-context size (turn end, compaction, restore,
     /// fork, rollback). Always an estimate; never mixed with API usage.
     const fn set_context_tokens(&mut self, tokens: u64) {
@@ -161,7 +142,6 @@ impl ComposerState {
 #[derive(Debug, Default)]
 struct StatusState {
     started_at: Option<Instant>,
-    frame: usize,
 }
 
 impl StatusState {
@@ -169,7 +149,6 @@ impl StatusState {
         match (self.started_at.is_some(), active) {
             (false, true) => {
                 self.started_at = Some(Instant::now());
-                self.frame = 0;
             }
             (true, false) => self.reset(),
             _ => {}
@@ -375,6 +354,7 @@ pub struct TerminalUi {
     next_block_id: u64,
     status: StatusState,
     usage: UsageState,
+    turn_stats: Option<TurnStats>,
     current_turn_id: Option<TurnId>,
     reasoning_block_id: Option<u64>,
     /// Id of the turn's active streaming assistant block (if any). Deltas are
@@ -408,6 +388,7 @@ impl TerminalUi {
             next_block_id: 1,
             status: StatusState::default(),
             usage: UsageState::default(),
+            turn_stats: None,
             current_turn_id: None,
             reasoning_block_id: None,
             assistant_block_id: None,
@@ -512,7 +493,7 @@ impl TerminalUi {
         // `begin_fresh_viewport` resets usage; restore the estimated context
         // size so the status line reflects current occupancy before any API
         // usage is reported for the new history.
-        if let Some(tokens) = session.context_tokens {
+        if let Some(tokens) = session.stats.context_tokens {
             self.usage.set_context_tokens(tokens);
         }
         self.blocks.mark_all_committed();
@@ -586,7 +567,21 @@ impl TerminalUi {
         RenderPlan::REDRAW
     }
 
-    pub const fn turn_started(&self) -> RenderPlan {
+    pub fn turn_started(&mut self) -> RenderPlan {
+        self.turn_stats = None;
+        RenderPlan::REDRAW
+    }
+
+    pub fn turn_progress(&mut self, stats: TurnStats) -> RenderPlan {
+        if self.turn_stats == Some(stats) {
+            return RenderPlan::NONE;
+        }
+        self.turn_stats = Some(stats);
+        RenderPlan::REDRAW
+    }
+
+    pub fn set_context_tokens(&mut self, tokens: u64) -> RenderPlan {
+        self.usage.set_context_tokens(tokens);
         RenderPlan::REDRAW
     }
 
@@ -721,17 +716,14 @@ impl TerminalUi {
     pub fn commit_turn(&mut self, view: &TurnView) -> RenderPlan {
         self.finish_live_output();
         let elapsed_seconds = self.status.elapsed_seconds();
-        if let Some(tokens) = view.context_tokens {
-            self.usage.set_context_tokens(tokens);
-        }
-        let usage = UsageState::commit_turn_usage(view.usage.as_ref());
-        let footer = turn_footer(&view.result, elapsed_seconds, usage);
+        let footer = turn_footer(&view.result, elapsed_seconds, view.stats);
         self.blocks
             .remove_streamed_turn(self.current_turn_id, view.id);
         self.assistant_block_id = None;
         self.push_turn_messages(&view.messages);
         self.push_history_block(footer);
         self.current_turn_id = None;
+        self.turn_stats = None;
         RenderPlan::COMMIT
     }
 
@@ -788,10 +780,9 @@ impl TerminalUi {
         if !self.view.activity.is_active() && self.subagents.is_empty() {
             return RenderPlan::NONE;
         }
-        self.status.frame = self.status.frame.wrapping_add(1);
         // The periodic working refresh is the fallback flush point: it
-        // redraws current state, so partial lines that never completed a
-        // newline still appear here.
+        // updates elapsed time and flushes partial lines that never completed
+        // a newline.
         RenderPlan::REDRAW
     }
 
@@ -807,6 +798,7 @@ impl TerminalUi {
     pub fn leave(&mut self) -> io::Result<()> {
         self.finish_live_output();
         self.current_turn_id = None;
+        self.turn_stats = None;
         self.commit_transcript_to_scrollback()?;
         self.surface.leave_screen()
     }
@@ -839,6 +831,7 @@ impl TerminalUi {
 
     fn reset_turn_state(&mut self) {
         self.status.reset();
+        self.turn_stats = None;
         self.current_turn_id = None;
         self.reasoning_block_id = None;
         self.assistant_block_id = None;
@@ -1113,12 +1106,9 @@ impl TerminalUi {
 
     fn viewport_frame(&self, width: u16, height: u16) -> viewport::ViewportFrame {
         let elapsed = format_elapsed(self.status.elapsed_seconds());
-        let (busy, interruptible, status_header) = match self.view.activity {
-            ActivityView::Idle => (false, false, ""),
-            ActivityView::Active {
-                header,
-                interruptible,
-            } => (true, interruptible, header),
+        let (busy, status_header) = match self.view.activity {
+            ActivityView::Idle => (false, ""),
+            ActivityView::Active { header, .. } => (true, header),
         };
         let status_header = sanitize_single_line(status_header);
         let model = sanitize_single_line(&self.session.model);
@@ -1129,10 +1119,9 @@ impl TerminalUi {
             transcript: self.blocks.pending(),
             scroll_top: self.scroll_top,
             busy,
-            interruptible,
             status_header: &status_header,
-            status_dots: status_dots(self.status.frame),
             elapsed: &elapsed,
+            turn_stats: self.current_turn_id.and(self.turn_stats),
             prompt_lines: &self.view.composer.lines,
             prompt_cursor_row: self.view.composer.cursor_row,
             prompt_cursor_column: self.view.composer.cursor_column,
@@ -1209,11 +1198,6 @@ fn insert_history_blocks(
     Ok(blocks.len())
 }
 
-const fn status_dots(frame: usize) -> &'static str {
-    const FRAMES: [&str; 4] = [".  ", ".. ", "...", ".. "];
-    FRAMES[frame % FRAMES.len()]
-}
-
 const fn normalize_scroll_top(scroll_top: &mut Option<u16>, rendered_top: u16) {
     if scroll_top.is_some() {
         *scroll_top = Some(rendered_top);
@@ -1252,15 +1236,10 @@ fn tool_results_map(messages: &[Message]) -> HashMap<ToolCallId, ToolResultView<
     results
 }
 
-fn turn_footer(result: &TurnResult, elapsed_seconds: u64, usage: TurnUsage) -> HistoryBlock {
+fn turn_footer(result: &TurnResult, elapsed_seconds: u64, stats: TurnStats) -> HistoryBlock {
     match result {
         TurnResult::Completed(StopReason::Aborted) => HistoryBlock::interrupted(),
-        TurnResult::Completed(_) => HistoryBlock::worked(
-            format_elapsed(elapsed_seconds),
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.generation_ms,
-        ),
+        TurnResult::Completed(_) => HistoryBlock::worked(format_elapsed(elapsed_seconds), stats),
         TurnResult::Failed(error) | TurnResult::Interrupted(error) => HistoryBlock::error(error),
     }
 }
@@ -1383,45 +1362,9 @@ mod tests {
     }
 
     #[test]
-    fn animates_status_with_a_fixed_width_dot_pulse() {
-        assert_eq!(status_dots(0), ".  ");
-        assert_eq!(status_dots(1), ".. ");
-        assert_eq!(status_dots(2), "...");
-        assert_eq!(status_dots(3), ".. ");
-        assert_eq!(status_dots(4), ".  ");
-        assert!((0..8).all(|frame| UnicodeWidthStr::width(status_dots(frame)) == 3));
-    }
-
-    #[test]
-    fn usage_commits_turn_usage_for_the_worked_summary_without_touching_context() {
+    fn turn_progress_does_not_change_context_usage() {
         let mut usage = UsageState::default();
         usage.set_context_tokens(500);
-        let turn = UsageState::commit_turn_usage(Some(&Usage {
-            input_tokens: 100,
-            output_tokens: 20,
-            generation_ms: 400,
-            estimated: false,
-        }));
-        // The context size is updated separately from `set_context_tokens`;
-        // committing turn usage only feeds the worked summary block.
-        assert_eq!(usage.context_tokens, Some(500));
-        assert_eq!(turn.input_tokens, 100);
-        assert_eq!(turn.output_tokens, 20);
-        assert_eq!(turn.generation_ms, 400);
-
-        let turn = UsageState::commit_turn_usage(Some(&Usage {
-            input_tokens: 150,
-            output_tokens: 30,
-            generation_ms: 600,
-            estimated: true,
-        }));
-        assert_eq!(usage.context_tokens, Some(500));
-        assert_eq!(turn.input_tokens, 150);
-        assert_eq!(turn.output_tokens, 30);
-        assert_eq!(turn.generation_ms, 600);
-
-        let turn = UsageState::commit_turn_usage(None);
-        assert_eq!(turn, TurnUsage::default());
         assert_eq!(usage.context_tokens, Some(500));
     }
 
@@ -1493,14 +1436,32 @@ mod tests {
         let footer = turn_footer(
             &TurnResult::Completed(ash_core::StopReason::EndTurn),
             3,
-            TurnUsage {
-                input_tokens: 10,
-                output_tokens: 2,
+            TurnStats {
+                usage: ash_core::Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    tool_calls: 1,
+                    estimated: false,
+                },
                 generation_ms: 100,
             },
         );
 
-        assert_eq!(footer, HistoryBlock::worked("3s".to_string(), 10, 2, 100));
+        assert_eq!(
+            footer,
+            HistoryBlock::worked(
+                "3s".to_string(),
+                TurnStats {
+                    usage: ash_core::Usage {
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        tool_calls: 1,
+                        estimated: false,
+                    },
+                    generation_ms: 100,
+                }
+            )
+        );
     }
 
     #[test]
@@ -1509,7 +1470,7 @@ mod tests {
             turn_footer(
                 &TurnResult::Completed(StopReason::Aborted),
                 3,
-                TurnUsage::default()
+                TurnStats::default()
             ),
             HistoryBlock::interrupted()
         );
@@ -1525,7 +1486,7 @@ mod tests {
             turn_footer(
                 &TurnResult::Failed("invalid response".into()),
                 3,
-                TurnUsage::default()
+                TurnStats::default()
             ),
             HistoryBlock::error("invalid response")
         );
@@ -1533,7 +1494,7 @@ mod tests {
             turn_footer(
                 &TurnResult::Interrupted("session closed".into()),
                 3,
-                TurnUsage::default(),
+                TurnStats::default(),
             ),
             HistoryBlock::error("session closed")
         );

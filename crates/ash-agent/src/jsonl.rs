@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use ash_core::{
     ash_data_dir, parse_agent_path, AgentPath, Content, Message, MessageContent, SessionId,
-    SessionIdentity, SessionSummary, TurnId, TurnResult, Usage,
+    SessionIdentity, SessionSummary, TurnId, TurnResult, TurnStats, Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,42 @@ use crate::{AcceptedInput, ContextCheckpoint, LogEntry, SessionAppender, Session
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct StoredTurnStats {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    tool_calls: u64,
+    generation_ms: u64,
+    estimated: bool,
+}
+
+impl From<TurnStats> for StoredTurnStats {
+    fn from(stats: TurnStats) -> Self {
+        Self {
+            input_tokens: stats.usage.input_tokens,
+            output_tokens: stats.usage.output_tokens,
+            tool_calls: stats.usage.tool_calls,
+            generation_ms: stats.generation_ms,
+            estimated: stats.usage.estimated,
+        }
+    }
+}
+
+impl From<StoredTurnStats> for TurnStats {
+    fn from(stats: StoredTurnStats) -> Self {
+        Self {
+            usage: Usage {
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                tool_calls: stats.tool_calls,
+                estimated: stats.estimated,
+            },
+            generation_ms: stats.generation_ms,
+        }
+    }
+}
 
 /// Current on-disk session file format. Bumped on incompatible changes; old
 /// formats are rejected outright rather than guessed at.
@@ -134,8 +170,9 @@ enum FileRecord {
     TurnEnd {
         turn_id: TurnId,
         result: TurnResult,
-        usage: Option<Usage>,
+        usage: Option<StoredTurnStats>,
     },
+    CompactionUsage(Usage),
     Rollback,
     ContextCompacted(ContextCheckpoint),
 }
@@ -156,11 +193,12 @@ impl FileRecord {
                 variant(message)
             }
             LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(checkpoint),
-            LogEntry::TurnEnd { id, result, usage } => Self::TurnEnd {
+            LogEntry::TurnEnd { id, result, stats } => Self::TurnEnd {
                 turn_id: id,
                 result,
-                usage,
+                usage: Some(stats.into()),
             },
+            LogEntry::CompactionUsage(usage) => Self::CompactionUsage(usage),
             LogEntry::Rollback => Self::Rollback,
         }
     }
@@ -180,8 +218,9 @@ impl FileRecord {
             } => Some(LogEntry::TurnEnd {
                 id: turn_id,
                 result,
-                usage,
+                stats: usage.map_or_else(TurnStats::default, Into::into),
             }),
+            Self::CompactionUsage(usage) => Some(LogEntry::CompactionUsage(usage)),
             Self::Rollback => Some(LogEntry::Rollback),
             Self::SessionHeader(_) => None,
         }
@@ -1431,7 +1470,7 @@ mod tests {
                 LogEntry::TurnEnd {
                     id: turn_id,
                     result: ash_core::TurnResult::Completed(ash_core::StopReason::EndTurn),
-                    usage: None,
+                    stats: TurnStats::default(),
                 },
             ])
             .await

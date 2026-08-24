@@ -4,10 +4,11 @@ use std::{
 };
 
 use ash_core::{
-    CancellationToken, ForkPoint, Message, MessageId, SessionEvent, SessionEventKind, SessionId,
-    SessionIdentity, SessionView, TurnId, TurnResult, TurnView,
+    ActiveTurnStats, CancellationToken, ForkPoint, Message, MessageId, SessionEvent,
+    SessionEventKind, SessionId, SessionIdentity, SessionStats, SessionView, TurnId, TurnResult,
+    TurnStats, TurnView,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::context::estimate_request_tokens;
@@ -25,6 +26,7 @@ pub struct Session {
     identity: SessionIdentity,
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<SessionEvent>,
+    stats: watch::Receiver<SessionStats>,
 }
 
 pub struct Turn {
@@ -70,14 +72,16 @@ impl Session {
     pub(crate) fn spawn(state: SessionActorState) -> Self {
         let id = state.id();
         let identity = state.identity().clone();
+        let initial_stats = state.stats();
         let (commands, command_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(256);
+        let (stats_tx, stats) = watch::channel(initial_stats);
         let events_clone = events.clone();
         tokio::spawn(async move {
             // Keep actor panics visible: the JoinHandle is dropped here, so a
             // panic inside the actor would otherwise disappear with it.
             if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                run_session(state, command_rx, events_clone),
+                run_session(state, command_rx, events_clone, stats_tx),
             ))
             .await
             {
@@ -92,6 +96,7 @@ impl Session {
             identity,
             commands,
             events,
+            stats,
         }
     }
 
@@ -108,6 +113,16 @@ impl Session {
     #[must_use]
     pub fn events(&self) -> BroadcastStream<SessionEvent> {
         BroadcastStream::new(self.events.subscribe())
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> SessionStats {
+        *self.stats.borrow()
+    }
+
+    #[must_use]
+    pub fn subscribe_stats(&self) -> watch::Receiver<SessionStats> {
+        self.stats.clone()
     }
 
     /// Submit a new turn and return a handle to it.
@@ -281,6 +296,7 @@ async fn run_session(
     mut state: SessionActorState,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<SessionEvent>,
+    stats: watch::Sender<SessionStats>,
 ) {
     let mut queues = ActorQueues::default();
     let mut sequence = 0_u64;
@@ -293,6 +309,7 @@ async fn run_session(
                 &mut commands,
                 &events,
                 &mut sequence,
+                &stats,
             )
             .await;
             continue;
@@ -300,7 +317,15 @@ async fn run_session(
         let Some(command) = commands.recv().await else {
             break;
         };
-        dispatch_idle_command(command, &mut state, &mut queues).await;
+        dispatch_idle_command(
+            command,
+            &mut state,
+            &mut queues,
+            &events,
+            &mut sequence,
+            &stats,
+        )
+        .await;
     }
 }
 
@@ -311,6 +336,7 @@ async fn run_turn(
     commands: &mut mpsc::Receiver<Command>,
     events: &broadcast::Sender<SessionEvent>,
     sequence: &mut u64,
+    stats: &watch::Sender<SessionStats>,
 ) {
     let QueuedTurn {
         id,
@@ -323,13 +349,6 @@ async fn run_turn(
         inputs = std::mem::take(&mut queues.inbox);
     }
     let session_id = state.id();
-    publish(
-        events,
-        session_id,
-        Some(id),
-        sequence,
-        SessionEventKind::TurnStarted,
-    );
     let (payload_tx, mut payload_rx) = mpsc::channel(64);
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let execution = state.submit_inputs(id, inputs, steer_rx, payload_tx, cancellation.clone());
@@ -342,6 +361,7 @@ async fn run_turn(
             result = &mut execution => break result,
             payload = payload_rx.recv() => {
                 if let Some(kind) = payload {
+                    apply_turn_stats(stats, id, &kind);
                     publish(events, session_id, Some(id), sequence, kind);
                 }
             }
@@ -356,6 +376,7 @@ async fn run_turn(
         }
     };
     while let Ok(kind) = payload_rx.try_recv() {
+        apply_turn_stats(stats, id, &kind);
         publish(events, session_id, Some(id), sequence, kind);
     }
     drop(execution);
@@ -368,11 +389,26 @@ async fn run_turn(
                 id,
                 result: TurnResult::Failed(error.to_string()),
                 messages: Vec::new(),
-                usage: None,
-                context_tokens: None,
+                stats: ash_core::TurnStats::default(),
             })
         }
     };
+    let previous = *stats.borrow();
+    let next = state.stats();
+    if previous != next {
+        stats.send_replace(next);
+    }
+    if previous.context_tokens != next.context_tokens {
+        if let Some(tokens) = next.context_tokens {
+            publish(
+                events,
+                session_id,
+                Some(id),
+                sequence,
+                SessionEventKind::ContextChanged { tokens },
+            );
+        }
+    }
     let completed = view.clone();
     publish(
         events,
@@ -383,6 +419,35 @@ async fn run_turn(
     );
     if let Some(completion) = completion {
         let _ = completion.send(Ok(completed));
+    }
+}
+
+fn apply_turn_stats(
+    stats: &watch::Sender<SessionStats>,
+    turn_id: TurnId,
+    event: &SessionEventKind,
+) {
+    let mut next = *stats.borrow();
+    match event {
+        SessionEventKind::TurnStarted => {
+            next.active_turn = Some(ActiveTurnStats {
+                turn_id,
+                stats: TurnStats::default(),
+            });
+        }
+        SessionEventKind::TurnProgress(turn_stats) => {
+            next.active_turn = Some(ActiveTurnStats {
+                turn_id,
+                stats: *turn_stats,
+            });
+        }
+        SessionEventKind::ContextChanged { tokens } => next.context_tokens = Some(*tokens),
+        SessionEventKind::Live(_)
+        | SessionEventKind::TurnCompleted(_)
+        | SessionEventKind::ContextCompacted(_) => return,
+    }
+    if *stats.borrow() != next {
+        stats.send_replace(next);
     }
 }
 
@@ -419,16 +484,27 @@ async fn dispatch_idle_command(
     command: Command,
     state: &mut SessionActorState,
     queues: &mut ActorQueues,
+    events: &broadcast::Sender<SessionEvent>,
+    sequence: &mut u64,
+    stats: &watch::Sender<SessionStats>,
 ) {
     match command {
         Command::Submit(turn) => queues.turns.push_back(turn),
         Command::Notify(input) => queues.inbox.push(input),
         Command::Steer { reply, .. } => reject_steer(reply),
         Command::Rollback(reply) => {
-            let _ = reply.send(state.rollback_last_turn().await);
+            let result = state.rollback_last_turn().await;
+            if result.is_ok() {
+                publish_current_stats(state, stats, events, sequence);
+            }
+            let _ = reply.send(result);
         }
         Command::Compact(reply) => {
-            let _ = reply.send(state.compact().await);
+            let result = state.compact().await;
+            // A failed compaction may still have incurred and persisted model
+            // usage, so always refresh from the durable projection.
+            publish_current_stats(state, stats, events, sequence);
+            let _ = reply.send(result);
         }
         Command::View(reply) => {
             let _ = reply.send(Ok(state.view()));
@@ -444,6 +520,30 @@ async fn dispatch_idle_command(
                 })
             });
             let _ = reply.send(result);
+        }
+    }
+}
+
+fn publish_current_stats(
+    state: &SessionActorState,
+    stats: &watch::Sender<SessionStats>,
+    events: &broadcast::Sender<SessionEvent>,
+    sequence: &mut u64,
+) {
+    let previous = *stats.borrow();
+    let next = state.stats();
+    if previous != next {
+        stats.send_replace(next);
+    }
+    if previous.context_tokens != next.context_tokens {
+        if let Some(tokens) = next.context_tokens {
+            publish(
+                events,
+                state.id(),
+                None,
+                sequence,
+                SessionEventKind::ContextChanged { tokens },
+            );
         }
     }
 }
@@ -594,8 +694,16 @@ impl SessionActorState {
 
     pub fn view(&self) -> SessionView {
         let mut view = self.log.view();
-        view.context_tokens = self.estimate_context_tokens(&view.context);
+        view.stats.context_tokens = self.estimate_context_tokens(&view.context);
         view
+    }
+
+    pub fn stats(&self) -> SessionStats {
+        SessionStats {
+            settled_usage: self.log.usage(),
+            active_turn: None,
+            context_tokens: self.estimate_context_tokens(&self.log.model_context()),
+        }
     }
 
     pub(crate) async fn resume(
@@ -700,6 +808,7 @@ impl SessionActorState {
             }));
         }
         self.append(&accepted).await?;
+        let _ = events.send(SessionEventKind::TurnStarted).await;
         let mut model_context = self.log.model_context();
         let turn_config = self.config.clone();
         let writer = self.writer().await?;
@@ -712,7 +821,7 @@ impl SessionActorState {
             steering,
             Vec::new(),
         );
-        let engine_result = run_agent_turn_persisted(
+        let outcome = run_agent_turn_persisted(
             self.runtime.model(),
             &turn_config,
             &mut model_context,
@@ -720,11 +829,10 @@ impl SessionActorState {
             &mut persistence,
         )
         .await;
-        let (turn_result, usage) = match &engine_result {
-            Ok((reason, usage)) => (TurnResult::Completed(reason.clone()), *usage),
-            Err(error) => (TurnResult::Failed(error.to_string()), None),
+        let turn_result = match &outcome.result {
+            Ok(reason) => TurnResult::Completed(reason.clone()),
+            Err(error) => TurnResult::Failed(error.to_string()),
         };
-        let context_tokens = self.estimate_context_tokens(&model_context);
         // Commit point: buffer the turn's terminal entry, then write all
         // buffered messages plus the turn end in one write+flush. On crash
         // before this point the turn has no `TurnEnd`, so the projection
@@ -732,12 +840,12 @@ impl SessionActorState {
         persistence.stage(&[LogEntry::TurnEnd {
             id: turn_id,
             result: turn_result,
-            usage,
+            stats: outcome.stats,
         }]);
         let appended = match persistence.commit().await {
             Ok(appended) => appended,
             // A commit failure is only fatal when nothing else already failed.
-            Err(error) if engine_result.is_ok() => {
+            Err(error) if outcome.result.is_ok() => {
                 return Err(error);
             }
             Err(_) => Vec::new(),
@@ -749,13 +857,12 @@ impl SessionActorState {
         for entry in appended {
             self.log.push(entry);
         }
-        engine_result?;
-        let mut committed = self.log.turn_view(turn_id).ok_or_else(|| {
+        outcome.result?;
+        let committed = self.log.turn_view(turn_id).ok_or_else(|| {
             ash_core::AshError::Config(format!(
                 "committed turn {turn_id} is missing from the durable projection"
             ))
         })?;
-        committed.context_tokens = context_tokens;
         Ok(committed)
     }
 
@@ -783,9 +890,21 @@ impl SessionActorState {
         let model_context = self.log.model_context();
         let before_tokens =
             estimate_request_tokens(self.config.system_prompt.as_deref(), &model_context, &tools);
-        let Some(compacted) =
-            compact_with_adapter(&self.config, &model_context, model, cancel).await?
-        else {
+        let outcome = compact_with_adapter(&self.config, &model_context, model, cancel).await;
+        let usage = outcome.stats.usage;
+        let compacted = match outcome.result {
+            Ok(compacted) => compacted,
+            Err(error) => {
+                if usage != ash_core::Usage::default() {
+                    self.append(&[LogEntry::CompactionUsage(usage)]).await?;
+                }
+                return Err(error);
+            }
+        };
+        let Some(compacted) = compacted else {
+            if usage != ash_core::Usage::default() {
+                self.append(&[LogEntry::CompactionUsage(usage)]).await?;
+            }
             return Ok(ContextUpdate {
                 before_tokens: u64::try_from(before_tokens).unwrap_or(u64::MAX),
                 after_tokens: u64::try_from(before_tokens).unwrap_or(u64::MAX),
@@ -793,7 +912,11 @@ impl SessionActorState {
             });
         };
         let checkpoint = ContextCheckpoint::from_model_context(&compacted.messages)?;
-        self.append(&[LogEntry::Checkpoint(checkpoint)]).await?;
+        let mut entries = vec![LogEntry::Checkpoint(checkpoint)];
+        if usage != ash_core::Usage::default() {
+            entries.push(LogEntry::CompactionUsage(usage));
+        }
+        self.append(&entries).await?;
         Ok(compacted.update)
     }
 
@@ -857,7 +980,7 @@ mod tests {
     use crate::agent::RetryBackoff;
     use ash_core::{
         Content, ContentBlock, MessageContent, MessageId, ModelClient, ModelEvent, ModelId,
-        ModelRequest, ModelStream, StopReason, ToolCallId,
+        ModelRequest, ModelStream, ModelUsage, StopReason, ToolCallId, Usage,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -1248,6 +1371,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_manual_compaction_persists_reported_usage() {
+        let directory = TempDir::new().unwrap();
+        let config = config();
+        let runtime = runtime_in(directory.path());
+        let messages = vec![
+            Message::user(&format!("old request {}", "x".repeat(10_000))),
+            Message::assistant_text("old answer"),
+            Message::user("recent request"),
+        ];
+        let mut state = session_with_messages(config, runtime, &messages).await;
+        let reported = ModelUsage {
+            input_tokens: 80,
+            output_tokens: 12,
+        };
+        let expected = Usage {
+            input_tokens: reported.input_tokens,
+            output_tokens: reported.output_tokens,
+            tool_calls: 0,
+            estimated: false,
+        };
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                ModelEvent::Usage(reported),
+                ModelEvent::Text("partial summary".to_string()),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let error = state
+            .compact_using(&adapter, &CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("without a terminal marker"));
+        assert_eq!(state.log.usage(), expected);
+        assert!(!state
+            .log
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Checkpoint(_))));
+        let stored = stored_session(&state.store, state.id()).await;
+        assert_eq!(stored.log.usage(), expected);
+    }
+
+    #[tokio::test]
+    async fn failed_manual_compaction_refreshes_the_session_stats_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let reported = ModelUsage {
+            input_tokens: 80,
+            output_tokens: 12,
+        };
+        let expected = Usage {
+            input_tokens: reported.input_tokens,
+            output_tokens: reported.output_tokens,
+            tool_calls: 0,
+            estimated: false,
+        };
+        let runtime = Runtime::new(
+            Arc::new(MockAdapter {
+                responses: Mutex::new(VecDeque::from([vec![
+                    ModelEvent::Usage(reported),
+                    ModelEvent::Text("partial summary".to_string()),
+                ]])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            "test",
+        )
+        .with_session_store(Arc::new(crate::JsonlSessionStore::new(directory.path())));
+        let messages = vec![
+            Message::user(&format!("old request {}", "x".repeat(10_000))),
+            Message::assistant_text("old answer"),
+            Message::user("recent request"),
+        ];
+        let state = session_with_messages(config(), runtime, &messages).await;
+        let session = Session::spawn(state);
+
+        let error = session.compact().await.unwrap_err();
+
+        assert!(error.to_string().contains("without a terminal marker"));
+        assert_eq!(session.stats().settled_usage, expected);
+    }
+
+    #[tokio::test]
     async fn session_serializes_submitted_turns_in_acceptance_order() {
         let directory = TempDir::new().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1392,7 +1598,7 @@ mod tests {
         assert_eq!(emitted.id, projected.id);
         assert_eq!(emitted.messages, projected.messages);
         assert_eq!(emitted.result, projected.result);
-        assert_eq!(emitted.usage, projected.usage);
+        assert_eq!(emitted.stats, projected.stats);
     }
 
     #[tokio::test]

@@ -13,20 +13,77 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
-/// Provider-neutral usage accounting.
-///
-/// `estimated` marks locally estimated values (no API usage was reported);
-/// `generation_ms` measures the wall-clock time from the first output token
-/// of any kind (reasoning, text, or tool call) to the end of the stream.
-/// Provider-reported `output_tokens` includes reasoning/thinking tokens, so
-/// the clock must start at the first reasoning delta for the rate
-/// (`output_tokens` / `generation_ms`) to be honest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Session-level additive resource consumption, including local work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub generation_ms: u64,
+    #[serde(default)]
+    pub tool_calls: u64,
     pub estimated: bool,
+}
+
+impl Usage {
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            tool_calls: self.tool_calls.saturating_add(other.tool_calls),
+            estimated: self.estimated || other.estimated,
+        }
+    }
+
+    #[must_use]
+    pub const fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// Observable statistics for one turn. The live copy is ephemeral; the final
+/// copy is persisted with the turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStats {
+    #[serde(flatten)]
+    pub usage: Usage,
+    /// Sum of model generation windows, excluding tool execution and backoff.
+    pub generation_ms: u64,
+}
+
+impl TurnStats {
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            usage: self.usage.saturating_add(other.usage),
+            generation_ms: self.generation_ms.saturating_add(other.generation_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveTurnStats {
+    pub turn_id: TurnId,
+    pub stats: TurnStats,
+}
+
+/// Latest read-only projection of one session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStats {
+    /// Usage backed by durable session-log entries.
+    pub settled_usage: Usage,
+    /// Latest replaceable snapshot for the running turn.
+    pub active_turn: Option<ActiveTurnStats>,
+    /// Local estimate of the context prepared for the model.
+    pub context_tokens: Option<u64>,
+}
+
+impl SessionStats {
+    #[must_use]
+    pub fn total_usage(self) -> Usage {
+        self.active_turn.map_or(self.settled_usage, |active| {
+            self.settled_usage.saturating_add(active.stats.usage)
+        })
+    }
 }
 
 /// Terminal result of one turn. `StopReason` alone cannot express failure or
@@ -47,12 +104,7 @@ pub struct TurnView {
     pub id: TurnId,
     pub result: TurnResult,
     pub messages: Vec<Message>,
-    pub usage: Option<Usage>,
-    /// Locally estimated token count of the model context after this turn
-    /// (system prompt + tools + model context). Same estimator the runtime
-    /// uses for compaction; the UI shows this as the current context size.
-    #[serde(default)]
-    pub context_tokens: Option<u64>,
+    pub stats: TurnStats,
 }
 
 /// Full projected state of a session, derived from its durable log. Never
@@ -62,11 +114,7 @@ pub struct SessionView {
     pub messages: Vec<Message>,
     pub context: Vec<Message>,
     pub turns: Vec<TurnView>,
-    /// Locally estimated token count of the current model context (system
-    /// prompt + tools + `context`). Same estimator the runtime uses for
-    /// compaction; the UI shows this as the current context size.
-    #[serde(default)]
-    pub context_tokens: Option<u64>,
+    pub stats: SessionStats,
 }
 
 /// Ephemeral streaming deltas for the current turn. Never persisted and never
@@ -119,6 +167,10 @@ pub enum SessionEventKind {
     TurnStarted,
     /// Ephemeral streaming delta for the active turn's live preview.
     Live(LiveEvent),
+    /// Ephemeral full snapshot of the active turn's statistics.
+    TurnProgress(TurnStats),
+    /// Local size of the context prepared for the next model request.
+    ContextChanged { tokens: u64 },
     /// A turn settled: the canonical boundary for committing scrollback.
     TurnCompleted(TurnView),
     /// The model context was compacted while a turn was executing.
@@ -164,6 +216,65 @@ mod tests {
                 }
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn usage_saturates_counters_and_propagates_estimates() {
+        let usage = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: 10,
+            tool_calls: 2,
+            estimated: false,
+        }
+        .saturating_add(Usage {
+            input_tokens: 1,
+            output_tokens: u64::MAX,
+            tool_calls: u64::MAX,
+            estimated: true,
+        });
+
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, u64::MAX);
+        assert_eq!(usage.tool_calls, u64::MAX);
+        assert!(usage.estimated);
+        assert_eq!(usage.total_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn session_stats_add_active_usage_without_mutating_settled_usage() {
+        let settled_usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            tool_calls: 1,
+            estimated: false,
+        };
+        let stats = SessionStats {
+            settled_usage,
+            active_turn: Some(ActiveTurnStats {
+                turn_id: TurnId::new(),
+                stats: TurnStats {
+                    usage: Usage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        tool_calls: 1,
+                        estimated: true,
+                    },
+                    generation_ms: 100,
+                },
+            }),
+            context_tokens: Some(20),
+        };
+
+        assert_eq!(stats.settled_usage, settled_usage);
+        assert_eq!(
+            stats.total_usage(),
+            Usage {
+                input_tokens: 14,
+                output_tokens: 7,
+                tool_calls: 2,
+                estimated: true,
+            }
         );
     }
 }

@@ -1,4 +1,6 @@
-use ash_core::{Message, MessageId, SessionView, TurnId, TurnResult, TurnView, Usage};
+use ash_core::{
+    Message, MessageId, SessionStats, SessionView, TurnId, TurnResult, TurnStats, TurnView, Usage,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Input;
@@ -46,8 +48,9 @@ pub enum LogEntry {
     TurnEnd {
         id: TurnId,
         result: TurnResult,
-        usage: Option<Usage>,
+        stats: TurnStats,
     },
+    CompactionUsage(Usage),
     Rollback,
 }
 
@@ -67,6 +70,7 @@ struct Projector {
     open: Option<OpenTurn>,
     checkpoint: Option<AppliedCheckpoint>,
     turn_boundaries: Vec<ProjectionSnapshot>,
+    settled_usage: Usage,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +201,11 @@ impl SessionLog {
         self.projection.turn_view(turn_id)
     }
 
+    #[must_use]
+    pub const fn usage(&self) -> Usage {
+        self.projection.settled_usage
+    }
+
     /// Full projected state: history, model context, and turn views.
     #[must_use]
     pub fn view(&self) -> SessionView {
@@ -204,7 +213,11 @@ impl SessionLog {
             messages: self.projection.history.clone(),
             context: self.projection.context.clone(),
             turns: self.projection.turns(),
-            context_tokens: None,
+            stats: SessionStats {
+                settled_usage: self.projection.settled_usage,
+                active_turn: None,
+                context_tokens: None,
+            },
         }
     }
 }
@@ -245,17 +258,20 @@ impl Projector {
                     open.events.push(OpenEvent::Checkpoint(checkpoint.clone()));
                 }
             }
-            LogEntry::TurnEnd { result, usage, .. } => {
+            LogEntry::TurnEnd { result, stats, .. } => {
+                self.settled_usage = self.settled_usage.saturating_add(stats.usage);
                 if let Some(open) = self.open.take() {
                     self.settle(&open);
                     self.turns.push(TurnView {
                         id: open.id,
                         result: result.clone(),
                         messages: open.messages,
-                        usage: *usage,
-                        context_tokens: None,
+                        stats: *stats,
                     });
                 }
+            }
+            LogEntry::CompactionUsage(usage) => {
+                self.settled_usage = self.settled_usage.saturating_add(*usage);
             }
             LogEntry::Rollback => self.rollback(),
         }
@@ -364,8 +380,7 @@ fn interrupted_turn(id: TurnId, messages: Vec<Message>) -> TurnView {
         id,
         result: TurnResult::Interrupted("turn left open when the session ended".to_string()),
         messages,
-        usage: None,
-        context_tokens: None,
+        stats: TurnStats::default(),
     }
 }
 
@@ -392,6 +407,13 @@ mod tests {
     use ash_core::{MessageContent, StopReason};
 
     fn reference_projection(entries: &[LogEntry]) -> SessionView {
+        let settled_usage = entries
+            .iter()
+            .fold(Usage::default(), |usage, entry| match entry {
+                LogEntry::TurnEnd { stats, .. } => usage.saturating_add(stats.usage),
+                LogEntry::CompactionUsage(compaction) => usage.saturating_add(*compaction),
+                _ => usage,
+            });
         let mut active = Vec::new();
         for entry in entries {
             if matches!(entry, LogEntry::Rollback) {
@@ -456,7 +478,7 @@ mod tests {
                 LogEntry::Checkpoint(checkpoint) => {
                     context = apply_checkpoint(&all, checkpoint);
                 }
-                LogEntry::TurnEnd { id, result, usage } => {
+                LogEntry::TurnEnd { id, result, stats } => {
                     if current == Some(*id) {
                         current = None;
                     }
@@ -465,11 +487,11 @@ mod tests {
                             id: open_id,
                             result: result.clone(),
                             messages,
-                            usage: *usage,
-                            context_tokens: None,
+                            stats: *stats,
                         });
                     }
                 }
+                LogEntry::CompactionUsage(_) => {}
                 LogEntry::Rollback => unreachable!(),
             }
         }
@@ -480,7 +502,11 @@ mod tests {
             messages,
             context,
             turns,
-            context_tokens: None,
+            stats: SessionStats {
+                settled_usage,
+                active_turn: None,
+                context_tokens: None,
+            },
         }
     }
 
@@ -586,12 +612,15 @@ mod tests {
         log.push(LogEntry::TurnEnd {
             id: turn_id,
             result: TurnResult::Completed(StopReason::EndTurn),
-            usage: Some(Usage {
-                input_tokens: 10,
-                output_tokens: 5,
+            stats: TurnStats {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    tool_calls: 1,
+                    estimated: false,
+                },
                 generation_ms: 300,
-                estimated: false,
-            }),
+            },
         });
 
         let turns = log.turns();
@@ -602,7 +631,8 @@ mod tests {
             TurnResult::Completed(StopReason::EndTurn)
         ));
         assert_eq!(turns[0].messages.len(), 2);
-        assert_eq!(turns[0].usage.unwrap().input_tokens, 10);
+        assert_eq!(turns[0].stats.usage.input_tokens, 10);
+        assert_eq!(log.usage().tool_calls, 1);
         assert_eq!(log.turn_messages(turn_id).len(), 2);
     }
 
@@ -631,7 +661,7 @@ mod tests {
         log.push(LogEntry::TurnEnd {
             id: turn_id,
             result: TurnResult::Completed(StopReason::EndTurn),
-            usage: None,
+            stats: TurnStats::default(),
         });
 
         // A settled turn's assistant messages are normal history.
@@ -692,13 +722,52 @@ mod tests {
         log.push(LogEntry::TurnEnd {
             id: turn_id,
             result: TurnResult::Completed(StopReason::EndTurn),
-            usage: None,
+            stats: TurnStats::default(),
         });
         log.push(LogEntry::Rollback);
 
         assert!(log.turns().is_empty());
         assert!(log.messages().is_empty());
         assert!(log.model_context().is_empty());
+    }
+
+    #[test]
+    fn rollback_keeps_settled_usage_and_compaction_cost() {
+        let turn_id = TurnId::new();
+        let mut log = SessionLog::new();
+        log.push(LogEntry::TurnStart(turn_id));
+        log.push(LogEntry::Message(Message::user("question")));
+        log.push(LogEntry::TurnEnd {
+            id: turn_id,
+            result: TurnResult::Completed(StopReason::EndTurn),
+            stats: TurnStats {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    tool_calls: 1,
+                    estimated: false,
+                },
+                generation_ms: 100,
+            },
+        });
+        log.push(LogEntry::Rollback);
+        log.push(LogEntry::CompactionUsage(Usage {
+            input_tokens: 4,
+            output_tokens: 2,
+            tool_calls: 0,
+            estimated: true,
+        }));
+
+        assert!(log.turns().is_empty());
+        assert_eq!(
+            log.usage(),
+            Usage {
+                input_tokens: 14,
+                output_tokens: 7,
+                tool_calls: 1,
+                estimated: true,
+            }
+        );
     }
 
     #[test]
@@ -722,7 +791,7 @@ mod tests {
             LogEntry::TurnEnd {
                 id: first,
                 result: TurnResult::Completed(StopReason::EndTurn),
-                usage: None,
+                stats: TurnStats::default(),
             },
             LogEntry::TurnStart(second),
             accepted(second, "second"),
@@ -734,7 +803,7 @@ mod tests {
             LogEntry::TurnEnd {
                 id: second,
                 result: TurnResult::Completed(StopReason::MaxTokens),
-                usage: None,
+                stats: TurnStats::default(),
             },
         ];
 
@@ -781,7 +850,7 @@ mod tests {
             log.push(LogEntry::TurnEnd {
                 id: turn_id,
                 result: TurnResult::Completed(StopReason::EndTurn),
-                usage: None,
+                stats: TurnStats::default(),
             });
         }
 
@@ -804,7 +873,7 @@ mod tests {
         log.push(LogEntry::TurnEnd {
             id: turn_id,
             result: TurnResult::Completed(StopReason::EndTurn),
-            usage: None,
+            stats: TurnStats::default(),
         });
 
         let restored: SessionLog =

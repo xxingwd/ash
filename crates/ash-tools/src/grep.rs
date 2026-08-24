@@ -54,9 +54,10 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
         move |ctx, args: GrepArgs| {
             let root = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
                     search(
                         &root,

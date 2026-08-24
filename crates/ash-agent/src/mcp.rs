@@ -65,10 +65,11 @@ impl Tool for McpToolAdapter {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
+        let deadline = ctx.require_deadline()?;
 
         let result = await_tool_call(
             &ctx.cancellation,
-            ctx.deadline,
+            deadline,
             self.connection.peer.call_tool(request),
         )
         .await?
@@ -262,7 +263,7 @@ mod tests {
             session_id: SessionId::new(),
             turn_id: TurnId::new(),
             cancellation: CancellationToken::new(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             session: SessionToolContext {
                 identity: SessionIdentity::root(SessionId::new()),
                 messages: Vec::new(),

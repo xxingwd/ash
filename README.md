@@ -61,8 +61,9 @@ cargo run -p ash-cli -- \
 
 模型上下文窗口默认是 1M token，可用 `--max-context-tokens` 或
 `ASH_MAX_CONTEXT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
-1 token 的轻量估算，不引入 tokenizer 依赖。每轮结束后的 `Worked` 行显示输入、输出
-token 和生成速度；服务端没有返回 usage 时使用带 `~` 的本地估算值。
+1 token 的轻量估算，不引入 tokenizer 依赖。当前 Turn 的 `Working` 行会实时显示输入、
+输出、工具调用数和生成速度；每轮结束后的 `Worked` 行使用持久化的最终统计。服务端没有
+返回 usage 时使用本地估算值，并在 token 数前显示 `~`。
 
 估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文，并持久化一条
 隐藏的 compaction checkpoint。原始消息、终端 scrollback 和会话标题保持不变。压缩器
@@ -144,15 +145,19 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 ## 子 Agent
 
-默认交互链路提供三个协作工具：
+默认交互链路提供五个协作工具：
 
 - `agent`：创建命名 Agent 并发送初始 `message`
 - `message_agent`：向现有命名 Agent 发送后续 `message`；`interrupt: true` 会先取消未完成工作
+- `list_agents`：读取当前 Agent 的状态、累计 usage 和最近任务，不消费后台结果
+- `remove_agent`：解除与 Agent 的关系并取消未完成工作；名称不可复用，但 Session 日志保留
 - `wait_agent`：等待并消费后台任务的未读结果；`timeout_ms: 0` 立即返回当前快照
 
 `agent` 和 `message_agent` 默认使用 `wait: true`，这一轮完成后直接返回结果。独立任务可
 设置 `wait: false` 后台执行，父 Agent 继续处理其他工作，等需要结果时再调用
 `wait_agent`。同步返回的结果不会再次出现；父调用被取消或超时则自动转入未读结果队列。
+被 `remove_agent` 清理的 Agent 不再接受消息，迟到结果也不会重新进入完成队列。该操作不会
+删除子 Session 的 JSONL，但当前不提供把已移除 Agent 重新挂载到协作树的功能。
 
 这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，只追加所选类型的工作
 指令，不继承协作工具或主 Agent 的编排提示。
@@ -166,13 +171,16 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临时移除，因此 Ash
 也不对外暴露它。子 Agent 继承当前模型、协议、工作目录、工具、AGENTS.md 和 Skills
 配置，但从空会话历史开始，并通过与父 Agent 相同的 `Runtime -> Session -> Turn`
-流水线运行。名字在当前根 Session 内保持稳定，后续消息复用同一子 Session。
+流水线运行。名字在当前根 Session 内保持稳定，允许最多 64 个小写 ASCII 字母、数字、
+下划线或连字符（例如 `be-resource-product`）；后续消息复用同一子 Session。
+子 Agent 列表中的累计 usage 由已完成 Session usage 与当前 Turn 的最新进度组成，因此会在
+运行期间更新；Turn 完成后自动收敛到持久化的 Session 统计。
 
 ASH 支持多个子 Agent 并行，但这只是能力而不是强制流程：只有独立问题或清晰边界的
 工作流才适合拆给 explorer/worker。简单任务和紧耦合的即时阻塞仍由当前 Agent 自己
-完成。当前不向模型提供 list/remove：Agent 由进程内 controller 持有，并按根 Session
-隔离；切换会话时 TUI 只展示当前根的 Agent，切回原会话仍可继续使用原有 Agent。整个
-controller 退出时统一释放，避免为少用的管理动作引入额外生命周期协议。
+完成。Agent 由进程内 controller 持有，并按根 Session 隔离；`list_agents` 只读取当前
+投影，`remove_agent` 只解除路由并保留 Session 日志。切换会话时 TUI 只展示当前根的
+Agent，切回原会话仍可继续使用原有 Agent。整个 controller 退出时统一释放。
 
 ## 终端行为
 
@@ -212,7 +220,6 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
 - 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；没有后续排队任务时，只有
   已完成的工具结果会保留本轮，否则撤销整轮并把原问题恢复到输入框
-- 任务运行时状态栏显示 `esc to interrupt`，第一次按 `Esc` 不展示额外状态
 - 任务运行时 `Ctrl-C` 不取消当前请求
 - 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出

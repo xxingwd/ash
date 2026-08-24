@@ -1,18 +1,19 @@
 use ash_core::{
     CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent, ModelRequest,
     ModelStream, SessionEventKind, SessionIdentity, SessionToolContext, StopReason, ToolCallId,
-    ToolContext, ToolDefinition, ToolError, ToolOutput, TurnId, Usage,
+    ToolContext, ToolDefinition, ToolError, ToolOutput, ToolTimeout, TurnId, TurnStats,
 };
-use futures::StreamExt;
-use std::time::Instant;
+use futures::{future::join_all, StreamExt};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::agent::RetryBackoff;
 use crate::store::SessionPersistence;
+use crate::usage::UsageAccumulator;
 use crate::{
-    context::count_output_tokens,
-    context_policy::{CompactedContext, ContextRequest, DefaultContextPolicy},
+    context::{estimate_output_tokens, output_block_characters, output_character_count},
+    context_policy::{CompactionOutcome, ContextRequest, DefaultContextPolicy},
     log::{ContextCheckpoint, LogEntry},
     AcceptedInput, Input, RunConfig,
 };
@@ -20,6 +21,7 @@ use crate::{
 const MAX_AGENT_OUTPUT_BYTES: usize = 64 * 1024;
 const AGENT_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the agent ...\n";
+const TURN_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct PendingToolCall {
@@ -45,6 +47,8 @@ enum RetryAction {
 struct CollectedResponse {
     message: Option<Message>,
     usage: UsageAccumulator,
+    estimated_output_tokens: u64,
+    generation_ms: u64,
     outcome: ResponseOutcome,
 }
 
@@ -67,12 +71,12 @@ enum OpenResponseBlock {
     Text,
 }
 
-pub async fn compact_with_adapter(
+pub(crate) async fn compact_with_adapter(
     config: &RunConfig,
     messages: &[Message],
     model: &dyn ModelClient,
     cancel: &CancellationToken,
-) -> Result<Option<CompactedContext>, ash_core::AshError> {
+) -> CompactionOutcome {
     let tools = config.tool_definitions();
     DefaultContextPolicy
         .compact(
@@ -90,11 +94,9 @@ pub async fn compact_with_adapter(
         .await
 }
 
-#[derive(Default)]
-struct UsageAccumulator {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    generation_ms: u64,
+pub(crate) struct EngineOutcome {
+    pub result: Result<StopReason, ash_core::AshError>,
+    pub stats: TurnStats,
 }
 
 struct AgentTurnRunner<'config, 'store> {
@@ -108,6 +110,7 @@ struct AgentTurnRunner<'config, 'store> {
     steering: mpsc::UnboundedReceiver<Input>,
     ephemeral_context: Vec<Message>,
     tool_defs: Vec<ToolDefinition>,
+    stats: TurnStats,
 }
 
 /// Everything one turn execution needs beyond the run config: who is
@@ -141,41 +144,13 @@ impl TurnExecution {
     }
 }
 
-impl UsageAccumulator {
-    fn record(&mut self, input_tokens: u64, output_tokens: u64) {
-        if input_tokens > 0 {
-            self.input_tokens = Some(
-                self.input_tokens
-                    .map_or(input_tokens, |current| current.max(input_tokens)),
-            );
-        }
-        if output_tokens > 0 {
-            self.output_tokens = Some(
-                self.output_tokens
-                    .map_or(output_tokens, |current| current.max(output_tokens)),
-            );
-        }
-    }
-
-    fn finalize(self, input_tokens: u64, output_tokens: u64) -> Usage {
-        let estimated =
-            self.input_tokens.is_none() || (self.output_tokens.is_none() && output_tokens > 0);
-        Usage {
-            input_tokens: self.input_tokens.unwrap_or(input_tokens),
-            output_tokens: self.output_tokens.unwrap_or(output_tokens),
-            generation_ms: self.generation_ms,
-            estimated,
-        }
-    }
-}
-
 pub async fn run_agent_turn_persisted(
     model: &dyn ModelClient,
     config: &RunConfig,
     messages: &mut Vec<Message>,
     execution: TurnExecution,
     persistence: &mut SessionPersistence,
-) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
+) -> EngineOutcome {
     run_agent_turn_inner(model, config, messages, execution, Some(persistence)).await
 }
 
@@ -185,7 +160,7 @@ async fn run_agent_turn_inner(
     messages: &mut Vec<Message>,
     execution: TurnExecution,
     persistence: Option<&mut SessionPersistence>,
-) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
+) -> EngineOutcome {
     AgentTurnRunner::new(config, model, persistence, execution)
         .run(messages)
         .await
@@ -210,25 +185,33 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             steering: execution.steering,
             ephemeral_context: execution.ephemeral_context,
             tool_defs,
+            stats: TurnStats::default(),
         }
     }
 
-    async fn run(
+    async fn run(&mut self, messages: &mut Vec<Message>) -> EngineOutcome {
+        let result = self.run_result(messages).await;
+        EngineOutcome {
+            result,
+            stats: self.stats,
+        }
+    }
+
+    async fn run_result(
         &mut self,
         messages: &mut Vec<Message>,
-    ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
-        let mut turn_usage: Option<Usage> = None;
+    ) -> Result<StopReason, ash_core::AshError> {
         for turn in 0..self.config.max_turns {
             if self.cancel.is_cancelled() {
-                return Ok((StopReason::Aborted, turn_usage));
+                return Ok(StopReason::Aborted);
             }
             debug!(turn = turn + 1, "calling LLM");
-            if let Step::Done(reason) = self.step(messages, &mut turn_usage).await? {
-                return Ok((reason, turn_usage));
+            if let Step::Done(reason) = self.step(messages).await? {
+                return Ok(reason);
             }
         }
 
-        Ok((StopReason::MaxTurns, turn_usage))
+        Ok(StopReason::MaxTurns)
     }
 
     /// Run one model call plus its follow-up work (tool execution, steering).
@@ -239,11 +222,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
     /// taken before any tool call was executed: the partial output is
     /// discarded (both from memory and from the staged log) and the identical
     /// request is re-issued, so retries never repeat side effects.
-    async fn step(
-        &mut self,
-        messages: &mut Vec<Message>,
-        turn_usage: &mut Option<Usage>,
-    ) -> Result<Step, ash_core::AshError> {
+    async fn step(&mut self, messages: &mut Vec<Message>) -> Result<Step, ash_core::AshError> {
         let mut retries = 0u32;
         loop {
             let estimated_input_tokens = self.prepare_context(messages).await?;
@@ -256,7 +235,6 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             let rollback_messages_len = messages.len();
 
             let request_messages = self.request_messages(messages);
-            let request_started = Instant::now();
             let mut stream = self.model.stream(ModelRequest {
                 model: self.config.model.clone(),
                 system: self.config.system_prompt.clone(),
@@ -267,8 +245,27 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
             let CollectedResponse {
                 message,
                 usage,
+                estimated_output_tokens,
+                generation_ms,
                 outcome,
-            } = collect_response(&mut stream, &self.tx, &self.cancel, request_started).await;
+            } = collect_response(
+                &mut stream,
+                &self.tx,
+                &self.cancel,
+                self.stats,
+                u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
+            )
+            .await;
+
+            let request_stats = TurnStats {
+                usage: usage.finish(
+                    u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
+                    estimated_output_tokens,
+                ),
+                generation_ms,
+            };
+            self.stats = self.stats.saturating_add(request_stats);
+            send_progress(&self.tx, self.stats);
 
             // Retry only safe, retryable failures before any side effect.
             // A truncated stream produced no terminal marker from the
@@ -295,16 +292,6 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 None => {}
             }
 
-            let estimated_output_tokens = message
-                .as_ref()
-                .map(count_output_tokens)
-                .and_then(|tokens| u64::try_from(tokens).ok())
-                .unwrap_or(0);
-            let call_usage = usage.finalize(
-                u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
-                estimated_output_tokens,
-            );
-            merge_turn_usage(turn_usage, call_usage);
             if let Some(message) = message {
                 self.persist_message(&message)?;
                 messages.push(message);
@@ -381,7 +368,7 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         &mut self,
         messages: &mut Vec<Message>,
     ) -> Result<usize, ash_core::AshError> {
-        let prepared = self
+        let outcome = self
             .config
             .context_policy
             .prepare(
@@ -396,11 +383,23 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
                 self.model,
                 &self.cancel,
             )
-            .await?;
+            .await;
+        self.stats = self.stats.saturating_add(outcome.stats);
+        if outcome.stats != TurnStats::default() {
+            send_progress(&self.tx, self.stats);
+        }
+        let prepared = outcome.result?;
         let estimated_input_tokens = prepared.estimated_input_tokens;
         let update = prepared.update;
         *messages = prepared.messages;
         self.ephemeral_context = prepared.ephemeral_context;
+        send_live(
+            &self.tx,
+            SessionEventKind::ContextChanged {
+                tokens: u64::try_from(estimated_input_tokens).unwrap_or(u64::MAX),
+            },
+        )
+        .await;
         let Some(update) = update else {
             return Ok(estimated_input_tokens);
         };
@@ -456,74 +455,109 @@ impl<'config, 'store> AgentTurnRunner<'config, 'store> {
         true
     }
 
+    /// Run one model response's calls concurrently against the same context.
+    /// `join_all` preserves provider order for the durable tool-result messages.
     async fn execute_tool_calls(
         &mut self,
         messages: &mut Vec<Message>,
         calls: Vec<PendingToolCall>,
     ) -> Result<(), ash_core::AshError> {
-        for call in calls {
-            send_live(
-                &self.tx,
-                SessionEventKind::Live(LiveEvent::ToolStarted {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                }),
-            )
-            .await;
-            let result = limit_tool_result(
-                self.execute_tool(messages, &call.name, call.arguments.clone())
-                    .await,
-            );
-            let (output, is_error, attachments) = match result {
-                Ok(ToolOutput { text, attachments }) => (text, false, attachments),
-                Err(error) => (error.to_string(), true, Vec::new()),
-            };
-            send_live(
-                &self.tx,
-                SessionEventKind::Live(LiveEvent::ToolFinished {
-                    id: call.id.clone(),
-                    name: call.name,
-                    arguments: call.arguments,
-                    output: output.clone(),
-                    is_error,
-                }),
-            )
-            .await;
-            let result = if is_error { Err(output) } else { Ok(output) };
-            let message = Message::tool_result(call.id, result, attachments);
+        self.stats.usage.tool_calls = self
+            .stats
+            .usage
+            .tool_calls
+            .saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX));
+        send_progress(&self.tx, self.stats);
+
+        let context_messages = self.request_messages(messages);
+        let results = join_all(
+            calls
+                .into_iter()
+                .map(|call| self.execute_tool_call(&context_messages, call)),
+        )
+        .await;
+
+        for message in results {
             self.persist_message(&message)?;
             messages.push(message);
         }
         Ok(())
     }
 
+    async fn execute_tool_call(
+        &self,
+        context_messages: &[Message],
+        call: PendingToolCall,
+    ) -> Message {
+        send_live(
+            &self.tx,
+            SessionEventKind::Live(LiveEvent::ToolStarted {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            }),
+        )
+        .await;
+        let result = limit_tool_result(
+            self.execute_tool(context_messages, &call.name, call.arguments.clone())
+                .await,
+        );
+        let (output, is_error, attachments) = match result {
+            Ok(ToolOutput { text, attachments }) => (text, false, attachments),
+            Err(error) => (error.to_string(), true, Vec::new()),
+        };
+        send_live(
+            &self.tx,
+            SessionEventKind::Live(LiveEvent::ToolFinished {
+                id: call.id.clone(),
+                name: call.name,
+                arguments: call.arguments,
+                output: output.clone(),
+                is_error,
+            }),
+        )
+        .await;
+        let result = if is_error { Err(output) } else { Ok(output) };
+        Message::tool_result(call.id, result, attachments)
+    }
+
     async fn execute_tool(
         &self,
-        messages: &[Message],
+        context_messages: &[Message],
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         let Some(tool) = self.config.tools.iter().find(|tool| tool.name() == name) else {
             return Err(ToolError::Execution(format!("unknown tool: {name}")));
         };
+        let timeout = match tool.timeout() {
+            ToolTimeout::Session => Some(self.config.max_tool_duration),
+            ToolTimeout::Disabled => None,
+        };
         let context = ToolContext {
             session_id: self.identity.id,
             turn_id: self.turn_id,
             cancellation: self.cancel.clone(),
-            deadline: Instant::now() + self.config.max_tool_duration,
+            deadline: timeout.map(|timeout| Instant::now() + timeout),
             session: SessionToolContext {
                 identity: self.identity.clone(),
-                messages: self.request_messages(messages),
+                messages: context_messages.to_vec(),
             },
         };
+        let execution = tool.execute(context, arguments);
+        tokio::pin!(execution);
 
-        tokio::select! {
-            () = self.cancel.cancelled() => Err(ToolError::Cancelled),
-            result = tokio::time::timeout(
-                self.config.max_tool_duration,
-                tool.execute(context, arguments),
-            ) => result.unwrap_or(Err(ToolError::Timeout(self.config.max_tool_duration)))
+        match timeout {
+            Some(timeout) => tokio::select! {
+                () = self.cancel.cancelled() => Err(ToolError::Cancelled),
+                result = tokio::time::timeout(timeout, &mut execution) => {
+                    result.unwrap_or(Err(ToolError::Timeout(timeout)))
+                }
+            },
+            None => tokio::select! {
+                () = self.cancel.cancelled() => Err(ToolError::Cancelled),
+                result = &mut execution => result,
+            },
         }
     }
 
@@ -545,16 +579,38 @@ async fn send_live(tx: &mpsc::Sender<SessionEventKind>, kind: SessionEventKind) 
     }
 }
 
+/// Progress is an ephemeral full snapshot. Dropping one under backpressure is
+/// safe because the next snapshot or the durable TurnCompleted event converges.
+fn send_progress(tx: &mpsc::Sender<SessionEventKind>, stats: TurnStats) {
+    match tx.try_send(SessionEventKind::TurnProgress(stats)) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!("dropping turn progress: session event receiver closed");
+        }
+    }
+}
+
 async fn collect_response(
     stream: &mut ModelStream,
     tx: &mpsc::Sender<SessionEventKind>,
     cancel: &CancellationToken,
-    request_started: Instant,
+    settled_stats: TurnStats,
+    estimated_input_tokens: u64,
 ) -> CollectedResponse {
     let mut accumulator = ResponseAccumulator::new();
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + TURN_PROGRESS_INTERVAL,
+        TURN_PROGRESS_INTERVAL,
+    );
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let stream_exit = loop {
         let next = tokio::select! {
             () = cancel.cancelled() => break StreamExit::Cancelled,
+            _ = progress.tick(), if accumulator.first_output_at.is_some() => {
+                accumulator
+                    .publish_progress(tx, settled_stats, estimated_input_tokens);
+                continue;
+            }
             next = stream.next() => next,
         };
         let Some(item) = next else {
@@ -564,14 +620,18 @@ async fn collect_response(
             Ok(item) => item,
             Err(error) => break StreamExit::Failed(error),
         };
-        accumulator.apply(tx, item).await;
+        let first_output = accumulator.apply(tx, item).await;
+        if first_output {
+            accumulator.publish_progress(tx, settled_stats, estimated_input_tokens);
+        }
     };
-    accumulator.finish(stream_exit, request_started)
+    accumulator.finish(stream_exit)
 }
 
 /// Incremental state accumulated while reading one model stream.
 struct ResponseAccumulator {
     blocks: Vec<ContentBlock>,
+    output_characters: usize,
     thought_started_at: Option<Instant>,
     first_output_at: Option<Instant>,
     stop_reason: StopReason,
@@ -584,6 +644,7 @@ impl ResponseAccumulator {
     fn new() -> Self {
         Self {
             blocks: Vec::new(),
+            output_characters: 0,
             thought_started_at: None,
             first_output_at: None,
             stop_reason: StopReason::EndTurn,
@@ -594,10 +655,14 @@ impl ResponseAccumulator {
     }
 
     /// Fold one stream item into the accumulator, forwarding live deltas.
-    async fn apply(&mut self, tx: &mpsc::Sender<SessionEventKind>, item: ModelEvent) {
+    async fn apply(&mut self, tx: &mpsc::Sender<SessionEventKind>, item: ModelEvent) -> bool {
+        let had_output = self.first_output_at.is_some();
         match item {
             ModelEvent::Text(delta) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
+                self.output_characters = self
+                    .output_characters
+                    .saturating_add(output_character_count(&delta));
                 finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
                 match self.blocks.last_mut() {
                     Some(ContentBlock::Text(text)) => text.push_str(&delta),
@@ -608,6 +673,9 @@ impl ResponseAccumulator {
             }
             ModelEvent::Reasoning(delta) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
+                self.output_characters = self
+                    .output_characters
+                    .saturating_add(output_character_count(&delta));
                 if let Some(ContentBlock::Thought { text, .. }) = self.blocks.last_mut() {
                     text.push_str(&delta);
                 } else {
@@ -626,17 +694,19 @@ impl ResponseAccumulator {
                 arguments,
             } => {
                 self.first_output_at.get_or_insert_with(Instant::now);
-                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
-                self.open_block = None;
-                self.blocks.push(ContentBlock::ToolCall {
+                let block = ContentBlock::ToolCall {
                     id,
                     name,
                     arguments,
-                });
+                };
+                self.output_characters = self
+                    .output_characters
+                    .saturating_add(output_block_characters(&block));
+                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
+                self.open_block = None;
+                self.blocks.push(block);
             }
-            ModelEvent::Usage(reported) => self
-                .usage
-                .record(reported.input_tokens, reported.output_tokens),
+            ModelEvent::Usage(reported) => self.usage.record(reported),
             ModelEvent::Stop(reason) => {
                 finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
                 self.open_block = None;
@@ -644,13 +714,32 @@ impl ResponseAccumulator {
                 self.stop_reason = reason;
             }
         }
+        !had_output && self.first_output_at.is_some()
+    }
+
+    fn publish_progress(
+        &self,
+        tx: &mpsc::Sender<SessionEventKind>,
+        settled_stats: TurnStats,
+        estimated_input_tokens: u64,
+    ) {
+        let estimated_output_tokens = estimated_output_tokens(self.output_characters);
+        let request_stats = TurnStats {
+            usage: self
+                .usage
+                .finish(estimated_input_tokens, estimated_output_tokens),
+            generation_ms: elapsed_generation_ms(self.first_output_at),
+        };
+        let stats = settled_stats.saturating_add(request_stats);
+        send_progress(tx, stats);
     }
 
     /// Finalize the accumulated blocks into a response, applying truncation
     /// and cancellation rules and extracting pending tool calls.
-    fn finish(self, stream_exit: StreamExit, request_started: Instant) -> CollectedResponse {
+    fn finish(self, stream_exit: StreamExit) -> CollectedResponse {
         let Self {
             mut blocks,
+            output_characters,
             mut thought_started_at,
             first_output_at,
             mut stop_reason,
@@ -658,6 +747,9 @@ impl ResponseAccumulator {
             usage,
             open_block,
         } = self;
+        // Usage accounts for model work even when cancellation removes the
+        // unfinished block from the durable/display message projection.
+        let estimated_output_tokens = estimated_output_tokens(output_characters);
         if matches!(stream_exit, StreamExit::Cancelled) {
             discard_open_block(&mut blocks, open_block, &mut thought_started_at);
         } else {
@@ -678,13 +770,16 @@ impl ResponseAccumulator {
 
         CollectedResponse {
             message,
-            usage: UsageAccumulator {
-                generation_ms: elapsed_generation_ms(first_output_at, request_started),
-                ..usage
-            },
+            usage,
+            estimated_output_tokens,
+            generation_ms: elapsed_generation_ms(first_output_at),
             outcome,
         }
     }
+}
+
+fn estimated_output_tokens(characters: usize) -> u64 {
+    u64::try_from(estimate_output_tokens(characters)).unwrap_or(u64::MAX)
 }
 
 fn pending_tool_calls(blocks: &[ContentBlock]) -> Vec<PendingToolCall> {
@@ -705,14 +800,10 @@ fn pending_tool_calls(blocks: &[ContentBlock]) -> Vec<PendingToolCall> {
         .collect()
 }
 
-fn elapsed_generation_ms(first_output_at: Option<Instant>, request_started: Instant) -> u64 {
-    u64::try_from(
-        first_output_at
-            .unwrap_or(request_started)
-            .elapsed()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
+fn elapsed_generation_ms(first_output_at: Option<Instant>) -> u64 {
+    first_output_at.map_or(0, |started| {
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 /// Map a stream exit plus any accumulated tool calls to the turn outcome.
@@ -757,20 +848,6 @@ fn retry_delay(attempt: u32, backoff: RetryBackoff) -> std::time::Duration {
     let max_ms = u64::try_from(backoff.max.as_millis()).unwrap_or(u64::MAX);
     let millis = base_ms.saturating_mul(1u64 << attempt.min(20)).min(max_ms);
     std::time::Duration::from_millis(millis)
-}
-
-/// Merge a single model call's usage into the running turn total. The API
-/// reports the full model input (system prompt, tools, and history) per
-/// request, so later calls in a turn already include earlier ones: take the
-/// latest snapshot instead of summing deltas. Output tokens are per-call
-/// increments and do accumulate across the turn.
-fn merge_turn_usage(turn_usage: &mut Option<Usage>, call_usage: Usage) {
-    *turn_usage = Some(turn_usage.map_or(call_usage, |acc| Usage {
-        input_tokens: acc.input_tokens.max(call_usage.input_tokens),
-        output_tokens: acc.output_tokens.saturating_add(call_usage.output_tokens),
-        generation_ms: acc.generation_ms.saturating_add(call_usage.generation_ms),
-        estimated: acc.estimated || call_usage.estimated,
-    }));
 }
 
 fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
@@ -846,7 +923,7 @@ mod tests {
 
     use ash_core::{
         Content, MessageContent, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
-        SessionId, Tool, ToolCallId, ToolContext, ToolError,
+        ModelUsage, SessionId, Tool, ToolCallId, ToolContext, ToolError,
     };
     use tempfile::TempDir;
 
@@ -863,7 +940,7 @@ mod tests {
         session_id: SessionId,
         model: &dyn ModelClient,
         persistence: Option<&mut SessionPersistence>,
-    ) -> Result<(StopReason, Option<Usage>), ash_core::AshError> {
+    ) -> Result<(StopReason, TurnStats), ash_core::AshError> {
         let (_, steering) = mpsc::unbounded_channel();
         let execution = TurnExecution::new(
             metadata(session_id),
@@ -873,7 +950,8 @@ mod tests {
             steering,
             Vec::new(),
         );
-        run_agent_turn_inner(model, config, messages, execution, persistence).await
+        let outcome = run_agent_turn_inner(model, config, messages, execution, persistence).await;
+        outcome.result.map(|reason| (reason, outcome.stats))
     }
 
     fn metadata(session_id: SessionId) -> SessionIdentity {
@@ -986,6 +1064,256 @@ mod tests {
         }
     }
 
+    struct UnboundedBlockingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for UnboundedBlockingTool {
+        fn name(&self) -> &'static str {
+            "unbounded_blocking"
+        }
+
+        fn description(&self) -> &'static str {
+            "unbounded blocking"
+        }
+
+        fn timeout(&self) -> ToolTimeout {
+            ToolTimeout::Disabled
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            context: ToolContext,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            if context.deadline.is_some() {
+                return Err(ToolError::Execution(
+                    "disabled tool unexpectedly received a deadline".to_string(),
+                ));
+            }
+            futures::future::pending().await
+        }
+    }
+
+    struct SlowUnboundedTool;
+
+    #[async_trait::async_trait]
+    impl Tool for SlowUnboundedTool {
+        fn name(&self) -> &'static str {
+            "slow_unbounded"
+        }
+
+        fn description(&self) -> &'static str {
+            "slow unbounded"
+        }
+
+        fn timeout(&self) -> ToolTimeout {
+            ToolTimeout::Disabled
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            context: ToolContext,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            if context.deadline.is_some() {
+                return Err(ToolError::Execution(
+                    "disabled tool unexpectedly received a deadline".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok("finished without a deadline".into())
+        }
+    }
+
+    struct ConcurrentTool {
+        barrier: tokio::sync::Barrier,
+        second_completed: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcurrentTool {
+        fn name(&self) -> &'static str {
+            "concurrent"
+        }
+
+        fn description(&self) -> &'static str {
+            "concurrent"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            context: ToolContext,
+            arguments: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            let value = arguments["value"]
+                .as_str()
+                .ok_or_else(|| ToolError::Execution("missing value".into()))?;
+            let context_len = context.session.messages.len();
+
+            self.barrier.wait().await;
+            if value == "first" {
+                self.second_completed.notified().await;
+            } else {
+                self.second_completed.notify_one();
+            }
+
+            Ok(format!("{value}:{context_len}").into())
+        }
+    }
+
+    fn tool_call_adapter(name: &str) -> MockAdapter {
+        MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                ModelEvent::ToolCall {
+                    id: ToolCallId::from_provider("call_1"),
+                    name: name.to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn config_with_tool(tool: Arc<dyn Tool>, max_tool_duration: Duration) -> RunConfig {
+        RunConfig {
+            system_prompt: None,
+            tools: vec![tool],
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration,
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_timeout_still_bounds_regular_tools() {
+        let adapter = tool_call_adapter("blocking");
+        let config = config_with_tool(Arc::new(BlockingTool), Duration::from_millis(5));
+        let mut messages = vec![Message::user("use a tool")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, _) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            SessionId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::MaxTurns);
+        assert!(matches!(
+            &messages[2].content,
+            MessageContent::ToolResult { result: Err(error), .. } if error == "timeout after 5ms"
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_can_outlive_the_session_tool_limit() {
+        let adapter = tool_call_adapter("slow_unbounded");
+        let config = config_with_tool(Arc::new(SlowUnboundedTool), Duration::from_millis(1));
+        let mut messages = vec![Message::user("use a tool")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, _) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            SessionId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::MaxTurns);
+        assert!(matches!(
+            &messages[2].content,
+            MessageContent::ToolResult { result: Ok(output), .. }
+                if output == "finished without a deadline"
+        ));
+    }
+
+    #[tokio::test]
+    async fn runs_tool_calls_concurrently_and_records_results_in_call_order() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                ModelEvent::ToolCall {
+                    id: ToolCallId::from_provider("call_1"),
+                    name: "concurrent".into(),
+                    arguments: serde_json::json!({"value": "first"}),
+                },
+                ModelEvent::ToolCall {
+                    id: ToolCallId::from_provider("call_2"),
+                    name: "concurrent".into(),
+                    arguments: serde_json::json!({"value": "second"}),
+                },
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let tool = ConcurrentTool {
+            barrier: tokio::sync::Barrier::new(2),
+            second_completed: tokio::sync::Notify::new(),
+        };
+        let config = config_with_tool(Arc::new(tool), Duration::from_secs(5));
+        let mut messages = vec![Message::user("use two tools")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, stats) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_with_adapter(
+                &config,
+                &mut messages,
+                tx,
+                CancellationToken::new(),
+                SessionId::new(),
+                &adapter,
+                None,
+            ),
+        )
+        .await
+        .expect("tool calls did not execute concurrently")
+        .unwrap();
+
+        assert_eq!(reason, StopReason::MaxTurns);
+        assert_eq!(stats.usage.tool_calls, 2);
+        assert!(matches!(
+            &messages[2].content,
+            MessageContent::ToolResult { id, result: Ok(output), .. }
+                if id.as_str() == "call_1" && output == "first:2"
+        ));
+        assert!(matches!(
+            &messages[3].content,
+            MessageContent::ToolResult { id, result: Ok(output), .. }
+                if id.as_str() == "call_2" && output == "second:2"
+        ));
+    }
+
     #[tokio::test]
     async fn preserves_full_history_across_tool_turns() {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1057,10 +1385,18 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 80,
+                        output_tokens: 12,
+                    }),
                     ModelEvent::Text("condensed facts".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 60,
+                        output_tokens: 4,
+                    }),
                     ModelEvent::Text("done".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
@@ -1091,7 +1427,7 @@ mod tests {
             persisted_session(directory.path(), &messages).await;
         let (tx, mut rx) = mpsc::channel(16);
 
-        let (reason, _usage) = run_with_adapter(
+        let (reason, stats) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -1105,6 +1441,9 @@ mod tests {
         persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(stats.usage.input_tokens, 140);
+        assert_eq!(stats.usage.output_tokens, 16);
+        assert!(!stats.usage.estimated);
         let stored = load_session(&store, session_id).await;
         assert_eq!(stored.log.messages().len(), 7);
         assert_eq!(stored.log.model_context().len(), 6);
@@ -1143,11 +1482,25 @@ mod tests {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 80,
+                        output_tokens: 12,
+                    }),
                     ModelEvent::Text("condensed facts".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
-                vec![ModelEvent::Text("partial".into())],
                 vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 60,
+                        output_tokens: 3,
+                    }),
+                    ModelEvent::Text("partial".into()),
+                ],
+                vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 60,
+                        output_tokens: 5,
+                    }),
                     ModelEvent::Text("complete".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
@@ -1181,7 +1534,7 @@ mod tests {
             persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(16);
 
-        let (reason, _usage) = run_with_adapter(
+        let (reason, stats) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -1195,6 +1548,9 @@ mod tests {
         persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(stats.usage.input_tokens, 200);
+        assert_eq!(stats.usage.output_tokens, 20);
+        assert!(!stats.usage.estimated);
         assert_eq!(requests.lock().unwrap().len(), 3);
         let stored = load_session(&store, session_id).await;
         assert_eq!(stored.log.model_context(), messages);
@@ -1255,15 +1611,15 @@ mod tests {
             vec![ephemeral],
         );
 
-        let (reason, _) = run_agent_turn_inner(
+        let outcome = run_agent_turn_inner(
             &adapter,
             &config,
             &mut messages,
             execution,
             Some(&mut persistence),
         )
-        .await
-        .unwrap();
+        .await;
+        let reason = outcome.result.unwrap();
         persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
@@ -1291,9 +1647,13 @@ mod tests {
     #[tokio::test]
     async fn automatic_compaction_rejects_a_stream_without_a_clean_stop() {
         let adapter = MockAdapter {
-            responses: Mutex::new(VecDeque::from([vec![ModelEvent::Text(
-                "partial summary".into(),
-            )]])),
+            responses: Mutex::new(VecDeque::from([vec![
+                ModelEvent::Usage(ModelUsage {
+                    input_tokens: 77,
+                    output_tokens: 9,
+                }),
+                ModelEvent::Text("partial summary".into()),
+            ]])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let config = RunConfig {
@@ -1313,20 +1673,23 @@ mod tests {
             Message::user("recent"),
         ];
         let (tx, _rx) = mpsc::channel(4);
-
-        let error = run_with_adapter(
-            &config,
-            &mut messages,
+        let (_, steering) = mpsc::unbounded_channel();
+        let execution = TurnExecution::new(
+            metadata(SessionId::new()),
+            TurnId::new(),
             tx,
             CancellationToken::new(),
-            SessionId::new(),
-            &adapter,
-            None,
-        )
-        .await
-        .unwrap_err();
+            steering,
+            Vec::new(),
+        );
 
+        let outcome = run_agent_turn_inner(&adapter, &config, &mut messages, execution, None).await;
+
+        let error = outcome.result.unwrap_err();
         assert!(error.to_string().contains("without a terminal marker"));
+        assert_eq!(outcome.stats.usage.input_tokens, 77);
+        assert_eq!(outcome.stats.usage.output_tokens, 9);
+        assert!(!outcome.stats.usage.estimated);
     }
 
     #[tokio::test]
@@ -1404,18 +1767,14 @@ mod tests {
     async fn aggregates_usage_for_each_model_call() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([vec![
-                ModelEvent::Usage(Usage {
+                ModelEvent::Usage(ModelUsage {
                     input_tokens: 120,
                     output_tokens: 0,
-                    generation_ms: 0,
-                    estimated: false,
                 }),
                 ModelEvent::Reasoning("checking".into()),
-                ModelEvent::Usage(Usage {
+                ModelEvent::Usage(ModelUsage {
                     input_tokens: 0,
                     output_tokens: 25,
-                    generation_ms: 0,
-                    estimated: false,
                 }),
                 ModelEvent::Stop(StopReason::EndTurn),
             ]])),
@@ -1448,22 +1807,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
-        let usage = usage.unwrap();
-        assert_eq!(usage.input_tokens, 120);
-        assert_eq!(usage.output_tokens, 25);
-        assert!(!usage.estimated);
+        assert_eq!(usage.usage.input_tokens, 120);
+        assert_eq!(usage.usage.output_tokens, 25);
+        assert!(!usage.usage.estimated);
     }
 
     #[tokio::test]
-    async fn multi_call_turn_keeps_the_latest_input_snapshot_and_sums_output() {
+    async fn multi_request_turn_sums_input_and_output_usage() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
                 vec![
-                    ModelEvent::Usage(Usage {
+                    ModelEvent::Usage(ModelUsage {
                         input_tokens: 100,
                         output_tokens: 10,
-                        generation_ms: 0,
-                        estimated: false,
                     }),
                     ModelEvent::ToolCall {
                         id: ToolCallId::from_provider("call_1"),
@@ -1473,11 +1829,9 @@ mod tests {
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
                 vec![
-                    ModelEvent::Usage(Usage {
+                    ModelEvent::Usage(ModelUsage {
                         input_tokens: 130,
                         output_tokens: 5,
-                        generation_ms: 0,
-                        estimated: false,
                     }),
                     ModelEvent::Text("done".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
@@ -1512,19 +1866,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
-        let usage = usage.unwrap();
-        // The API reports the full input per request: the second call (130)
-        // already includes the first call's context, so the turn keeps the
-        // latest snapshot instead of summing to 230. Output is incremental
-        // and sums to 15.
-        assert_eq!(usage.input_tokens, 130);
-        assert_eq!(usage.output_tokens, 15);
-        assert!(!usage.estimated);
+        assert_eq!(usage.usage.input_tokens, 230);
+        assert_eq!(usage.usage.output_tokens, 15);
+        assert_eq!(usage.usage.tool_calls, 1);
+        assert!(!usage.usage.estimated);
+    }
+
+    #[tokio::test]
+    async fn response_accumulator_counts_streamed_output_incrementally() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut accumulator = ResponseAccumulator::new();
+        for event in [
+            ModelEvent::Text("你".into()),
+            ModelEvent::Text("好".into()),
+            ModelEvent::Reasoning("😀".into()),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call_1"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "Cargo.toml"}),
+            },
+        ] {
+            accumulator.apply(&tx, event).await;
+        }
+
+        let projected_characters = accumulator
+            .blocks
+            .iter()
+            .map(output_block_characters)
+            .fold(0usize, usize::saturating_add);
+        assert_eq!(accumulator.output_characters, projected_characters);
+        assert_eq!(
+            estimated_output_tokens(accumulator.output_characters),
+            u64::try_from(estimate_output_tokens(projected_characters)).unwrap()
+        );
     }
 
     #[test]
     fn fills_missing_provider_usage_with_estimates() {
-        let usage = UsageAccumulator::default().finalize(120, 25);
+        let usage = UsageAccumulator::default().finish(120, 25);
 
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 25);
@@ -1534,14 +1913,62 @@ mod tests {
     #[test]
     fn combines_split_provider_usage_without_marking_it_estimated() {
         let mut usage = UsageAccumulator::default();
-        usage.record(120, 0);
-        usage.record(0, 25);
+        usage.record(ModelUsage {
+            input_tokens: 120,
+            output_tokens: 0,
+        });
+        usage.record(ModelUsage {
+            input_tokens: 0,
+            output_tokens: 25,
+        });
 
-        let usage = usage.finalize(999, 999);
+        let usage = usage.finish(999, 999);
 
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 25);
         assert!(!usage.estimated);
+    }
+
+    #[tokio::test]
+    async fn response_without_generated_content_has_zero_generation_time() {
+        let adapter = MockAdapter {
+            responses: Mutex::new(VecDeque::from([vec![
+                ModelEvent::Usage(ModelUsage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                }),
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let config = RunConfig {
+            system_prompt: None,
+            tools: Vec::new(),
+            model: ModelId::new("test-model"),
+            max_turns: 1,
+            max_context_tokens: 200_000,
+            context_policy: Arc::new(crate::DefaultContextPolicy),
+            max_tool_duration: Duration::from_secs(1),
+            max_retries: 0,
+            retry_backoff: RetryBackoff::default(),
+        };
+        let mut messages = vec![Message::user("question")];
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (reason, stats) = run_with_adapter(
+            &config,
+            &mut messages,
+            tx,
+            CancellationToken::new(),
+            SessionId::new(),
+            &adapter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(stats.generation_ms, 0);
     }
 
     #[tokio::test]
@@ -1598,7 +2025,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
-        let usage = usage.unwrap();
         // The 30ms thinking phase must be part of the generation window;
         // starting the clock at the trailing text burst would measure ~0ms
         // and report an absurd tok/s.
@@ -1689,7 +2115,7 @@ mod tests {
         let mut messages = vec![Message::user("question")];
         let (tx, mut rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let reason = {
+        let (reason, stats) = {
             let turn = run_with_adapter(
                 &config,
                 &mut messages,
@@ -1701,17 +2127,24 @@ mod tests {
             );
             tokio::pin!(turn);
 
-            let event = tokio::select! {
-                event = rx.recv() => event,
-                result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
+            let event = loop {
+                let event = tokio::select! {
+                    event = rx.recv() => event,
+                    result = &mut turn => panic!("turn ended before cancellation: {result:?}"),
+                };
+                if matches!(event, Some(SessionEventKind::Live(_))) {
+                    break event;
+                }
             };
             assert!(
                 matches!(event, Some(SessionEventKind::Live(LiveEvent::TextDelta(text))) if text == "partial")
             );
             cancel.cancel();
-            (&mut turn).await.unwrap().0
+            (&mut turn).await.unwrap()
         };
         assert_eq!(reason, StopReason::Aborted);
+        assert!(stats.usage.output_tokens > 0);
+        assert!(stats.usage.estimated);
 
         assert_eq!(messages.len(), 1);
         assert!(matches!(
@@ -1732,13 +2165,18 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let response = collect_response(&mut stream, &tx, &cancel, Instant::now());
+        let response = collect_response(&mut stream, &tx, &cancel, TurnStats::default(), 0);
         tokio::pin!(response);
 
         for expected in ["completed thought", "partial answer"] {
-            let event = tokio::select! {
-                event = rx.recv() => event,
-                result = &mut response => panic!("response ended before cancellation: {}", result.message.is_some()),
+            let event = loop {
+                let event = tokio::select! {
+                    event = rx.recv() => event,
+                    result = &mut response => panic!("response ended before cancellation: {}", result.message.is_some()),
+                };
+                if matches!(event, Some(SessionEventKind::Live(_))) {
+                    break event;
+                }
             };
             assert!(matches!(
                             event,
@@ -1824,8 +2262,18 @@ mod tests {
             // First call: the provider cuts the stream mid-response (text
             // without any `Stop`). Second call: clean finish.
             responses: Mutex::new(VecDeque::from([
-                vec![ModelEvent::Text("partial thought".into())],
                 vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 40,
+                        output_tokens: 3,
+                    }),
+                    ModelEvent::Text("partial thought".into()),
+                ],
+                vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 40,
+                        output_tokens: 5,
+                    }),
                     ModelEvent::Text("complete".into()),
                     ModelEvent::Stop(StopReason::EndTurn),
                 ],
@@ -1852,7 +2300,7 @@ mod tests {
             persisted_session(directory.path(), &messages).await;
         let (tx, _rx) = mpsc::channel(8);
 
-        let (reason, _usage) = run_with_adapter(
+        let (reason, stats) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -1866,6 +2314,9 @@ mod tests {
         persistence.commit().await.unwrap();
 
         assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(stats.usage.input_tokens, 80);
+        assert_eq!(stats.usage.output_tokens, 8);
+        assert!(!stats.usage.estimated);
         assert_eq!(requests.lock().unwrap().len(), 2);
         // The partial output must not survive the retry, neither in memory
         // nor in the staged/committed log.
@@ -1890,8 +2341,20 @@ mod tests {
     async fn truncated_stream_exhausts_retries_and_reports_truncated() {
         let adapter = MockAdapter {
             responses: Mutex::new(VecDeque::from([
-                vec![ModelEvent::Text("still cut".into())],
-                vec![ModelEvent::Text("cut again".into())],
+                vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 40,
+                        output_tokens: 3,
+                    }),
+                    ModelEvent::Text("still cut".into()),
+                ],
+                vec![
+                    ModelEvent::Usage(ModelUsage {
+                        input_tokens: 40,
+                        output_tokens: 3,
+                    }),
+                    ModelEvent::Text("cut again".into()),
+                ],
             ])),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1912,7 +2375,7 @@ mod tests {
         let mut messages = vec![Message::user("question")];
         let (tx, _rx) = mpsc::channel(8);
 
-        let (reason, _usage) = run_with_adapter(
+        let (reason, stats) = run_with_adapter(
             &config,
             &mut messages,
             tx,
@@ -1925,6 +2388,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(reason, StopReason::Truncated);
+        assert_eq!(stats.usage.input_tokens, 80);
+        assert_eq!(stats.usage.output_tokens, 6);
+        assert!(!stats.usage.estimated);
         // The final (also truncated) attempt is kept so the user sees what
         // the provider returned before the retry budget ran out.
         assert_eq!(messages.len(), 2);
@@ -2008,29 +2474,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_completes_an_active_tool_call() {
-        let adapter = MockAdapter {
-            responses: Mutex::new(VecDeque::from([vec![
-                ModelEvent::ToolCall {
-                    id: ToolCallId::from_provider("call_1"),
-                    name: "blocking".into(),
-                    arguments: serde_json::json!({}),
-                },
-                ModelEvent::Stop(StopReason::EndTurn),
-            ]])),
-            requests: Arc::new(Mutex::new(Vec::new())),
-        };
-        let config = RunConfig {
-            system_prompt: None,
-            tools: vec![Arc::new(BlockingTool)],
-            model: ModelId::new("test-model"),
-            max_turns: 1,
-            max_context_tokens: 200_000,
-            context_policy: Arc::new(crate::DefaultContextPolicy),
-            max_tool_duration: Duration::from_secs(30),
-            max_retries: 0,
-            retry_backoff: RetryBackoff::default(),
-        };
+    async fn cancellation_completes_an_unbounded_tool_call() {
+        let adapter = tool_call_adapter("unbounded_blocking");
+        let config = config_with_tool(Arc::new(UnboundedBlockingTool), Duration::from_millis(1));
         let mut messages = vec![Message::user("use a tool")];
         let (tx, mut rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();

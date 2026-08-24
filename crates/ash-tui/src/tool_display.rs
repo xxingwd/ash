@@ -18,6 +18,8 @@ enum ToolKind {
     Skill,
     Agent,
     MessageAgent,
+    ListAgents,
+    RemoveAgent,
     WaitAgent,
     Other,
 }
@@ -35,6 +37,8 @@ impl ToolKind {
             "skill" => Self::Skill,
             "agent" => Self::Agent,
             "message_agent" => Self::MessageAgent,
+            "list_agents" => Self::ListAgents,
+            "remove_agent" => Self::RemoveAgent,
             "wait_agent" => Self::WaitAgent,
             _ => Self::Other,
         }
@@ -71,6 +75,8 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
             | ToolKind::Skill
             | ToolKind::Agent
             | ToolKind::MessageAgent
+            | ToolKind::ListAgents
+            | ToolKind::RemoveAgent
             | ToolKind::WaitAgent,
             false,
         ) => ToolRenderer::Generic(OutputPresentation::Hidden),
@@ -97,8 +103,10 @@ fn tool_detail(name: &str, arguments: &Value) -> String {
         ToolKind::WebFetch => url_argument(arguments),
         ToolKind::Bash => string_argument(arguments, "command"),
         ToolKind::Skill => string_argument(arguments, "name"),
-        ToolKind::Agent | ToolKind::MessageAgent => string_argument(arguments, "name"),
-        ToolKind::WaitAgent | ToolKind::Other => String::new(),
+        ToolKind::Agent | ToolKind::MessageAgent | ToolKind::RemoveAgent => {
+            string_argument(arguments, "name")
+        }
+        ToolKind::ListAgents | ToolKind::WaitAgent | ToolKind::Other => String::new(),
     }
 }
 
@@ -237,6 +245,10 @@ mod tests {
             ("message_agent".to_string(), "research".to_string())
         );
         assert_eq!(
+            tool_call_summary("remove_agent", &json!({"name": "research"})),
+            ("remove_agent".to_string(), "research".to_string())
+        );
+        assert_eq!(
             tool_call_summary("custom_tool", &json!({"payload": "x"})),
             ("custom_tool".to_string(), String::new())
         );
@@ -328,6 +340,14 @@ mod tests {
         );
         assert_eq!(
             tool_renderer("wait_agent", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
+            tool_renderer("list_agents", false),
+            ToolRenderer::Generic(OutputPresentation::Hidden)
+        );
+        assert_eq!(
+            tool_renderer("remove_agent", false),
             ToolRenderer::Generic(OutputPresentation::Hidden)
         );
         assert_eq!(

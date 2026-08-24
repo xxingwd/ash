@@ -1,4 +1,4 @@
-use ash_core::SessionId;
+use ash_core::{SessionId, Usage};
 
 /// Presentation-only snapshot of a child agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +7,7 @@ pub struct SubagentView {
     pub name: String,
     pub profile: String,
     pub state: SubagentViewState,
+    pub usage: Usage,
     pub last_message: String,
 }
 

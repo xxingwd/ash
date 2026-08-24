@@ -32,9 +32,11 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
         move |ctx, args: BashArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
-            async move { run_command(&working_dir, args, cancellation, deadline).await }
+            async move {
+                run_command(&working_dir, args, cancellation, deadline?).await
+            }
         },
     )
 }
@@ -482,7 +484,7 @@ mod tests {
             session_id: SessionId::new(),
             turn_id: TurnId::new(),
             cancellation,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
             session: SessionToolContext {
                 identity: SessionIdentity::root(SessionId::new()),
                 messages: Vec::new(),

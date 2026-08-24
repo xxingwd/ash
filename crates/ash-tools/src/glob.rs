@@ -28,9 +28,10 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Find files by glob pattern inside the working directory. Respects ignore files and returns at most 100 workspace-relative paths.",
         move |ctx, args: GlobArgs| {
             let root = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
                     find_files(
                         &root,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -7,8 +7,9 @@ use std::{
 use crate::snapshot::{SubagentSnapshot, SubagentState, SubagentTreeSnapshot};
 use ash_agent::{Agent, Input, InputSource, Runtime, Session, SessionOptions, Turn};
 use ash_core::{
-    define_tool, is_valid_segment, AgentPath, CancellationToken, ContentBlock, Message,
-    MessageContent, SessionId, Tool, ToolContext, ToolError, TurnId, TurnResult,
+    define_tool, define_tool_with_timeout, is_valid_segment, AgentPath, CancellationToken,
+    ContentBlock, Message, MessageContent, SessionId, Tool, ToolContext, ToolError, ToolTimeout,
+    TurnId, TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,13 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
-const COLLABORATION_TOOL_NAMES: [&str; 3] = ["agent", "message_agent", "wait_agent"];
+const COLLABORATION_TOOL_NAMES: [&str; 5] = [
+    "agent",
+    "message_agent",
+    "list_agents",
+    "remove_agent",
+    "wait_agent",
+];
 /// Explorer projection is deliberately an allowlist: unknown custom and MCP
 /// tools are not assumed to be read-only.
 const EXPLORER_TOOL_NAMES: [&str; 5] = ["read", "glob", "grep", "webfetch", "skill"];
@@ -146,7 +153,8 @@ struct ControlState {
 #[derive(Default)]
 struct AgentTree {
     agents: HashMap<AgentPath, AgentEntry>,
-    completions: VecDeque<AgentCompletion>,
+    removed: HashSet<AgentPath>,
+    completions: VecDeque<QueuedCompletion>,
 }
 
 struct AgentEntry {
@@ -174,6 +182,11 @@ struct CompletionDelivery {
     acknowledge: oneshot::Sender<()>,
 }
 
+struct QueuedCompletion {
+    path: AgentPath,
+    completion: AgentCompletion,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AgentCompletion {
     name: String,
@@ -194,6 +207,7 @@ impl AgentEntry {
             } else {
                 SubagentState::Running
             },
+            usage: self.session.stats().total_usage(),
             last_message: self.last_message.clone(),
         }
     }
@@ -220,7 +234,13 @@ impl AgentTree {
             .values()
             .map(AgentEntry::snapshot)
             .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.name.cmp(&right.name));
+        agents.sort_by(|left, right| {
+            right
+                .state
+                .is_active()
+                .cmp(&left.state.is_active())
+                .then_with(|| left.name.cmp(&right.name))
+        });
         agents
     }
 }
@@ -242,7 +262,7 @@ impl ControlState {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AgentArgs {
-    /// Stable name using lowercase letters, digits, and underscores.
+    /// Stable name using lowercase letters, digits, underscores, or hyphens.
     name: String,
     /// Initial message for the new agent.
     message: String,
@@ -265,6 +285,15 @@ struct MessageAgentArgs {
     /// Wait for this turn and return its result. Defaults to true.
     #[serde(default = "default_true")]
     wait: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListAgentsArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoveAgentArgs {
+    /// Name of an existing agent to detach.
+    name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -300,8 +329,8 @@ impl AgentControl {
     }
 
     async fn publish(&self) {
-        let snapshots = self.inner.state.lock().await.snapshots();
-        self.inner.subagent_tx.send_replace(snapshots);
+        let state = self.inner.state.lock().await;
+        self.inner.subagent_tx.send_replace(state.snapshots());
     }
 
     /// Build the model-visible collaboration tools.
@@ -315,15 +344,21 @@ impl AgentControl {
             "Create a named leaf agent and send its initial message. Use this proactively for a concrete, bounded workstream that can be investigated or implemented independently. With `wait=true`, return the result in this call; with `wait=false`, submit it in the background for a later `wait_agent` call. Include enough context and the expected output. Names remain available for follow-up messages.\n\nAvailable profiles:\n{}",
             AgentProfile::descriptions()
         );
-        let agent = define_tool("agent", &description, move |context, args: AgentArgs| {
-            let control = create.clone();
-            async move { control.create(context, args).await }
-        })?;
+        let agent = define_tool_with_timeout(
+            "agent",
+            &description,
+            ToolTimeout::Disabled,
+            move |context, args: AgentArgs| {
+                let control = create.clone();
+                async move { control.create(context, args).await }
+            },
+        )?;
 
         let message = self.clone();
-        let message_agent = define_tool(
+        let message_agent = define_tool_with_timeout(
             "message_agent",
             "Send a follow-up message to an existing named agent. Busy agents queue turns in submission order. Set `interrupt=true` to cancel unfinished work first. With `wait=true`, return the result in this call; with `wait=false`, submit it in the background for `wait_agent`.",
+            ToolTimeout::Disabled,
             move |context, args: MessageAgentArgs| {
                 let control = message.clone();
                 async move { control.message(context, args).await }
@@ -331,16 +366,43 @@ impl AgentControl {
         )?;
 
         let wait = self.clone();
-        let wait_agent = define_tool(
+        let wait_agent = define_tool_with_timeout(
             "wait_agent",
             "Wait for unread agent-turn results. Returns every result completed since the previous wait, plus the current idle/running snapshot.",
+            ToolTimeout::Disabled,
             move |context, args: WaitAgentArgs| {
                 let control = wait.clone();
                 async move { control.wait(context, args).await }
             },
         )?;
 
-        Ok(vec![agent, message_agent, wait_agent])
+        let list = self.clone();
+        let list_agents = define_tool(
+            "list_agents",
+            "List active child agents with their state, current session usage, and latest task.",
+            move |context, _: ListAgentsArgs| {
+                let control = list.clone();
+                async move { control.list(context).await }
+            },
+        )?;
+
+        let remove = self.clone();
+        let remove_agent = define_tool(
+            "remove_agent",
+            "Detach a named child agent and cancel its unfinished turns. Its persisted session is retained, but the name cannot be reused in this agent tree.",
+            move |context, args: RemoveAgentArgs| {
+                let control = remove.clone();
+                async move { control.remove(context, args).await }
+            },
+        )?;
+
+        Ok(vec![
+            agent,
+            message_agent,
+            list_agents,
+            remove_agent,
+            wait_agent,
+        ])
     }
 
     async fn create(&self, context: ToolContext, args: AgentArgs) -> Result<String, ToolError> {
@@ -359,9 +421,9 @@ impl AgentControl {
             // without a second reservation state machine.
             let mut state = self.inner.state.lock().await;
             let tree = state.trees.entry(identity.root_id).or_default();
-            if tree.agents.contains_key(&path) {
+            if tree.agents.contains_key(&path) || tree.removed.contains(&path) {
                 return Err(ToolError::Execution(format!(
-                    "agent already exists: {}",
+                    "agent name already used: {}",
                     args.name
                 )));
             }
@@ -379,6 +441,7 @@ impl AgentControl {
                 )
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
+            self.spawn_stats_pump(identity.root_id, path.clone(), &session);
             let (completion_tx, observations) = mpsc::unbounded_channel();
             let Submission {
                 tracked,
@@ -467,13 +530,63 @@ impl AgentControl {
         }
     }
 
+    async fn list(&self, context: ToolContext) -> Result<String, ToolError> {
+        let root_id = context.session.identity.root_id;
+        let agents = self
+            .inner
+            .state
+            .lock()
+            .await
+            .trees
+            .get(&root_id)
+            .map_or_else(Vec::new, AgentTree::snapshots);
+        json_output(&serde_json::json!({ "agents": agents }))
+    }
+
+    async fn remove(
+        &self,
+        context: ToolContext,
+        args: RemoveAgentArgs,
+    ) -> Result<String, ToolError> {
+        validate_name(&args.name)?;
+        let identity = context.session.identity;
+        let path = identity
+            .path
+            .join(&args.name)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let entry =
+            {
+                let mut state = self.inner.state.lock().await;
+                let tree = state.trees.get_mut(&identity.root_id).ok_or_else(|| {
+                    ToolError::Execution(format!("agent not found: {}", args.name))
+                })?;
+                let entry = tree.agents.remove(&path).ok_or_else(|| {
+                    ToolError::Execution(format!("agent not found: {}", args.name))
+                })?;
+                tree.removed.insert(path.clone());
+                tree.completions.retain(|queued| queued.path != path);
+                entry
+            };
+        entry.cancel_pending();
+        drop(entry);
+        self.publish().await;
+        self.inner.updates.notify_waiters();
+        json_output(&serde_json::json!({
+            "name": args.name,
+            "removed": true,
+        }))
+    }
+
     async fn wait(&self, context: ToolContext, args: WaitAgentArgs) -> Result<String, ToolError> {
-        let remaining = context
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        let max_timeout_ms = u64::try_from(remaining.as_millis())
+        let max_timeout_ms = context.deadline.map_or(MAX_WAIT_TIMEOUT_MS, |deadline| {
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            )
             .unwrap_or(u64::MAX)
-            .min(MAX_WAIT_TIMEOUT_MS);
+            .min(MAX_WAIT_TIMEOUT_MS)
+        });
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
@@ -492,7 +605,10 @@ impl AgentControl {
                 let all_idle = tree.agents.values().all(|agent| agent.turns.is_empty());
                 (!tree.completions.is_empty() || all_idle || timeout_ms == 0).then(|| {
                     wait_output(
-                        tree.completions.drain(..).collect(),
+                        tree.completions
+                            .drain(..)
+                            .map(|queued| queued.completion)
+                            .collect(),
                         tree.snapshots(),
                         false,
                     )
@@ -509,7 +625,11 @@ impl AgentControl {
             if timed_out {
                 let mut state = self.inner.state.lock().await;
                 let tree = state.trees.entry(root_id).or_default();
-                let completions = tree.completions.drain(..).collect::<Vec<_>>();
+                let completions = tree
+                    .completions
+                    .drain(..)
+                    .map(|queued| queued.completion)
+                    .collect::<Vec<_>>();
                 let timed_out = completions.is_empty();
                 return wait_output(completions, tree.snapshots(), timed_out);
             }
@@ -550,6 +670,49 @@ impl AgentControl {
         });
     }
 
+    fn spawn_stats_pump(&self, root_id: SessionId, path: AgentPath, session: &Session) {
+        let control = Arc::downgrade(&self.inner);
+        let shutdown = self.inner.shutdown.clone();
+        let mut stats = session.subscribe_stats();
+        tokio::spawn(async move {
+            let mut usage = stats.borrow().total_usage();
+            loop {
+                let changed = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    changed = stats.changed() => changed,
+                };
+                if changed.is_err() {
+                    break;
+                }
+                let next_usage = stats.borrow_and_update().total_usage();
+                if usage == next_usage {
+                    continue;
+                }
+                usage = next_usage;
+                let Some(inner) = control.upgrade() else {
+                    break;
+                };
+                let control = Self { inner };
+                if !control.publish_agent_stats(root_id, &path).await {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn publish_agent_stats(&self, root_id: SessionId, path: &AgentPath) -> bool {
+        let state = self.inner.state.lock().await;
+        if state
+            .trees
+            .get(&root_id)
+            .is_none_or(|tree| !tree.agents.contains_key(path))
+        {
+            return false;
+        }
+        self.inner.subagent_tx.send_replace(state.snapshots());
+        true
+    }
+
     async fn settle_turn(
         &self,
         root_id: SessionId,
@@ -581,7 +744,10 @@ impl AgentControl {
             match response {
                 Some(response) => Some((completion, response)),
                 None => {
-                    tree.completions.push_back(completion);
+                    tree.completions.push_back(QueuedCompletion {
+                        path: path.clone(),
+                        completion,
+                    });
                     None
                 }
             }
@@ -589,7 +755,8 @@ impl AgentControl {
 
         self.publish().await;
         if let Some((completion, response)) = delivery {
-            self.deliver_completion(root_id, completion, response).await;
+            self.deliver_completion(root_id, path.clone(), completion, response)
+                .await;
         } else {
             self.inner.updates.notify_waiters();
         }
@@ -599,6 +766,7 @@ impl AgentControl {
     async fn deliver_completion(
         &self,
         root_id: SessionId,
+        path: AgentPath,
         completion: AgentCompletion,
         response: oneshot::Sender<CompletionDelivery>,
     ) {
@@ -614,15 +782,24 @@ impl AgentControl {
         {
             return;
         }
-        self.queue_completion(root_id, fallback).await;
+        self.queue_completion(root_id, path, fallback).await;
     }
 
-    async fn queue_completion(&self, root_id: SessionId, completion: AgentCompletion) {
+    async fn queue_completion(
+        &self,
+        root_id: SessionId,
+        path: AgentPath,
+        completion: AgentCompletion,
+    ) {
         let mut state = self.inner.state.lock().await;
         let Some(tree) = state.trees.get_mut(&root_id) else {
             return;
         };
-        tree.completions.push_back(completion);
+        if !tree.agents.contains_key(&path) {
+            return;
+        }
+        tree.completions
+            .push_back(QueuedCompletion { path, completion });
         drop(state);
         self.inner.updates.notify_waiters();
     }
@@ -700,7 +877,7 @@ fn validate_name(name: &str) -> Result<(), ToolError> {
         Ok(())
     } else {
         Err(ToolError::Execution(
-            "name must contain only lowercase letters, digits, and underscores and be at most 64 characters"
+            "name must use lowercase letters, digits, underscores, or hyphens and be at most 64 characters"
                 .to_string(),
         ))
     }
@@ -764,6 +941,7 @@ mod tests {
         ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream, SessionIdentity,
         SessionToolContext, StopReason,
     };
+    use futures::StreamExt as _;
 
     use super::*;
 
@@ -775,6 +953,8 @@ mod tests {
         calls: AtomicUsize,
         started: Arc<Notify>,
     }
+
+    struct StreamingModel;
 
     impl ModelClient for TestModel {
         fn stream(&self, request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
@@ -797,6 +977,15 @@ mod tests {
                     Ok(ModelEvent::Stop(StopReason::EndTurn)),
                 ])))
             }
+        }
+    }
+
+    impl ModelClient for StreamingModel {
+        fn stream(&self, _: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+            Ok(Box::pin(
+                futures::stream::iter([Ok(ModelEvent::Text("live progress".to_string()))])
+                    .chain(futures::stream::pending()),
+            ))
         }
     }
 
@@ -823,7 +1012,7 @@ mod tests {
             session_id: identity.id,
             turn_id: TurnId::new(),
             cancellation: CancellationToken::new(),
-            deadline: std::time::Instant::now() + Duration::from_secs(2),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(2)),
             session: SessionToolContext {
                 identity,
                 messages: Vec::new(),
@@ -881,7 +1070,27 @@ mod tests {
 
         assert_eq!(
             tool_names(&installed),
-            ["agent", "message_agent", "wait_agent"]
+            [
+                "agent",
+                "message_agent",
+                "list_agents",
+                "remove_agent",
+                "wait_agent"
+            ]
+        );
+        assert_eq!(
+            installed
+                .tools()
+                .iter()
+                .map(|tool| tool.timeout())
+                .collect::<Vec<_>>(),
+            [
+                ToolTimeout::Disabled,
+                ToolTimeout::Disabled,
+                ToolTimeout::Session,
+                ToolTimeout::Session,
+                ToolTimeout::Disabled,
+            ]
         );
         assert_eq!(tool_names(&control.inner.definition), Vec::<&str>::new());
         let prompt = installed.system_prompt().unwrap();
@@ -927,7 +1136,7 @@ mod tests {
             .create(
                 context(identity.clone()),
                 AgentArgs {
-                    name: "research".to_string(),
+                    name: "be-resource-product".to_string(),
                     message: "inspect".to_string(),
                     profile: Some(ProfileName::Explorer),
                     wait: true,
@@ -936,7 +1145,7 @@ mod tests {
             .await
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(output["name"], "research");
+        assert_eq!(output["name"], "be-resource-product");
         assert_eq!(output["final_message"], "done");
 
         let mut state = control.inner.state.lock().await;
@@ -1084,14 +1293,21 @@ mod tests {
     #[tokio::test]
     async fn unacknowledged_synchronous_delivery_becomes_unread() {
         let (control, _directory, _) = control();
-        let root_id = SessionId::new();
+        let identity = SessionIdentity::root(SessionId::new());
+        let root_id = identity.root_id;
         control
-            .inner
-            .state
-            .lock()
+            .create(
+                context(identity.clone()),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "initial".to_string(),
+                    profile: None,
+                    wait: true,
+                },
+            )
             .await
-            .trees
-            .insert(root_id, AgentTree::default());
+            .unwrap();
+        let path = identity.path.join("worker").unwrap();
         let completion = AgentCompletion {
             name: "worker".to_string(),
             profile: ProfileName::Default,
@@ -1104,7 +1320,7 @@ mod tests {
             let control = control.clone();
             tokio::spawn(async move {
                 control
-                    .deliver_completion(root_id, completion, response)
+                    .deliver_completion(root_id, path, completion, response)
                     .await;
             })
         };
@@ -1201,7 +1417,190 @@ mod tests {
         assert!(outcomes
             .iter()
             .filter_map(|result| result.as_ref().err())
-            .any(|error| error.to_string().contains("agent already exists: same")));
+            .any(|error| error.to_string().contains("agent name already used: same")));
+    }
+
+    #[tokio::test]
+    async fn list_reports_usage_and_remove_tombstones_the_name() {
+        let (control, directory, _) = control();
+        let identity = SessionIdentity::root(SessionId::new());
+        control
+            .create(
+                context(identity.clone()),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "inspect usage".to_string(),
+                    profile: None,
+                    wait: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let listed = control.list(context(identity.clone())).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(listed["agents"][0]["name"], "worker");
+        assert_eq!(listed["agents"][0]["state"], "idle");
+        assert!(
+            listed["agents"][0]["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let child_id = {
+            let state = control.inner.state.lock().await;
+            let entry =
+                &state.trees[&identity.root_id].agents[&identity.path.join("worker").unwrap()];
+            assert!(entry.session.stats().active_turn.is_none());
+            assert_eq!(entry.snapshot().usage, entry.session.stats().total_usage());
+            entry.session.id()
+        };
+
+        control
+            .remove(
+                context(identity.clone()),
+                RemoveAgentArgs {
+                    name: "worker".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let listed = control.list(context(identity.clone())).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        assert!(listed["agents"].as_array().unwrap().is_empty());
+        assert!(directory.path().join(format!("{child_id}.jsonl")).exists());
+
+        let error = control
+            .create(
+                context(identity),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "reuse".to_string(),
+                    profile: None,
+                    wait: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("agent name already used: worker"));
+    }
+
+    #[tokio::test]
+    async fn snapshots_include_active_turn_progress_before_it_settles() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let runtime = Runtime::new(Arc::new(StreamingModel), "test").with_session_store(Arc::new(
+            ash_agent::JsonlSessionStore::new(directory.path()),
+        ));
+        let control = AgentControl::new(runtime, agent(), options());
+        let identity = SessionIdentity::root(SessionId::new());
+        let mut snapshots = control.subscribe();
+
+        control
+            .create(
+                context(identity.clone()),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "stream usage".to_string(),
+                    profile: None,
+                    wait: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let live = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = snapshots
+                    .borrow_and_update()
+                    .iter()
+                    .find(|tree| tree.root_id == identity.root_id)
+                    .and_then(|tree| tree.agents.first())
+                    .cloned();
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.usage.output_tokens > 0)
+                {
+                    break snapshot.expect("live snapshot");
+                }
+                snapshots.changed().await.expect("snapshot sender");
+            }
+        })
+        .await
+        .expect("active usage update");
+
+        assert_eq!(live.state, SubagentState::Running);
+        assert!(live.usage.input_tokens > 0);
+        assert!(live.usage.output_tokens > 0);
+        let state = control.inner.state.lock().await;
+        let entry = &state.trees[&identity.root_id].agents[&identity.path.join("worker").unwrap()];
+        assert_eq!(
+            entry.session.stats().settled_usage,
+            ash_core::Usage::default()
+        );
+        assert!(entry.session.stats().active_turn.is_some());
+        assert_eq!(entry.snapshot().usage, entry.session.stats().total_usage());
+    }
+
+    #[tokio::test]
+    async fn removing_running_agent_drops_its_late_completion_and_snapshot() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let started = Arc::new(Notify::new());
+        let runtime = Runtime::new(
+            Arc::new(BlockingThenDoneModel {
+                calls: AtomicUsize::new(0),
+                started: Arc::clone(&started),
+            }),
+            "test",
+        )
+        .with_session_store(Arc::new(ash_agent::JsonlSessionStore::new(
+            directory.path(),
+        )));
+        let control = AgentControl::new(runtime, agent(), options());
+        let identity = SessionIdentity::root(SessionId::new());
+        let snapshots = control.subscribe();
+        control
+            .create(
+                context(identity.clone()),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "block".to_string(),
+                    profile: None,
+                    wait: false,
+                },
+            )
+            .await
+            .unwrap();
+        started.notified().await;
+
+        control
+            .remove(
+                context(identity.clone()),
+                RemoveAgentArgs {
+                    name: "worker".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(snapshots
+            .borrow()
+            .iter()
+            .find(|tree| tree.root_id == identity.root_id)
+            .is_none_or(|tree| tree.agents.is_empty()));
+        let output = control
+            .wait(
+                context(identity),
+                WaitAgentArgs {
+                    timeout_ms: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(output["agents"].as_array().unwrap().is_empty());
+        assert!(output["completions"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

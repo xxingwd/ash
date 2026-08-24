@@ -4,6 +4,15 @@ pub use tokio_util::sync::CancellationToken;
 
 use crate::{error::ToolError, Content, Message, SessionId, SessionIdentity, TurnId};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolTimeout {
+    /// Use the timeout configured for the calling session.
+    #[default]
+    Session,
+    /// Run until completion or cancellation.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -16,9 +25,22 @@ pub struct ToolContext {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub cancellation: CancellationToken,
-    pub deadline: std::time::Instant,
+    pub deadline: Option<std::time::Instant>,
     /// Read-only snapshot of the calling session, for session-aware tools.
     pub session: SessionToolContext,
+}
+
+impl ToolContext {
+    /// Return the deadline supplied to a timeout-bound tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the tool disabled the session timeout.
+    pub fn require_deadline(&self) -> Result<std::time::Instant, ToolError> {
+        self.deadline.ok_or_else(|| {
+            ToolError::Execution("tool requires a bounded execution deadline".to_string())
+        })
+    }
 }
 
 /// Read-only invocation state used by session-aware tools.
@@ -69,6 +91,9 @@ impl From<&str> for ToolOutput {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn timeout(&self) -> ToolTimeout {
+        ToolTimeout::Session
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
@@ -88,6 +113,7 @@ pub struct FnTool<Args, F, Fut, Output> {
     name: String,
     description: String,
     schema: serde_json::Value,
+    timeout: ToolTimeout,
     execute: F,
     _phantom: std::marker::PhantomData<fn(Args) -> (Fut, Output)>,
 }
@@ -110,6 +136,26 @@ where
     Fut: std::future::Future<Output = std::result::Result<Output, ToolError>> + Send + 'static,
     Output: Into<ToolOutput> + Send + Sync + 'static,
 {
+    define_tool_with_timeout(name, description, ToolTimeout::Session, f)
+}
+
+/// Build a tool with an explicit execution timeout policy.
+///
+/// # Errors
+///
+/// Returns [`ToolError`] under the same conditions as [`define_tool`].
+pub fn define_tool_with_timeout<Args, F, Fut, Output>(
+    name: &str,
+    description: &str,
+    timeout: ToolTimeout,
+    f: F,
+) -> Result<Arc<dyn Tool>, ToolError>
+where
+    Args: serde::de::DeserializeOwned + Send + Sync + schemars::JsonSchema + 'static,
+    F: Fn(ToolContext, Args) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Output, ToolError>> + Send + 'static,
+    Output: Into<ToolOutput> + Send + Sync + 'static,
+{
     let schema = schemars::schema_for!(Args);
     let schema_value = serde_json::to_value(schema).map_err(|error| {
         ToolError::Execution(format!(
@@ -121,6 +167,7 @@ where
         name: name.to_string(),
         description: description.to_string(),
         schema: schema_value,
+        timeout,
         execute: f,
         _phantom: std::marker::PhantomData,
     }))
@@ -140,6 +187,10 @@ where
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn timeout(&self) -> ToolTimeout {
+        self.timeout
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

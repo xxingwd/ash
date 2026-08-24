@@ -86,8 +86,12 @@ pub fn count_tokens(messages: &[Message]) -> usize {
         .saturating_add(3)
 }
 
-pub fn count_output_tokens(message: &Message) -> usize {
-    estimate_character_count(message_characters(message))
+pub(crate) const fn estimate_output_tokens(characters: usize) -> usize {
+    estimate_character_count(characters)
+}
+
+pub(crate) fn output_character_count(input: &str) -> usize {
+    character_units(input)
 }
 
 /// Estimate the token count of a full request: system prompt + tools + messages.
@@ -431,14 +435,7 @@ fn message_characters(message: &Message) -> usize {
         }
         MessageContent::Assistant(blocks) => blocks
             .iter()
-            .map(|block| match block {
-                ContentBlock::Text(text) | ContentBlock::Thought { text, .. } => {
-                    character_units(text)
-                }
-                ContentBlock::ToolCall {
-                    name, arguments, ..
-                } => character_units(name).saturating_add(character_units(&arguments.to_string())),
-            })
+            .map(output_block_characters)
             .fold(0usize, usize::saturating_add),
         MessageContent::ToolResult {
             result,
@@ -453,6 +450,15 @@ fn message_characters(message: &Message) -> usize {
             };
             character_units(payload).saturating_add(content_characters(attachments))
         }
+    }
+}
+
+pub(crate) fn output_block_characters(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text(text) | ContentBlock::Thought { text, .. } => character_units(text),
+        ContentBlock::ToolCall {
+            name, arguments, ..
+        } => character_units(name).saturating_add(character_units(&arguments.to_string())),
     }
 }
 
@@ -642,7 +648,7 @@ mod tests {
             ContentBlock::Text("answer".to_string()),
         ]);
 
-        assert!(count_output_tokens(&message) >= 3);
+        assert!(estimate_output_tokens(message_characters(&message)) >= 3);
     }
 
     #[test]

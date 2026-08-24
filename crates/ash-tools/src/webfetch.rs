@@ -28,9 +28,10 @@ pub fn tool() -> Result<Arc<dyn Tool>, ToolError> {
         "Fetch an HTTP or HTTPS URL. HTML is converted to Markdown; Markdown and other textual responses are returned as text. Responses are limited to 5MB.",
         move |ctx, args: WebFetchArgs| {
             let client = client.clone();
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 crate::path::ensure_running(&cancellation, deadline)?;
                 let url = parse_url(&args.url)?;
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());

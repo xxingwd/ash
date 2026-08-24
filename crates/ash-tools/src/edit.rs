@@ -36,9 +36,10 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
         "Edit one file using one or more exact replacements. Every edits[].oldText must be unique and non-overlapping in the original file; replacements are not applied incrementally.",
         move |ctx, args: EditArgs| {
             let working_dir = Arc::clone(&working_dir);
+            let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
-            let deadline = ctx.deadline;
             async move {
+                let deadline = deadline?;
                 let count = args.edits.len();
                 let result =
                     edit_file(&working_dir, &args.path, args.edits, cancellation, deadline).await?;

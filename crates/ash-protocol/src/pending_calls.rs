@@ -1,15 +1,13 @@
-use ash_core::{ModelEvent, ProtocolError, StopReason, ToolCallId, Usage};
+use ash_core::{ModelEvent, ModelUsage, ProtocolError, StopReason, ToolCallId};
 use serde_json::{json, Value};
 
 /// Shared construction of provider-neutral usage records. Stream decoders
 /// report token counts under provider-specific field names; once those are
-/// read, every protocol builds the same `Usage` shape.
-pub const fn build_usage(input_tokens: u64, output_tokens: u64) -> Usage {
-    Usage {
+/// read, every protocol builds the same `ModelUsage` shape.
+pub const fn build_usage(input_tokens: u64, output_tokens: u64) -> ModelUsage {
+    ModelUsage {
         input_tokens,
         output_tokens,
-        generation_ms: 0,
-        estimated: false,
     }
 }
 
@@ -285,10 +283,13 @@ mod tests {
     #[test]
     fn usage_and_stop_reason_helpers_are_provider_neutral() {
         let usage = build_usage(120, 25);
-        assert_eq!(usage.input_tokens, 120);
-        assert_eq!(usage.output_tokens, 25);
-        assert_eq!(usage.generation_ms, 0);
-        assert!(!usage.estimated);
+        assert_eq!(
+            usage,
+            ModelUsage {
+                input_tokens: 120,
+                output_tokens: 25,
+            }
+        );
 
         assert_eq!(stop_reason("length"), StopReason::MaxTokens);
         assert_eq!(stop_reason("max_tokens"), StopReason::MaxTokens);

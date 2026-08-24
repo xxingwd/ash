@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use ash_core::TurnStats;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -10,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     scrollback::{sanitize_terminal_text, wrap_text},
-    status_line::{format_token_count, format_token_rate},
+    status_line::{format_token_rate, format_token_usage},
 };
 
 const USER_HORIZONTAL_INSET: u16 = 2;
@@ -27,9 +28,7 @@ pub enum HistoryBlock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Worked {
     elapsed: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    generation_ms: u64,
+    stats: TurnStats,
 }
 
 impl HistoryBlock {
@@ -49,18 +48,8 @@ impl HistoryBlock {
         Self::Interrupted
     }
 
-    pub(crate) const fn worked(
-        elapsed: String,
-        input_tokens: u64,
-        output_tokens: u64,
-        generation_ms: u64,
-    ) -> Self {
-        Self::Worked(Worked {
-            elapsed,
-            input_tokens,
-            output_tokens,
-            generation_ms,
-        })
+    pub(crate) const fn worked(elapsed: String, stats: TurnStats) -> Self {
+        Self::Worked(Worked { elapsed, stats })
     }
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
@@ -206,15 +195,14 @@ fn render_worked(worked: &Worked, width: u16) -> Buffer {
 
 fn worked_separator(worked: &Worked, width: u16) -> String {
     let mut label = format!("─ Worked for {}", worked.elapsed);
-    if worked.input_tokens > 0 || worked.output_tokens > 0 {
-        let _ = write!(
-            label,
-            " · {} in / {} out",
-            format_token_count(worked.input_tokens),
-            format_token_count(worked.output_tokens),
-        );
-        if let Some(rate) = format_token_rate(worked.output_tokens, worked.generation_ms) {
+    let usage = worked.stats.usage;
+    if usage.total_tokens() > 0 || usage.tool_calls > 0 {
+        let _ = write!(label, " · {}", format_token_usage(usage));
+        if let Some(rate) = format_token_rate(usage.output_tokens, worked.stats.generation_ms) {
             let _ = write!(label, " · {rate}");
+        }
+        if usage.tool_calls > 0 {
+            let _ = write!(label, " · {} tools", usage.tool_calls);
         }
     }
     label.push_str(" ─");
@@ -314,10 +302,21 @@ mod tests {
 
     #[test]
     fn worked_block_fills_or_truncates_to_the_terminal_width() {
-        let buffer = HistoryBlock::worked("2m 05s".to_string(), 1_200, 345, 1_500).render(64);
+        let stats = TurnStats {
+            usage: ash_core::Usage {
+                input_tokens: 1_200,
+                output_tokens: 345,
+                tool_calls: 2,
+                estimated: true,
+            },
+            generation_ms: 1_500,
+        };
+        let buffer = HistoryBlock::worked("2m 05s".to_string(), stats).render(64);
         let separator = row_text(&buffer, 0);
 
-        assert!(separator.starts_with("─ Worked for 2m 05s · 1.2k in / 345 out · 230 tok/s ─"));
+        assert!(
+            separator.starts_with("─ Worked for 2m 05s · 1.2k in / 345 out · 230 tok/s · 2 tools")
+        );
         assert_eq!(UnicodeWidthStr::width(separator.as_str()), 64);
         assert!(buffer
             .cell((0, 0))
@@ -326,7 +325,7 @@ mod tests {
             .contains(Modifier::DIM));
         assert_eq!(
             row_text(
-                &HistoryBlock::worked("0s".to_string(), 0, 0, 0).render(10),
+                &HistoryBlock::worked("0s".to_string(), TurnStats::default()).render(10),
                 0
             ),
             "─ Worked f"
