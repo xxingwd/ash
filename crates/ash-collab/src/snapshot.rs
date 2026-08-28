@@ -12,11 +12,9 @@ pub struct SubagentTreeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
     pub name: String,
-    pub profile: String,
     pub state: SubagentState,
-    /// Settled session usage plus the active turn's latest progress snapshot.
+    /// Settled protocol usage plus the active turn's latest progress snapshot.
     pub usage: Usage,
-    pub last_message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

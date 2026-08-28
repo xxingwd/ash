@@ -307,7 +307,6 @@ mod tests {
                 input_tokens: 1_200,
                 output_tokens: 345,
                 tool_calls: 2,
-                estimated: true,
             },
             generation_ms: 1_500,
         };

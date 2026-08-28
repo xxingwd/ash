@@ -49,16 +49,13 @@ impl SessionUiInfo {
 
 #[derive(Debug, Default)]
 struct UsageState {
-    /// Current model-context size, always a local estimate from the agent
-    /// (same estimator the runtime uses for compaction). The API usage is
-    /// not used here: it is billed per request/turn and would drift from the
-    /// context that actually drives compaction.
+    /// Current model-context size from the same local estimator the runtime
+    /// uses for compaction.
     context_tokens: Option<u64>,
 }
 
 impl UsageState {
-    /// Record the current model-context size (turn end, compaction, restore,
-    /// fork, rollback). Always an estimate; never mixed with API usage.
+    /// Record the current model-context size after a projection change.
     const fn set_context_tokens(&mut self, tokens: u64) {
         self.context_tokens = Some(tokens);
     }
@@ -262,12 +259,6 @@ impl BlockStore {
 
     fn push_pending(&mut self, block: LiveBlock) {
         self.blocks.push(block);
-    }
-
-    fn pending_last_mut(&mut self) -> Option<&mut LiveBlock> {
-        (self.blocks.len() > self.committed_len)
-            .then(|| self.blocks.last_mut())
-            .flatten()
     }
 
     fn pending_position(&self, predicate: impl FnMut(&LiveBlock) -> bool) -> Option<usize> {
@@ -490,9 +481,8 @@ impl TerminalUi {
             self.push_restored_messages_excluding(&session.messages, &turn_message_ids);
             self.push_restored_turns(&session.turns);
         }
-        // `begin_fresh_viewport` resets usage; restore the estimated context
-        // size so the status line reflects current occupancy before any API
-        // usage is reported for the new history.
+        // `begin_fresh_viewport` resets usage; restore context occupancy for
+        // the newly projected history.
         if let Some(tokens) = session.stats.context_tokens {
             self.usage.set_context_tokens(tokens);
         }
@@ -651,9 +641,6 @@ impl TerminalUi {
 
     pub fn tool_started(&mut self, id: ToolCallId, name: String, arguments: Value) -> RenderPlan {
         self.finish_live_output();
-        if absorbs_running_read(self.blocks.pending(), &name, &arguments) {
-            return RenderPlan::NONE;
-        }
         let block_id = self.allocate_block_id();
         self.push_block(LiveBlock::running_tool(block_id, id, name, arguments));
         RenderPlan::REDRAW
@@ -672,12 +659,6 @@ impl TerminalUi {
             .pending_position(|block| block.is_running_tool(id))
         {
             self.blocks.pending_mut()[position].finish_tool(id, output.to_string(), is_error);
-            if position > 0
-                && self.blocks.pending_mut()[position - 1]
-                    .try_append_tool(name, arguments, is_error)
-            {
-                self.blocks.remove_pending(position);
-            }
         } else {
             self.push_tool_block(
                 name.to_string(),
@@ -753,8 +734,8 @@ impl TerminalUi {
     }
 
     /// Toggle the global tool-output display mode: full output vs short
-    /// preview. Applies to every tool block and persists across session
-    /// switches (`Ctrl+o`).
+    /// preview. Applies to every visible tool output and persists across
+    /// session switches (`Ctrl+o`).
     pub fn toggle_tool_expanded(&mut self) -> RenderPlan {
         self.tools_expanded = !self.tools_expanded;
         // Committed blocks are baked into the scrollback surface; rebuilding
@@ -977,13 +958,6 @@ impl TerminalUi {
     }
 
     fn push_tool_block(&mut self, name: String, arguments: Value, output: String, is_error: bool) {
-        if self
-            .blocks
-            .pending_last_mut()
-            .is_some_and(|block| block.try_append_tool(&name, &arguments, is_error))
-        {
-            return;
-        }
         let id = self.allocate_block_id();
         self.push_block(LiveBlock::tool(id, name, arguments, output, is_error));
     }
@@ -1176,26 +1150,26 @@ fn inserted_blocks(error: &io::Error) -> usize {
 }
 
 /// Inserts the blocks into the terminal surface, returning the number of
-/// blocks physically written. On failure, the error carries how many blocks
-/// were already inserted so callers never re-commit already-rendered rows.
+/// source blocks physically written. Consecutive silent tools of the same
+/// name collapse into one inserted row; a failure still reports the
+/// source-block count so a retry never re-renders already-written history.
 fn insert_history_blocks(
     surface: &mut InlineScreen,
     blocks: &[LiveBlock],
     render_width: u16,
     tools_expanded: bool,
 ) -> io::Result<usize> {
-    for (index, block) in blocks.iter().enumerate() {
-        let buffer = block.render(render_width, tools_expanded);
-        if let Err(source) = surface.insert_buffer(&buffer, 1) {
-            return Err(PartialInsert {
-                inserted: index,
-                source,
-            }
-            .into());
+    let mut inserted = 0;
+    for group in viewport::grouped_transcript(blocks, render_width, tools_expanded) {
+        if let Err(source) = surface.insert_buffer(&group.buffer, 1) {
+            return Err(PartialInsert { inserted, source }.into());
         }
-        block.clear_render_cache();
+        inserted += group.source.len();
+        for block in group.source {
+            block.clear_render_cache();
+        }
     }
-    Ok(blocks.len())
+    Ok(inserted)
 }
 
 const fn normalize_scroll_top(scroll_top: &mut Option<u16>, rendered_top: u16) {
@@ -1252,12 +1226,6 @@ fn restored_turn_footer(result: &TurnResult) -> Option<HistoryBlock> {
             Some(HistoryBlock::error(error))
         }
     }
-}
-
-fn absorbs_running_read(transcript: &[LiveBlock], name: &str, arguments: &Value) -> bool {
-    transcript
-        .last()
-        .is_some_and(|block| block.can_group_read(name, arguments))
 }
 
 #[cfg(test)]
@@ -1441,7 +1409,6 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 2,
                     tool_calls: 1,
-                    estimated: false,
                 },
                 generation_ms: 100,
             },
@@ -1456,7 +1423,6 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 2,
                         tool_calls: 1,
-                        estimated: false,
                     },
                     generation_ms: 100,
                 }
@@ -1530,34 +1496,5 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(result.output, "updated");
-    }
-
-    #[test]
-    fn consecutive_reads_do_not_open_a_running_row() {
-        let first = LiveBlock::tool(
-            1,
-            "read".to_string(),
-            serde_json::json!({"path": "/workspace/src/inline.rs"}),
-            String::new(),
-            false,
-        );
-        let second = LiveBlock::tool(
-            2,
-            "bash".to_string(),
-            serde_json::json!({"command": "pwd"}),
-            String::new(),
-            false,
-        );
-
-        assert!(absorbs_running_read(
-            std::slice::from_ref(&first),
-            "read",
-            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
-        ));
-        assert!(!absorbs_running_read(
-            &[first, second],
-            "read",
-            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
-        ));
     }
 }

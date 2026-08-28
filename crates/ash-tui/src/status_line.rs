@@ -136,7 +136,6 @@ mod tests {
                 input_tokens: 12_345,
                 output_tokens: 678,
                 tool_calls: 1,
-                estimated: true,
             }),
             "12.3k in / 678 out"
         );

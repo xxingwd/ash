@@ -5,6 +5,5 @@ expression: usage
 {
   "input_tokens": 100,
   "output_tokens": 50,
-  "tool_calls": 2,
-  "estimated": false
+  "tool_calls": 2
 }

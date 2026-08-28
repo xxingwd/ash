@@ -1,127 +1,43 @@
 use std::path::{Path, PathBuf};
 
 use ash_core::{
-    ash_data_dir, parse_agent_path, AgentPath, Content, Message, MessageContent, SessionId,
-    SessionIdentity, SessionSummary, TurnId, TurnResult, TurnStats, Usage,
+    ash_data_dir, Content, Message, MessageContent, SessionId, SessionIdentity, SessionSummary,
+    TurnId, TurnResult, TurnStats, Usage,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use crate::store::{OpenedSession, SessionStore, StoredSession};
-use crate::{AcceptedInput, ContextCheckpoint, LogEntry, SessionAppender, SessionLog};
+use crate::log::{ContextCheckpoint, LogEntry, SessionLog};
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-struct StoredTurnStats {
-    input_tokens: u64,
-    output_tokens: u64,
-    #[serde(default)]
-    tool_calls: u64,
-    generation_ms: u64,
-    estimated: bool,
+#[derive(Debug)]
+pub(crate) struct StoredSession {
+    pub(crate) identity: SessionIdentity,
+    pub(crate) log: SessionLog,
 }
 
-impl From<TurnStats> for StoredTurnStats {
-    fn from(stats: TurnStats) -> Self {
-        Self {
-            input_tokens: stats.usage.input_tokens,
-            output_tokens: stats.usage.output_tokens,
-            tool_calls: stats.usage.tool_calls,
-            generation_ms: stats.generation_ms,
-            estimated: stats.usage.estimated,
-        }
-    }
-}
-
-impl From<StoredTurnStats> for TurnStats {
-    fn from(stats: StoredTurnStats) -> Self {
-        Self {
-            usage: Usage {
-                input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
-                tool_calls: stats.tool_calls,
-                estimated: stats.estimated,
-            },
-            generation_ms: stats.generation_ms,
-        }
-    }
+#[derive(Debug)]
+pub(crate) struct OpenedSession {
+    pub(crate) session: StoredSession,
+    pub(crate) writer: SessionWriter,
 }
 
 /// Current on-disk session file format. Bumped on incompatible changes; old
 /// formats are rejected outright rather than guessed at.
-const SESSION_FORMAT_VERSION: u32 = 1;
+const SESSION_FORMAT_VERSION: u32 = 5;
 
 /// Immutable data needed to discover and display a session without replaying it.
-/// Lineage fields are all required: a file without them cannot be placed in a
-/// session tree and is rejected instead of silently becoming a root session.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionHeader {
     format_version: u32,
     session_id: SessionId,
     root_id: SessionId,
-    /// Explicitly `null` for a root session; a missing field is rejected so
-    /// corrupt files never silently degrade to a root session.
     parent_id: Option<SessionId>,
-    path: AgentPath,
     title: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for SessionHeader {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-        use std::collections::BTreeMap;
-
-        let mut map = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
-        let parent_present = map.contains_key("parent_id");
-        let parent_id = map
-            .remove("parent_id")
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(serde::de::Error::custom)?
-            .flatten();
-        if !parent_present {
-            return Err(D::Error::custom("missing required field `parent_id`"));
-        }
-        let format_version: u32 = take_field(&mut map, "format_version")?;
-        let session_id: SessionId = take_field(&mut map, "session_id")?;
-        let root_id: SessionId = take_field(&mut map, "root_id")?;
-        let path: AgentPath = take_field(&mut map, "path")?;
-        let title: Option<String> = map
-            .remove("title")
-            .map(serde_json::from_value::<Option<String>>)
-            .transpose()
-            .map_err(serde::de::Error::custom)?
-            .flatten();
-        Ok(Self {
-            format_version,
-            session_id,
-            root_id,
-            parent_id,
-            path,
-            title,
-        })
-    }
-}
-
-fn take_field<T, E>(
-    map: &mut std::collections::BTreeMap<String, serde_json::Value>,
-    name: &str,
-) -> Result<T, E>
-where
-    T: serde::de::DeserializeOwned,
-    E: serde::de::Error,
-{
-    let value = map
-        .remove(name)
-        .ok_or_else(|| E::custom(format!("missing required field `{name}`")))?;
-    serde_json::from_value(value).map_err(E::custom)
 }
 
 impl SessionHeader {
@@ -131,7 +47,6 @@ impl SessionHeader {
             session_id: identity.id,
             root_id: identity.root_id,
             parent_id: identity.parent_id,
-            path: identity.path,
             title,
         }
     }
@@ -141,7 +56,6 @@ impl SessionHeader {
             id: self.session_id,
             root_id: self.root_id,
             parent_id: self.parent_id,
-            path: self.path.clone(),
         }
     }
 }
@@ -163,14 +77,13 @@ enum FileRecord {
     TurnStart {
         turn_id: TurnId,
     },
-    InputAccepted(AcceptedInput),
     UserMessage(Message),
     AssistantMessage(Message),
     ToolResult(Message),
     TurnEnd {
         turn_id: TurnId,
         result: TurnResult,
-        usage: Option<StoredTurnStats>,
+        stats: TurnStats,
     },
     CompactionUsage(Usage),
     Rollback,
@@ -181,7 +94,6 @@ impl FileRecord {
     fn from_entry(entry: LogEntry) -> Self {
         match entry {
             LogEntry::TurnStart(turn_id) => Self::TurnStart { turn_id },
-            LogEntry::Input(input) => Self::InputAccepted(input),
             LogEntry::Message(message) => {
                 // Match on a borrow to pick the variant, then move the message
                 // into it without cloning.
@@ -196,7 +108,7 @@ impl FileRecord {
             LogEntry::TurnEnd { id, result, stats } => Self::TurnEnd {
                 turn_id: id,
                 result,
-                usage: Some(stats.into()),
+                stats,
             },
             LogEntry::CompactionUsage(usage) => Self::CompactionUsage(usage),
             LogEntry::Rollback => Self::Rollback,
@@ -206,7 +118,6 @@ impl FileRecord {
     fn into_entry(self) -> Option<LogEntry> {
         match self {
             Self::TurnStart { turn_id } => Some(LogEntry::TurnStart(turn_id)),
-            Self::InputAccepted(input) => Some(LogEntry::Input(input)),
             Self::UserMessage(message)
             | Self::AssistantMessage(message)
             | Self::ToolResult(message) => Some(LogEntry::Message(message)),
@@ -214,11 +125,11 @@ impl FileRecord {
             Self::TurnEnd {
                 turn_id,
                 result,
-                usage,
+                stats,
             } => Some(LogEntry::TurnEnd {
                 id: turn_id,
                 result,
-                stats: usage.map_or_else(TurnStats::default, Into::into),
+                stats,
             }),
             Self::CompactionUsage(usage) => Some(LogEntry::CompactionUsage(usage)),
             Self::Rollback => Some(LogEntry::Rollback),
@@ -228,7 +139,6 @@ impl FileRecord {
 
     const fn user_message(&self) -> Option<&Message> {
         match self {
-            Self::InputAccepted(input) => Some(&input.message),
             Self::UserMessage(message) => Some(message),
             _ => None,
         }
@@ -293,7 +203,7 @@ impl Replay {
 
     fn finish(self, path: &Path) -> Result<StoredFile, ash_core::AshError> {
         let mut header = self.header.ok_or_else(|| missing_header(path))?;
-        ensure_canonical_path(&header, path)?;
+        ensure_supported_format(&header, path)?;
         let log = SessionLog::from_entries(
             self.records
                 .into_iter()
@@ -307,10 +217,7 @@ impl Replay {
     }
 }
 
-/// Validate one replayed header: the format version must match and the agent
-/// path must parse and already be in canonical form before the header is
-/// trusted.
-fn ensure_canonical_path(header: &StoredHeader, path: &Path) -> Result<(), ash_core::AshError> {
+fn ensure_supported_format(header: &StoredHeader, path: &Path) -> Result<(), ash_core::AshError> {
     if header.format_version != SESSION_FORMAT_VERSION {
         return Err(ash_core::AshError::Config(format!(
             "unsupported session format {} in {} (expected {SESSION_FORMAT_VERSION})",
@@ -318,24 +225,13 @@ fn ensure_canonical_path(header: &StoredHeader, path: &Path) -> Result<(), ash_c
             path.display()
         )));
     }
-    let invalid = || {
-        ash_core::AshError::Config(format!(
-            "invalid session header in {}: {}",
-            path.display(),
-            header.identity.path
-        ))
-    };
-    let parsed = parse_agent_path(header.identity.path.as_str()).map_err(|_| invalid())?;
-    if parsed != header.identity.path {
-        return Err(invalid());
-    }
     Ok(())
 }
 
 /// An exclusively locked append handle. The lock follows the file descriptor
 /// and is released automatically when the writer is dropped.
 #[derive(Debug)]
-pub struct SessionWriter {
+pub(crate) struct SessionWriter {
     path: PathBuf,
     state: WriterState,
 }
@@ -391,7 +287,7 @@ impl SessionWriter {
             push_line(
                 &mut data,
                 FileRecord::SessionHeader(SessionHeader::new(
-                    identity.clone(),
+                    *identity,
                     title_from_entries(entries),
                 )),
             )?;
@@ -419,14 +315,7 @@ impl SessionWriter {
     }
 }
 
-#[async_trait::async_trait]
-impl SessionAppender for SessionWriter {
-    async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
-        Self::append(self, entries).await
-    }
-}
-
-pub struct JsonlSessionStore {
+pub(crate) struct JsonlSessionStore {
     directory: PathBuf,
 }
 
@@ -439,7 +328,7 @@ impl Default for JsonlSessionStore {
 }
 
 impl JsonlSessionStore {
-    pub fn new(directory: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
         }
@@ -528,17 +417,14 @@ impl JsonlSessionStore {
         }
         Ok(children)
     }
-}
-#[async_trait::async_trait]
-impl SessionStore for JsonlSessionStore {
-    async fn open_new(
+    pub(crate) async fn open_new(
         &self,
         identity: SessionIdentity,
-    ) -> Result<Box<dyn SessionAppender>, ash_core::AshError> {
-        Ok(Box::new(SessionWriter::new(&self.directory, identity)))
+    ) -> Result<SessionWriter, ash_core::AshError> {
+        Ok(SessionWriter::new(&self.directory, identity))
     }
 
-    async fn open(
+    pub(crate) async fn open(
         &self,
         session_id: SessionId,
     ) -> Result<Option<OpenedSession>, ash_core::AshError> {
@@ -553,11 +439,12 @@ impl SessionStore for JsonlSessionStore {
         ensure_newline_terminated(&mut file).await?;
         Ok(Some(OpenedSession {
             session: stored.into_stored(),
-            writer: Box::new(SessionWriter::existing(path, file)),
+            writer: SessionWriter::existing(path, file),
         }))
     }
 
-    async fn load(
+    #[cfg(test)]
+    pub(crate) async fn load(
         &self,
         session_id: SessionId,
     ) -> Result<Option<StoredSession>, ash_core::AshError> {
@@ -569,15 +456,21 @@ impl SessionStore for JsonlSessionStore {
         Ok(Some(stored.into_stored()))
     }
 
-    async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+    pub(crate) async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         self.read_summaries(SummaryScope::Roots).await
     }
 
-    async fn tree(&self, root_id: SessionId) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+    pub(crate) async fn tree(
+        &self,
+        root_id: SessionId,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
         self.read_summaries(SummaryScope::Tree(root_id)).await
     }
 
-    async fn delete_tree(&self, root_id: SessionId) -> Result<usize, ash_core::AshError> {
+    pub(crate) async fn delete_tree(
+        &self,
+        root_id: SessionId,
+    ) -> Result<usize, ash_core::AshError> {
         let Some(root_path) = self.find_session(root_id).await? else {
             return Ok(0);
         };
@@ -617,7 +510,7 @@ enum SummaryScope {
 impl SummaryScope {
     fn includes(&self, identity: &SessionIdentity) -> bool {
         match self {
-            Self::Roots => identity.parent_id.is_none(),
+            Self::Roots => identity.is_root(),
             Self::Tree(root_id) => identity.root_id == *root_id,
         }
     }
@@ -679,6 +572,7 @@ async fn lock_session(
     Ok(tokio::fs::File::from_std(file))
 }
 
+#[cfg(test)]
 async fn read_session(path: &Path) -> Result<StoredFile, ash_core::AshError> {
     let file = tokio::fs::File::open(path).await?;
     replay_session(&mut tokio::io::BufReader::new(file), path).await
@@ -749,7 +643,7 @@ where
     };
     let header =
         stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
-    ensure_canonical_path(&header, path)?;
+    ensure_supported_format(&header, path)?;
     if let Some(session_id) = canonical_session_id(path) {
         ensure_session_id(header.identity.id, session_id, path)?;
     }
@@ -760,11 +654,7 @@ fn ensure_root_identity(
     identity: &SessionIdentity,
     expected_id: SessionId,
 ) -> Result<(), ash_core::AshError> {
-    if identity.id == expected_id
-        && identity.root_id == expected_id
-        && identity.parent_id.is_none()
-        && identity.path == AgentPath::root()
-    {
+    if identity.is_root() && identity.id == expected_id {
         return Ok(());
     }
     Err(ash_core::AshError::Config(format!(
@@ -858,7 +748,6 @@ fn ensure_session_id(
 
 fn title_from_entries(entries: &[LogEntry]) -> Option<String> {
     entries.iter().find_map(|entry| match entry {
-        LogEntry::Input(input) => message_title(&input.message),
         LogEntry::Message(message) => message_title(message),
         _ => None,
     })
@@ -957,11 +846,14 @@ mod tests {
     async fn create_child_session(
         store: &JsonlSessionStore,
         parent: SessionIdentity,
-        task_name: &str,
         entries: &[LogEntry],
     ) -> SessionId {
         let session_id = SessionId::new();
-        let identity = parent.child(session_id, task_name).unwrap();
+        let identity = SessionIdentity {
+            id: session_id,
+            root_id: parent.root_id,
+            parent_id: Some(parent.id),
+        };
         let mut writer = store.open_new(identity).await.unwrap();
         writer.append(entries).await.unwrap();
         session_id
@@ -1219,7 +1111,6 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
@@ -1239,16 +1130,16 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
         let grandchild_id = create_child_session(
             &store,
-            SessionIdentity::root(root_id)
-                .child(child_id, "research")
-                .unwrap(),
-            "scan",
+            SessionIdentity {
+                id: child_id,
+                root_id,
+                parent_id: Some(root_id),
+            },
             &[LogEntry::Message(Message::user("deep"))],
         )
         .await;
@@ -1280,16 +1171,16 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
         let grandchild_id = create_child_session(
             &store,
-            SessionIdentity::root(root_id)
-                .child(child_id, "research")
-                .unwrap(),
-            "scan",
+            SessionIdentity {
+                id: child_id,
+                root_id,
+                parent_id: Some(root_id),
+            },
             &[LogEntry::Message(Message::user("deep"))],
         )
         .await;
@@ -1325,7 +1216,6 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
@@ -1345,7 +1235,6 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("subagent"))],
         )
         .await;
@@ -1368,7 +1257,6 @@ mod tests {
         let child_id = create_child_session(
             &store,
             SessionIdentity::root(root_id),
-            "research",
             &[LogEntry::Message(Message::user("child work"))],
         )
         .await;
@@ -1377,7 +1265,6 @@ mod tests {
         assert_eq!(loaded.identity.id, child_id);
         assert_eq!(loaded.identity.root_id, root_id);
         assert_eq!(loaded.identity.parent_id, Some(root_id));
-        assert_eq!(loaded.identity.path.as_str(), "/root/research");
     }
 
     #[tokio::test]
@@ -1395,18 +1282,6 @@ mod tests {
 
         let error = store.open(session_id).await.unwrap_err();
         assert!(error.to_string().contains("missing its header"));
-    }
-
-    #[test]
-    fn rejects_a_header_that_omits_parent_id() {
-        // Everything except the required parent_id field. Without the presence
-        // check this would silently degrade to a root session.
-        let json = r#"{"format_version":1,"session_id":"e990cdf4-3efb-4f0e-9de4-71131ad45d37","root_id":"e990cdf4-3efb-4f0e-9de4-71131ad45d37","path":"/root"}"#;
-
-        let error = serde_json::from_str::<SessionHeader>(json).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("missing required field `parent_id`"));
     }
 
     #[tokio::test]
@@ -1428,21 +1303,63 @@ mod tests {
         assert!(error.to_string().contains("unsupported session format"));
     }
 
+    #[tokio::test]
+    async fn rejects_the_previous_session_format_without_migration() {
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let path = directory.path().join(session_filename(session_id));
+        let previous_version = SESSION_FORMAT_VERSION - 1;
+        tokio::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"t\",\"type\":\"session_header\",\"payload\":{{\"format_version\":{previous_version},\"session_id\":\"{session_id}\",\"root_id\":\"{session_id}\",\"parent_id\":null,\"title\":null}}}}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+
+        let error = store.open(session_id).await.unwrap_err();
+        assert!(error.to_string().contains("unsupported session format"));
+    }
+
     #[test]
     fn serializes_a_strict_header_with_explicit_null_parent() {
         let session_id = SessionId::new();
         let header = SessionHeader::new(SessionIdentity::root(session_id), None);
         let json = serde_json::to_value(&header).unwrap();
 
-        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["format_version"], SESSION_FORMAT_VERSION);
         assert_eq!(
             json["session_id"],
             serde_json::to_value(session_id).unwrap()
         );
         assert_eq!(json["root_id"], serde_json::to_value(session_id).unwrap());
         assert_eq!(json["parent_id"], serde_json::Value::Null);
-        assert_eq!(json["path"], "/root");
+        assert!(json.get("path").is_none());
         assert!(json.get("title").is_some());
+    }
+
+    #[test]
+    fn turn_end_requires_direct_turn_stats() {
+        let mut json = serde_json::to_value(FileRecord::from_entry(LogEntry::TurnEnd {
+            id: TurnId::new(),
+            result: TurnResult::Completed(ash_core::StopReason::EndTurn),
+            stats: TurnStats {
+                usage: Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    tool_calls: 1,
+                },
+                generation_ms: 20,
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(json["payload"]["stats"]["input_tokens"], 7);
+        assert!(json["payload"].get("usage").is_none());
+        json["payload"].as_object_mut().unwrap().remove("stats");
+        assert!(serde_json::from_value::<FileRecord>(json).is_err());
     }
 
     #[tokio::test]

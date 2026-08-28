@@ -79,13 +79,10 @@ async fn fetch(
     cancellation: &CancellationToken,
 ) -> Result<String, ToolError> {
     let response = send(client, url).await?;
+    let status = response.status();
 
-    if !response.status().is_success() {
-        return Err(ToolError::Execution(format!(
-            "request to {} failed with HTTP {}",
-            response.url(),
-            response.status()
-        )));
+    if !status.is_success() {
+        return Err(ToolError::Execution(format!("HTTP {status}")));
     }
 
     let content_type = response
@@ -106,10 +103,12 @@ async fn fetch(
 
     let body = collect_body(response, cancellation).await?;
     let text = String::from_utf8_lossy(&body).into_owned();
-    if is_html(&content_type, &text) {
-        return html_to_markdown(text, cancellation).await;
-    }
-    Ok(nonempty(text))
+    let content = if is_html(&content_type, &text) {
+        html_to_markdown(text, cancellation).await?
+    } else {
+        text
+    };
+    Ok(format_success(status, content))
 }
 
 async fn send(client: &Client, url: Url) -> Result<Response, ToolError> {
@@ -120,7 +119,7 @@ async fn send(client: &Client, url: Url) -> Result<Response, ToolError> {
         .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
         .send()
         .await
-        .map_err(|error| ToolError::Execution(format!("request failed: {error}")))
+        .map_err(|error| ToolError::Execution(format!("request failed: {}", error.without_url())))
 }
 
 async fn collect_body(
@@ -210,8 +209,15 @@ async fn html_to_markdown(
     })
     .await
     .map_err(|error| ToolError::Execution(format!("HTML conversion task failed: {error}")))?
-    .map(nonempty)
     .map_err(|error| ToolError::Execution(format!("cannot convert HTML to Markdown: {error}")))
+}
+
+fn format_success(status: reqwest::StatusCode, content: String) -> String {
+    let characters = content.chars().count();
+    format!(
+        "HTTP {status} · {characters} chars\n\n{}",
+        nonempty(content)
+    )
 }
 
 fn nonempty(content: String) -> String {
@@ -246,6 +252,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn success_summary_counts_characters_in_returned_content() {
+        assert_eq!(
+            format_success(reqwest::StatusCode::OK, "Ash 好".to_string()),
+            "HTTP 200 OK · 5 chars\n\nAsh 好"
+        );
+        assert_eq!(
+            format_success(reqwest::StatusCode::OK, String::new()),
+            "HTTP 200 OK · 0 chars\n\n(empty response)"
+        );
+    }
+
     #[tokio::test]
     async fn converts_html_to_markdown_and_removes_scripts() {
         let body = "<html><body><h1>Hello</h1><p>Read <a href=\"https://example.com\">more</a>.</p><script>bad()</script></body></html>";
@@ -259,9 +277,33 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(output.starts_with("HTTP 200 OK · "));
         assert!(output.contains("# Hello"));
         assert!(output.contains("[more](https://example.com)"));
         assert!(!output.contains("bad()"));
+    }
+
+    #[tokio::test]
+    async fn http_errors_omit_the_url() {
+        let (url, _) = server(vec![response(
+            "404 Not Found",
+            "text/plain",
+            &[],
+            "missing",
+        )])
+        .await;
+
+        let error = fetch(
+            &Client::new(),
+            parse_url(&url).unwrap(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 404 Not Found"));
+        assert!(!error.contains(&url));
     }
 
     #[tokio::test]

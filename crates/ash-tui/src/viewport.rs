@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     block_layout::{layout_stack, StackItem},
-    live_block::LiveBlock,
+    live_block::{render_grouped_tool, LiveBlock},
     menu::MenuView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
@@ -97,14 +97,10 @@ pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
         .unwrap_or(u16::MAX)
         .clamp(1, MAX_COMPOSER_ROWS);
 
-    let rendered_blocks = input
-        .transcript
+    let rendered_groups = grouped_transcript(input.transcript, width, input.tools_expanded);
+    let items = rendered_groups
         .iter()
-        .map(|block| block.render(width, input.tools_expanded))
-        .collect::<Vec<_>>();
-    let items = rendered_blocks
-        .iter()
-        .map(|block| StackItem::block(block.area.height))
+        .map(|group| StackItem::block(group.buffer.area.height))
         .collect::<Vec<_>>();
     let layout = layout_stack(width, &items);
     let menu_rows = u16::try_from(input.menu.item_count().min(MENU_MAX_ROWS)).unwrap_or(u16::MAX);
@@ -130,7 +126,7 @@ pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
     let mut buffer = Buffer::empty(Rect::new(0, 0, terminal_width, terminal_height));
     render_transcript(
         &layout.areas,
-        &rendered_blocks,
+        &rendered_groups,
         scroll_top,
         transcript_view_rows,
         &mut buffer,
@@ -174,6 +170,47 @@ pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
     }
 }
 
+pub(crate) struct RenderedTranscriptGroup<'a> {
+    pub(crate) source: &'a [LiveBlock],
+    pub(crate) buffer: Arc<Buffer>,
+}
+
+pub(crate) fn grouped_transcript(
+    blocks: &[LiveBlock],
+    width: u16,
+    expanded: bool,
+) -> Vec<RenderedTranscriptGroup<'_>> {
+    blocks
+        .chunk_by(|left, right| {
+            left.grouped_tool_name(expanded)
+                .zip(right.grouped_tool_name(expanded))
+                .is_some_and(|(left, right)| left == right)
+        })
+        .map(|source| {
+            let buffer = if let [block] = source {
+                block.render(width, expanded)
+            } else {
+                let name = source
+                    .first()
+                    .and_then(|block| block.grouped_tool_name(expanded))
+                    .unwrap_or_default();
+                let details = source
+                    .iter()
+                    .filter_map(|block| block.grouped_tool_detail(expanded))
+                    .map(|(_, detail)| detail)
+                    .collect::<Vec<_>>();
+                Arc::new(render_grouped_tool(
+                    name,
+                    &details,
+                    source.iter().any(LiveBlock::is_running),
+                    width,
+                ))
+            };
+            RenderedTranscriptGroup { source, buffer }
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct ScreenRows {
     transcript: u16,
@@ -192,15 +229,6 @@ struct ScreenAreas {
     menu: Rect,
     subagents: Rect,
     footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-enum ScreenRegion {
-    Transcript,
-    Status,
-    Composer,
-    Subagents,
-    Footer,
 }
 
 #[derive(Clone, Copy)]
@@ -295,20 +323,20 @@ fn screen_height(rows: ScreenRows) -> u32 {
 }
 
 fn layout_screen(width: u16, rows: ScreenRows, fitted_height: u32) -> ScreenAreas {
-    let mut regions = Vec::with_capacity(5);
+    let mut parts = Vec::with_capacity(5);
     let mut constraints = Vec::with_capacity(5);
-    for (region, rows) in [
-        (ScreenRegion::Transcript, rows.transcript),
-        (ScreenRegion::Status, rows.status),
+    for (part, rows) in [
+        (ScreenPart::Transcript, rows.transcript),
+        (ScreenPart::Status, rows.status),
         (
-            ScreenRegion::Composer,
+            ScreenPart::Composer,
             rows.composer.saturating_add(rows.menu),
         ),
-        (ScreenRegion::Subagents, rows.subagents),
-        (ScreenRegion::Footer, rows.footer),
+        (ScreenPart::Subagents, rows.subagents),
+        (ScreenPart::Footer, rows.footer),
     ] {
         if rows > 0 {
-            regions.push(region);
+            parts.push(part);
             constraints.push(Constraint::Length(rows));
         }
     }
@@ -323,11 +351,11 @@ fn layout_screen(width: u16, rows: ScreenRows, fitted_height: u32) -> ScreenArea
             u16::try_from(fitted_height).unwrap_or(u16::MAX),
         ));
     let mut areas = ScreenAreas::default();
-    for (region, area) in regions.into_iter().zip(layout.iter().copied()) {
-        match region {
-            ScreenRegion::Transcript => areas.transcript = area,
-            ScreenRegion::Status => areas.status = area,
-            ScreenRegion::Composer if rows.menu > 0 => {
+    for (part, area) in parts.into_iter().zip(layout.iter().copied()) {
+        match part {
+            ScreenPart::Transcript => areas.transcript = area,
+            ScreenPart::Status => areas.status = area,
+            ScreenPart::Composer if rows.menu > 0 => {
                 let input_surface = Layout::vertical([
                     Constraint::Length(rows.composer),
                     Constraint::Length(rows.menu),
@@ -336,9 +364,10 @@ fn layout_screen(width: u16, rows: ScreenRows, fitted_height: u32) -> ScreenArea
                 areas.composer = input_surface[0];
                 areas.menu = input_surface[1];
             }
-            ScreenRegion::Composer => areas.composer = area,
-            ScreenRegion::Subagents => areas.subagents = area,
-            ScreenRegion::Footer => areas.footer = area,
+            ScreenPart::Composer => areas.composer = area,
+            ScreenPart::Menu => areas.menu = area,
+            ScreenPart::Subagents => areas.subagents = area,
+            ScreenPart::Footer => areas.footer = area,
         }
     }
     areas
@@ -375,13 +404,13 @@ fn prompt_window<'a>(input: &'a ViewportInput<'_>, rows: u16) -> PromptWindow<'a
 
 fn render_transcript(
     areas: &[Rect],
-    blocks: &[Arc<Buffer>],
+    groups: &[RenderedTranscriptGroup<'_>],
     scroll_top: u16,
     visible_rows: u16,
     buffer: &mut Buffer,
 ) {
     let visible_bottom = scroll_top.saturating_add(visible_rows);
-    for (block, area) in blocks.iter().zip(areas) {
+    for (group, area) in groups.iter().zip(areas) {
         let top = area.y.max(scroll_top);
         let bottom = area.bottom().min(visible_bottom);
         if top >= bottom {
@@ -394,7 +423,7 @@ fn render_transcript(
             bottom.saturating_sub(top),
         );
         let source_y = top.saturating_sub(area.y);
-        crate::buffer::copy_rows(block, buffer, source_y, target);
+        crate::buffer::copy_rows(&group.buffer, buffer, source_y, target);
     }
 }
 
@@ -414,7 +443,6 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let message = sanitize_single_line(&subagent.last_message);
         let metrics = format!(
             "  {} · {} tools",
             format_token_usage(subagent.usage),
@@ -422,18 +450,14 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
         );
         let prefix_width = UnicodeWidthStr::width(state_symbol).saturating_add(1);
         let metrics_width = UnicodeWidthStr::width(metrics.as_str());
-        let name_width = usize::from(area.width)
-            .saturating_sub(prefix_width)
-            .saturating_sub(metrics_width);
-        let fixed = format!("{}{}", truncate_end(&subagent.name, name_width), metrics);
-        let fixed_width = UnicodeWidthStr::width(fixed.as_str());
-        let task_width = usize::from(area.width)
-            .saturating_sub(prefix_width)
-            .saturating_sub(fixed_width)
-            .saturating_sub(3);
-        let task =
-            (task_width >= 8 && !message.is_empty()).then(|| truncate_end(&message, task_width));
-        let mut spans = vec![
+        let available = usize::from(area.width).saturating_sub(prefix_width);
+        let name_width = UnicodeWidthStr::width(subagent.name.as_str());
+        let fixed = if name_width.saturating_add(metrics_width) <= available {
+            format!("{}{metrics}", subagent.name)
+        } else {
+            truncate_end(&subagent.name, available)
+        };
+        let spans = vec![
             Span::styled(
                 format!("{state_symbol} "),
                 Style::default()
@@ -442,13 +466,6 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
             ),
             Span::styled(fixed, Style::default().add_modifier(Modifier::BOLD)),
         ];
-        if let Some(task) = task {
-            spans.push(Span::styled(
-                " · ",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            spans.push(Span::raw(task));
-        }
         let line = Line::from(spans);
         buffer.set_line(
             area.x,
@@ -971,7 +988,6 @@ mod tests {
                 input_tokens: 12_000,
                 output_tokens: 2_200,
                 tool_calls: 8,
-                estimated: false,
             },
             generation_ms: 2_000,
         };
@@ -993,18 +1009,6 @@ mod tests {
 
         let narrow = status_text(TURN_STATS_STATUS_WIDTH - 1, "Working", Some(running));
         assert_eq!(narrow, "• Working (2s)");
-
-        let estimated = ash_core::TurnStats {
-            usage: ash_core::Usage {
-                estimated: true,
-                ..running.usage
-            },
-            ..running
-        };
-        assert!(
-            status_text(TURN_STATS_STATUS_WIDTH, "Working", Some(estimated))
-                .contains("12.0k in / 2.2k out")
-        );
     }
 
     #[test]
@@ -1026,28 +1030,22 @@ mod tests {
             SubagentView {
                 root_id: ash_core::SessionId::new(),
                 name: "inspect_glob".to_string(),
-                profile: "explorer".to_string(),
                 state: SubagentViewState::Running,
                 usage: ash_core::Usage {
                     input_tokens: 12_000,
                     output_tokens: 2_200,
                     tool_calls: 8,
-                    estimated: false,
                 },
-                last_message: "Inspect the glob API".to_string(),
             },
             SubagentView {
                 root_id: ash_core::SessionId::new(),
                 name: "fix_bash".to_string(),
-                profile: "worker".to_string(),
                 state: SubagentViewState::Running,
                 usage: ash_core::Usage {
                     input_tokens: 5_400,
                     output_tokens: 700,
                     tool_calls: 3,
-                    estimated: true,
                 },
-                last_message: "Add cwd to bash".to_string(),
             },
         ];
         let frame = render(ViewportInput {
@@ -1077,7 +1075,6 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
         assert!(row_text(&frame.buffer, 6).contains("inspect_glob"));
         assert!(row_text(&frame.buffer, 6).contains("12.0k in / 2.2k out · 8 tools"));
-        assert!(row_text(&frame.buffer, 6).contains("Inspect the glob API"));
         assert!(!row_text(&frame.buffer, 6).contains("explorer"));
         assert!(row_text(&frame.buffer, 7).contains("fix_bash"));
         assert!(row_text(&frame.buffer, 7).contains("5.4k in / 700 out · 3 tools"));
@@ -1090,10 +1087,8 @@ mod tests {
         let subagents = [SubagentView {
             root_id: ash_core::SessionId::new(),
             name: "inspect_glob".to_string(),
-            profile: "explorer".to_string(),
             state: SubagentViewState::Idle,
             usage: ash_core::Usage::default(),
-            last_message: "Inspect the glob API".to_string(),
         }];
         let frame = render(ViewportInput {
             terminal_width: 80,
@@ -1123,24 +1118,20 @@ mod tests {
     }
 
     #[test]
-    fn subagent_rows_preserve_snapshot_order_and_bound_long_tasks() {
+    fn subagent_rows_preserve_snapshot_order() {
         let root_id = ash_core::SessionId::new();
         let agents = [
             SubagentView {
                 root_id,
                 name: "idle".to_string(),
-                profile: "default".to_string(),
                 state: SubagentViewState::Idle,
                 usage: ash_core::Usage::default(),
-                last_message: "idle task".to_string(),
             },
             SubagentView {
                 root_id,
                 name: "running".to_string(),
-                profile: "default".to_string(),
                 state: SubagentViewState::Running,
                 usage: ash_core::Usage::default(),
-                last_message: "a very long task that cannot fit in a narrow terminal".to_string(),
             },
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 38, 2));
@@ -1153,27 +1144,24 @@ mod tests {
     }
 
     #[test]
-    fn subagent_rows_truncate_names_before_settled_usage() {
+    fn subagent_rows_hide_usage_before_truncating_names() {
         let agent = SubagentView {
             root_id: ash_core::SessionId::new(),
             name: "a_very_long_agent_name_that_would_hide_usage".to_string(),
-            profile: "default".to_string(),
             state: SubagentViewState::Idle,
             usage: ash_core::Usage {
                 input_tokens: 12_000,
                 output_tokens: 700,
                 tool_calls: 3,
-                estimated: false,
             },
-            last_message: "task hidden first".to_string(),
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 54, 1));
 
         render_subagents(Rect::new(0, 0, 54, 1), &[agent], &mut buffer);
 
         let row = row_text(&buffer, 0);
-        assert!(row.contains('…'));
-        assert!(row.contains("12.0k in / 700 out · 3 tools"));
+        assert!(row.contains("a_very_long_agent_name_that_would_hide_usage"));
+        assert!(!row.contains("12.0k in / 700 out · 3 tools"));
     }
 
     #[test]
@@ -1183,10 +1171,8 @@ mod tests {
             .map(|index| SubagentView {
                 root_id,
                 name: format!("agent_{index}"),
-                profile: "default".to_string(),
                 state: SubagentViewState::Idle,
                 usage: ash_core::Usage::default(),
-                last_message: String::new(),
             })
             .collect::<Vec<_>>();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 5));
@@ -1637,5 +1623,156 @@ mod tests {
 
         assert!(context_display(Some(12_345), None).is_none());
         assert!(context_display(Some(12_345), Some(0)).is_none());
+    }
+
+    #[test]
+    fn consecutive_outputless_tools_group_only_while_collapsed() {
+        let blocks = [
+            LiveBlock::tool(
+                1,
+                "read".to_string(),
+                serde_json::json!({"path": "/workspace/src/inline.rs"}),
+                String::new(),
+                false,
+            ),
+            LiveBlock::running_tool(
+                2,
+                ash_core::ToolCallId::from_provider("call-2"),
+                "read".to_string(),
+                serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+            ),
+            LiveBlock::tool(
+                3,
+                "skill".to_string(),
+                serde_json::json!({"name": "review"}),
+                "review instructions".to_string(),
+                false,
+            ),
+            LiveBlock::tool(
+                4,
+                "skill".to_string(),
+                serde_json::json!({"name": "explore"}),
+                "explore instructions".to_string(),
+                false,
+            ),
+            LiveBlock::tool(
+                5,
+                "bash".to_string(),
+                serde_json::json!({"command": "pwd"}),
+                "/tmp".to_string(),
+                false,
+            ),
+        ];
+        let source_lengths = grouped_transcript(&blocks, 79, false)
+            .into_iter()
+            .map(|group| group.source.len())
+            .collect::<Vec<_>>();
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 16,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: false,
+            status_header: "",
+            elapsed: "0s",
+            turn_stats: None,
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            menu: MenuView::None,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
+        });
+
+        assert_eq!(source_lengths, [2, 2, 1]);
+        assert_eq!(
+            grouped_transcript(&blocks, 79, true)
+                .into_iter()
+                .map(|group| group.source.len())
+                .collect::<Vec<_>>(),
+            [2, 1, 1, 1]
+        );
+        assert_eq!(row_text(&frame.buffer, 0), "• Read inline.rs, viewport.rs");
+        assert_eq!(frame.buffer.cell((0, 0)).expect("bullet").fg, Color::Cyan);
+        assert_eq!(row_text(&frame.buffer, 2), "• Skill review, explore");
+        assert_eq!(row_text(&frame.buffer, 4), "• Bash pwd");
+        assert_eq!(row_text(&frame.buffer, 5), "  └ /tmp");
+    }
+
+    #[test]
+    fn failed_silent_tool_breaks_a_group_and_keeps_its_output() {
+        let blocks = [
+            LiveBlock::tool(
+                1,
+                "read".to_string(),
+                serde_json::json!({"path": "/workspace/src/inline.rs"}),
+                String::new(),
+                false,
+            ),
+            LiveBlock::tool(
+                2,
+                "read".to_string(),
+                serde_json::json!({"path": "/workspace/src/missing.rs"}),
+                "file not found".to_string(),
+                true,
+            ),
+            LiveBlock::tool(
+                3,
+                "read".to_string(),
+                serde_json::json!({"path": "/workspace/src/viewport.rs"}),
+                String::new(),
+                false,
+            ),
+        ];
+
+        let groups = grouped_transcript(&blocks, 79, false);
+
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|group| group.source.len() == 1));
+        assert_eq!(row_text(&groups[1].buffer, 0), "• Read missing.rs");
+        assert_eq!(row_text(&groups[1].buffer, 1), "  └ file not found");
+        assert_eq!(
+            groups[1].buffer.cell((0, 0)).expect("bullet").fg,
+            Color::Red
+        );
+    }
+
+    #[test]
+    fn a_single_running_read_keeps_its_own_row() {
+        let blocks = [LiveBlock::running_tool(
+            1,
+            ash_core::ToolCallId::from_provider("call-1"),
+            "read".to_string(),
+            serde_json::json!({"path": "/workspace/src/inline.rs"}),
+        )];
+        let frame = render(ViewportInput {
+            terminal_width: 80,
+            terminal_height: 8,
+            transcript: &blocks,
+            scroll_top: None,
+            busy: true,
+            status_header: "Working",
+            elapsed: "1s",
+            turn_stats: None,
+            prompt_lines: &[],
+            prompt_cursor_row: 0,
+            prompt_cursor_column: 0,
+            menu: MenuView::None,
+            model: "mock",
+            protocol: "openai",
+            working_dir: Path::new("/tmp/ash"),
+            context_tokens: None,
+            context_limit: None,
+            tools_expanded: false,
+            subagents: &[],
+        });
+
+        assert_eq!(row_text(&frame.buffer, 0), "• Read inline.rs");
+        assert_eq!(frame.buffer.cell((0, 0)).expect("bullet").fg, Color::Cyan);
     }
 }

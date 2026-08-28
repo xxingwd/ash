@@ -29,7 +29,8 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
 }
 
-/// Provider-reported token usage for one model request.
+/// Provider-reported token usage for one model request. A stream may split
+/// fields across reports or repeat cumulative snapshots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModelUsage {
     pub input_tokens: u64,

@@ -21,6 +21,10 @@ pub enum AshError {
 pub enum SessionError {
     #[error("session is busy; cancel and wait for the active turn before retrying")]
     Busy,
+    #[error("session turn queue is full")]
+    QueueFull,
+    #[error("a child session cannot be resumed through the root path")]
+    ChildSession,
     #[error("the target turn is not active")]
     InactiveTurn,
     #[error("session runtime has stopped")]

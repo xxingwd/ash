@@ -72,6 +72,8 @@ impl Default for TurnId {
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     Serialize,
     Deserialize,
@@ -170,6 +172,16 @@ pub enum ContentBlock {
         name: String,
         arguments: serde_json::Value,
     },
+}
+
+impl ContentBlock {
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Thought { .. } | Self::ToolCall { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +303,21 @@ impl Message {
                 .join("\n"),
         )
     }
+
+    /// Visible assistant text, excluding thoughts and tool calls.
+    #[must_use]
+    pub fn visible_text(&self) -> Option<String> {
+        let MessageContent::Assistant(blocks) = &self.content else {
+            return None;
+        };
+        let text = blocks
+            .iter()
+            .filter_map(ContentBlock::text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    }
 }
 
 impl Content {
@@ -327,6 +354,20 @@ mod tests {
         assert_eq!(system.user_turn_text(), None);
         assert_eq!(system.content_text().as_deref(), Some("rules"));
         assert_eq!(system.role(), Role::System);
+        assert_eq!(system.visible_text(), None);
+        assert_eq!(user.visible_text(), None);
+        assert_eq!(
+            Message::assistant(vec![
+                ContentBlock::Thought {
+                    text: "thinking".to_string(),
+                    elapsed_seconds: 1,
+                },
+                ContentBlock::Text("visible".to_string()),
+            ])
+            .visible_text()
+            .as_deref(),
+            Some("visible")
+        );
     }
 
     #[test]

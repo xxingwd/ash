@@ -6,7 +6,7 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 - 真正的 SSE 增量输出
 - 连续对话与工具调用历史
 - 默认启用 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`webfetch` 七个内置工具
-- Codex 风格的 `default`、`explorer`、`worker` 子 Agent
+- 可并行提交、异步收取结果的命名子 Agent
 - 保留终端原生 scrollback 的 inline TUI
 
 ## 运行
@@ -61,9 +61,10 @@ cargo run -p ash-cli -- \
 
 模型上下文窗口默认是 1M token，可用 `--max-context-tokens` 或
 `ASH_MAX_CONTEXT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
-1 token 的轻量估算，不引入 tokenizer 依赖。当前 Turn 的 `Working` 行会实时显示输入、
-输出、工具调用数和生成速度；每轮结束后的 `Worked` 行使用持久化的最终统计。服务端没有
-返回 usage 时使用本地估算值，并在 token 数前显示 `~`。
+1 token 的轻量估算，不引入 tokenizer 依赖。该估算只用于模型调用前的 context preflight
+和底栏占用率。当前 Turn 的 `Working` 行按每次模型调用返回的协议 usage 累加输入、输出，
+并显示精确工具调用数与生成速度；Turn 结束后的 `Worked` 行读取 JSONL 中持久化的最终统计。
+服务端未返回 usage 时不会用本地估算回填输入或输出。
 
 估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文，并持久化一条
 隐藏的 compaction checkpoint。原始消息、终端 scrollback 和会话标题保持不变。压缩器
@@ -125,7 +126,7 @@ Session ID：
 ```
 
 普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
-首行只保存时间戳、Session ID、标题和会话类型等列表元数据；后续按顺序追加完整用户
+首行只保存格式版本、时间戳、Session ID、root ID、parent ID 和标题；后续按顺序追加完整用户
 消息、Assistant 消息、工具结果和 Turn 结束状态。压缩时只追加摘要和近期历史起点；
 恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。恢复时
 沿用当前运行配置，不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此
@@ -145,42 +146,26 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 
 ## 子 Agent
 
-默认交互链路提供五个协作工具：
+默认交互链路提供五个异步协作工具：
 
-- `agent`：创建命名 Agent 并发送初始 `message`
-- `message_agent`：向现有命名 Agent 发送后续 `message`；`interrupt: true` 会先取消未完成工作
-- `list_agents`：读取当前 Agent 的状态、累计 usage 和最近任务，不消费后台结果
-- `remove_agent`：解除与 Agent 的关系并取消未完成工作；名称不可复用，但 Session 日志保留
-- `wait_agent`：等待并消费后台任务的未读结果；`timeout_ms: 0` 立即返回当前快照
+- `agent`：创建命名 Agent、提交初始 `message`，立即返回 accepted 和 Turn ID
+- `message_agent`：向现有命名 Agent 提交 FIFO follow-up，立即返回 accepted 和 Turn ID
+- `wait_agent`：返回当前全部未读结果；仍有任务但暂无结果时等待下一次完成
+- `list_agents`：读取当前根 Session 下 Agent 的 idle/running 状态和累计协议 usage
+- `remove_agent`：删除没有运行任务和未读结果的 Agent
 
-`agent` 和 `message_agent` 默认使用 `wait: true`，这一轮完成后直接返回结果。独立任务可
-设置 `wait: false` 后台执行，父 Agent 继续处理其他工作，等需要结果时再调用
-`wait_agent`。同步返回的结果不会再次出现；父调用被取消或超时则自动转入未读结果队列。
-被 `remove_agent` 清理的 Agent 不再接受消息，迟到结果也不会重新进入完成队列。该操作不会
-删除子 Session 的 JSONL，但当前不提供把已移除 Agent 重新挂载到协作树的功能。
+每个 child 自己保存 pending Turn 和未读结果；`wait_agent` 是唯一消费结果的入口，没有队列
+参数和内部超时。取消等待不会消费结果，也不会取消 child。一次 wait 会取走当时所有 Agent
+的未读结果；同一 child 内保持 FIFO，不承诺不同 child 之间的全局完成顺序。结果消费完且
+Agent idle 后可以删除，名字随后可立即复用。
 
-这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，只追加所选类型的工作
-指令，不继承协作工具或主 Agent 的编排提示。
+这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，继承当前模型、普通工具、
+AGENTS.md 和 Skills 配置，但不继承协作工具或主 Agent 的编排提示，并从空历史开始。名字在
+当前 root Session 内有效：trim 后必须非空、不含控制字符且不超过 64 个 Unicode 字符。
 
-内置类型与 Codex CLI `0.144.3` 对齐：
-
-- `default`：继承当前配置的通用 Agent
-- `explorer`：用于明确、窄范围、只读的代码库问题
-- `worker`：用于实现、修复、测试和重构，需要明确文件或模块所有权
-
-Codex 源码中仍保留 `awaiter` 配置，但该版本已从可用角色中临时移除，因此 Ash
-也不对外暴露它。子 Agent 继承当前模型、协议、工作目录、工具、AGENTS.md 和 Skills
-配置，但从空会话历史开始，并通过与父 Agent 相同的 `Runtime -> Session -> Turn`
-流水线运行。名字在当前根 Session 内保持稳定，允许最多 64 个小写 ASCII 字母、数字、
-下划线或连字符（例如 `be-resource-product`）；后续消息复用同一子 Session。
-子 Agent 列表中的累计 usage 由已完成 Session usage 与当前 Turn 的最新进度组成，因此会在
-运行期间更新；Turn 完成后自动收敛到持久化的 Session 统计。
-
-ASH 支持多个子 Agent 并行，但这只是能力而不是强制流程：只有独立问题或清晰边界的
-工作流才适合拆给 explorer/worker。简单任务和紧耦合的即时阻塞仍由当前 Agent 自己
-完成。Agent 由进程内 controller 持有，并按根 Session 隔离；`list_agents` 只读取当前
-投影，`remove_agent` 只解除路由并保留 Session 日志。切换会话时 TUI 只展示当前根的
-Agent，切回原会话仍可继续使用原有 Agent。整个 controller 退出时统一释放。
+child 与 root 使用同一套普通 Session 和 JSONL 持久化规则，保留自己的多轮历史，并通过
+`root_id`、`parent_id` 记录 lineage。root 会话列表不展示 child；tree 查询和删除覆盖其下
+的 durable child。目前不提供 child picker 或单独 resume 入口。
 
 ## 终端行为
 
@@ -188,7 +173,7 @@ Agent，切回原会话仍可继续使用原有 Agent。整个 controller 退出
 滚动、选择和复制因此保持可用。当前用户消息、流式 Thought、工具与回答只存在于本轮 live
 viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随最新内容。
 
-收到 `AgentFinished` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
+收到 `TurnCompleted` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
 随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
 resize 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并立即释放
 Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。`/new`、
@@ -200,14 +185,15 @@ Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由�
 Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinking` 字段，
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
-工具调用使用语义化单行摘要，不直接打印参数 JSON。连续的原生 `read` 调用会聚合为
-一个摘要；`glob`、`grep` 和 `skill` 分别显示匹配模式、正则和 Skill 名称；`bash` 始终
-显示实际命令，不猜测 Shell 意图。文件内容、编辑前后文本、默认参数、工作目录和绝对
-路径不会进入终端历史。聚合只影响展示，底层工具调用、结果和会话记录仍保持独立。
+工具调用使用语义化单行摘要，不直接打印参数 JSON。折叠状态下没有结果正文的连续同名
+工具（如 `read`、`skill`、`agent`、`wait_agent`）会聚成一个摘要；展开后需要显示正文的
+工具会恢复为独立调用。`glob`、`grep` 折叠时显示结果数量，`webfetch` 显示 HTTP 状态和
+字符数，因此不参与聚合；三者展开时都显示完整结果。`bash` 始终显示实际命令，不猜测
+Shell 意图。聚合只影响展示，底层工具调用、结果和会话记录仍保持独立。
 
 工具输出、bash 命令续行和思考区默认只显示少量行（折叠模式，5 行预算，超长时保留
-头尾加省略号）。按 `Ctrl-O` 可全局展开到 50 行预算，再次按恢复折叠；展开状态跨会话
-保持。
+头尾加省略号）。按 `Ctrl-O` 可全局展开全部内容，再次按恢复折叠；展开状态跨会话保持。
+`read` 的成功输出在两种模式下都不显示。
 
 - `Enter`：空闲时提交新一轮；任务运行时向同一 Session 队列提交下一轮
 - 输入 `/`：显示斜杠命令补全；继续输入会按命令名或别名过滤
@@ -216,19 +202,19 @@ Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 - `↑` / `↓`：输入历史
 - `PageUp` / `PageDown`：按页浏览当前 live turn
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
-- `Ctrl-O`：在所有工具输出与思考区之间切换折叠（5 行预览）与展开（50 行）
+- `Ctrl-O`：在所有可见工具输出与思考区之间切换折叠（5 行预览）与完整展开
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
 - 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；没有后续排队任务时，只有
   已完成的工具结果会保留本轮，否则撤销整轮并把原问题恢复到输入框
-- 任务运行时 `Ctrl-C` 不取消当前请求
-- 空输入时 `Ctrl-C` 或 `Ctrl-D`：退出
+- 任务运行且输入框为空时 `Ctrl-C`：取消当前 Turn；有草稿时先清空输入
+- 空闲且输入框为空时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出
 
 运行中提交的消息会创建独立 Turn，由 Session 按接收顺序执行。排队输入只在对应 Turn
 真正开始时进入终端历史，不会切断当前流式回答。`Esc` 不会反向撤销已经由
 工具写入文件系统的修改。斜杠命令始终显示；运行中输入 `/new`、`/clear`、`/resume`、
 `/undo`、`/fork` 或 `/compact` 时，命令不会发出，输入会保留，界面不显示额外状态。
-`/status` 仍可查看状态，`/exit` 会直接结束程序。`/undo` 会移除最近一轮并恢复其输入，
+`/status` 同样会被阻止，只有 `/exit` 会直接结束程序。`/undo` 会移除最近一轮并恢复其输入，
 但不会撤销工具副作用。`/fork` 不会修改原 Session；它会从所选输入之前的历史创建新
 Session，随后重放继承的历史并恢复该输入。
 

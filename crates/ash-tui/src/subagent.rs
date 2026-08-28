@@ -5,10 +5,8 @@ use ash_core::{SessionId, Usage};
 pub struct SubagentView {
     pub root_id: SessionId,
     pub name: String,
-    pub profile: String,
     pub state: SubagentViewState,
     pub usage: Usage,
-    pub last_message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

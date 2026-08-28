@@ -15,10 +15,7 @@ use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::{sanitize_terminal_text, wrap_text},
-    tool_display::{
-        read_group_detail, read_group_summary, tool_call_summary, tool_renderer,
-        OutputPresentation, ToolRenderer,
-    },
+    tool_display::{tool_call_summary, tool_renderer, OutputPresentation, ToolRenderer},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
 };
 
@@ -55,7 +52,6 @@ enum LiveBlockKind {
         source: String,
         state: ReasoningState,
     },
-    ReadGroup(Vec<String>),
     Tool {
         name: String,
         arguments: Value,
@@ -123,11 +119,6 @@ impl LiveBlock {
         output: String,
         is_error: bool,
     ) -> Self {
-        if !is_error {
-            if let Some(detail) = read_group_detail(&name, &arguments) {
-                return Self::new(id, LiveBlockKind::ReadGroup(vec![detail]));
-            }
-        }
         Self::new(
             id,
             LiveBlockKind::Tool {
@@ -189,7 +180,6 @@ impl LiveBlock {
                 self.kind,
                 LiveBlockKind::Assistant { .. }
                     | LiveBlockKind::Reasoning { .. }
-                    | LiveBlockKind::ReadGroup(_)
                     | LiveBlockKind::Tool { .. }
             )
     }
@@ -261,9 +251,8 @@ impl LiveBlock {
 
     pub(crate) fn finish_tool(&mut self, id: &ToolCallId, output: String, is_error: bool) -> bool {
         let LiveBlockKind::Tool {
-            name,
-            arguments,
             state: ToolState::Running { id: running_id },
+            ..
         } = &self.kind
         else {
             return false;
@@ -271,17 +260,10 @@ impl LiveBlock {
         if running_id != id {
             return false;
         }
-        let read_detail = (!is_error)
-            .then(|| read_group_detail(name, arguments))
-            .flatten();
-        if let Some(detail) = read_detail {
-            self.kind = LiveBlockKind::ReadGroup(vec![detail]);
-        } else {
-            let LiveBlockKind::Tool { state, .. } = &mut self.kind else {
-                unreachable!("tool state changed while completing it");
-            };
-            *state = ToolState::Finished { output, is_error };
-        }
+        let LiveBlockKind::Tool { state, .. } = &mut self.kind else {
+            unreachable!("tool state changed while completing it");
+        };
+        *state = ToolState::Finished { output, is_error };
         self.invalidate();
         true
     }
@@ -296,32 +278,35 @@ impl LiveBlock {
         )
     }
 
-    pub(crate) fn try_append_tool(
-        &mut self,
-        name: &str,
-        arguments: &Value,
-        is_error: bool,
-    ) -> bool {
-        if is_error {
-            return false;
+    pub(crate) fn grouped_tool_name(&self, expanded: bool) -> Option<&str> {
+        let LiveBlockKind::Tool { name, state, .. } = &self.kind else {
+            return None;
+        };
+        if matches!(state, ToolState::Finished { is_error: true, .. }) {
+            return None;
         }
-        let Some(detail) = read_group_detail(name, arguments) else {
-            return false;
-        };
-        let LiveBlockKind::ReadGroup(details) = &mut self.kind else {
-            return false;
-        };
-        details.push(detail);
-        self.invalidate();
-        true
+        crate::tool_display::is_groupable_tool(name, expanded).then_some(name.as_str())
     }
 
-    /// A follow-up `read` can join this group without a separate running row.
-    /// Showing that row and then folding it back in would grow and shrink the
-    /// live viewport on every consecutive read.
-    pub(crate) fn can_group_read(&self, name: &str, arguments: &Value) -> bool {
-        read_group_detail(name, arguments).is_some()
-            && matches!(self.kind, LiveBlockKind::ReadGroup(_))
+    pub(crate) fn grouped_tool_detail(&self, expanded: bool) -> Option<(String, String)> {
+        let LiveBlockKind::Tool {
+            name, arguments, ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        self.grouped_tool_name(expanded)
+            .map(|_| tool_call_summary(name, arguments))
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(
+            self.kind,
+            LiveBlockKind::Tool {
+                state: ToolState::Running { .. },
+                ..
+            }
+        )
     }
 
     pub(crate) fn render(&self, width: u16, expanded: bool) -> Arc<Buffer> {
@@ -424,7 +409,6 @@ impl LiveBlock {
                 state: ReasoningState::Running { .. },
                 ..
             } => unreachable!("running reasoning is rendered through the streaming cache"),
-            LiveBlockKind::ReadGroup(details) => render_read_group(details, width),
             LiveBlockKind::Tool {
                 name,
                 arguments,
@@ -478,7 +462,7 @@ fn render_running_reasoning(
         width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1),
     );
     let limit = if expanded {
-        crate::ansi::EXPANDED_MAX_LINES
+        usize::MAX
     } else {
         crate::ansi::COLLAPSED_MAX_LINES
     };
@@ -547,11 +531,6 @@ fn render_thought(source: &str, elapsed_seconds: u64, width: u16, expanded: bool
         );
     }
     buffer
-}
-
-fn render_read_group(details: &[String], width: u16) -> Buffer {
-    let (action, detail) = read_group_summary(details);
-    render_tool_title(&action, &detail, false, width)
 }
 
 fn render_welcome(width: u16, working_dir: &std::path::Path) -> Buffer {
@@ -750,26 +729,24 @@ fn render_presented_tool_output(
     width: u16,
     expanded: bool,
 ) -> Option<Buffer> {
-    match presentation {
-        OutputPresentation::Hidden => None,
-        OutputPresentation::Summary if !expanded => render_tool_output_summary(output, width),
-        OutputPresentation::Summary | OutputPresentation::Preview => {
-            Some(render_tool_output(output, width, expanded))
-        }
+    match (presentation, expanded) {
+        (OutputPresentation::Omitted, _) | (OutputPresentation::Expandable, false) => None,
+        (OutputPresentation::Summary, false) => render_tool_output_summary(output, width),
+        (
+            OutputPresentation::Expandable
+            | OutputPresentation::Summary
+            | OutputPresentation::Preview,
+            true,
+        )
+        | (OutputPresentation::Preview, false) => Some(render_tool_output(output, width, expanded)),
     }
 }
 
 fn render_tool_output_summary(output: &str, width: u16) -> Option<Buffer> {
-    let first = output.lines().find(|line| !line.trim().is_empty())?;
-    let truncation = output
+    output
         .lines()
-        .rev()
-        .find(|line| line.starts_with("[Results truncated"));
-    let summary = truncation.map_or_else(
-        || first.to_string(),
-        |truncation| format!("{first}\n{truncation}"),
-    );
-    Some(render_tool_output(&summary, width, false))
+        .find(|line| !line.trim().is_empty())
+        .map(|summary| render_tool_output(summary, width, false))
 }
 
 fn render_running_tool(name: &str, arguments: &Value, width: u16, expanded: bool) -> Buffer {
@@ -919,12 +896,11 @@ fn render_bash_command_line_with_action(
 /// full command is shown. The first command line already lives on the title
 /// row, so this applies to the remaining lines only.
 fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usize {
-    let limit = if expanded {
-        crate::ansi::EXPANDED_MAX_LINES
-    } else {
-        crate::ansi::COLLAPSED_MAX_LINES
-    };
     let total = lines.len();
+    if expanded {
+        return total;
+    }
+    let limit = crate::ansi::COLLAPSED_MAX_LINES;
     if total <= limit {
         return total;
     }
@@ -940,22 +916,20 @@ fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usi
     limit
 }
 
-/// Render a short preview of tool output: a few head/tail lines with an
-/// ellipsis between them when the output is longer. Expanded mode shows many
-/// more lines. ANSI colors from the tool (e.g. colored bash output) survive
-/// into the rendered spans.
+/// Render tool output as a bounded head/tail preview or in full when expanded.
+/// ANSI colors from the tool (e.g. colored bash output) survive into the
+/// rendered spans.
 fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     use crate::ansi::split_output;
 
     const FIRST_PREFIX: &str = "  └ ";
     const SUBSEQUENT_PREFIX: &str = "    ";
-    let limit = if expanded {
-        crate::ansi::EXPANDED_MAX_LINES
+    let lines = if expanded {
+        split_output(output, usize::MAX, 0, FIRST_PREFIX, SUBSEQUENT_PREFIX, true)
     } else {
-        crate::ansi::COLLAPSED_MAX_LINES
+        let half = crate::ansi::COLLAPSED_MAX_LINES / 2;
+        split_output(output, half, half, FIRST_PREFIX, SUBSEQUENT_PREFIX, true)
     };
-    let half = limit / 2;
-    let lines = split_output(output, half, half, FIRST_PREFIX, SUBSEQUENT_PREFIX, true);
     if lines.is_empty() {
         return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
     }
@@ -974,6 +948,17 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
 fn render_tool_title(action: &str, detail: &str, is_error: bool, width: u16) -> Buffer {
     let color = if is_error { Color::Red } else { Color::Green };
     render_tool_title_with_color(action, detail, color, width)
+}
+
+pub(crate) fn render_grouped_tool(
+    name: &str,
+    details: &[String],
+    running: bool,
+    width: u16,
+) -> Buffer {
+    let (action, detail) = crate::tool_display::grouped_tool_summary(name, details);
+    let color = if running { Color::Cyan } else { Color::Green };
+    render_tool_title_with_color(&action, &detail, color, width)
 }
 
 /// How a tool name is shown in a title: underscores become spaces and the
@@ -1291,6 +1276,23 @@ mod tests {
     }
 
     #[test]
+    fn expanded_running_reasoning_shows_every_line() {
+        let source = (1..=80)
+            .map(|line| format!("- item {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut block = LiveBlock::reasoning(1);
+        assert!(block.append_reasoning_source(&source));
+
+        let collapsed = block.render(80, false);
+        assert_eq!(collapsed.area.height, 6);
+
+        let expanded = block.render(80, true);
+        assert_eq!(expanded.area.height, 81);
+        assert!(row_text(&expanded, 80).contains("item 80"));
+    }
+
+    #[test]
     fn running_tool_becomes_completed_in_the_same_block() {
         let call_id = ToolCallId::from_provider("call-1");
         let mut block = LiveBlock::running_tool(
@@ -1344,42 +1346,8 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_successful_matching_tools_share_one_summary() {
-        let mut block = LiveBlock::tool(
-            1,
-            "read".to_string(),
-            serde_json::json!({"path": "/workspace/src/inline.rs"}),
-            String::new(),
-            false,
-        );
-
-        assert!(block.try_append_tool(
-            "read",
-            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
-            false,
-        ));
-        assert!(!block.try_append_tool(
-            "bash",
-            &serde_json::json!({"command": "rg ToolGroup src"}),
-            false,
-        ));
-        assert!(!block.try_append_tool(
-            "read",
-            &serde_json::json!({"path": "/workspace/src/live_block.rs"}),
-            true,
-        ));
-
-        let buffer = block.render(80, false);
-        let rendered = (0..buffer.area.width)
-            .filter_map(|column| buffer.cell((column, 0)))
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(rendered.contains("• Read inline.rs, viewport.rs"));
-    }
-
-    #[test]
-    fn a_read_group_absorbs_the_next_read_without_a_running_row() {
-        let group = LiveBlock::tool(
+    fn outputless_tools_expose_a_groupable_detail() {
+        let read = LiveBlock::tool(
             1,
             "read".to_string(),
             serde_json::json!({"path": "/workspace/src/inline.rs"}),
@@ -1392,33 +1360,43 @@ mod tests {
             "read".to_string(),
             serde_json::json!({"path": "/workspace/src/viewport.rs"}),
         );
-
-        assert!(group.can_group_read(
-            "read",
-            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
-        ));
-        assert!(!group.can_group_read("bash", &serde_json::json!({"command": "pwd"}),));
-        assert!(!running.can_group_read(
-            "read",
-            &serde_json::json!({"path": "/workspace/src/viewport.rs"}),
-        ));
-    }
-
-    #[test]
-    fn non_groupable_tools_remain_independent() {
-        let mut block = LiveBlock::tool(
-            1,
+        let bash = LiveBlock::tool(
+            3,
             "bash".to_string(),
-            serde_json::json!({"command": "cargo test"}),
+            serde_json::json!({"command": "pwd"}),
             String::new(),
             false,
         );
-
-        assert!(!block.try_append_tool(
-            "bash",
-            &serde_json::json!({"command": "cargo clippy"}),
+        let skill = LiveBlock::tool(
+            4,
+            "skill".to_string(),
+            serde_json::json!({"name": "review"}),
+            "full instructions".to_string(),
             false,
-        ));
+        );
+        let failed = LiveBlock::tool(
+            5,
+            "read".to_string(),
+            serde_json::json!({"path": "/workspace/src/missing.rs"}),
+            "file not found".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            read.grouped_tool_detail(false),
+            Some(("read".to_string(), "inline.rs".to_string()))
+        );
+        assert_eq!(
+            running.grouped_tool_detail(false),
+            Some(("read".to_string(), "viewport.rs".to_string()))
+        );
+        assert_eq!(
+            skill.grouped_tool_detail(false),
+            Some(("skill".to_string(), "review".to_string()))
+        );
+        assert_eq!(skill.grouped_tool_detail(true), None);
+        assert_eq!(bash.grouped_tool_detail(false), None);
+        assert_eq!(failed.grouped_tool_detail(false), None);
     }
 
     #[test]
@@ -1446,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_bash_output_shows_more_lines() {
+    fn expanded_bash_output_shows_every_line() {
         let output = (1..=120)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1460,12 +1438,12 @@ mod tests {
         );
         // Collapsed: 5 output lines (2 head + 1 ellipsis + 2 tail).
         assert_eq!(block.render(40, false).area.height, 6);
-        // Expanded: 50 output lines (25 head + 1 ellipsis + 24 tail).
         let expanded = block.render(40, true);
-        assert_eq!(expanded.area.height, 1 + 51);
+        assert_eq!(expanded.area.height, 1 + 120);
         assert!(row_text(&expanded, 1).contains("line 1"), "head");
-        assert!(row_text(&expanded, 26).contains("+70 lines"), "ellipsis");
-        assert!(row_text(&expanded, 51).contains("line 120"), "tail");
+        assert!(row_text(&expanded, 120).contains("line 120"), "tail");
+        assert!(!(0..expanded.area.height)
+            .any(|row| row_text(&expanded, row).contains("truncated for display")));
         // The two render modes are independent of any per-block state.
         assert_eq!(block.render(40, false).area.height, 6);
     }
@@ -1512,6 +1490,11 @@ mod tests {
         assert!(row_text(&rendered, 1).contains("echo step 2"));
         assert!(row_text(&rendered, 3).contains("+15 lines"));
         assert!(row_text(&rendered, 5).contains("echo step 20"));
+
+        let expanded = block.render(40, true);
+        assert_eq!(expanded.area.height, 1 + 19 + 1);
+        assert!(row_text(&expanded, 19).contains("echo step 20"));
+        assert!(row_text(&expanded, 20).contains("done"));
     }
 
     #[test]
@@ -1745,51 +1728,55 @@ mod generic_output_tests {
     }
 
     #[test]
-    fn successful_searches_summarize_and_expand_while_failures_show_the_error() {
-        let search_output = "Found 2 matching lines\n\nsrc/main.rs:\n  Line 12: let x = 1;";
-        let found = LiveBlock::tool(
-            1,
-            "grep".to_string(),
-            serde_json::json!({"pattern": "let x", "path": "src"}),
-            search_output.to_string(),
-            false,
-        );
-        let rendered = found.render(50, false);
-        assert_eq!(rendered.area.height, 2);
-        assert!(row_text(&rendered, 0).contains("Grep"));
-        assert!(row_text(&rendered, 1).contains("Found 2 matching lines"));
-        assert!(!rendered_to_string(&rendered).contains("Line 12"));
+    fn successful_search_tools_summarize_then_expand_fully() {
+        let cases = [
+            (
+                "grep",
+                serde_json::json!({"pattern": "let x", "path": "src"}),
+                "Found 2 matching lines\n\nsrc/main.rs:\n  Line 12: let x = 1;",
+            ),
+            (
+                "glob",
+                serde_json::json!({"pattern": "**/*.rs"}),
+                "Found 1 file\nsrc/main.rs",
+            ),
+        ];
 
-        let expanded = found.render(50, true);
-        assert!(rendered_to_string(&expanded).contains("Line 12"));
+        for (name, arguments, output) in cases {
+            let block = LiveBlock::tool(1, name.to_string(), arguments, output.to_string(), false);
 
-        let failed = LiveBlock::tool(
-            1,
-            "grep".to_string(),
-            serde_json::json!({"pattern": "[", "path": "src"}),
-            "invalid regular expression".to_string(),
-            true,
-        );
-        let rendered = failed.render(50, false);
-        assert!(rendered_to_string(&rendered).contains("invalid regular"));
+            let collapsed = block.render(80, false);
+            let collapsed_text = rendered_to_string(&collapsed);
+            assert_eq!(collapsed.area.height, 2, "{name}");
+            assert!(collapsed_text.contains(output.lines().next().unwrap()));
+            assert!(!collapsed_text.contains("src/main.rs"));
+
+            let expanded_text = rendered_to_string(&block.render(80, true));
+            assert!(expanded_text.contains("src/main.rs"), "{name} expanded");
+        }
     }
 
     #[test]
-    fn collapsed_glob_summary_keeps_the_truncation_notice() {
+    fn successful_webfetch_summarizes_then_expands_fully() {
         let block = LiveBlock::tool(
             1,
-            "glob".to_string(),
-            serde_json::json!({"pattern": "**/*.rs"}),
-            "Found 100 files\nsrc/first.rs\n\n[Results truncated at 100 files. Use a narrower path or pattern.]"
-                .to_string(),
+            "webfetch".to_string(),
+            serde_json::json!({"url": "https://example.com/docs"}),
+            "HTTP 200 OK · 42 chars\n\n# Documentation\n\nFull fetched page content.".to_string(),
             false,
         );
 
-        let rendered = block.render(80, false);
-        let text = rendered_to_string(&rendered);
-        assert!(text.contains("Found 100 files"));
-        assert!(text.contains("Results truncated at 100 files"));
-        assert!(!text.contains("src/first.rs"));
+        let collapsed = block.render(80, false);
+        let collapsed_text = rendered_to_string(&collapsed);
+        assert_eq!(collapsed.area.height, 2);
+        assert!(collapsed_text.contains("HTTP 200 OK · 42 chars"));
+        assert!(!collapsed_text.contains("Documentation"));
+
+        let expanded = block.render(80, true);
+        let expanded_text = rendered_to_string(&expanded);
+        assert!(expanded_text.contains("HTTP 200 OK · 42 chars"));
+        assert!(expanded_text.contains("Documentation"));
+        assert!(expanded_text.contains("Full fetched page content."));
     }
 
     fn rendered_to_string(buffer: &Buffer) -> String {
@@ -1800,12 +1787,12 @@ mod generic_output_tests {
     }
 
     #[test]
-    fn wait_agent_success_is_silent_but_errors_surface() {
-        let snapshot = r#"{"agents":[{"session_id":"…","status":"Completed"}],"timed_out":false}"#;
+    fn expandable_tools_hide_success_until_expanded_but_errors_surface() {
+        let snapshot = r#"{"completions":[{"name":"research","turn_id":"…"}]}"#;
         let done = LiveBlock::tool(
             1,
             "wait_agent".to_string(),
-            serde_json::json!({"timeout_ms": 0}),
+            serde_json::json!({}),
             snapshot.to_string(),
             false,
         );
@@ -1813,15 +1800,18 @@ mod generic_output_tests {
         assert_eq!(rendered.area.height, 1);
         assert!(row_text(&rendered, 0).contains("Wait agent"));
 
+        let expanded = done.render(80, true);
+        assert!(rendered_to_string(&expanded).contains("completions"));
+
         let failed = LiveBlock::tool(
             1,
             "wait_agent".to_string(),
-            serde_json::json!({"timeout_ms": 0}),
-            "wait queue is unavailable".to_string(),
+            serde_json::json!({}),
+            "wait failed".to_string(),
             true,
         );
         let rendered = failed.render(50, false);
-        assert!(rendered_to_string(&rendered).contains("wait queue"));
+        assert!(rendered_to_string(&rendered).contains("wait failed"));
     }
 }
 

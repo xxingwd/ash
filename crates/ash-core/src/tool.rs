@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 pub use tokio_util::sync::CancellationToken;
 
-use crate::{error::ToolError, Content, Message, SessionId, SessionIdentity, TurnId};
+use crate::{error::ToolError, Content, SessionIdentity};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolTimeout {
@@ -22,12 +22,9 @@ pub struct ToolDefinition {
 
 #[derive(Clone)]
 pub struct ToolContext {
-    pub session_id: SessionId,
-    pub turn_id: TurnId,
+    pub identity: SessionIdentity,
     pub cancellation: CancellationToken,
     pub deadline: Option<std::time::Instant>,
-    /// Read-only snapshot of the calling session, for session-aware tools.
-    pub session: SessionToolContext,
 }
 
 impl ToolContext {
@@ -41,17 +38,31 @@ impl ToolContext {
             ToolError::Execution("tool requires a bounded execution deadline".to_string())
         })
     }
-}
 
-/// Read-only invocation state used by session-aware tools.
-///
-/// Model credentials, model clients, prompts, and the complete tool registry are
-/// intentionally not exposed here. Product-specific tools must capture those
-/// capabilities when they are constructed.
-#[derive(Clone)]
-pub struct SessionToolContext {
-    pub identity: SessionIdentity,
-    pub messages: Vec<Message>,
+    /// Await one tool operation under this context's cancellation and deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Cancelled`] or [`ToolError::DeadlineExceeded`]
+    /// before the operation completes.
+    pub async fn run<T>(&self, operation: impl Future<Output = T>) -> Result<T, ToolError> {
+        tokio::pin!(operation);
+        match self.deadline {
+            Some(deadline) => tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(ToolError::Cancelled),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    Err(ToolError::DeadlineExceeded)
+                }
+                result = &mut operation => Ok(result),
+            },
+            None => tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(ToolError::Cancelled),
+                result = &mut operation => Ok(result),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,5 +216,26 @@ where
         let typed_args: Args = serde_json::from_value(args)
             .map_err(|e| ToolError::Execution(format!("invalid arguments: {e}")))?;
         (self.execute)(ctx, typed_args).await.map(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SessionId;
+
+    #[tokio::test]
+    async fn cancellation_wins_when_every_tool_branch_is_ready() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let context = ToolContext {
+            identity: SessionIdentity::root(SessionId::new()),
+            cancellation,
+            deadline: Some(std::time::Instant::now()),
+        };
+
+        let result = context.run(std::future::ready(())).await;
+
+        assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 }

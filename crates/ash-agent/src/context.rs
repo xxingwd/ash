@@ -86,19 +86,10 @@ pub fn count_tokens(messages: &[Message]) -> usize {
         .saturating_add(3)
 }
 
-pub(crate) const fn estimate_output_tokens(characters: usize) -> usize {
-    estimate_character_count(characters)
-}
-
-pub(crate) fn output_character_count(input: &str) -> usize {
-    character_units(input)
-}
-
 /// Estimate the token count of a full request: system prompt + tools + messages.
 ///
-/// This is the single estimation entry point used both at runtime (when the
-/// API does not report usage) and when recomputing the current context size
-/// after restore, rollback, or fork.
+/// This is the single local estimation entry point for context preflight and
+/// context occupancy. It is never used as model usage.
 pub fn estimate_request_tokens(
     system_prompt: Option<&str>,
     messages: &[Message],
@@ -453,7 +444,7 @@ fn message_characters(message: &Message) -> usize {
     }
 }
 
-pub(crate) fn output_block_characters(block: &ContentBlock) -> usize {
+fn output_block_characters(block: &ContentBlock) -> usize {
     match block {
         ContentBlock::Text(text) | ContentBlock::Thought { text, .. } => character_units(text),
         ContentBlock::ToolCall {
@@ -636,19 +627,6 @@ mod tests {
         assert!(plan.summary_prompt.contains("<previous-summary>"));
         assert!(plan.summary_prompt.contains("previous facts"));
         assert_eq!(plan.tail.len(), 4);
-    }
-
-    #[test]
-    fn output_estimate_includes_visible_reasoning() {
-        let message = Message::assistant(vec![
-            ContentBlock::Thought {
-                text: "reasoning".to_string(),
-                elapsed_seconds: 0,
-            },
-            ContentBlock::Text("answer".to_string()),
-        ]);
-
-        assert!(estimate_output_tokens(message_characters(&message)) >= 3);
     }
 
     #[test]

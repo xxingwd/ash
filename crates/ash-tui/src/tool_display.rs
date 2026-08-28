@@ -1,10 +1,8 @@
-use std::fmt::Write;
+use std::collections::HashSet;
 
 use serde_json::Value;
 
 use crate::scrollback::{sanitize_single_line, sanitize_terminal_text};
-
-const GROUP_DETAIL_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolKind {
@@ -55,7 +53,8 @@ pub enum ToolRenderer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputPresentation {
-    Hidden,
+    Omitted,
+    Expandable,
     Summary,
     Preview,
 }
@@ -67,25 +66,21 @@ pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
         (ToolKind::Edit, false) => ToolRenderer::Edit,
         (ToolKind::Write, false) => ToolRenderer::Write,
         (_, true) => ToolRenderer::Generic(OutputPresentation::Preview),
-        (ToolKind::Glob | ToolKind::Grep, false) => {
+        (ToolKind::Glob | ToolKind::Grep | ToolKind::WebFetch, false) => {
             ToolRenderer::Generic(OutputPresentation::Summary)
         }
+        (ToolKind::Read, false) => ToolRenderer::Generic(OutputPresentation::Omitted),
         (
-            ToolKind::Read
-            | ToolKind::Skill
+            ToolKind::Skill
             | ToolKind::Agent
             | ToolKind::MessageAgent
             | ToolKind::ListAgents
             | ToolKind::RemoveAgent
             | ToolKind::WaitAgent,
             false,
-        ) => ToolRenderer::Generic(OutputPresentation::Hidden),
+        ) => ToolRenderer::Generic(OutputPresentation::Expandable),
         _ => ToolRenderer::Generic(OutputPresentation::Preview),
     }
-}
-
-pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
-    (ToolKind::from_name(name) == ToolKind::Read).then(|| short_path_argument(arguments))
 }
 
 /// One tool call's title label and detail. The label is the exact tool
@@ -93,6 +88,29 @@ pub fn read_group_detail(name: &str, arguments: &Value) -> Option<String> {
 /// layer.
 pub fn tool_call_summary(name: &str, arguments: &Value) -> (String, String) {
     (name.to_string(), tool_detail(name, arguments))
+}
+
+/// A tool can join a consecutive same-name group exactly when its successful
+/// output is not visible in the current display mode.
+pub fn is_groupable_tool(name: &str, expanded: bool) -> bool {
+    match tool_renderer(name, false) {
+        ToolRenderer::Generic(OutputPresentation::Omitted) => true,
+        ToolRenderer::Generic(OutputPresentation::Expandable) => !expanded,
+        ToolRenderer::Bash
+        | ToolRenderer::Edit
+        | ToolRenderer::Write
+        | ToolRenderer::Generic(OutputPresentation::Summary | OutputPresentation::Preview) => false,
+    }
+}
+
+pub fn grouped_tool_summary(name: &str, details: &[String]) -> (String, String) {
+    let mut seen = HashSet::new();
+    let unique = details
+        .iter()
+        .filter_map(|detail| (!detail.is_empty()).then_some(detail.as_str()))
+        .filter(|detail| seen.insert(*detail))
+        .collect::<Vec<_>>();
+    (name.to_string(), unique.join(", "))
 }
 
 fn tool_detail(name: &str, arguments: &Value) -> String {
@@ -108,25 +126,6 @@ fn tool_detail(name: &str, arguments: &Value) -> String {
         }
         ToolKind::ListAgents | ToolKind::WaitAgent | ToolKind::Other => String::new(),
     }
-}
-
-pub fn read_group_summary(details: &[String]) -> (String, String) {
-    let mut unique = details.iter().filter(|detail| !detail.is_empty()).fold(
-        Vec::new(),
-        |mut unique, detail| {
-            if !unique.contains(&detail.as_str()) {
-                unique.push(detail.as_str());
-            }
-            unique
-        },
-    );
-    let hidden = unique.len().saturating_sub(GROUP_DETAIL_LIMIT);
-    unique.truncate(GROUP_DETAIL_LIMIT);
-    let mut detail = unique.join(", ");
-    if hidden > 0 {
-        let _ = write!(detail, " +{hidden}");
-    }
-    ("read".to_string(), detail)
 }
 
 fn raw_path_argument(arguments: &Value) -> String {
@@ -290,27 +289,49 @@ mod tests {
     #[test]
     fn groups_matching_tools_behind_one_action() {
         assert_eq!(
-            read_group_summary(&["inline.rs".to_string(), "viewport.rs".to_string()]),
+            grouped_tool_summary(
+                "read",
+                &["inline.rs".to_string(), "viewport.rs".to_string()],
+            ),
             ("read".to_string(), "inline.rs, viewport.rs".to_string())
+        );
+        assert_eq!(
+            grouped_tool_summary("skill", &["review".to_string(), "explore".to_string()]),
+            ("skill".to_string(), "review, explore".to_string())
         );
     }
 
     #[test]
-    fn group_summaries_cap_visible_details() {
+    fn group_summaries_keep_every_unique_detail() {
         let details = ["a", "b", "c", "d", "e", "f"].map(str::to_string);
 
         assert_eq!(
-            read_group_summary(&details),
-            ("read".to_string(), "a, b, c, d +2".to_string())
+            grouped_tool_summary("read", &details),
+            ("read".to_string(), "a, b, c, d, e, f".to_string())
         );
     }
 
     #[test]
     fn group_summaries_deduplicate_details() {
         assert_eq!(
-            read_group_summary(&["app.rs".to_string(), "app.rs".to_string()]),
+            grouped_tool_summary("read", &["app.rs".to_string(), "app.rs".to_string()]),
             ("read".to_string(), "app.rs".to_string())
         );
+    }
+
+    #[test]
+    fn groupability_follows_output_visibility() {
+        for name in ["read", "skill", "agent", "wait_agent"] {
+            assert!(is_groupable_tool(name, false), "{name} collapsed");
+        }
+        assert!(is_groupable_tool("read", true));
+        for name in ["skill", "agent", "wait_agent"] {
+            assert!(!is_groupable_tool(name, true), "{name} expanded");
+        }
+        for name in ["bash", "glob", "grep", "webfetch", "write"] {
+            assert!(!is_groupable_tool(name, false), "{name} collapsed");
+            assert!(!is_groupable_tool(name, true), "{name} expanded");
+        }
     }
 
     #[test]
@@ -320,7 +341,7 @@ mod tests {
         assert_eq!(tool_renderer("write", false), ToolRenderer::Write);
         assert_eq!(
             tool_renderer("read", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Omitted)
         );
         assert_eq!(
             tool_renderer("grep", false),
@@ -331,24 +352,28 @@ mod tests {
             ToolRenderer::Generic(OutputPresentation::Summary)
         );
         assert_eq!(
+            tool_renderer("webfetch", false),
+            ToolRenderer::Generic(OutputPresentation::Summary)
+        );
+        assert_eq!(
             tool_renderer("skill", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Expandable)
         );
         assert_eq!(
             tool_renderer("agent", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Expandable)
         );
         assert_eq!(
             tool_renderer("wait_agent", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Expandable)
         );
         assert_eq!(
             tool_renderer("list_agents", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Expandable)
         );
         assert_eq!(
             tool_renderer("remove_agent", false),
-            ToolRenderer::Generic(OutputPresentation::Hidden)
+            ToolRenderer::Generic(OutputPresentation::Expandable)
         );
         assert_eq!(
             tool_renderer("read", true),

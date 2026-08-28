@@ -119,7 +119,6 @@ fn serializes_event_usage_with_the_stable_contract() {
         input_tokens: 100,
         output_tokens: 50,
         tool_calls: 2,
-        estimated: false,
     };
     assert_json_snapshot!("event_usage", usage);
 }

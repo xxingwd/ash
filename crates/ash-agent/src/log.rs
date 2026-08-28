@@ -1,21 +1,12 @@
 use ash_core::{
     Message, MessageId, SessionStats, SessionView, TurnId, TurnResult, TurnStats, TurnView, Usage,
 };
-use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::Input;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextCheckpoint {
-    pub summary: Message,
-    pub tail_start_id: Option<MessageId>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AcceptedInput {
-    pub turn_id: TurnId,
-    pub input: Input,
-    pub message: Message,
+pub(crate) struct ContextCheckpoint {
+    pub(crate) summary: Message,
+    pub(crate) tail_start_id: Option<MessageId>,
 }
 
 impl ContextCheckpoint {
@@ -24,7 +15,7 @@ impl ContextCheckpoint {
     /// # Errors
     ///
     /// Returns `AshError` when the context has no summary message.
-    pub fn from_model_context(messages: &[Message]) -> Result<Self, ash_core::AshError> {
+    pub(crate) fn from_model_context(messages: &[Message]) -> Result<Self, ash_core::AshError> {
         let summary = messages.first().cloned().ok_or_else(|| {
             ash_core::AshError::Config("compacted context has no summary message".to_string())
         })?;
@@ -38,11 +29,9 @@ impl ContextCheckpoint {
 /// One durable, append-only history entry. This is the only persisted truth;
 /// full history, model context, turn views, and UI display are all projected
 /// from it. Live deltas never appear here.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum LogEntry {
+#[derive(Clone, Debug)]
+pub(crate) enum LogEntry {
     TurnStart(TurnId),
-    Input(AcceptedInput),
     Message(Message),
     Checkpoint(ContextCheckpoint),
     TurnEnd {
@@ -54,10 +43,9 @@ pub enum LogEntry {
     Rollback,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct SessionLog {
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SessionLog {
     entries: Vec<LogEntry>,
-    #[serde(skip)]
     projection: Projector,
 }
 
@@ -106,28 +94,14 @@ struct AppliedCheckpoint {
     all_len: usize,
 }
 
-impl<'de> Deserialize<'de> for SessionLog {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct StoredLog {
-            entries: Vec<LogEntry>,
-        }
-
-        let stored = StoredLog::deserialize(deserializer)?;
-        Ok(Self::from_entries(stored.entries))
-    }
-}
-
 impl SessionLog {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn from_messages(messages: impl IntoIterator<Item = Message>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_messages(messages: impl IntoIterator<Item = Message>) -> Self {
         Self::from_entries(messages.into_iter().map(LogEntry::Message).collect())
     }
 
@@ -143,40 +117,30 @@ impl SessionLog {
     }
 
     #[must_use]
-    pub fn entries(&self) -> &[LogEntry] {
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[LogEntry] {
         &self.entries
     }
 
-    #[must_use]
-    pub fn contains_idempotency_key(&self, key: &str) -> bool {
-        self.entries.iter().any(|entry| {
-            matches!(
-                entry,
-                LogEntry::Input(AcceptedInput { input, .. })
-                    if input.idempotency_key.as_deref() == Some(key)
-            )
-        })
-    }
-
-    pub fn push(&mut self, entry: LogEntry) {
+    pub(crate) fn push(&mut self, entry: LogEntry) {
         self.projection.apply(&entry);
         self.entries.push(entry);
     }
 
     /// Full user-visible history, excluding messages removed by rollback and
     /// partial messages from a turn that never settled (e.g. after a crash):
-    /// its accepted inputs stay visible, but half-streamed assistant and tool
+    /// its user messages stay visible, but half-streamed assistant and tool
     /// messages are not exposed as normal history.
     #[must_use]
-    pub fn messages(&self) -> Vec<Message> {
+    pub(crate) fn messages(&self) -> Vec<Message> {
         self.projection.history.clone()
     }
 
     /// The model context for the next request, honoring checkpoints. Messages
-    /// of a turn that never settled are excluded (except its accepted inputs)
+    /// of a turn that never settled are excluded (except its user messages)
     /// so the model never resumes from a half-streamed fact.
     #[must_use]
-    pub fn model_context(&self) -> Vec<Message> {
+    pub(crate) fn model_context(&self) -> Vec<Message> {
         self.projection.context.clone()
     }
 
@@ -184,14 +148,16 @@ impl SessionLog {
     /// session ended (no `TurnEnd`, e.g. after a crash) is projected as
     /// `Interrupted` so partial turns never masquerade as normal history.
     #[must_use]
-    pub fn turns(&self) -> Vec<TurnView> {
+    #[cfg(test)]
+    pub(crate) fn turns(&self) -> Vec<TurnView> {
         self.projection.turns()
     }
 
-    /// Messages belonging to one turn: accepted inputs plus model and tool
+    /// Messages belonging to one turn: user, model, and tool
     /// messages recorded under that turn id.
     #[must_use]
-    pub fn turn_messages(&self, turn_id: TurnId) -> Vec<Message> {
+    #[cfg(test)]
+    pub(crate) fn turn_messages(&self, turn_id: TurnId) -> Vec<Message> {
         self.turn_view(turn_id)
             .map(|turn| turn.messages)
             .unwrap_or_default()
@@ -202,13 +168,13 @@ impl SessionLog {
     }
 
     #[must_use]
-    pub const fn usage(&self) -> Usage {
+    pub(crate) const fn usage(&self) -> Usage {
         self.projection.settled_usage
     }
 
     /// Full projected state: history, model context, and turn views.
     #[must_use]
-    pub fn view(&self) -> SessionView {
+    pub(crate) fn view(&self) -> SessionView {
         SessionView {
             messages: self.projection.history.clone(),
             context: self.projection.context.clone(),
@@ -241,9 +207,6 @@ impl Projector {
                     context_start: self.context.clone(),
                     checkpoint_start: self.checkpoint.clone(),
                 });
-            }
-            LogEntry::Input(input) => {
-                self.push_message(input.message.clone(), true);
             }
             LogEntry::Message(message) => {
                 self.push_message(message.clone(), message.is_user_turn());
@@ -455,14 +418,6 @@ mod tests {
                     current = Some(*id);
                     open = Some((*id, Vec::new()));
                 }
-                LogEntry::Input(input) => {
-                    all.push(input.message.clone());
-                    messages.push(input.message.clone());
-                    context.push(input.message.clone());
-                    if let Some((_, turn_messages)) = open.as_mut() {
-                        turn_messages.push(input.message.clone());
-                    }
-                }
                 LogEntry::Message(message) => {
                     all.push(message.clone());
                     let partial =
@@ -519,12 +474,8 @@ mod tests {
         }
     }
 
-    fn accepted(turn_id: TurnId, text: &str) -> LogEntry {
-        LogEntry::Input(AcceptedInput {
-            turn_id,
-            input: Input::user(text),
-            message: Message::user(text),
-        })
+    fn user_message(text: &str) -> LogEntry {
+        LogEntry::Message(Message::user(text))
     }
 
     #[test]
@@ -583,21 +534,12 @@ mod tests {
     }
 
     #[test]
-    fn input_entries_preserve_trigger_metadata_and_idempotency() {
-        let mut input = Input::from_text(crate::InputSource::Heartbeat, "check health");
-        input.idempotency_key = Some("heartbeat:42".to_string());
-        input
-            .metadata
-            .insert("source".to_string(), serde_json::json!("scheduler"));
-        let message = Message::user_content(input.content.clone());
+    fn user_messages_are_visible_while_a_turn_is_open() {
+        let message = Message::user("check health");
         let mut log = SessionLog::new();
-        log.push(LogEntry::Input(AcceptedInput {
-            turn_id: TurnId::new(),
-            input,
-            message: message.clone(),
-        }));
+        log.push(LogEntry::TurnStart(TurnId::new()));
+        log.push(LogEntry::Message(message.clone()));
 
-        assert!(log.contains_idempotency_key("heartbeat:42"));
         assert_eq!(log.messages()[0].id, message.id);
         assert_eq!(log.model_context()[0].id, message.id);
     }
@@ -617,7 +559,6 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                     tool_calls: 1,
-                    estimated: false,
                 },
                 generation_ms: 300,
             },
@@ -678,7 +619,7 @@ mod tests {
         log.push(LogEntry::Message(Message::assistant_text("partial answer")));
         log.push(LogEntry::Message(Message::assistant_text("more partial")));
 
-        // The accepted input stays visible; half-streamed assistant messages
+        // The user message stays visible; half-streamed assistant messages
         // are not exposed as normal history or model context.
         let messages = log.messages();
         assert_eq!(messages.len(), 1);
@@ -702,22 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn rollback_drops_every_input_in_the_latest_turn() {
+    fn rollback_drops_every_message_in_the_latest_turn() {
         let turn_id = TurnId::new();
         let first_input = Message::user("note");
         let second_input = Message::user("task");
         let mut log = SessionLog::new();
         log.push(LogEntry::TurnStart(turn_id));
-        log.push(LogEntry::Input(AcceptedInput {
-            turn_id,
-            input: Input::user("note"),
-            message: first_input,
-        }));
-        log.push(LogEntry::Input(AcceptedInput {
-            turn_id,
-            input: Input::user("task"),
-            message: second_input,
-        }));
+        log.push(LogEntry::Message(first_input));
+        log.push(LogEntry::Message(second_input));
         log.push(LogEntry::Message(Message::assistant_text("done")));
         log.push(LogEntry::TurnEnd {
             id: turn_id,
@@ -745,7 +678,6 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                     tool_calls: 1,
-                    estimated: false,
                 },
                 generation_ms: 100,
             },
@@ -755,7 +687,6 @@ mod tests {
             input_tokens: 4,
             output_tokens: 2,
             tool_calls: 0,
-            estimated: true,
         }));
 
         assert!(log.turns().is_empty());
@@ -765,7 +696,6 @@ mod tests {
                 input_tokens: 14,
                 output_tokens: 7,
                 tool_calls: 1,
-                estimated: true,
             }
         );
     }
@@ -774,9 +704,9 @@ mod tests {
     fn incremental_projection_matches_the_previous_projection_rules() {
         let first = TurnId::new();
         let second = TurnId::new();
-        let first_input = accepted(first, "first");
+        let first_input = user_message("first");
         let tail_id = match &first_input {
-            LogEntry::Input(input) => input.message.id,
+            LogEntry::Message(message) => message.id,
             _ => unreachable!(),
         };
         let entries = vec![
@@ -794,11 +724,11 @@ mod tests {
                 stats: TurnStats::default(),
             },
             LogEntry::TurnStart(second),
-            accepted(second, "second"),
+            user_message("second"),
             LogEntry::Message(Message::assistant_text("unfinished")),
             LogEntry::Rollback,
             LogEntry::TurnStart(second),
-            accepted(second, "replacement"),
+            user_message("replacement"),
             LogEntry::Message(Message::assistant_text("replacement answer")),
             LogEntry::TurnEnd {
                 id: second,
@@ -824,7 +754,7 @@ mod tests {
         let turn_id = TurnId::new();
         let mut log = SessionLog::from_messages([original.clone()]);
         log.push(LogEntry::TurnStart(turn_id));
-        log.push(accepted(turn_id, "new task"));
+        log.push(user_message("new task"));
         log.push(LogEntry::Checkpoint(ContextCheckpoint {
             summary: Message::system("temporary summary"),
             tail_start_id: None,
@@ -845,7 +775,7 @@ mod tests {
             (second, "second", "second answer"),
         ] {
             log.push(LogEntry::TurnStart(turn_id));
-            log.push(accepted(turn_id, prompt));
+            log.push(user_message(prompt));
             log.push(LogEntry::Message(Message::assistant_text(answer)));
             log.push(LogEntry::TurnEnd {
                 id: turn_id,
@@ -861,23 +791,5 @@ mod tests {
         log.push(LogEntry::Rollback);
         assert!(log.turns().is_empty());
         assert!(log.messages().is_empty());
-    }
-
-    #[test]
-    fn deserialization_rebuilds_the_incremental_projection() {
-        let turn_id = TurnId::new();
-        let mut log = SessionLog::new();
-        log.push(LogEntry::TurnStart(turn_id));
-        log.push(accepted(turn_id, "question"));
-        log.push(LogEntry::Message(Message::assistant_text("answer")));
-        log.push(LogEntry::TurnEnd {
-            id: turn_id,
-            result: TurnResult::Completed(StopReason::EndTurn),
-            stats: TurnStats::default(),
-        });
-
-        let restored: SessionLog =
-            serde_json::from_value(serde_json::to_value(&log).unwrap()).unwrap();
-        assert_eq!(restored.view(), log.view());
     }
 }

@@ -571,10 +571,13 @@ fn handle_session_event(
             id,
             name,
             arguments,
-            output,
-            is_error,
+            result,
         }) => {
-            let effect = terminal.tool_finished(&id, &name, &arguments, &output, is_error);
+            let (output, is_error) = match &result {
+                Ok(output) => (output.as_str(), false),
+                Err(error) => (error.as_str(), true),
+            };
+            let effect = terminal.tool_finished(&id, &name, &arguments, output, is_error);
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -1145,18 +1148,14 @@ mod tests {
             SubagentView {
                 root_id: first,
                 name: "first".to_string(),
-                profile: "default".to_string(),
                 state: SubagentViewState::Running,
                 usage: ash_core::Usage::default(),
-                last_message: "one".to_string(),
             },
             SubagentView {
                 root_id: second,
                 name: "second".to_string(),
-                profile: "default".to_string(),
                 state: SubagentViewState::Running,
                 usage: ash_core::Usage::default(),
-                last_message: "two".to_string(),
             },
         ]);
         let mut state = AppState::new(Vec::new());

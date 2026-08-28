@@ -13,14 +13,15 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
-/// Session-level additive resource consumption, including local work.
+/// Additive provider-reported token usage plus exact tool execution count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Input tokens reported by model protocols.
     pub input_tokens: u64,
+    /// Output tokens reported by model protocols.
     pub output_tokens: u64,
-    #[serde(default)]
+    /// Tool calls that actually started execution.
     pub tool_calls: u64,
-    pub estimated: bool,
 }
 
 impl Usage {
@@ -30,7 +31,6 @@ impl Usage {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
             tool_calls: self.tool_calls.saturating_add(other.tool_calls),
-            estimated: self.estimated || other.estimated,
         }
     }
 
@@ -132,8 +132,7 @@ pub enum LiveEvent {
         id: ToolCallId,
         name: String,
         arguments: serde_json::Value,
-        output: String,
-        is_error: bool,
+        result: Result<String, String>,
     },
 }
 
@@ -181,7 +180,6 @@ pub enum SessionEventKind {
 pub enum StopReason {
     EndTurn,
     MaxTokens,
-    MaxTurns,
     Aborted,
     /// The model stream ended before the provider signalled a normal terminal
     /// state (no `finish_reason`, `message_stop`, `response.completed`, or
@@ -220,24 +218,21 @@ mod tests {
     }
 
     #[test]
-    fn usage_saturates_counters_and_propagates_estimates() {
+    fn usage_saturates_all_counters() {
         let usage = Usage {
             input_tokens: u64::MAX,
             output_tokens: 10,
             tool_calls: 2,
-            estimated: false,
         }
         .saturating_add(Usage {
             input_tokens: 1,
             output_tokens: u64::MAX,
             tool_calls: u64::MAX,
-            estimated: true,
         });
 
         assert_eq!(usage.input_tokens, u64::MAX);
         assert_eq!(usage.output_tokens, u64::MAX);
         assert_eq!(usage.tool_calls, u64::MAX);
-        assert!(usage.estimated);
         assert_eq!(usage.total_tokens(), u64::MAX);
     }
 
@@ -247,7 +242,6 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             tool_calls: 1,
-            estimated: false,
         };
         let stats = SessionStats {
             settled_usage,
@@ -258,7 +252,6 @@ mod tests {
                         input_tokens: 4,
                         output_tokens: 2,
                         tool_calls: 1,
-                        estimated: true,
                     },
                     generation_ms: 100,
                 },
@@ -273,7 +266,6 @@ mod tests {
                 input_tokens: 14,
                 output_tokens: 7,
                 tool_calls: 2,
-                estimated: true,
             }
         );
     }

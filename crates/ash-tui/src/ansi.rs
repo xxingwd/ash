@@ -15,8 +15,6 @@ use ratatui::text::{Line, Span};
 /// Display budget for a collapsed block: tool output, bash command
 /// continuations, and live reasoning all preview at this many lines.
 pub const COLLAPSED_MAX_LINES: usize = 5;
-/// Display budget when tool blocks are expanded (`Ctrl+o`).
-pub const EXPANDED_MAX_LINES: usize = 50;
 
 /// Bash highlighting palette. Uses the same base ratatui colors as the
 /// markdown renderer (Green for quotes, Cyan for code, Blue for markers) so

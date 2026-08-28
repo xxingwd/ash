@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use ash_core::{Tool, ToolContext, ToolError, ToolOutput};
 use rmcp::model::{CallToolRequestParams, JsonObject};
@@ -65,15 +65,10 @@ impl Tool for McpToolAdapter {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        let deadline = ctx.require_deadline()?;
-
-        let result = await_tool_call(
-            &ctx.cancellation,
-            deadline,
-            self.connection.peer.call_tool(request),
-        )
-        .await?
-        .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
+        let result = ctx
+            .run(self.connection.peer.call_tool(request))
+            .await?
+            .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
 
         let mut output = String::new();
         for item in &result.content {
@@ -89,21 +84,6 @@ impl Tool for McpToolAdapter {
         } else {
             Ok(output.into())
         }
-    }
-}
-
-async fn await_tool_call<T>(
-    cancellation: &ash_core::CancellationToken,
-    deadline: Instant,
-    call: impl Future<Output = T>,
-) -> Result<T, ToolError> {
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(ToolError::Cancelled),
-        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-            Err(ToolError::DeadlineExceeded)
-        }
-        result = call => Ok(result),
     }
 }
 
@@ -212,9 +192,7 @@ pub async fn load_mcp_tools(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{
-        CancellationToken, SessionId, SessionIdentity, SessionToolContext, ToolContext, TurnId,
-    };
+    use ash_core::{CancellationToken, SessionId, SessionIdentity, ToolContext};
     use rmcp::{
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
@@ -260,14 +238,9 @@ mod tests {
 
     fn tool_context() -> ToolContext {
         ToolContext {
-            session_id: SessionId::new(),
-            turn_id: TurnId::new(),
+            identity: SessionIdentity::root(SessionId::new()),
             cancellation: CancellationToken::new(),
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
-            session: SessionToolContext {
-                identity: SessionIdentity::root(SessionId::new()),
-                messages: Vec::new(),
-            },
         }
     }
 
@@ -275,25 +248,25 @@ mod tests {
     async fn tool_calls_observe_cancellation() {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
+        let context = ToolContext {
+            identity: SessionIdentity::root(SessionId::new()),
+            cancellation,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        };
 
-        let result = await_tool_call(
-            &cancellation,
-            Instant::now() + std::time::Duration::from_secs(1),
-            std::future::pending::<()>(),
-        )
-        .await;
+        let result = context.run(std::future::pending::<()>()).await;
 
         assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 
     #[tokio::test]
     async fn tool_calls_observe_deadlines() {
-        let result = await_tool_call(
-            &CancellationToken::new(),
-            Instant::now(),
-            std::future::pending::<()>(),
-        )
-        .await;
+        let context = ToolContext {
+            identity: SessionIdentity::root(SessionId::new()),
+            cancellation: CancellationToken::new(),
+            deadline: Some(std::time::Instant::now()),
+        };
+        let result = context.run(std::future::pending::<()>()).await;
 
         assert!(matches!(result, Err(ToolError::DeadlineExceeded)));
     }

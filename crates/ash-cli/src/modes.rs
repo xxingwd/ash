@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, path::PathBuf};
 
 use crate::message_history::MessageHistoryStore;
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, Runtime, Session, SessionOptions, Skill, Turn,
+    build_system_prompt, skill_tool, Agent, Runtime, Session, Skill, Turn,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_collab::{SubagentState, SubagentTreeSnapshot};
@@ -17,10 +17,11 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::{Cli, Command};
 
+const COLLABORATION_INSTRUCTIONS: &str = "You are the main agent. Delegate only concrete, bounded work that benefits from independent execution. Reuse existing agents for related follow-ups, wait for their results, and review those results before using them. Child agents share the workspace and cannot delegate further.";
+
 struct InteractiveController {
     session: Session,
     agent: Agent,
-    options: SessionOptions,
     runtime: Runtime,
     event_tx: tokio::sync::mpsc::Sender<UiEvent>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
@@ -74,8 +75,9 @@ enum CancelledTurn {
 
 struct AgentSetup {
     agent: Agent,
-    options: SessionOptions,
     runtime: Runtime,
+    protocol: String,
+    working_dir: PathBuf,
     subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
 }
 
@@ -118,22 +120,28 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     let mut agent = Agent::new(ModelId::new(model), tools)
         .with_system_prompt(system_prompt)
         .with_max_context_tokens(max_context_tokens);
-    let options = SessionOptions {
-        working_dir,
-        ..SessionOptions::default()
-    };
     if let Some(skill) = active_skill {
         agent = skill.apply_overrides(agent);
     }
-    let runtime = Runtime::new(create_adapter(provider), protocol.as_cli_name());
-    let (agent, control) =
-        ash_collab::install_collaboration(agent, options.clone(), runtime.clone())?;
+    let protocol = protocol.as_cli_name().to_string();
+    let runtime = Runtime::new(create_adapter(provider));
+    let (agent, control) = ash_collab::install_collaboration(agent, runtime.clone())?;
+    let system_prompt = [
+        agent.system_prompt().unwrap_or_default(),
+        COLLABORATION_INSTRUCTIONS,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let agent = agent.with_system_prompt(system_prompt);
     let subagent_monitor = Some(map_subagent_monitor(control.subscribe()));
 
     Ok(AgentSetup {
         agent,
-        options,
         runtime,
+        protocol,
+        working_dir,
         subagent_monitor,
     })
 }
@@ -168,13 +176,11 @@ fn subagent_views(trees: &[SubagentTreeSnapshot]) -> Vec<SubagentView> {
             tree.agents.iter().map(|snapshot| SubagentView {
                 root_id: tree.root_id,
                 name: snapshot.name.clone(),
-                profile: snapshot.profile.clone(),
                 state: match snapshot.state {
                     SubagentState::Idle => SubagentViewState::Idle,
                     SubagentState::Running => SubagentViewState::Running,
                 },
                 usage: snapshot.usage,
-                last_message: snapshot.last_message.clone(),
             })
         })
         .collect()
@@ -252,7 +258,7 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         stdin.read_line(&mut input).await?;
         input
     };
-    let session = setup.runtime.start(&setup.agent, &setup.options);
+    let session = setup.runtime.start(&setup.agent);
     let mut events = session.events();
     let turn = session.submit(input).await?;
     let mut completion = Box::pin(turn.wait());
@@ -282,12 +288,8 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
 fn print_usage(stats: ash_core::TurnStats) {
     let usage = stats.usage;
     eprintln!(
-        "[usage: {} in / {} out tokens, {} tools, {} ms{}]",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.tool_calls,
-        stats.generation_ms,
-        if usage.estimated { " (estimated)" } else { "" }
+        "[usage: {} in / {} out tokens, {} tools, {} ms]",
+        usage.input_tokens, usage.output_tokens, usage.tool_calls, stats.generation_ms,
     );
 }
 
@@ -298,10 +300,8 @@ fn print_event(event: SessionEventKind) {
             eprintln!("{}", format!("[tool: {name}]").cyan());
         }
         SessionEventKind::Live(LiveEvent::ToolFinished {
-            is_error: true,
-            output,
-            ..
-        }) => eprintln!("{}", format!("[error: {output}]").red()),
+            result: Err(error), ..
+        }) => eprintln!("{}", format!("[error: {error}]").red()),
         SessionEventKind::TurnCompleted(view) => match view.result {
             TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
                 eprintln!("{}", format!("[error: {error}]").red());
@@ -315,13 +315,12 @@ fn print_event(event: SessionEventKind) {
 async fn run_interactive(setup: AgentSetup) -> Result<()> {
     let AgentSetup {
         agent,
-        options,
         runtime,
+        protocol,
+        working_dir,
         subagent_monitor,
     } = setup;
-    let protocol = runtime.model_backend().to_string();
     let model = agent.model().as_str().to_string();
-    let working_dir = options.working_dir.clone();
     let context_limit = Some(u64::try_from(agent.max_context_tokens()).unwrap_or(u64::MAX));
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
@@ -339,12 +338,11 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         .with_input_history(input_history)
         .with_subagent_monitor(subagent_monitor);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
-    let session = runtime.start(&agent, &options);
+    let session = runtime.start(&agent);
 
     InteractiveController {
         session,
         agent,
-        options,
         runtime,
         event_tx,
         command_rx,
@@ -414,7 +412,7 @@ impl InteractiveController {
                         UiCommand::Rollback => self.rollback_last_turn().await,
                         UiCommand::Compact => self.compact_session().await,
                         UiCommand::NewSession => {
-                            self.session = self.runtime.start(&self.agent, &self.options);
+                            self.session = self.runtime.start(&self.agent);
                             let _ = self
                                 .event_tx
                                 .send(UiEvent::SessionChanged {
@@ -501,11 +499,7 @@ impl InteractiveController {
     }
 
     async fn resume_session(&mut self, session_id: SessionId) {
-        let event = match self
-            .runtime
-            .resume(&self.agent, &self.options, session_id)
-            .await
-        {
+        let event = match self.runtime.resume(&self.agent, session_id).await {
             Ok(Some(session)) => match session.view().await {
                 Ok(view) => {
                     let session_id = session.id();
