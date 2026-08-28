@@ -1,23 +1,25 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ash_core::{
-    ash_data_dir, Content, Message, MessageContent, SessionId, SessionIdentity, SessionSummary,
-    TurnId, TurnResult, TurnStats, Usage,
+    ash_data_dir, Conversation, SessionId, SessionIdentity, SessionSummary, StorageError, Turn,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use crate::log::{ContextCheckpoint, LogEntry, SessionLog};
-
 const MAX_SESSION_TITLE_CHARS: usize = 160;
+const MAX_INIT_RECORD_BYTES: usize = 16 * 1024;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
 #[derive(Debug)]
 pub(crate) struct StoredSession {
     pub(crate) identity: SessionIdentity,
-    pub(crate) log: SessionLog,
+    pub(crate) conversation: Conversation,
 }
 
 #[derive(Debug)]
@@ -26,291 +28,149 @@ pub(crate) struct OpenedSession {
     pub(crate) writer: SessionWriter,
 }
 
-/// Current on-disk session file format. Bumped on incompatible changes; old
-/// formats are rejected outright rather than guessed at.
-const SESSION_FORMAT_VERSION: u32 = 5;
-
-/// Immutable data needed to discover and display a session without replaying it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SessionHeader {
-    format_version: u32,
-    session_id: SessionId,
-    root_id: SessionId,
-    parent_id: Option<SessionId>,
-    title: Option<String>,
-}
-
-impl SessionHeader {
-    fn new(identity: SessionIdentity, title: Option<String>) -> Self {
-        Self {
-            format_version: SESSION_FORMAT_VERSION,
-            session_id: identity.id,
-            root_id: identity.root_id,
-            parent_id: identity.parent_id,
-            title,
-        }
-    }
-
-    fn identity(&self) -> SessionIdentity {
-        SessionIdentity {
-            id: self.session_id,
-            root_id: self.root_id,
-            parent_id: self.parent_id,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct StoredHeader {
-    format_version: u32,
-    identity: SessionIdentity,
-    created_at: String,
-    title: Option<String>,
-}
-
-/// One durable entry on disk. Messages are split by role so a session file is
-/// readable at a glance; `from_entry`/`into_entry` map them to `LogEntry`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-enum FileRecord {
-    SessionHeader(SessionHeader),
-    TurnStart {
-        turn_id: TurnId,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Record {
+    Init {
+        identity: SessionIdentity,
+        created_at: String,
+        title: String,
     },
-    UserMessage(Message),
-    AssistantMessage(Message),
-    ToolResult(Message),
-    TurnEnd {
-        turn_id: TurnId,
-        result: TurnResult,
-        stats: TurnStats,
+    Turn {
+        turn: Arc<Turn>,
+        summary: Option<String>,
     },
-    CompactionUsage(Usage),
-    Rollback,
-    ContextCompacted(ContextCheckpoint),
+    Checkpoint {
+        summary: String,
+    },
 }
 
-impl FileRecord {
-    fn from_entry(entry: LogEntry) -> Self {
-        match entry {
-            LogEntry::TurnStart(turn_id) => Self::TurnStart { turn_id },
-            LogEntry::Message(message) => {
-                // Match on a borrow to pick the variant, then move the message
-                // into it without cloning.
-                let variant = match &message.content {
-                    MessageContent::User(_) | MessageContent::System(_) => Self::UserMessage,
-                    MessageContent::Assistant(_) => Self::AssistantMessage,
-                    MessageContent::ToolResult { .. } => Self::ToolResult,
-                };
-                variant(message)
-            }
-            LogEntry::Checkpoint(checkpoint) => Self::ContextCompacted(checkpoint),
-            LogEntry::TurnEnd { id, result, stats } => Self::TurnEnd {
-                turn_id: id,
-                result,
-                stats,
-            },
-            LogEntry::CompactionUsage(usage) => Self::CompactionUsage(usage),
-            LogEntry::Rollback => Self::Rollback,
-        }
-    }
-
-    fn into_entry(self) -> Option<LogEntry> {
-        match self {
-            Self::TurnStart { turn_id } => Some(LogEntry::TurnStart(turn_id)),
-            Self::UserMessage(message)
-            | Self::AssistantMessage(message)
-            | Self::ToolResult(message) => Some(LogEntry::Message(message)),
-            Self::ContextCompacted(checkpoint) => Some(LogEntry::Checkpoint(checkpoint)),
-            Self::TurnEnd {
-                turn_id,
-                result,
-                stats,
-            } => Some(LogEntry::TurnEnd {
-                id: turn_id,
-                result,
-                stats,
-            }),
-            Self::CompactionUsage(usage) => Some(LogEntry::CompactionUsage(usage)),
-            Self::Rollback => Some(LogEntry::Rollback),
-            Self::SessionHeader(_) => None,
-        }
-    }
-
-    const fn user_message(&self) -> Option<&Message> {
-        match self {
-            Self::UserMessage(message) => Some(message),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct FileLine {
-    timestamp: String,
-    #[serde(flatten)]
-    record: FileRecord,
-}
-
-impl FileLine {
-    fn new(record: FileRecord) -> Self {
-        Self {
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            record,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct StoredFile {
-    header: StoredHeader,
-    log: SessionLog,
-}
-
-impl StoredFile {
-    fn into_stored(self) -> StoredSession {
-        StoredSession {
-            identity: self.header.identity,
-            log: self.log,
-        }
-    }
-
-    #[cfg(test)]
-    fn messages(&self) -> Vec<Message> {
-        self.log.messages()
-    }
-
-    #[cfg(test)]
-    fn model_context(&self) -> Vec<Message> {
-        self.log.model_context()
-    }
-}
-
-#[derive(Default)]
-struct Replay {
-    header: Option<StoredHeader>,
-    records: Vec<FileRecord>,
-}
-
-impl Replay {
-    fn apply(&mut self, line: FileLine) {
-        if let Some(header) = stored_header(&line.record, &line.timestamp) {
-            self.header.get_or_insert(header);
-        } else {
-            self.records.push(line.record);
-        }
-    }
-
-    fn finish(self, path: &Path) -> Result<StoredFile, ash_core::AshError> {
-        let mut header = self.header.ok_or_else(|| missing_header(path))?;
-        ensure_supported_format(&header, path)?;
-        let log = SessionLog::from_entries(
-            self.records
-                .into_iter()
-                .filter_map(FileRecord::into_entry)
-                .collect(),
-        );
-        header.title = header
-            .title
-            .or_else(|| title_from_messages(&log.messages()));
-        Ok(StoredFile { header, log })
-    }
-}
-
-fn ensure_supported_format(header: &StoredHeader, path: &Path) -> Result<(), ash_core::AshError> {
-    if header.format_version != SESSION_FORMAT_VERSION {
-        return Err(ash_core::AshError::Config(format!(
-            "unsupported session format {} in {} (expected {SESSION_FORMAT_VERSION})",
-            header.format_version,
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// An exclusively locked append handle. The lock follows the file descriptor
-/// and is released automatically when the writer is dropped.
 #[derive(Debug)]
 pub(crate) struct SessionWriter {
     path: PathBuf,
-    state: WriterState,
-}
-
-/// A writer is either brand new (header not yet written) or attached to an
-/// already-open locked file. The two states are mutually exclusive, so they
-/// are modelled as one enum instead of two optional fields.
-#[derive(Debug)]
-enum WriterState {
-    New { identity: SessionIdentity },
-    Open { file: tokio::fs::File },
+    identity: SessionIdentity,
+    file: Option<tokio::fs::File>,
+    failed: bool,
 }
 
 impl SessionWriter {
     fn new(directory: &Path, identity: SessionIdentity) -> Self {
         Self {
-            path: directory.join(session_filename(identity.id)),
-            state: WriterState::New { identity },
+            path: directory.join(session_filename(identity.id())),
+            identity,
+            file: None,
+            failed: false,
         }
     }
 
-    const fn existing(path: PathBuf, file: tokio::fs::File) -> Self {
+    fn existing(path: PathBuf, identity: SessionIdentity, file: tokio::fs::File) -> Self {
         Self {
             path,
-            state: WriterState::Open { file },
+            identity,
+            file: Some(file),
+            failed: false,
         }
     }
 
-    pub(crate) async fn append(&mut self, entries: &[LogEntry]) -> Result<(), ash_core::AshError> {
-        if entries.is_empty() {
+    pub(crate) async fn commit_turn(
+        &mut self,
+        turn: Arc<Turn>,
+        summary: Option<String>,
+    ) -> Result<(), ash_core::AshError> {
+        self.append(vec![Record::Turn { turn, summary }]).await
+    }
+
+    pub(crate) async fn checkpoint(&mut self, summary: String) -> Result<(), ash_core::AshError> {
+        self.append(vec![Record::Checkpoint { summary }]).await
+    }
+
+    pub(crate) async fn seed(&mut self, turns: &[Arc<Turn>]) -> Result<(), ash_core::AshError> {
+        self.append(
+            turns
+                .iter()
+                .cloned()
+                .map(|turn| Record::Turn {
+                    turn,
+                    summary: None,
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    async fn append(&mut self, records: Vec<Record>) -> Result<(), ash_core::AshError> {
+        if records.is_empty() {
             return Ok(());
         }
-        let is_new = matches!(self.state, WriterState::New { .. });
-        if entries
-            .iter()
-            .any(|entry| matches!(entry, LogEntry::Rollback))
-            && is_new
-        {
-            return Err(ash_core::AshError::Config(
-                "session store has no persisted turn to roll back".to_string(),
-            ));
+        if self.failed {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session writer is unusable after a failed append",
+            ))
+            .into());
         }
+        let result = self.append_inner(records).await;
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
 
-        let mut data = String::new();
+    async fn append_inner(&mut self, records: Vec<Record>) -> Result<(), ash_core::AshError> {
+        let is_new = self.file.is_none();
+        let directory = if is_new {
+            Some(
+                self.path
+                    .parent()
+                    .ok_or_else(|| {
+                        StorageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "session path has no parent directory",
+                        ))
+                    })?
+                    .to_path_buf(),
+            )
+        } else {
+            None
+        };
+        let mut data = Vec::new();
         if is_new {
-            let WriterState::New { identity } = &self.state else {
-                // `is_new` was captured before any mutation, so this is
-                // unreachable; fail closed rather than panic.
-                return Err(ash_core::AshError::Config(
-                    "session writer state changed during append".to_string(),
-                ));
+            let first_turn = records.iter().find_map(|record| match record {
+                Record::Turn { turn, .. } => Some(turn.as_ref()),
+                Record::Init { .. } | Record::Checkpoint { .. } => None,
+            });
+            let Some(first_turn) = first_turn else {
+                return Err(corrupt("a new session must start with a turn"));
             };
-            push_line(
+            encode(
                 &mut data,
-                FileRecord::SessionHeader(SessionHeader::new(
-                    *identity,
-                    title_from_entries(entries),
-                )),
+                &Record::Init {
+                    identity: self.identity,
+                    created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    title: turn_title(first_turn),
+                },
             )?;
         }
-        for entry in entries.iter().cloned() {
-            push_line(&mut data, FileRecord::from_entry(entry))?;
+        for record in records {
+            encode(&mut data, &record)?;
         }
 
-        if is_new {
-            if let Some(parent) = self.path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let file = create_locked_session(&self.path).await?;
-            self.state = WriterState::Open { file };
+        if let Some(directory) = &directory {
+            ensure_directory(directory).await?;
+            self.file = Some(create_locked(&self.path).await?);
         }
-        let WriterState::Open { file } = &mut self.state else {
-            // Guaranteed by the `is_new` transition above.
-            return Err(ash_core::AshError::Config(
-                "session store was not materialized".to_string(),
-            ));
-        };
-        file.write_all(data.as_bytes()).await?;
-        file.flush().await?;
+        let file = self.file.as_mut().ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session file is not open",
+            ))
+        })?;
+        file.write_all(&data).await.map_err(StorageError::from)?;
+        file.flush().await.map_err(StorageError::from)?;
+        file.sync_data().await.map_err(StorageError::from)?;
+        if let Some(directory) = &directory {
+            sync_directory(directory).await?;
+        }
         Ok(())
     }
 }
@@ -321,9 +181,7 @@ pub(crate) struct JsonlSessionStore {
 
 impl Default for JsonlSessionStore {
     fn default() -> Self {
-        Self {
-            directory: ash_data_dir().join("sessions"),
-        }
+        Self::new(ash_data_dir().join("sessions"))
     }
 }
 
@@ -334,93 +192,11 @@ impl JsonlSessionStore {
         }
     }
 
-    async fn find_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<PathBuf>, ash_core::AshError> {
-        // One session id maps to exactly one canonical path. Directory scans
-        // and legacy fallbacks are intentionally absent.
-        let path = self.directory.join(session_filename(session_id));
-        Ok(tokio::fs::try_exists(&path).await?.then_some(path))
-    }
-
-    async fn session_paths(&self) -> Result<Vec<PathBuf>, ash_core::AshError> {
-        let mut entries = match tokio::fs::read_dir(&self.directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut candidates = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if canonical_session_id(&path).is_none() {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .await
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((modified, path));
-        }
-        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-        Ok(candidates.into_iter().map(|(_, path)| path).collect())
-    }
-
-    async fn read_summaries(
-        &self,
-        scope: SummaryScope,
-    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        let mut summaries = Vec::new();
-        for path in self.session_paths().await? {
-            match read_summary(&path, scope).await {
-                Ok(Some(summary)) => summaries.push(summary),
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping unreadable session");
-                }
-            }
-        }
-        Ok(summaries)
-    }
-
-    /// Lock every session in `root_id`'s tree except the already-locked
-    /// root. Each candidate is re-read under its lock so a file swapped
-    /// between the scan and the lock cannot be deleted by mistake.
-    /// Unreadable sessions are skipped with a warning.
-    async fn lock_tree_children(
-        &self,
-        root_id: SessionId,
-        root_path: &Path,
-    ) -> Result<Vec<(PathBuf, tokio::fs::File)>, ash_core::AshError> {
-        let mut children = Vec::new();
-        for path in self.session_paths().await? {
-            if path == root_path {
-                continue;
-            }
-            let identity = match read_identity(&path).await {
-                Ok(identity) => identity,
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping unreadable session during tree deletion");
-                    continue;
-                }
-            };
-            if identity.root_id != root_id {
-                continue;
-            }
-
-            let mut file = open_locked_session(&path).await?;
-            let locked_identity = read_locked_identity(&mut file, &path).await?;
-            if locked_identity.root_id == root_id {
-                children.push((path, file));
-            }
-        }
-        Ok(children)
-    }
     pub(crate) async fn open_new(
         &self,
         identity: SessionIdentity,
     ) -> Result<SessionWriter, ash_core::AshError> {
+        ensure_directory(&self.directory).await?;
         Ok(SessionWriter::new(&self.directory, identity))
     }
 
@@ -428,18 +204,33 @@ impl JsonlSessionStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<OpenedSession>, ash_core::AshError> {
-        let Some(path) = self.find_session(session_id).await? else {
+        let path = self.directory.join(session_filename(session_id));
+        if !tokio::fs::try_exists(&path)
+            .await
+            .map_err(StorageError::from)?
+        {
             return Ok(None);
-        };
-        let file = open_locked_session(&path).await?;
-        let mut reader = tokio::io::BufReader::new(file);
-        let stored = replay_session(&mut reader, &path).await?;
-        ensure_session_id(stored.header.identity.id, session_id, &path)?;
-        let mut file = reader.into_inner();
-        ensure_newline_terminated(&mut file).await?;
+        }
+        let mut file = open_locked(&path).await?;
+        let (stored, valid_len) = replay_file(&mut file, &path).await?;
+        if stored.identity.id() != session_id {
+            return Err(StorageError::IdentityMismatch {
+                expected: session_id,
+                actual: stored.identity.id(),
+            }
+            .into());
+        }
+        let length = file.metadata().await.map_err(StorageError::from)?.len();
+        if valid_len < length {
+            file.set_len(valid_len).await.map_err(StorageError::from)?;
+            file.sync_data().await.map_err(StorageError::from)?;
+        }
+        file.seek(std::io::SeekFrom::End(0))
+            .await
+            .map_err(StorageError::from)?;
         Ok(Some(OpenedSession {
-            session: stored.into_stored(),
-            writer: SessionWriter::existing(path, file),
+            writer: SessionWriter::existing(path, stored.identity, file),
+            session: stored,
         }))
     }
 
@@ -448,81 +239,333 @@ impl JsonlSessionStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<StoredSession>, ash_core::AshError> {
-        let Some(path) = self.find_session(session_id).await? else {
+        let path = self.directory.join(session_filename(session_id));
+        if !tokio::fs::try_exists(&path)
+            .await
+            .map_err(StorageError::from)?
+        {
             return Ok(None);
-        };
-        let stored = read_session(&path).await?;
-        ensure_session_id(stored.header.identity.id, session_id, &path)?;
-        Ok(Some(stored.into_stored()))
+        }
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(StorageError::from)?;
+        let (stored, _) = replay_file(&mut file, &path).await?;
+        Ok(Some(stored))
     }
 
     pub(crate) async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.read_summaries(SummaryScope::Roots).await
+        self.summaries(|identity| identity.is_root()).await
     }
 
     pub(crate) async fn tree(
         &self,
         root_id: SessionId,
     ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
-        self.read_summaries(SummaryScope::Tree(root_id)).await
+        self.summaries(|identity| identity.root_id() == root_id)
+            .await
     }
 
     pub(crate) async fn delete_tree(
         &self,
         root_id: SessionId,
     ) -> Result<usize, ash_core::AshError> {
-        let Some(root_path) = self.find_session(root_id).await? else {
+        let root_path = self.directory.join(session_filename(root_id));
+        if !tokio::fs::try_exists(&root_path)
+            .await
+            .map_err(StorageError::from)?
+        {
             return Ok(0);
+        }
+        let mut paths = Vec::new();
+        for path in self.session_paths().await? {
+            let init = match read_init(&path).await {
+                Ok(init) => init,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "skipping unreadable session");
+                    continue;
+                }
+            };
+            if init.identity.root_id() == root_id {
+                paths.push(path);
+            }
+        }
+        let root = read_init(&root_path).await?;
+        if !root.identity.is_root() || root.identity.id() != root_id {
+            return Err(StorageError::IdentityMismatch {
+                expected: root_id,
+                actual: root.identity.id(),
+            }
+            .into());
+        }
+
+        let mut locks = Vec::with_capacity(paths.len());
+        for path in &paths {
+            locks.push(open_locked(path).await?);
+        }
+        for path in &paths {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(StorageError::from)?;
+        }
+        drop(locks);
+        if !paths.is_empty() {
+            sync_directory(&self.directory).await?;
+        }
+        Ok(paths.len())
+    }
+
+    async fn summaries(
+        &self,
+        includes: impl Fn(SessionIdentity) -> bool,
+    ) -> Result<Vec<SessionSummary>, ash_core::AshError> {
+        let mut summaries = Vec::new();
+        for path in self.session_paths().await? {
+            match read_init(&path).await {
+                Ok(init) if includes(init.identity) => summaries.push(SessionSummary {
+                    session_id: init.identity.id(),
+                    title: init.title,
+                    created_at: display_created_at(&init.created_at),
+                }),
+                Ok(_) => {}
+                Err(error) => warn!(path = %path.display(), %error, "skipping unreadable session"),
+            }
+        }
+        Ok(summaries)
+    }
+
+    async fn session_paths(&self) -> Result<Vec<PathBuf>, ash_core::AshError> {
+        let mut directory = match tokio::fs::read_dir(&self.directory).await {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StorageError::Io(error).into()),
         };
-        let root_identity = read_identity(&root_path).await?;
-        ensure_root_identity(&root_identity, root_id)?;
-
-        // Lock the root first. A live root owns this lock, and therefore
-        // cannot create more durable children while deletion is being
-        // prepared.
-        let mut root_file = open_locked_session(&root_path).await?;
-        let locked_root_identity = read_locked_identity(&mut root_file, &root_path).await?;
-        ensure_root_identity(&locked_root_identity, root_id)?;
-
-        let children = self.lock_tree_children(root_id, &root_path).await?;
-
-        // All locks are acquired before the first removal. Children go first
-        // so an I/O failure cannot remove the root while leaving descendants.
-        let deleted = children.len() + 1;
-        for (path, _file) in children {
-            tokio::fs::remove_file(path).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = directory.next_entry().await.map_err(StorageError::from)? {
+            let path = entry.path();
+            if canonical_session_id(&path).is_some() {
+                let modified = entry
+                    .metadata()
+                    .await
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                paths.push((modified, path));
+            }
         }
-        tokio::fs::remove_file(root_path).await?;
-        drop(root_file);
-        Ok(deleted)
+        paths.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        Ok(paths.into_iter().map(|(_, path)| path).collect())
     }
 }
 
-/// Which sessions a summary query should surface.
-#[derive(Clone, Copy)]
-enum SummaryScope {
-    /// Root sessions only: the default session picker.
-    Roots,
-    /// Every session belonging to one collaboration tree.
-    Tree(SessionId),
+struct Init {
+    identity: SessionIdentity,
+    created_at: String,
+    title: String,
 }
 
-impl SummaryScope {
-    fn includes(&self, identity: &SessionIdentity) -> bool {
-        match self {
-            Self::Roots => identity.is_root(),
-            Self::Tree(root_id) => identity.root_id == *root_id,
+async fn replay_file(
+    file: &mut tokio::fs::File,
+    path: &Path,
+) -> Result<(StoredSession, u64), ash_core::AshError> {
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(StorageError::from)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(StorageError::from)?;
+    let valid_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let complete = &bytes[..valid_len];
+    let mut records = complete
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty());
+    let first = records
+        .next()
+        .ok_or_else(|| corrupt_at(path, "missing Init record", None))?;
+    let init = init_from_record(decode(first, path)?, path)?;
+    let mut conversation = Conversation::new();
+    let mut ids = HashSet::new();
+    for line in records {
+        match decode(line, path)? {
+            Record::Init { .. } => {
+                return Err(corrupt_at(
+                    path,
+                    "Init record appears after the first line",
+                    None,
+                ));
+            }
+            Record::Turn { turn, summary } => {
+                if !ids.insert(turn.id) {
+                    return Err(corrupt_at(path, "duplicate turn id", None));
+                }
+                validate_summary(summary.as_deref(), path)?;
+                conversation.push(turn, summary);
+            }
+            Record::Checkpoint { summary } => {
+                validate_summary(Some(&summary), path)?;
+                conversation.compact(summary);
+            }
         }
     }
+    Ok((
+        StoredSession {
+            identity: init.identity,
+            conversation,
+        },
+        u64::try_from(valid_len).unwrap_or(u64::MAX),
+    ))
 }
 
-fn push_line(data: &mut String, record: FileRecord) -> Result<(), ash_core::AshError> {
-    data.push_str(
-        &serde_json::to_string(&FileLine::new(record))
-            .map_err(|error| ash_core::AshError::Config(error.to_string()))?,
+async fn read_init(path: &Path) -> Result<Init, ash_core::AshError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(StorageError::from)?;
+    let mut reader = tokio::io::BufReader::new(file).take(
+        u64::try_from(MAX_INIT_RECORD_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
     );
-    data.push('\n');
+    let mut line = Vec::new();
+    let bytes = reader
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(StorageError::from)?;
+    if bytes > MAX_INIT_RECORD_BYTES {
+        return Err(corrupt_at(path, "Init record is too large", None));
+    }
+    if bytes == 0 || !line.ends_with(b"\n") {
+        return Err(corrupt_at(path, "missing complete Init record", None));
+    }
+    line.pop();
+    init_from_record(decode(&line, path)?, path)
+}
+
+fn init_from_record(record: Record, path: &Path) -> Result<Init, ash_core::AshError> {
+    match record {
+        Record::Init {
+            identity,
+            created_at,
+            title,
+        } if !created_at.trim().is_empty() && !title.trim().is_empty() => Ok(Init {
+            identity,
+            created_at,
+            title,
+        }),
+        Record::Init { .. } => Err(corrupt_at(path, "Init fields cannot be empty", None)),
+        Record::Turn { .. } | Record::Checkpoint { .. } => {
+            Err(corrupt_at(path, "first record is not Init", None))
+        }
+    }
+}
+
+fn validate_summary(summary: Option<&str>, path: &Path) -> Result<(), ash_core::AshError> {
+    if summary.is_some_and(|summary| summary.trim().is_empty()) {
+        return Err(corrupt_at(path, "checkpoint summary cannot be empty", None));
+    }
     Ok(())
+}
+
+fn encode(data: &mut Vec<u8>, record: &Record) -> Result<(), ash_core::AshError> {
+    serde_json::to_writer(&mut *data, record)
+        .map_err(|error| corrupt_with_source("cannot encode session record", error))?;
+    data.push(b'\n');
+    Ok(())
+}
+
+fn decode(line: &[u8], path: &Path) -> Result<Record, ash_core::AshError> {
+    serde_json::from_slice(line).map_err(|error| {
+        corrupt_at(
+            path,
+            "invalid complete session record",
+            Some(Box::new(error)),
+        )
+    })
+}
+
+fn corrupt(message: impl Into<String>) -> ash_core::AshError {
+    StorageError::Corrupt {
+        message: message.into(),
+        source: None,
+    }
+    .into()
+}
+
+fn corrupt_with_source(
+    message: impl Into<String>,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> ash_core::AshError {
+    StorageError::Corrupt {
+        message: message.into(),
+        source: Some(Box::new(source)),
+    }
+    .into()
+}
+
+fn corrupt_at(
+    path: &Path,
+    message: &str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+) -> ash_core::AshError {
+    StorageError::Corrupt {
+        message: format!("{}: {message}", path.display()),
+        source,
+    }
+    .into()
+}
+
+async fn ensure_directory(path: &Path) -> Result<(), ash_core::AshError> {
+    if tokio::fs::try_exists(path)
+        .await
+        .map_err(StorageError::from)?
+    {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(StorageError::from)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent).await?;
+    }
+    Ok(())
+}
+
+async fn sync_directory(path: &Path) -> Result<(), ash_core::AshError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(|error| {
+            StorageError::Io(std::io::Error::other(format!(
+                "directory sync task failed: {error}"
+            )))
+        })?
+        .map_err(StorageError::from)?;
+    Ok(())
+}
+
+async fn create_locked(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
+    locked(path, true).await
+}
+
+async fn open_locked(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
+    locked(path, false).await
+}
+
+async fn locked(path: &Path, create_new: bool) -> Result<tokio::fs::File, ash_core::AshError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).append(true);
+    if create_new {
+        options.create_new(true);
+    }
+    let file = options.open(path).map_err(StorageError::from)?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => StorageError::AlreadyOpen {
+            path: path.display().to_string(),
+        },
+        std::fs::TryLockError::Error(error) => StorageError::Io(error),
+    })?;
+    Ok(tokio::fs::File::from_std(file))
 }
 
 fn session_filename(session_id: SessionId) -> String {
@@ -536,248 +579,17 @@ fn canonical_session_id(path: &Path) -> Option<SessionId> {
     path.file_stem()?.to_str()?.parse().ok()
 }
 
-async fn create_locked_session(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    locked_session(path, true).await
-}
-
-async fn open_locked_session(path: &Path) -> Result<tokio::fs::File, ash_core::AshError> {
-    locked_session(path, false).await
-}
-
-async fn locked_session(
-    path: &Path,
-    create_new: bool,
-) -> Result<tokio::fs::File, ash_core::AshError> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).append(true);
-    if create_new {
-        options.create_new(true);
-    }
-    let file = options.open(path).await?;
-    lock_session(file, path).await
-}
-
-async fn lock_session(
-    file: tokio::fs::File,
-    path: &Path,
-) -> Result<tokio::fs::File, ash_core::AshError> {
-    let file = file.into_std().await;
-    file.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => ash_core::AshError::Config(format!(
-            "session is already open in another runtime: {}",
-            path.display()
-        )),
-        std::fs::TryLockError::Error(error) => error.into(),
-    })?;
-    Ok(tokio::fs::File::from_std(file))
-}
-
-#[cfg(test)]
-async fn read_session(path: &Path) -> Result<StoredFile, ash_core::AshError> {
-    let file = tokio::fs::File::open(path).await?;
-    replay_session(&mut tokio::io::BufReader::new(file), path).await
-}
-
-async fn read_identity(path: &Path) -> Result<SessionIdentity, ash_core::AshError> {
-    let mut file = tokio::fs::File::open(path).await?;
-    read_locked_identity(&mut file, path).await
-}
-
-async fn read_locked_identity(
-    file: &mut tokio::fs::File,
-    path: &Path,
-) -> Result<SessionIdentity, ash_core::AshError> {
-    file.seek(std::io::SeekFrom::Start(0)).await?;
-    read_header(&mut tokio::io::BufReader::new(file), path)
-        .await
-        .map(|header| header.identity)
-}
-
-async fn replay_session<R>(reader: &mut R, path: &Path) -> Result<StoredFile, ash_core::AshError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut replay = Replay::default();
-    let mut line = String::new();
-    while reader.read_line(&mut line).await? != 0 {
-        let value = line.trim();
-        if !value.is_empty() {
-            match serde_json::from_str::<FileLine>(value) {
-                Ok(parsed) => replay.apply(parsed),
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping malformed session line");
-                }
-            }
-        }
-        line.clear();
-    }
-    replay.finish(path)
-}
-
-async fn read_summary(
-    path: &Path,
-    scope: SummaryScope,
-) -> Result<Option<SessionSummary>, ash_core::AshError> {
-    let file = tokio::fs::File::open(path).await?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut header = read_header(&mut reader, path).await?;
-    if !scope.includes(&header.identity) {
-        return Ok(None);
-    }
-    if header.title.is_none() {
-        header.title = read_first_user_title(&mut reader, path).await?;
-    }
-    Ok(header.title.map(|title| SessionSummary {
-        session_id: header.identity.id,
-        title,
-        created_at: display_created_at(&header.created_at),
-    }))
-}
-
-async fn read_header<R>(reader: &mut R, path: &Path) -> Result<StoredHeader, ash_core::AshError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let Some(first) = read_first_record(reader, path).await? else {
-        return Err(missing_header(path));
-    };
-    let header =
-        stored_header(&first.record, &first.timestamp).ok_or_else(|| missing_header(path))?;
-    ensure_supported_format(&header, path)?;
-    if let Some(session_id) = canonical_session_id(path) {
-        ensure_session_id(header.identity.id, session_id, path)?;
-    }
-    Ok(header)
-}
-
-fn ensure_root_identity(
-    identity: &SessionIdentity,
-    expected_id: SessionId,
-) -> Result<(), ash_core::AshError> {
-    if identity.is_root() && identity.id == expected_id {
-        return Ok(());
-    }
-    Err(ash_core::AshError::Config(format!(
-        "session {expected_id} is not a root session"
-    )))
-}
-
-fn stored_header(record: &FileRecord, timestamp: &str) -> Option<StoredHeader> {
-    match record {
-        FileRecord::SessionHeader(header) => Some(StoredHeader {
-            format_version: header.format_version,
-            identity: header.identity(),
-            created_at: timestamp.to_string(),
-            title: header.title.clone(),
-        }),
-        _ => None,
-    }
-}
-
-async fn read_first_record<R>(
-    reader: &mut R,
-    path: &Path,
-) -> Result<Option<FileLine>, ash_core::AshError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut line = String::new();
-    while reader.read_line(&mut line).await? != 0 {
-        let value = line.trim();
-        if value.is_empty() {
-            line.clear();
-            continue;
-        }
-        return serde_json::from_str(value).map(Some).map_err(|error| {
-            ash_core::AshError::Config(format!(
-                "invalid session header in {}: {error}",
-                path.display()
-            ))
-        });
-    }
-    Ok(None)
-}
-
-async fn read_first_user_title<R>(
-    reader: &mut R,
-    path: &Path,
-) -> Result<Option<String>, ash_core::AshError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut line = String::new();
-    while reader.read_line(&mut line).await? != 0 {
-        let value = line.trim();
-        if !value.is_empty() {
-            match serde_json::from_str::<FileLine>(value) {
-                Ok(parsed) => {
-                    if let Some(title) = parsed.record.user_message().and_then(message_title) {
-                        return Ok(Some(title));
-                    }
-                }
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "skipping malformed session line");
-                }
-            }
-        }
-        line.clear();
-    }
-    Ok(None)
-}
-
-fn missing_header(path: &Path) -> ash_core::AshError {
-    ash_core::AshError::Config(format!(
-        "session file is missing its header: {}",
-        path.display()
-    ))
-}
-
-fn ensure_session_id(
-    actual: SessionId,
-    expected: SessionId,
-    path: &Path,
-) -> Result<(), ash_core::AshError> {
-    if actual == expected {
-        return Ok(());
-    }
-    Err(ash_core::AshError::Config(format!(
-        "session id in header does not match filename {}: expected {expected}, found {actual}",
-        path.display()
-    )))
-}
-
-fn title_from_entries(entries: &[LogEntry]) -> Option<String> {
-    entries.iter().find_map(|entry| match entry {
-        LogEntry::Message(message) => message_title(message),
-        _ => None,
-    })
-}
-
-fn title_from_messages(messages: &[Message]) -> Option<String> {
-    messages.iter().find_map(message_title)
-}
-
-fn message_title(message: &Message) -> Option<String> {
-    let MessageContent::User(contents) = &message.content else {
-        return None;
-    };
-    let title = contents
-        .iter()
-        .filter_map(|content| match content {
-            Content::Text(text) => Some(text.as_str()),
-            Content::Image { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    Some(shorten_title(if title.is_empty() {
-        UNTITLED_CHAT
-    } else {
-        title.as_str()
-    }))
+fn turn_title(turn: &Turn) -> String {
+    shorten_title(turn.input.title().unwrap_or(UNTITLED_CHAT))
 }
 
 fn shorten_title(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = if title.is_empty() {
+        UNTITLED_CHAT
+    } else {
+        &title
+    };
     let mut chars = title.chars();
     let prefix = chars
         .by_ref()
@@ -793,11 +605,6 @@ fn shorten_title(title: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
-fn session_title(messages: &[Message]) -> String {
-    title_from_messages(messages).unwrap_or_else(|| UNTITLED_CHAT.to_string())
-}
-
 fn display_created_at(created_at: &str) -> String {
     DateTime::parse_from_rfc3339(created_at).map_or_else(
         |_| created_at.to_string(),
@@ -810,607 +617,239 @@ fn display_created_at(created_at: &str) -> String {
     )
 }
 
-async fn ensure_newline_terminated(file: &mut tokio::fs::File) -> std::io::Result<()> {
-    let length = file.metadata().await?.len();
-    if length == 0 {
-        return Ok(());
-    }
-    file.seek(std::io::SeekFrom::End(-1)).await?;
-    let mut last_byte = [0];
-    file.read_exact(&mut last_byte).await?;
-    if last_byte[0] != b'\n' {
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use ash_core::{
+        Content, Item, Step, StopReason, ToolCall, ToolCallId, ToolOutput, TurnResult, TurnStats,
+    };
     use tempfile::TempDir;
 
-    use super::*;
+    fn turn(id: u128, input: &str) -> Arc<Turn> {
+        Arc::new(Turn {
+            id: ash_core::TurnId::from_u128(id),
+            input: input.into(),
+            steps: Vec::new(),
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: TurnStats::default(),
+        })
+    }
 
-    async fn create_session(
-        store: &JsonlSessionStore,
-        session_id: SessionId,
-        entries: &[LogEntry],
-    ) {
-        let mut writer = store
-            .open_new(SessionIdentity::root(session_id))
+    #[tokio::test]
+    async fn root_commit_is_init_then_turn() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+
+        writer.commit_turn(turn(1, "hello"), None).await.unwrap();
+
+        let data = tokio::fs::read_to_string(directory.path().join(session_filename(id)))
             .await
             .unwrap();
-        writer.append(entries).await.unwrap();
-    }
-
-    async fn create_child_session(
-        store: &JsonlSessionStore,
-        parent: SessionIdentity,
-        entries: &[LogEntry],
-    ) -> SessionId {
-        let session_id = SessionId::new();
-        let identity = SessionIdentity {
-            id: session_id,
-            root_id: parent.root_id,
-            parent_id: Some(parent.id),
-        };
-        let mut writer = store.open_new(identity).await.unwrap();
-        writer.append(entries).await.unwrap();
-        session_id
-    }
-
-    async fn stored_log(store: &JsonlSessionStore, session_id: SessionId) -> SessionLog {
-        store.load(session_id).await.unwrap().unwrap().log
-    }
-
-    #[test]
-    fn uses_the_session_id_as_the_filename() {
-        let session_id = SessionId::new();
-
-        assert_eq!(session_filename(session_id), format!("{session_id}.jsonl"));
-    }
-
-    #[tokio::test]
-    async fn opening_a_new_writer_does_not_create_a_file() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        let writer = store
-            .open_new(SessionIdentity::root(session_id))
-            .await
-            .unwrap();
-
-        assert!(!directory.path().join(session_filename(session_id)).exists());
-        drop(writer);
-    }
-
-    #[tokio::test]
-    async fn creating_a_session_without_entries_does_not_create_a_file() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-
-        create_session(&store, session_id, &[]).await;
-
-        assert!(!directory.path().join(session_filename(session_id)).exists());
-        assert!(store.load(session_id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn writes_a_compact_header_before_the_log() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(
-            &store,
-            session_id,
-            &[LogEntry::Message(Message::user(
-                "  First session title\nwith details  ",
-            ))],
-        )
-        .await;
-
-        let path = directory.path().join(session_filename(session_id));
-        let contents = tokio::fs::read_to_string(&path).await.unwrap();
-        let first = serde_json::from_str::<FileLine>(contents.lines().next().unwrap()).unwrap();
-        assert!(matches!(
-            first.record,
-            FileRecord::SessionHeader(SessionHeader { title: Some(ref title), .. })
-                if title == "First session title with details"
-        ));
-        assert!(!contents.contains("system_prompt"));
-        assert!(contents.contains(r#""type":"session_header""#));
-        assert!(contents.contains(r#""session_id""#));
-
-        let loaded = read_session(&path).await.unwrap();
-        assert_eq!(loaded.header.identity.id, session_id);
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.model_context().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn holds_an_exclusive_lock_for_the_open_writer() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(
-            &store,
-            session_id,
-            &[LogEntry::Message(Message::user("question"))],
-        )
-        .await;
-
-        let opened = store.open(session_id).await.unwrap().unwrap();
-        let error = store.open(session_id).await.unwrap_err();
-        assert!(error.to_string().contains("already open"));
-
-        drop(opened);
-        assert!(store.open(session_id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn appends_rollback_and_replays_without_the_last_turn() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        let first = Message::user("first");
-        let first_answer = Message::assistant_text("first answer");
-        let second = Message::user("second");
-        create_session(
-            &store,
-            session_id,
-            &[
-                LogEntry::TurnStart(TurnId::new()),
-                LogEntry::Message(first),
-                LogEntry::Message(first_answer),
-                LogEntry::TurnStart(TurnId::new()),
-                LogEntry::Message(second),
-                LogEntry::Message(Message::assistant_text("second answer")),
-            ],
-        )
-        .await;
-        let mut opened = store.open(session_id).await.unwrap().unwrap();
-        opened.writer.append(&[LogEntry::Rollback]).await.unwrap();
-        drop(opened);
-
-        let loaded = stored_log(&store, session_id).await;
-        let messages = loaded.messages();
-        // history keeps only user messages; the second turn is rolled back.
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(&messages[0].content, MessageContent::User(_)));
-    }
-
-    #[tokio::test]
-    async fn compaction_keeps_full_history_and_rebuilds_only_model_context() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        let recent_request = Message::user("recent request");
-        let recent_answer = Message::assistant_text("recent answer");
-        create_session(
-            &store,
-            session_id,
-            &[
-                LogEntry::Message(Message::user("old request")),
-                LogEntry::Message(Message::assistant_text("old answer")),
-                LogEntry::Message(recent_request.clone()),
-                LogEntry::Message(recent_answer.clone()),
-            ],
-        )
-        .await;
-        let mut opened = store.open(session_id).await.unwrap().unwrap();
-        opened
-            .writer
-            .append(&[LogEntry::Checkpoint(
-                ContextCheckpoint::from_model_context(&[
-                    Message::assistant_text("<context-summary>\nold facts\n</context-summary>"),
-                    recent_request,
-                    recent_answer,
-                ])
-                .unwrap(),
-            )])
-            .await
-            .unwrap();
-        drop(opened);
-
-        let loaded = stored_log(&store, session_id).await;
-        assert_eq!(loaded.messages().len(), 4);
-        assert_eq!(loaded.model_context().len(), 3);
-        assert_eq!(session_title(&loaded.messages()), "old request");
-    }
-
-    #[tokio::test]
-    async fn lists_new_sessions_from_the_first_line() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(
-            &store,
-            session_id,
-            &[LogEntry::Message(Message::user("session title"))],
-        )
-        .await;
-        let path = directory.path().join(session_filename(session_id));
-        let mut contents = tokio::fs::read_to_string(&path).await.unwrap();
-        contents.push_str("malformed tail that list must not read\n");
-        tokio::fs::write(&path, contents).await.unwrap();
-
-        let listed = store.list_roots().await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].session_id, session_id);
-        assert_eq!(listed[0].title, "session title");
-        assert_eq!(listed[0].created_at.len(), 16);
-    }
-
-    #[tokio::test]
-    async fn loading_skips_a_malformed_record_and_keeps_the_valid_tail() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let path = directory.path().join(session_filename(session_id));
-        let mut contents = String::new();
-        push_line(
-            &mut contents,
-            FileRecord::SessionHeader(SessionHeader::new(
-                SessionIdentity::root(session_id),
-                Some("recoverable".to_string()),
-            )),
-        )
-        .unwrap();
-        push_line(
-            &mut contents,
-            FileRecord::UserMessage(Message::user("before damage")),
-        )
-        .unwrap();
-        contents.push_str("malformed record\n");
-        push_line(
-            &mut contents,
-            FileRecord::UserMessage(Message::user("after damage")),
-        )
-        .unwrap();
-        tokio::fs::write(path, contents).await.unwrap();
-
-        let store = JsonlSessionStore::new(directory.path());
-        let loaded = stored_log(&store, session_id).await;
-        let prompts = loaded
-            .messages()
-            .iter()
-            .filter_map(Message::user_turn_text)
-            .collect::<Vec<_>>();
-        assert_eq!(prompts, ["before damage", "after damage"]);
-    }
-
-    #[tokio::test]
-    async fn rejects_a_header_that_does_not_match_the_filename() {
-        let directory = TempDir::new().unwrap();
-        let filename_id = SessionId::new();
-        let header_id = SessionId::new();
-        let path = directory.path().join(session_filename(filename_id));
-        let mut contents = String::new();
-        push_line(
-            &mut contents,
-            FileRecord::SessionHeader(SessionHeader::new(
-                SessionIdentity::root(header_id),
-                Some("mismatched".to_string()),
-            )),
-        )
-        .unwrap();
-        tokio::fs::write(path, contents).await.unwrap();
-        let store = JsonlSessionStore::new(directory.path());
-
-        let error = store.open(filename_id).await.unwrap_err();
-        assert!(error.to_string().contains("does not match filename"));
-        assert!(store.list_roots().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn hides_child_sessions_from_the_session_list() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("subagent"))],
-        )
-        .await;
-
-        let listed = store.list_roots().await.unwrap();
-        assert!(listed.iter().any(|summary| summary.session_id == root_id));
-        assert!(!listed.iter().any(|summary| summary.session_id == child_id));
-    }
-
-    #[tokio::test]
-    async fn tree_lists_every_session_in_a_root_tree() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let other_root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("subagent"))],
-        )
-        .await;
-        let grandchild_id = create_child_session(
-            &store,
-            SessionIdentity {
-                id: child_id,
-                root_id,
-                parent_id: Some(root_id),
-            },
-            &[LogEntry::Message(Message::user("deep"))],
-        )
-        .await;
-        create_session(
-            &store,
-            other_root_id,
-            &[LogEntry::Message(Message::user("other"))],
-        )
-        .await;
-
-        let tree = store.tree(root_id).await.unwrap();
-        let tree_ids = tree
-            .iter()
-            .map(|summary| summary.session_id)
-            .collect::<Vec<_>>();
-        assert!(tree_ids.contains(&root_id));
-        assert!(tree_ids.contains(&child_id));
-        assert!(tree_ids.contains(&grandchild_id));
-        assert!(!tree_ids.contains(&other_root_id));
-    }
-
-    #[tokio::test]
-    async fn deletes_an_entire_session_tree_without_touching_other_roots() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let other_root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("subagent"))],
-        )
-        .await;
-        let grandchild_id = create_child_session(
-            &store,
-            SessionIdentity {
-                id: child_id,
-                root_id,
-                parent_id: Some(root_id),
-            },
-            &[LogEntry::Message(Message::user("deep"))],
-        )
-        .await;
-        create_session(
-            &store,
-            other_root_id,
-            &[LogEntry::Message(Message::user("other"))],
-        )
-        .await;
-
-        assert_eq!(store.delete_tree(root_id).await.unwrap(), 3);
-        assert!(store.load(root_id).await.unwrap().is_none());
-        assert!(store.load(child_id).await.unwrap().is_none());
-        assert!(store.load(grandchild_id).await.unwrap().is_none());
-        assert!(store.load(other_root_id).await.unwrap().is_some());
-        assert!(store.tree(root_id).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn deleting_a_missing_session_tree_is_a_noop() {
-        let directory = TempDir::new().unwrap();
-        let store = JsonlSessionStore::new(directory.path());
-
-        assert_eq!(store.delete_tree(SessionId::new()).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn rejects_a_child_session_as_a_tree_root() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("subagent"))],
-        )
-        .await;
-
-        let error = store.delete_tree(child_id).await.unwrap_err();
-        assert!(error.to_string().contains("is not a root session"));
-        assert!(store.load(root_id).await.unwrap().is_some());
-        assert!(store.load(child_id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn refuses_partial_deletion_while_a_child_session_is_open() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        create_session(&store, root_id, &[LogEntry::Message(Message::user("root"))]).await;
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("subagent"))],
-        )
-        .await;
-        let opened_child = store.open(child_id).await.unwrap().unwrap();
-
-        let error = store.delete_tree(root_id).await.unwrap_err();
-        assert!(error.to_string().contains("already open"));
-        assert!(store.load(root_id).await.unwrap().is_some());
-        assert!(store.load(child_id).await.unwrap().is_some());
-
-        drop(opened_child);
-        assert_eq!(store.delete_tree(root_id).await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn child_sessions_persist_and_restore_their_lineage() {
-        let directory = TempDir::new().unwrap();
-        let root_id = SessionId::new();
-        let store = JsonlSessionStore::new(directory.path());
-        let child_id = create_child_session(
-            &store,
-            SessionIdentity::root(root_id),
-            &[LogEntry::Message(Message::user("child work"))],
-        )
-        .await;
-
-        let loaded = store.load(child_id).await.unwrap().unwrap();
-        assert_eq!(loaded.identity.id, child_id);
-        assert_eq!(loaded.identity.root_id, root_id);
-        assert_eq!(loaded.identity.parent_id, Some(root_id));
-    }
-
-    #[tokio::test]
-    async fn rejects_a_header_without_lineage_fields() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let path = directory.path().join(session_filename(session_id));
-        tokio::fs::write(
-            &path,
-            format!("{{\"type\":\"session_header\",\"session_id\":\"{session_id}\"}}\n"),
-        )
-        .await
-        .unwrap();
-        let store = JsonlSessionStore::new(directory.path());
-
-        let error = store.open(session_id).await.unwrap_err();
-        assert!(error.to_string().contains("missing its header"));
-    }
-
-    #[tokio::test]
-    async fn rejects_headers_from_an_unsupported_format_version() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let path = directory.path().join(session_filename(session_id));
-        tokio::fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"t\",\"type\":\"session_header\",\"payload\":{{\"format_version\":0,\"session_id\":\"{session_id}\",\"root_id\":\"{session_id}\",\"parent_id\":null,\"path\":\"/root\",\"title\":null}}}}\n"
-            ),
-        )
-        .await
-        .unwrap();
-        let store = JsonlSessionStore::new(directory.path());
-
-        let error = store.open(session_id).await.unwrap_err();
-        assert!(error.to_string().contains("unsupported session format"));
-    }
-
-    #[tokio::test]
-    async fn rejects_the_previous_session_format_without_migration() {
-        let directory = TempDir::new().unwrap();
-        let session_id = SessionId::new();
-        let path = directory.path().join(session_filename(session_id));
-        let previous_version = SESSION_FORMAT_VERSION - 1;
-        tokio::fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"t\",\"type\":\"session_header\",\"payload\":{{\"format_version\":{previous_version},\"session_id\":\"{session_id}\",\"root_id\":\"{session_id}\",\"parent_id\":null,\"title\":null}}}}\n"
-            ),
-        )
-        .await
-        .unwrap();
-        let store = JsonlSessionStore::new(directory.path());
-
-        let error = store.open(session_id).await.unwrap_err();
-        assert!(error.to_string().contains("unsupported session format"));
-    }
-
-    #[test]
-    fn serializes_a_strict_header_with_explicit_null_parent() {
-        let session_id = SessionId::new();
-        let header = SessionHeader::new(SessionIdentity::root(session_id), None);
-        let json = serde_json::to_value(&header).unwrap();
-
-        assert_eq!(json["format_version"], SESSION_FORMAT_VERSION);
+        let lines = data.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let init = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
+        assert_eq!(init["type"], "init");
+        assert_eq!(init["title"], "hello");
+        assert!(init.get("turn").is_none());
+        assert!(init.get("turns").is_none());
         assert_eq!(
-            json["session_id"],
-            serde_json::to_value(session_id).unwrap()
+            serde_json::from_str::<serde_json::Value>(lines[1]).unwrap()["type"],
+            "turn"
         );
-        assert_eq!(json["root_id"], serde_json::to_value(session_id).unwrap());
-        assert_eq!(json["parent_id"], serde_json::Value::Null);
-        assert!(json.get("path").is_none());
-        assert!(json.get("title").is_some());
     }
 
-    #[test]
-    fn turn_end_requires_direct_turn_stats() {
-        let mut json = serde_json::to_value(FileRecord::from_entry(LogEntry::TurnEnd {
-            id: TurnId::new(),
-            result: TurnResult::Completed(ash_core::StopReason::EndTurn),
+    #[tokio::test]
+    async fn turn_summary_replays_at_the_turn_boundary() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "first"), None).await.unwrap();
+        let second = turn(2, "second");
+        writer
+            .commit_turn(Arc::clone(&second), Some("first summary".to_string()))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let stored = store.load(id).await.unwrap().unwrap();
+        let context = stored.conversation.context();
+        assert_eq!(context.summary(), Some("first summary"));
+        assert_eq!(context.turns(), &[second]);
+        assert_eq!(stored.conversation.turns().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn turn_round_trip_preserves_structured_content() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let expected = Arc::new(Turn {
+            id: ash_core::TurnId::from_u128(1),
+            input: ash_core::Input {
+                content: vec![
+                    Content::Text("inspect".to_string()),
+                    Content::Image {
+                        media_type: "image/png".to_string(),
+                        data: vec![1, 2, 3],
+                    },
+                ],
+            },
+            steps: vec![Step {
+                items: vec![
+                    Item::Thought {
+                        text: "reasoning".to_string(),
+                        elapsed_seconds: 2,
+                    },
+                    Item::ToolCall(ToolCall {
+                        id: ToolCallId::from_provider("call"),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "file.png"}),
+                        result: Ok(ToolOutput::with_attachments(
+                            "done",
+                            vec![Content::Image {
+                                media_type: "image/png".to_string(),
+                                data: vec![4, 5, 6],
+                            }],
+                        )),
+                    }),
+                    Item::Text("answer".to_string()),
+                ],
+            }],
+            result: TurnResult::Stopped(StopReason::EndTurn),
             stats: TurnStats {
-                usage: Usage {
-                    input_tokens: 7,
-                    output_tokens: 3,
-                    tool_calls: 1,
-                },
+                input_tokens: 10,
+                output_tokens: 5,
                 generation_ms: 20,
             },
-        }))
-        .unwrap();
+        });
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer
+            .commit_turn(Arc::clone(&expected), None)
+            .await
+            .unwrap();
+        drop(writer);
 
-        assert_eq!(json["payload"]["stats"]["input_tokens"], 7);
-        assert!(json["payload"].get("usage").is_none());
-        json["payload"].as_object_mut().unwrap().remove("stats");
-        assert!(serde_json::from_value::<FileRecord>(json).is_err());
+        let stored = store.load(id).await.unwrap().unwrap();
+
+        assert_eq!(stored.conversation.turns(), &[expected]);
     }
 
     #[tokio::test]
-    async fn writer_reuses_the_locked_file_handle() {
+    async fn checkpoint_replays_after_all_existing_turns() {
         let directory = TempDir::new().unwrap();
         let store = JsonlSessionStore::new(directory.path());
-        let session_id = SessionId::new();
-        let mut writer = store
-            .open_new(SessionIdentity::root(session_id))
-            .await
-            .unwrap();
-        let turn_id = TurnId::new();
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "first"), None).await.unwrap();
+        writer.checkpoint("all turns".to_string()).await.unwrap();
+        drop(writer);
 
-        writer
-            .append(&[
-                LogEntry::TurnStart(turn_id),
-                LogEntry::Message(Message::user("question")),
-            ])
-            .await
-            .unwrap();
-        assert!(directory.path().join(session_filename(session_id)).exists());
-        writer
-            .append(&[
-                LogEntry::Message(Message::assistant_text("answer")),
-                LogEntry::TurnEnd {
-                    id: turn_id,
-                    result: ash_core::TurnResult::Completed(ash_core::StopReason::EndTurn),
-                    stats: TurnStats::default(),
-                },
-            ])
-            .await
-            .unwrap();
-
-        let loaded = stored_log(&store, session_id).await;
-        assert_eq!(loaded.messages().len(), 2);
+        let stored = store.load(id).await.unwrap().unwrap();
+        let context = stored.conversation.context();
+        assert_eq!(context.summary(), Some("all turns"));
+        assert!(context.turns().is_empty());
     }
 
-    #[test]
-    fn default_session_dir_is_under_the_ash_data_dir() {
-        assert_eq!(
-            JsonlSessionStore::default().directory,
-            ash_data_dir().join("sessions")
-        );
+    #[tokio::test]
+    async fn seed_writes_independent_turn_records_without_summaries() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer
+            .seed(&[turn(1, "first"), turn(2, "second")])
+            .await
+            .unwrap();
+        drop(writer);
+
+        let data = tokio::fs::read_to_string(directory.path().join(session_filename(id)))
+            .await
+            .unwrap();
+        let records = data
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["title"], "first");
+        assert_eq!(records[1]["summary"], serde_json::Value::Null);
+        assert_eq!(records[2]["summary"], serde_json::Value::Null);
     }
 
-    #[test]
-    fn limits_titles_stored_in_the_header() {
-        let title = "a".repeat(MAX_SESSION_TITLE_CHARS + 20);
-        let shortened = session_title(&[Message::user(&title)]);
+    #[tokio::test]
+    async fn incomplete_tail_is_truncated_on_open() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "hello"), None).await.unwrap();
+        drop(writer);
+        let path = directory.path().join(session_filename(id));
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.write_all(b"{\"type\":").await.unwrap();
+        drop(file);
 
-        assert_eq!(shortened.chars().count(), MAX_SESSION_TITLE_CHARS);
-        assert!(shortened.ends_with("..."));
+        let opened = store.open(id).await.unwrap().unwrap();
+        drop(opened);
+
+        assert!(tokio::fs::read(&path).await.unwrap().ends_with(b"\n"));
+    }
+
+    #[tokio::test]
+    async fn complete_invalid_record_is_corrupt() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "hello"), None).await.unwrap();
+        drop(writer);
+        let path = directory.path().join(session_filename(id));
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .await
+            .unwrap();
+        file.write_all(b"not-json\n").await.unwrap();
+
+        assert!(matches!(
+            store.open(id).await,
+            Err(ash_core::AshError::Storage(StorageError::Corrupt { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_turn_id_is_corrupt() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "first"), None).await.unwrap();
+        writer.commit_turn(turn(1, "again"), None).await.unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            store.open(id).await,
+            Err(ash_core::AshError::Storage(StorageError::Corrupt { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn init_record_has_a_fixed_read_bound() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(session_filename(SessionId::new()));
+        tokio::fs::write(&path, vec![b'x'; MAX_INIT_RECORD_BYTES + 1])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            read_init(&path).await,
+            Err(ash_core::AshError::Storage(StorageError::Corrupt { .. }))
+        ));
     }
 }

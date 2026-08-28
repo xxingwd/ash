@@ -1,4 +1,4 @@
-use ash_core::{SessionId, Usage};
+use ash_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 /// Host-facing projection of the agents owned by one root session.
@@ -13,8 +13,6 @@ pub struct SubagentTreeSnapshot {
 pub struct SubagentSnapshot {
     pub name: String,
     pub state: SubagentState,
-    /// Settled protocol usage plus the active turn's latest progress snapshot.
-    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

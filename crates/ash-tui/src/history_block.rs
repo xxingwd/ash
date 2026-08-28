@@ -29,6 +29,7 @@ pub enum HistoryBlock {
 pub struct Worked {
     elapsed: String,
     stats: TurnStats,
+    tool_calls: usize,
 }
 
 impl HistoryBlock {
@@ -48,8 +49,12 @@ impl HistoryBlock {
         Self::Interrupted
     }
 
-    pub(crate) const fn worked(elapsed: String, stats: TurnStats) -> Self {
-        Self::Worked(Worked { elapsed, stats })
+    pub(crate) const fn worked(elapsed: String, stats: TurnStats, tool_calls: usize) -> Self {
+        Self::Worked(Worked {
+            elapsed,
+            stats,
+            tool_calls,
+        })
     }
 
     pub(crate) fn render(&self, width: u16) -> Buffer {
@@ -195,14 +200,18 @@ fn render_worked(worked: &Worked, width: u16) -> Buffer {
 
 fn worked_separator(worked: &Worked, width: u16) -> String {
     let mut label = format!("─ Worked for {}", worked.elapsed);
-    let usage = worked.stats.usage;
-    if usage.total_tokens() > 0 || usage.tool_calls > 0 {
-        let _ = write!(label, " · {}", format_token_usage(usage));
-        if let Some(rate) = format_token_rate(usage.output_tokens, worked.stats.generation_ms) {
+    let stats = worked.stats;
+    if stats.input_tokens > 0 || stats.output_tokens > 0 || worked.tool_calls > 0 {
+        let _ = write!(
+            label,
+            " · {}",
+            format_token_usage(stats.input_tokens, stats.output_tokens)
+        );
+        if let Some(rate) = format_token_rate(stats.output_tokens, stats.generation_ms) {
             let _ = write!(label, " · {rate}");
         }
-        if usage.tool_calls > 0 {
-            let _ = write!(label, " · {} tools", usage.tool_calls);
+        if worked.tool_calls > 0 {
+            let _ = write!(label, " · {} tools", worked.tool_calls);
         }
     }
     label.push_str(" ─");
@@ -303,14 +312,11 @@ mod tests {
     #[test]
     fn worked_block_fills_or_truncates_to_the_terminal_width() {
         let stats = TurnStats {
-            usage: ash_core::Usage {
-                input_tokens: 1_200,
-                output_tokens: 345,
-                tool_calls: 2,
-            },
+            input_tokens: 1_200,
+            output_tokens: 345,
             generation_ms: 1_500,
         };
-        let buffer = HistoryBlock::worked("2m 05s".to_string(), stats).render(64);
+        let buffer = HistoryBlock::worked("2m 05s".to_string(), stats, 2).render(64);
         let separator = row_text(&buffer, 0);
 
         assert!(
@@ -324,7 +330,7 @@ mod tests {
             .contains(Modifier::DIM));
         assert_eq!(
             row_text(
-                &HistoryBlock::worked("0s".to_string(), TurnStats::default()).render(10),
+                &HistoryBlock::worked("0s".to_string(), TurnStats::default(), 0).render(10),
                 0
             ),
             "─ Worked f"

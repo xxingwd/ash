@@ -1,13 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use crate::snapshot::{SubagentSnapshot, SubagentState, SubagentTreeSnapshot};
-use ash_agent::{Agent, Runtime, Session, Turn};
+use ash_agent::{Agent, Runtime, Session, TurnHandle};
 use ash_core::{
-    define_tool, define_tool_with_timeout, Message, SessionId, Tool, ToolContext, ToolError,
-    ToolTimeout, TurnId, TurnResult,
+    define_tool, define_tool_with_timeout, SessionId, Tool, ToolContext, ToolError, ToolTimeout,
+    TurnId, TurnResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ struct AgentGroup {
 
 struct AgentEntry {
     session: Session,
-    pending_turns: usize,
+    pending: HashSet<TurnId>,
     unread: VecDeque<TurnCompletion>,
 }
 
@@ -70,13 +70,26 @@ impl AgentEntry {
     fn snapshot(&self, name: &str) -> SubagentSnapshot {
         SubagentSnapshot {
             name: name.to_string(),
-            state: if self.pending_turns == 0 {
+            state: if self.pending.is_empty() {
                 SubagentState::Idle
             } else {
                 SubagentState::Running
             },
-            usage: self.session.stats().total_usage(),
         }
+    }
+
+    fn submit(&mut self, message: String) -> Result<TurnHandle, ToolError> {
+        let turn = submit(&self.session, message)?;
+        self.pending.insert(turn.id());
+        Ok(turn)
+    }
+
+    fn complete(&mut self, completion: TurnCompletion) -> bool {
+        if !self.pending.remove(&completion.turn_id) {
+            return false;
+        }
+        self.unread.push_back(completion);
+        true
     }
 }
 
@@ -98,7 +111,7 @@ impl AgentGroup {
     }
 
     fn has_pending(&self) -> bool {
-        self.agents.values().any(|entry| entry.pending_turns > 0)
+        self.agents.values().any(|entry| !entry.pending.is_empty())
     }
 
     fn drain_unread(&mut self) -> Vec<AgentCompletion> {
@@ -241,7 +254,7 @@ impl AgentControl {
         let list = self.clone();
         let list_agents = define_tool(
             "list_agents",
-            "List active child agents with their idle/running state and current usage.",
+            "List active child agents with their idle/running state.",
             move |context, _: ListAgentsArgs| {
                 let control = list.clone();
                 async move { control.list(context).await }
@@ -271,10 +284,10 @@ impl AgentControl {
         let name = normalize_name(&args.name)?;
         validate_message(&args.message)?;
         let identity = context.identity;
-        let root_id = identity.root_id;
+        let root_id = identity.root_id();
         let group = self.inner.group_or_insert(root_id).await;
 
-        let (turn, turn_id, session_id, stats) = {
+        let (turn, turn_id) = {
             let mut group = group.lock().await;
             if group.agents.contains_key(&name) {
                 return Err(ToolError::Execution(format!(
@@ -285,23 +298,18 @@ impl AgentControl {
                 .inner
                 .runtime
                 .start_child(&self.inner.definition, identity);
-            let session_id = session.id();
-            let stats = session.subscribe_stats();
-            let turn = submit(&session, args.message)?;
+            let mut entry = AgentEntry {
+                session,
+                pending: HashSet::new(),
+                unread: VecDeque::new(),
+            };
+            let turn = entry.submit(args.message)?;
             let turn_id = turn.id();
-            group.agents.insert(
-                name.clone(),
-                AgentEntry {
-                    session,
-                    pending_turns: 1,
-                    unread: VecDeque::new(),
-                },
-            );
+            group.agents.insert(name.clone(), entry);
             self.inner.publish(root_id, group.snapshots());
-            (turn, turn_id, session_id, stats)
+            (turn, turn_id)
         };
 
-        self.forward_stats(root_id, session_id, stats);
         self.forward_completion(root_id, name.clone(), turn);
         json_output(&AcceptedTurn {
             name,
@@ -317,7 +325,7 @@ impl AgentControl {
     ) -> Result<String, ToolError> {
         let name = normalize_name(&args.name)?;
         validate_message(&args.message)?;
-        let root_id = context.identity.root_id;
+        let root_id = context.identity.root_id();
         let group = self
             .inner
             .group(root_id)
@@ -330,9 +338,8 @@ impl AgentControl {
                 .agents
                 .get_mut(&name)
                 .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
-            let turn = submit(&entry.session, args.message)?;
+            let turn = entry.submit(args.message)?;
             let turn_id = turn.id();
-            entry.pending_turns = entry.pending_turns.saturating_add(1);
             self.inner.publish(root_id, group.snapshots());
             (turn, turn_id)
         };
@@ -346,7 +353,7 @@ impl AgentControl {
     }
 
     async fn list(&self, context: ToolContext) -> Result<String, ToolError> {
-        let agents = match self.inner.group(context.identity.root_id).await {
+        let agents = match self.inner.group(context.identity.root_id()).await {
             Some(group) => group.lock().await.snapshots(),
             None => Vec::new(),
         };
@@ -361,7 +368,7 @@ impl AgentControl {
         let name = normalize_name(&args.name)?;
         let group = self
             .inner
-            .group(context.identity.root_id)
+            .group(context.identity.root_id())
             .await
             .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
         {
@@ -370,7 +377,7 @@ impl AgentControl {
                 .agents
                 .get(&name)
                 .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
-            if entry.pending_turns > 0 {
+            if !entry.pending.is_empty() {
                 return Err(ToolError::Execution(format!(
                     "agent is still running: {name}"
                 )));
@@ -382,7 +389,7 @@ impl AgentControl {
             }
             group.agents.remove(&name);
             self.inner
-                .publish(context.identity.root_id, group.snapshots());
+                .publish(context.identity.root_id(), group.snapshots());
         }
         json_output(&RemovedAgent {
             name,
@@ -391,7 +398,7 @@ impl AgentControl {
     }
 
     async fn wait(&self, context: ToolContext) -> Result<String, ToolError> {
-        let root_id = context.identity.root_id;
+        let root_id = context.identity.root_id();
         loop {
             let notified = self.inner.updates.notified();
             tokio::pin!(notified);
@@ -417,12 +424,13 @@ impl AgentControl {
         }
     }
 
-    fn forward_completion(&self, root_id: SessionId, name: String, turn: Turn) {
+    fn forward_completion(&self, root_id: SessionId, name: String, turn: TurnHandle) {
         let inner = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
             let turn_id = turn.id();
             let (result, final_message) = match turn.wait().await {
-                Ok(view) => (view.result, final_assistant_message(&view.messages)),
+                Ok(turn) => (turn.result.clone(), turn.visible_text()),
+                Err(ash_core::AshError::Cancelled) => (TurnResult::Cancelled, None),
                 Err(error) => (TurnResult::Failed(error.to_string()), None),
             };
             let Some(inner) = inner.upgrade() else {
@@ -436,54 +444,22 @@ impl AgentControl {
                 let Some(entry) = group.agents.get_mut(&name) else {
                     return;
                 };
-                entry.unread.push_back(TurnCompletion {
+                let changed = entry.complete(TurnCompletion {
                     turn_id,
                     result,
                     final_message,
                 });
-                entry.pending_turns = entry.pending_turns.saturating_sub(1);
+                if !changed {
+                    return;
+                }
                 inner.publish(root_id, group.snapshots());
             }
             inner.updates.notify_waiters();
         });
     }
-
-    fn forward_stats(
-        &self,
-        root_id: SessionId,
-        session_id: SessionId,
-        mut stats: watch::Receiver<ash_core::SessionStats>,
-    ) {
-        let inner = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            let mut usage = stats.borrow_and_update().total_usage();
-            while stats.changed().await.is_ok() {
-                let next_usage = stats.borrow_and_update().total_usage();
-                if next_usage == usage {
-                    continue;
-                }
-                usage = next_usage;
-                let Some(inner) = inner.upgrade() else {
-                    return;
-                };
-                let Some(group) = inner.group(root_id).await else {
-                    return;
-                };
-                let group = group.lock().await;
-                let still_present = group
-                    .agents
-                    .values()
-                    .any(|entry| entry.session.id() == session_id);
-                if !still_present {
-                    return;
-                }
-                inner.publish(root_id, group.snapshots());
-            }
-        });
-    }
 }
 
-fn submit(session: &Session, message: String) -> Result<Turn, ToolError> {
+fn submit(session: &Session, message: String) -> Result<TurnHandle, ToolError> {
     session
         .try_submit(message)
         .map_err(|error| ToolError::Execution(error.to_string()))
@@ -536,10 +512,6 @@ fn validate_message(message: &str) -> Result<(), ToolError> {
     }
 }
 
-fn final_assistant_message(messages: &[Message]) -> Option<String> {
-    messages.iter().rev().find_map(Message::visible_text)
-}
-
 fn wait_output(completions: Vec<AgentCompletion>) -> Result<String, ToolError> {
     json_output(&WaitResult { completions })
 }
@@ -576,16 +548,13 @@ fn json_output(value: &impl Serialize) -> Result<String, ToolError> {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Mutex as StdMutex,
-        },
+        sync::{Arc, Mutex as StdMutex},
         time::Duration,
     };
 
     use ash_core::{
-        CancellationToken, ContentBlock, ModelClient, ModelEvent, ModelId, ModelRequest,
-        ModelStream, ModelUsage, SessionIdentity, StopReason,
+        CancellationToken, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
+        SessionIdentity, StopReason,
     };
     use futures::StreamExt as _;
     use tempfile::TempDir;
@@ -630,43 +599,6 @@ mod tests {
                     StopReason::EndTurn,
                 ))])),
             ))
-        }
-    }
-
-    struct ToolUsageGateModel {
-        calls: AtomicUsize,
-        start: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    impl ModelClient for ToolUsageGateModel {
-        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                let start = Arc::clone(&self.start);
-                return Ok(Box::pin(
-                    futures::stream::once(async move {
-                        start.notified().await;
-                        Ok(ModelEvent::Usage(ModelUsage {
-                            input_tokens: 120,
-                            output_tokens: 25,
-                        }))
-                    })
-                    .chain(futures::stream::iter([
-                        Ok(ModelEvent::ToolCall {
-                            id: ash_core::ToolCallId::from_provider("call"),
-                            name: "missing".to_string(),
-                            arguments: serde_json::json!({}),
-                        }),
-                        Ok(ModelEvent::Stop(StopReason::EndTurn)),
-                    ])),
-                ));
-            }
-
-            let release = Arc::clone(&self.release);
-            Ok(Box::pin(futures::stream::once(async move {
-                release.notified().await;
-                Ok(ModelEvent::Stop(StopReason::EndTurn))
-            })))
         }
     }
 
@@ -782,67 +714,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_snapshots_follow_live_protocol_usage_and_tool_counts() {
-        let directory = TempDir::new().unwrap();
-        let start = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let model = Arc::new(ToolUsageGateModel {
-            calls: AtomicUsize::new(0),
-            start: Arc::clone(&start),
-            release: Arc::clone(&release),
-        });
-        let runtime = Runtime::new(model).with_session_directory(directory.path());
-        let control = AgentControl::new(runtime, definition());
-        let identity = identity();
-        let mut snapshots = control.subscribe();
-
-        control
-            .create(
-                context(identity),
-                AgentArgs {
-                    name: "worker".to_string(),
-                    message: "inspect".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-        start.notify_one();
-
-        let live = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                snapshots.changed().await.unwrap();
-                let current = snapshots.borrow_and_update();
-                let Some(agent) = current
-                    .iter()
-                    .find(|tree| tree.root_id == identity.root_id)
-                    .and_then(|tree| tree.agents.iter().find(|agent| agent.name == "worker"))
-                else {
-                    continue;
-                };
-                if agent.usage.tool_calls == 1 {
-                    break agent.clone();
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(live.state, SubagentState::Running);
-        assert_eq!(
-            live.usage,
-            ash_core::Usage {
-                input_tokens: 120,
-                output_tokens: 25,
-                tool_calls: 1,
-            }
-        );
-
-        release.notify_one();
-        let output = control.wait(context(identity)).await.unwrap();
-        assert_eq!(completion_names(&output), ["worker"]);
-    }
-
-    #[tokio::test]
     async fn wait_drains_unread_results_from_every_agent_entry() {
         let directory = TempDir::new().unwrap();
         let control = control(
@@ -872,7 +743,7 @@ mod tests {
                 let notified = control.inner.updates.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let group = control.inner.group(identity.root_id).await.unwrap();
+                let group = control.inner.group(identity.root_id()).await.unwrap();
                 let unread = group
                     .lock()
                     .await
@@ -930,8 +801,8 @@ mod tests {
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
         let second: serde_json::Value = serde_json::from_str(&second).unwrap();
         assert_ne!(first["turn_id"], second["turn_id"]);
-        let group = control.inner.group(identity.root_id).await.unwrap();
-        assert_eq!(group.lock().await.agents["worker"].pending_turns, 2);
+        let group = control.inner.group(identity.root_id()).await.unwrap();
+        assert_eq!(group.lock().await.agents["worker"].pending.len(), 2);
 
         release.notify_one();
         let first_completion = control.wait(context(identity)).await.unwrap();
@@ -983,9 +854,11 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         let prompts = requests[1]
-            .messages
+            .context
+            .turns()
             .iter()
-            .filter_map(Message::user_turn_text)
+            .map(|turn| turn.input.text())
+            .chain(requests[1].context.current().map(|(input, _)| input.text()))
             .collect::<Vec<_>>();
         assert_eq!(prompts, ["first", "second"]);
     }
@@ -1025,10 +898,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ToolError::Cancelled));
         {
-            let group = control.inner.group(identity.root_id).await.unwrap();
+            let group = control.inner.group(identity.root_id()).await.unwrap();
             let group = group.lock().await;
             let entry = &group.agents["worker"];
-            assert_eq!(entry.pending_turns, 1);
+            assert_eq!(entry.pending.len(), 1);
             assert!(entry.unread.is_empty());
         }
 
@@ -1075,7 +948,7 @@ mod tests {
             .await
             .unwrap();
         control.create(context(identity), create()).await.unwrap();
-        let group = control.inner.group(identity.root_id).await.unwrap();
+        let group = control.inner.group(identity.root_id()).await.unwrap();
         assert_eq!(group.lock().await.agents.len(), 1);
     }
 
@@ -1115,20 +988,5 @@ mod tests {
             serde_json::from_str(&control.list(context(second)).await.unwrap()).unwrap();
         assert_eq!(first_list["agents"].as_array().unwrap().len(), 1);
         assert_eq!(second_list["agents"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn final_message_uses_the_last_nonempty_assistant_text() {
-        let messages = vec![
-            Message::assistant_text("first"),
-            Message::assistant(vec![
-                ContentBlock::Thought {
-                    text: "thinking".to_string(),
-                    elapsed_seconds: 1,
-                },
-                ContentBlock::Text("final".to_string()),
-            ]),
-        ];
-        assert_eq!(final_assistant_message(&messages).as_deref(), Some("final"));
     }
 }

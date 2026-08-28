@@ -1,7 +1,0 @@
----
-source: crates/ash-core/tests/snapshots.rs
-expression: content
----
-{
-  "Text": "Hello"
-}

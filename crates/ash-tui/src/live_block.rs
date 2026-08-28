@@ -167,10 +167,6 @@ impl LiveBlock {
         self.turn_id == Some(turn_id)
     }
 
-    pub(crate) const fn turn_id(&self) -> Option<TurnId> {
-        self.turn_id
-    }
-
     /// Blocks produced by live streaming for this turn (assistant text,
     /// reasoning, tool output). They are replaced by the canonical projection
     /// when the turn settles; user input and error blocks are kept.

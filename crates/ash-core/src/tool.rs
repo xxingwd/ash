@@ -65,7 +65,7 @@ impl ToolContext {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub text: String,
     pub attachments: Vec<Content>,

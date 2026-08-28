@@ -1,13 +1,13 @@
 use std::{collections::VecDeque, path::PathBuf};
 
-use crate::message_history::MessageHistoryStore;
+use crate::input_history::InputHistory;
 use anyhow::{Context, Result};
 use ash_agent::{
-    build_system_prompt, skill_tool, Agent, Runtime, Session, Skill, Turn,
+    build_system_prompt, skill_tool, Agent, Runtime, Session, Skill, TurnHandle,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
 use ash_collab::{SubagentState, SubagentTreeSnapshot};
-use ash_core::{LiveEvent, MessageId, ModelId, SessionEventKind, SessionId, TurnId, TurnResult};
+use ash_core::{Conversation, ModelId, SessionEvent, SessionId, TurnId, TurnResult};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
 use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiEvent};
 use futures::StreamExt;
@@ -25,40 +25,27 @@ struct InteractiveController {
     runtime: Runtime,
     event_tx: tokio::sync::mpsc::Sender<UiEvent>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
-    history_store: MessageHistoryStore,
+    history_store: InputHistory,
 }
 
 #[derive(Default)]
 struct TurnState {
-    turns: VecDeque<Turn>,
-    cancelled: Option<TurnId>,
+    turns: VecDeque<TurnHandle>,
 }
 
 impl TurnState {
-    fn track(&mut self, turn: Turn) {
+    fn track(&mut self, turn: TurnHandle) {
         self.turns.push_back(turn);
     }
 
-    fn finish(&mut self, id: Option<TurnId>) -> CancelledTurn {
-        let Some(id) = id else {
-            return CancelledTurn::No;
-        };
-        if self.turns.front().map(Turn::id) == Some(id) {
+    fn finish(&mut self, id: TurnId) {
+        if self.turns.front().map(TurnHandle::id) == Some(id) {
             self.turns.pop_front();
-        }
-        if self.cancelled == Some(id) {
-            self.cancelled = None;
-            CancelledTurn::Yes {
-                has_queued: !self.turns.is_empty(),
-            }
-        } else {
-            CancelledTurn::No
         }
     }
 
     fn cancel_active(&mut self) {
         if let Some(turn) = self.turns.front() {
-            self.cancelled = Some(turn.id());
             turn.cancellation_token().cancel();
         }
     }
@@ -66,11 +53,6 @@ impl TurnState {
     fn reset(&mut self) {
         *self = Self::default();
     }
-}
-
-enum CancelledTurn {
-    No,
-    Yes { has_queued: bool },
 }
 
 struct AgentSetup {
@@ -146,12 +128,6 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     })
 }
 
-fn turn_has_completed_tool(view: &ash_core::TurnView) -> bool {
-    view.messages
-        .iter()
-        .any(|message| matches!(message.content, ash_core::MessageContent::ToolResult { .. }))
-}
-
 fn map_subagent_monitor(
     mut source: tokio::sync::watch::Receiver<Vec<SubagentTreeSnapshot>>,
 ) -> tokio::sync::watch::Receiver<Vec<SubagentView>> {
@@ -180,7 +156,6 @@ fn subagent_views(trees: &[SubagentTreeSnapshot]) -> Vec<SubagentView> {
                     SubagentState::Idle => SubagentViewState::Idle,
                     SubagentState::Running => SubagentViewState::Running,
                 },
-                usage: snapshot.usage,
             })
         })
         .collect()
@@ -267,14 +242,14 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
         tokio::select! {
             biased;
             event = events.next() => match event {
-                Some(Ok(event)) => print_event(event.kind),
+                Some(Ok(event)) => print_event(event),
                 Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                 None => break,
             },
             result = &mut completion => {
                 let completed = result?;
                 println!();
-                print_usage(completed.stats);
+                print_usage(&completed);
                 return Ok(());
             }
         }
@@ -285,29 +260,35 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
 
 /// Print the completed turn's token usage to stderr, mirroring the tool
 /// diagnostics already shown there. Useful when diagnosing a run.
-fn print_usage(stats: ash_core::TurnStats) {
-    let usage = stats.usage;
+fn print_usage(turn: &ash_core::Turn) {
+    let stats = turn.stats;
     eprintln!(
         "[usage: {} in / {} out tokens, {} tools, {} ms]",
-        usage.input_tokens, usage.output_tokens, usage.tool_calls, stats.generation_ms,
+        stats.input_tokens,
+        stats.output_tokens,
+        turn.tool_calls().count(),
+        stats.generation_ms,
     );
 }
 
-fn print_event(event: SessionEventKind) {
+fn print_event(event: SessionEvent) {
     match event {
-        SessionEventKind::Live(LiveEvent::TextDelta(text)) => print!("{text}"),
-        SessionEventKind::Live(LiveEvent::ToolStarted { name, .. }) => {
+        SessionEvent::Text { text, .. } => print!("{text}"),
+        SessionEvent::ToolStarted { name, .. } => {
             eprintln!("{}", format!("[tool: {name}]").cyan());
         }
-        SessionEventKind::Live(LiveEvent::ToolFinished {
+        SessionEvent::ToolFinished {
             result: Err(error), ..
-        }) => eprintln!("{}", format!("[error: {error}]").red()),
-        SessionEventKind::TurnCompleted(view) => match view.result {
-            TurnResult::Failed(error) | TurnResult::Interrupted(error) => {
+        } => eprintln!("{}", format!("[error: {error}]").red()),
+        SessionEvent::Finished(turn) => match &turn.result {
+            TurnResult::Failed(error) => {
                 eprintln!("{}", format!("[error: {error}]").red());
             }
-            TurnResult::Completed(_) => {}
+            TurnResult::Stopped(_) | TurnResult::Cancelled | TurnResult::Truncated => {}
         },
+        SessionEvent::Discarded {
+            error: Some(error), ..
+        } => eprintln!("{}", format!("[error: {error}]").red()),
         _ => {}
     }
 }
@@ -321,11 +302,10 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         subagent_monitor,
     } = setup;
     let model = agent.model().as_str().to_string();
-    let context_limit = Some(u64::try_from(agent.max_context_tokens()).unwrap_or(u64::MAX));
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
     let event_rx = tokio_stream::wrappers::ReceiverStream::new(event_rx);
-    let history_store = MessageHistoryStore::default();
+    let history_store = InputHistory::default();
     let input_history = match history_store.load().await {
         Ok(history) => history,
         Err(error) => {
@@ -334,7 +314,6 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         }
     };
     let app = ash_tui::App::new(protocol, model, working_dir)
-        .with_context_limit(context_limit)
         .with_input_history(input_history)
         .with_subagent_monitor(subagent_monitor);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
@@ -359,8 +338,10 @@ impl InteractiveController {
     async fn run(mut self) {
         let _ = self
             .event_tx
-            .send(UiEvent::SessionChanged {
+            .send(UiEvent::ConversationChanged {
                 session_id: self.session.id(),
+                conversation: Conversation::new(),
+                input: None,
             })
             .await;
         let mut events = self.session.events();
@@ -369,24 +350,16 @@ impl InteractiveController {
             tokio::select! {
                 event = events.next() => match event {
                     Some(Ok(event)) => {
-                        let cancelled = if matches!(event.kind, SessionEventKind::TurnCompleted(_)) {
-                            turns.finish(event.turn_id)
-                        } else {
-                            CancelledTurn::No
-                        };
-                        if matches!(cancelled, CancelledTurn::Yes { has_queued: false })
-                            && matches!(&event.kind, SessionEventKind::TurnCompleted(view) if !turn_has_completed_tool(view))
-                        {
-                            let rollback = self.rollback_last_turn_event().await;
-                            if matches!(rollback, UiEvent::RollbackCompleted { .. }) {
-                                self.send_ui_event(rollback).await;
-                            } else {
-                                let _ = self.event_tx.send(UiEvent::Session(event)).await;
-                                self.send_ui_event(rollback).await;
-                            }
-                        } else {
-                            let _ = self.event_tx.send(UiEvent::Session(event)).await;
+                        match &event {
+                            SessionEvent::Finished(turn) => turns.finish(turn.id),
+                            SessionEvent::Discarded { turn_id, .. } => turns.finish(*turn_id),
+                            SessionEvent::Started(_)
+                            | SessionEvent::Text { .. }
+                            | SessionEvent::Thought { .. }
+                            | SessionEvent::ToolStarted { .. }
+                            | SessionEvent::ToolFinished { .. } => {}
                         }
+                        let _ = self.event_tx.send(UiEvent::Session(event)).await;
                     }
                     Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                     None => break,
@@ -409,28 +382,34 @@ impl InteractiveController {
                         UiCommand::Cancel => {
                             turns.cancel_active();
                         }
-                        UiCommand::Rollback => self.rollback_last_turn().await,
+                        UiCommand::Undo => {
+                            if self.undo().await {
+                                events = self.session.events();
+                                turns.reset();
+                            }
+                        }
                         UiCommand::Compact => self.compact_session().await,
                         UiCommand::NewSession => {
                             self.session = self.runtime.start(&self.agent);
                             let _ = self
                                 .event_tx
-                                .send(UiEvent::SessionChanged {
+                                .send(UiEvent::ConversationChanged {
                                     session_id: self.session.id(),
+                                    conversation: Conversation::new(),
+                                    input: None,
                                 })
                                 .await;
                             events = self.session.events();
                             turns.reset();
                         }
                         UiCommand::ListSessions => self.list_sessions().await,
-                        UiCommand::ListForkPoints => self.list_fork_points().await,
                         UiCommand::ResumeSession(session_id) => {
                             self.resume_session(session_id).await;
                             events = self.session.events();
                             turns.reset();
                         }
-                        UiCommand::ForkSession(message_id) => {
-                            self.fork_session(message_id).await;
+                        UiCommand::ForkSession(turn_id) => {
+                            self.fork_session(turn_id).await;
                             events = self.session.events();
                             turns.reset();
                         }
@@ -445,7 +424,7 @@ impl InteractiveController {
     }
 
     async fn record_input(&self, input: &str) {
-        if let Err(error) = self.history_store.append(self.session.id(), input).await {
+        if let Err(error) = self.history_store.append(input).await {
             tracing::warn!(%error, "failed to persist input history");
         }
     }
@@ -454,24 +433,35 @@ impl InteractiveController {
         let _ = self.event_tx.send(event).await;
     }
 
-    async fn rollback_last_turn(&self) {
-        let event = self.rollback_last_turn_event().await;
-        self.send_ui_event(event).await;
-    }
-
-    async fn rollback_last_turn_event(&self) -> UiEvent {
-        match self.session.rollback().await {
-            Ok(Some(prompt)) => {
-                if let Err(error) = self.history_store.undo(self.session.id(), &prompt).await {
-                    tracing::warn!(%error, "failed to undo input history entry");
+    async fn undo(&mut self) -> bool {
+        let event = match self.session.undo().await {
+            Ok(Some(forked)) => {
+                let conversation = match forked.session.conversation().await {
+                    Ok(conversation) => conversation,
+                    Err(error) => {
+                        self.send_ui_event(UiEvent::CommandFailed(format!(
+                            "Failed to restore the undo result: {error}"
+                        )))
+                        .await;
+                        return false;
+                    }
+                };
+                let session_id = forked.session.id();
+                self.session = forked.session;
+                UiEvent::ConversationChanged {
+                    session_id,
+                    conversation,
+                    input: Some(forked.input),
                 }
-                UiEvent::RollbackCompleted { prompt }
             }
             Ok(None) => {
                 UiEvent::CommandFailed("No submitted turn is available to undo.".to_string())
             }
             Err(error) => UiEvent::CommandFailed(format!("Failed to undo the last turn: {error}")),
-        }
+        };
+        let changed = matches!(event, UiEvent::ConversationChanged { .. });
+        self.send_ui_event(event).await;
+        changed
     }
 
     async fn compact_session(&self) {
@@ -490,21 +480,17 @@ impl InteractiveController {
         self.send_ui_event(event).await;
     }
 
-    async fn list_fork_points(&self) {
-        let event = match self.session.fork_points().await {
-            Ok(points) => UiEvent::ForkPointsListed { points },
-            Err(error) => UiEvent::CommandFailed(format!("Failed to list fork points: {error}")),
-        };
-        self.send_ui_event(event).await;
-    }
-
     async fn resume_session(&mut self, session_id: SessionId) {
         let event = match self.runtime.resume(&self.agent, session_id).await {
-            Ok(Some(session)) => match session.view().await {
-                Ok(view) => {
+            Ok(Some(session)) => match session.conversation().await {
+                Ok(conversation) => {
                     let session_id = session.id();
                     self.session = session;
-                    UiEvent::SessionRestored { session_id, view }
+                    UiEvent::ConversationChanged {
+                        session_id,
+                        conversation,
+                        input: None,
+                    }
                 }
                 Err(error) => UiEvent::CommandFailed(format!("Failed to restore chat: {error}")),
             },
@@ -516,18 +502,18 @@ impl InteractiveController {
         self.send_ui_event(event).await;
     }
 
-    async fn fork_session(&mut self, message_id: MessageId) {
-        let event = match self.session.fork_at(message_id).await {
+    async fn fork_session(&mut self, turn_id: TurnId) {
+        let event = match self.session.fork_at(turn_id).await {
             Ok(Some(forked)) => {
                 let session = forked.session;
-                match session.view().await {
-                    Ok(view) => {
+                match session.conversation().await {
+                    Ok(conversation) => {
                         let session_id = session.id();
                         self.session = session;
-                        UiEvent::SessionForked {
+                        UiEvent::ConversationChanged {
                             session_id,
-                            view,
-                            prompt: forked.prompt,
+                            conversation,
+                            input: Some(forked.input),
                         }
                     }
                     Err(error) => {

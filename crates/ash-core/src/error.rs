@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::SessionId;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AshError {
     #[error("protocol: {0}")]
@@ -8,12 +10,33 @@ pub enum AshError {
     Tool(#[from] ToolError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("storage: {0}")]
+    Storage(#[from] StorageError),
     #[error("config: {0}")]
     Config(String),
     #[error("{0}")]
     Session(#[from] SessionError),
     #[error("cancelled")]
     Cancelled,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("session is already open: {path}")]
+    AlreadyOpen { path: String },
+    #[error("session identity mismatch: expected {expected}, found {actual}")]
+    IdentityMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
+    #[error("corrupt session: {message}")]
+    Corrupt {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Session lifecycle failures that callers already branch on.
@@ -23,7 +46,7 @@ pub enum SessionError {
     Busy,
     #[error("session turn queue is full")]
     QueueFull,
-    #[error("a child session cannot be resumed through the root path")]
+    #[error("child sessions cannot be resumed, forked, or undone")]
     ChildSession,
     #[error("the target turn is not active")]
     InactiveTurn,

@@ -1,32 +1,57 @@
 # Ash Design
 
-Ash is an embeddable agent runtime. Product adapters such as the CLI and TUI own assembly and
-presentation; the workspace crates own reusable execution semantics. The design favors one owner per
-piece of state and concrete boundaries over unused extension points.
+Ash is an embeddable agent runtime. The CLI and TUI assemble products; the workspace crates own
+reusable execution semantics. The design keeps one owner for each piece of mutable state and keeps
+provider, persistence, and presentation details at their boundaries.
 
 ## Crate boundaries
 
 | Crate | Responsibility |
 | --- | --- |
-| `ash-core` | Provider-neutral messages, model streams, events, usage, tools, errors, and IDs |
-| `ash-protocol` | Translation between provider wire formats and `ash-core` |
+| `ash-core` | Provider-neutral conversation data, model streams, events, tools, errors, and IDs |
+| `ash-protocol` | Translation between provider wire formats and `ash-core::ModelContext` |
 | `ash-tools` | Filesystem, search, shell, editing, and web tools |
-| `ash-agent` | Agent definition, model loop, context planning, sessions, and JSONL persistence |
+| `ash-agent` | Agent definition, turn execution, sessions, compaction, and JSONL persistence |
 | `ash-collab` | Optional named child-agent communication |
-| `ash-tui` | Inline terminal projection and interaction |
+| `ash-tui` | Inline terminal state, rendering, and interaction |
 | `ash-cli` | Provider, prompt, tool, collaboration, and UI assembly |
 
-Protocol translation stays in `ash-protocol`; terminal state never enters `ash-agent`; collaboration
-is installed by an embedding application rather than built into the runtime.
+Protocol JSON stays in `ash-protocol`; terminal state stays in `ash-tui`; collaboration is installed
+by an embedding application rather than built into the runtime.
 
-## Agent and runtime
+## Conversation model
 
-`Agent` is the immutable behavior shared by every session that runs it. It owns the model ID, system
-prompt, tools, context limit, and tool timeout. Retry constants remain private engine details. There
-is no second session configuration that mirrors these fields.
+The durable domain is one typed tree:
 
-`Runtime` owns exactly two shared effectful dependencies: a model client and a concrete
-`JsonlSessionStore`. Its construction paths are:
+```text
+Conversation
+  checkpoint: optional summary and covered-turn index
+  turns: Arc<Turn>[]
+
+Turn
+  id, input, steps, result, stats
+
+Step
+  ordered Item[]
+
+Item
+  Text | Thought | ToolCall(arguments + result)
+```
+
+`Conversation` contains only completed facts. A running turn is private `TurnRunner` state and is
+converted to one immutable `Arc<Turn>` at completion. There is no `OpenTurn`, flat message model,
+session usage accumulator, or second projection of conversation history. Tool-call count is derived
+from `Turn::tool_calls()`; `TurnStats` stores only provider input/output tokens and generation time.
+
+`ModelContext` is the provider-neutral request view. It combines the conversation checkpoint,
+uncovered completed turns, and an optional current input/steps overlay. Provider adapters map that
+view directly to their wire format. They do not receive local message IDs or a second message DTO.
+
+## Runtime and session
+
+`Agent` is immutable behavior shared by sessions: model ID, system prompt, tools, context limit, and
+tool timeout. `Runtime` owns the model client and the concrete JSONL store. It exposes three creation
+paths:
 
 ```text
 start(agent)                    -> new root session
@@ -34,71 +59,88 @@ start_child(agent, parent)      -> new child session
 resume(agent, session_id)       -> existing root session
 ```
 
-All three use the same JSONL store. Working directory and protocol labels belong to application
-assembly and do not enter runtime state.
+`Session` is an actor and the sole writer for its conversation. It serializes a bounded FIFO of
+submitted turns and allows view, fork, undo, and manual compaction only while idle. `TurnHandle`
+owns cancellation and completion for a submitted turn; `Turn` is only the settled value.
 
-## Session and turn
+`SessionIdentity` contains `id`, `root_id`, and `parent_id`, and validates those relationships during
+construction and deserialization. Collaboration names are transient routing keys, not identity.
 
-`Session` is the concurrent conversation boundary. Its actor owns the append-only log, active turn,
-and FIFO queue of submitted turns. `Session::submit` is the only input path; collaboration and CLI
-inputs use it alike. Rollback, fork, compaction, and other projection mutations run only while idle.
+## Persistence
 
-Each `Turn` has a typed ID, cancellation token, and one completion receiver. `Turn::wait` returns the
-canonical `TurnView`; the same view is emitted as `SessionEventKind::TurnCompleted`. Cancellation
-targets that turn and does not introduce a second input or steering channel.
-
-`SessionIdentity` contains only `id`, `root_id`, and `parent_id`. A root has `id == root_id` and no
-parent; a child receives a fresh ID, preserves the root ID, and records its immediate parent. Names
-used by collaboration are routing keys, not durable session identity.
-
-## Log and persistence
-
-`SessionLog` is the semantic source for visible history, compacted model context, settled turn views,
-and settled usage. Its entries cover turn start, user/model/tool-result messages,
-context checkpoints, turn end, compaction usage, and rollback. Live stream deltas are never
-persisted. An open turn found during replay is projected as interrupted, and its partial response is
-not exposed as normal history.
-
-`JsonlSessionStore` is the only persistence implementation; there is no storage trait or child-only
-strategy. A session lazily acquires one exclusive `SessionWriter` on its first append and reuses it for
-later commits. Child sessions are durable under the same rules as roots and forks.
-
-The filename is `<session-id>.jsonl`. The strict format-4 header stores format version, creation time,
-session ID, root ID, parent ID, and optional title. It never stores model settings, secrets, working
-directory, collaboration names, or prompts. Older formats are rejected rather than migrated.
-`list_roots` excludes children, while tree listing and deletion use `root_id` to include all durable
-descendants. Only root sessions can be resumed through the root resume path.
-
-## Model loop and context
-
-The engine owns all model and tool IO. One turn repeatedly performs:
+The only durable records are:
 
 ```text
-pure context plan -> optional compaction call -> model stream -> ordered tool batch -> repeat
+Init { identity, created_at, title }
+Turn { turn, summary }
+Checkpoint { summary }
 ```
 
-After a tool batch completes, the engine prepares context and calls the model again until the model
-stops or the turn is cancelled. Safe retries remain part of the same model request.
+Each record occupies one JSONL line. `Init` never embeds history. A root's first completed turn is
+written as `[Init, Turn]`; a non-empty fork is `[Init, Turn, Turn, ...]`. `Turn.summary`, when present,
+summarizes all turns before that record. A standalone `Checkpoint` summarizes every turn before its
+position. Replay therefore has one rule: read `Init`, then apply each `Turn` or `Checkpoint` in order.
 
-Context planning is synchronous and pure: it prunes eligible old tool output, estimates the complete
-outbound request, decides whether compaction is needed, builds a plan, and applies a returned summary.
-It has no model client, cancellation token, event sender, async trait, or ephemeral message channel.
+The writer lazily creates and exclusively locks `<session-id>.jsonl`. A successful append flushes and
+syncs file data; first creation also syncs the session directory. A final line without a newline is
+treated as an interrupted append and truncated when the session is reopened. Any malformed complete
+record, duplicate turn ID, invalid identity, or misplaced `Init` is corruption.
 
-At 80% of the configured limit, the planner summarizes older history while retaining recent complete
-turns. Full visible history stays in the log; only model context receives a checkpoint. Automatic and
-manual compaction use the engine's normal stream collector and accept only non-empty text ending in a
-clean `EndTurn`, with no tool call.
+There is deliberately no format version, legacy parser, migration, dual write, or fallback. Data from
+an older layout must be removed before running this format.
 
-Before every model call within a turn, the engine locally estimates the complete outbound input. That
-estimate is used only for context occupancy and the compaction decision; it never enters usage.
+Root listing reads only `Init`. Child sessions use the same store but cannot be resumed through the
+root path. Tree listing and deletion use `root_id` to include durable descendants.
 
-The stream collector reconciles split or cumulative `ModelEvent::Usage` reports for one request, then
-the turn runner adds those request totals across all model calls in the turn. Receipt of usage updates
-live progress immediately. Tool-call count increases when an accepted call batch starts execution.
-Input/output usage and TPS therefore use provider-reported tokens, while context occupancy remains a
-local estimate. Missing provider usage contributes zero rather than falling back to an estimate.
-`TurnEnd` persists the completed turn aggregate in JSONL; `CompactionUsage` does the same for a manual
-compaction outside a turn.
+## Fork and undo
+
+`Conversation::before(turn_id)` is the only history split operation. It returns the turns before the
+selected turn plus that turn's input, and clears the checkpoint. It is pure and performs no IO.
+
+The session boundary turns a non-empty prefix into a new root and seeds it one `Turn` record per line,
+with every copied summary set to `null`. An empty prefix remains an in-memory session until it receives
+a turn. Its title is always derived from the first turn it writes. The original session is unchanged.
+
+`undo` is `before(last_turn_id)`; it is not in-place rollback. Child sessions reject both operations.
+
+## Turn execution and compaction
+
+One turn follows a single control path:
+
+```text
+TurnRunner -> optional compact -> model stream -> optional ordered tool batch -> repeat
+```
+
+The private stream collector returns one exhaustive `ModelResponse`: stopped, truncated, cancelled,
+or failed. `TurnRunner` owns retry policy, tool execution, and final `TurnResult`. Tool calls execute
+only after a semantic `EndTurn`; unknown stops, token limits, and truncated responses retain text and
+thoughts but discard unconfirmed tool calls.
+
+Before every ordinary model request, the runner estimates the entire outbound request. At 80% of the
+configured context window it may summarize all completed turns. A successful checkpoint therefore
+always has `tail == conversation.turns().len()`; the current runner input and steps remain outside the
+summary. A pending automatic summary is used immediately and committed atomically with the final turn.
+
+Manual compaction applies the same plan while idle and writes a standalone `Checkpoint`. It does not
+need a runner. Both paths skip compaction when there is no uncovered history or when the resulting
+request is not smaller.
+
+Compaction is one independent model call with a fixed system prompt, no tools, and no business-level
+`max_tokens`. It receives only the previous summary and newly uncovered turns. Tool text is bounded
+while serializing this prompt and attachments are omitted; the stored conversation is not pruned or
+copied. Only non-empty text ending in `EndTurn` succeeds. Tool calls, other stops, truncation,
+cancellation, transport failure, and an over-window input fail without writing a checkpoint.
+
+## Stream integrity, stats, and cancellation
+
+Provider EOF without a semantic stop is truncated. Truncated and retryable transport failures retry
+with cancellation-aware exponential backoff before any tool side effect. Each request's reported
+usage is added directly to the current `TurnStats`, including discarded retry attempts; missing usage
+is zero. No session-wide usage is stored or reconstructed.
+
+Cancellation without an executed tool and without a queued successor discards the running turn and
+writes no record. If the turn already has a tool result or a later turn depends on it, cancellation is
+committed once as `TurnResult::Cancelled`. A process crash never creates an interrupted turn.
 
 ## Tool execution
 
@@ -112,56 +154,30 @@ pub struct ToolContext {
 }
 ```
 
-They do not receive turn IDs or conversation history. Tool calls from one provider response execute
-concurrently, while ordered buffering preserves provider order when results enter model context. The
-agent's tool timeout is applied at this boundary unless a tool explicitly disables it; cancellation
-always remains effective.
+Calls from one accepted model response execute concurrently. Ordered buffering preserves their wire
+order in the resulting `Step`. `ToolContext::run` gives cancellation stable priority over deadlines;
+the agent timeout applies unless a tool explicitly disables it.
 
 ## Collaboration
 
-`ash-collab` is an optional communication layer exposing five tools:
+`ash-collab` owns named child-session routing, pending counts, and unread completions. It does not own
+a scheduler, turn state machine, conversation copy, usage accumulator, or cancellation registry.
+Children run the base `Agent`, so they keep independent durable conversations without recursively
+inheriting collaboration tools.
 
-- `agent`: create a named child, submit its first message, and immediately return its turn ID;
-- `message_agent`: submit a FIFO follow-up and immediately return its turn ID;
-- `wait_agent`: consume available child completions, waiting when work is still pending;
-- `list_agents`: read active child state and current session usage;
-- `remove_agent`: remove an idle child after all of its results have been consumed.
-
-The controller partitions children by root session ID and addresses active entries by a trimmed name.
-Names must be non-empty, contain no control characters, and contain at most 64 Unicode characters.
-Only an active duplicate is rejected; removal makes the name immediately reusable.
-
-Each `AgentEntry` owns its `Session`, pending turn count, and unread completions. A short-lived task
-waits for each submitted turn, forwards its terminal result to that entry, and wakes `wait_agent`.
-A wait drains all unread entries visible under the state lock. It has no queue argument or internal
-timeout; cancelling a wait neither consumes results nor cancels child work.
-
-Children use the clean base `Agent`, so they keep their own durable multi-turn history but do not
-inherit collaboration tools. Profiles, prompt additions, tool selection, and delegation policy are
-application concerns. The CLI adds its orchestration prompt only after installing the communication
-tools. Collaboration does not own a second scheduler, execution state machine, completion queue,
-usage accumulator, or cancellation registry.
+Submitting work is synchronous with the controller lock and uses the session's bounded `try_submit`.
+A short-lived task waits for each `TurnHandle`, publishes its settled result, and wakes waiters. Waiting
+consumes available completions but does not cancel child work.
 
 ## Events and TUI
 
-`SessionEventKind::Live` carries ephemeral text, reasoning, and tool previews. `TurnStarted`,
-`TurnProgress`, `ContextChanged`, `TurnCompleted`, and `ContextCompacted` expose execution boundaries
-and replaceable projections. Child-agent snapshots subscribe to the same session stats projection, so
-their running usage and tool counts update with the root TUI. Only durable log entries survive resume.
+`SessionEvent` has seven facts: started, text, thought, tool started, tool finished, finished, and
+discarded. Transient events carry `TurnId`; completion carries the canonical `Arc<Turn>`. There are no
+live usage, context, or projection events. `Discarded.error` is present only when a completed turn
+could not be persisted, so event-only consumers do not mistake storage failure for cancellation.
 
-The TUI replaces live preview content with the canonical `TurnView` after completion. Working and
-settled usage and child rows display protocol totals; context occupancy displays the local preflight
-estimate.
-
-## Stream integrity, retry, and cancellation
-
-A clean model response is accepted only after a semantic provider terminal marker. EOF without one is
-truncated, even if partial text or tool-call fragments arrived. A truncated response never executes
-tool calls. After retries are exhausted, accumulated text and reasoning are persisted with
-`StopReason::Truncated` so the next turn retains that context; tool-call blocks are discarded.
-
-Retry is limited to retryable transport/status failures and truncated streams before any tool side
-effect. The engine discards earlier attempts before retrying, retains any usage reported by those
-attempts, and uses cancellation-aware exponential backoff. Once a tool has started, retry cannot
-repeat that side effect. Cancellation and failure settle through the same turn boundary as normal
-completion.
+The TUI has one business-state owner, `AppState`. Events mutate it directly and produce a small
+`RenderPlan` describing terminal IO. `TerminalUi` owns only the terminal surface. Rendering borrows
+state and never stores a second conversation, operation, menu, stats, or transcript model. On finish,
+streamed blocks are replaced by blocks derived from the canonical turn; on resume, the same conversion
+is applied to `Conversation::turns()`.

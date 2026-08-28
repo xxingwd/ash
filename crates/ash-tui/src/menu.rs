@@ -1,8 +1,8 @@
-use ash_core::{ForkPoint, SessionSummary};
+use ash_core::SessionSummary;
 
 use crate::{
-    fork_picker::ForkPickerState,
-    session_picker::SessionPickerState,
+    fork_picker::ForkOption,
+    picker::PickerState,
     slash_command::{CommandCompletion, CommandCompletionState},
 };
 
@@ -19,7 +19,7 @@ pub enum MenuView<'a> {
         selected: usize,
     },
     ForkPoints {
-        items: &'a [ForkPoint],
+        items: &'a [ForkOption],
         selected: usize,
     },
 }
@@ -38,8 +38,8 @@ impl MenuView<'_> {
 #[derive(Debug)]
 pub enum ComposerMenuState {
     Commands(CommandCompletionState),
-    Sessions(SessionPickerState),
-    ForkPoints(ForkPickerState),
+    Sessions(PickerState<SessionSummary>),
+    ForkPoints(PickerState<ForkOption>),
 }
 
 impl Default for ComposerMenuState {
@@ -62,11 +62,11 @@ impl ComposerMenuState {
                 selected: completion.selected_index(),
             },
             Self::Sessions(picker) if picker.is_visible() => MenuView::Sessions {
-                items: picker.sessions(),
+                items: picker.items(),
                 selected: picker.selected_index(),
             },
             Self::ForkPoints(picker) if picker.is_visible() => MenuView::ForkPoints {
-                items: picker.points(),
+                items: picker.items(),
                 selected: picker.selected_index(),
             },
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => MenuView::None,
@@ -80,14 +80,16 @@ impl ComposerMenuState {
         }
     }
 
-    pub(crate) const fn visible_session_picker_mut(&mut self) -> Option<&mut SessionPickerState> {
+    pub(crate) const fn visible_session_picker_mut(
+        &mut self,
+    ) -> Option<&mut PickerState<SessionSummary>> {
         match self {
             Self::Sessions(picker) if picker.is_visible() => Some(picker),
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => None,
         }
     }
 
-    pub(crate) const fn visible_fork_picker_mut(&mut self) -> Option<&mut ForkPickerState> {
+    pub(crate) const fn visible_fork_picker_mut(&mut self) -> Option<&mut PickerState<ForkOption>> {
         match self {
             Self::ForkPoints(picker) if picker.is_visible() => Some(picker),
             Self::Commands(_) | Self::Sessions(_) | Self::ForkPoints(_) => None,
@@ -107,11 +109,11 @@ impl ComposerMenuState {
     }
 
     pub(crate) fn open_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        *self = Self::Sessions(SessionPickerState::with_items(sessions));
+        *self = Self::Sessions(PickerState::with_items(sessions));
     }
 
-    pub(crate) fn open_fork_points(&mut self, points: Vec<ForkPoint>) {
-        *self = Self::ForkPoints(ForkPickerState::with_items(points));
+    pub(crate) fn open_fork_points(&mut self, points: Vec<ForkOption>) {
+        *self = Self::ForkPoints(PickerState::with_items(points));
     }
 
     pub(crate) fn close_sessions(&mut self) {
@@ -129,7 +131,7 @@ impl ComposerMenuState {
 
 #[cfg(test)]
 mod tests {
-    use ash_core::{ForkPoint, MessageId, SessionId, SessionSummary};
+    use ash_core::{SessionId, SessionSummary, TurnId};
 
     use super::*;
 
@@ -154,8 +156,8 @@ mod tests {
         let mut menu = ComposerMenuState::default();
         menu.sync_commands("/", 1);
 
-        menu.open_fork_points(vec![ForkPoint {
-            message_id: MessageId::new(),
+        menu.open_fork_points(vec![ForkOption {
+            turn_id: TurnId::new(),
             prompt: "saved prompt".to_string(),
         }]);
 

@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ash_core::{ContentBlock, ProtocolError, StopReason};
+use ash_core::{Item, ProtocolError, Step, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    content_value, image_data_url, message_groups, model_config,
-    pending_calls::{build_usage, PendingCall},
-    project_request_messages, sse, text_tool_result, MessageGroup, ProviderConfig,
+    content_value, context_turns, image_data_url, model_config,
+    pending_calls::{usage_event, PendingCall},
+    sse, text_tool_result, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -28,61 +28,17 @@ impl ResponsesAdapter {
     }
 
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
-        let projected = project_request_messages(req)?;
         let mut input = Vec::new();
-        for group in message_groups(&projected.messages) {
-            match group {
-                MessageGroup::User(contents) => {
-                    input.push(json!({"role": "user", "content": responses_content(contents)}));
-                }
-                MessageGroup::Assistant(blocks) => {
-                    let mut text = String::new();
-                    let mut extra = Vec::new();
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text(t) => text.push_str(t),
-                            ContentBlock::Thought { text, .. } => {
-                                extra.push(json!({
-                                    "type": "reasoning",
-                                    "summary": [{"type": "summary_text", "text": text}],
-                                }));
-                            }
-                            ContentBlock::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            } => {
-                                extra.push(json!({
-                                    "type": "function_call",
-                                    "call_id": id.as_str(),
-                                    "name": name,
-                                    "arguments": arguments.to_string(),
-                                }));
-                            }
-                        }
-                    }
-                    if !text.is_empty() {
-                        input.push(json!({"role": "assistant", "content": text}));
-                    }
-                    input.extend(extra);
-                }
-                MessageGroup::ToolResults(group) => {
-                    for result in &group.results {
-                        let output = text_tool_result(result.output, result.is_error);
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": result.id.as_str(),
-                            "output": output,
-                        }));
-                    }
-                    let attachments = group.attachments().collect::<Vec<_>>();
-                    if !attachments.is_empty() {
-                        input.push(json!({
-                            "role": "user",
-                            "content": responses_attachments(&attachments),
-                        }));
-                    }
-                }
+        if let Some(summary) = req.context.summary() {
+            input.push(json!({"role": "assistant", "content": summary}));
+        }
+        for (turn_input, steps) in context_turns(&req.context) {
+            input.push(json!({
+                "role": "user",
+                "content": responses_content(&turn_input.content),
+            }));
+            for step in steps {
+                push_step(&mut input, step);
             }
         }
 
@@ -103,7 +59,7 @@ impl ResponsesAdapter {
             "input": input,
             "stream": true,
         });
-        if let Some(system) = &projected.system {
+        if let Some(system) = &req.system {
             body["instructions"] = json!(system);
         }
         if !tools.is_empty() {
@@ -114,6 +70,55 @@ impl ResponsesAdapter {
         }
         model_config::apply_from_env(&mut body)?;
         Ok(body)
+    }
+}
+
+fn push_step(input: &mut Vec<Value>, step: &Step) {
+    let mut text = String::new();
+    let mut extra = Vec::new();
+    for item in &step.items {
+        match item {
+            Item::Text(value) => text.push_str(value),
+            Item::Thought { text, .. } => extra.push(json!({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": text}],
+            })),
+            Item::ToolCall(call) => extra.push(json!({
+                "type": "function_call",
+                "call_id": call.id.as_str(),
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            })),
+        }
+    }
+    if !text.is_empty() {
+        input.push(json!({"role": "assistant", "content": text}));
+    }
+    input.extend(extra);
+
+    let mut attachments = Vec::new();
+    for call in step.items.iter().filter_map(|item| match item {
+        Item::ToolCall(call) => Some(call),
+        Item::Text(_) | Item::Thought { .. } => None,
+    }) {
+        let (output, is_error) = match &call.result {
+            Ok(output) => {
+                attachments.extend(output.attachments.iter());
+                (output.text.as_str(), false)
+            }
+            Err(error) => (error.as_str(), true),
+        };
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": call.id.as_str(),
+            "output": text_tool_result(output, is_error),
+        }));
+    }
+    if !attachments.is_empty() {
+        input.push(json!({
+            "role": "user",
+            "content": responses_attachments(&attachments),
+        }));
     }
 }
 
@@ -300,8 +305,8 @@ impl sse::Decoder for ResponsesDecoder {
         Ok(sse::DecodeResult::Continue(items))
     }
 
-    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
-        Ok((Vec::new(), self.completed.unwrap_or(StopReason::Truncated)))
+    fn finalize(self) -> Result<(Vec<ModelEvent>, Option<StopReason>), ProtocolError> {
+        Ok((Vec::new(), self.completed))
     }
 }
 
@@ -416,10 +421,10 @@ impl ResponsesDecoder {
         let response = &event["response"];
         let usage = response.get("usage").unwrap_or_else(|| &event["usage"]);
         if !usage.is_null() {
-            items.push(ModelEvent::Usage(build_usage(
+            items.push(usage_event(
                 usage["input_tokens"].as_u64().unwrap_or(0),
                 usage["output_tokens"].as_u64().unwrap_or(0),
-            )));
+            ));
         }
         self.completed = Some(stop);
         Ok(())
@@ -447,8 +452,8 @@ impl ResponsesDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
+    use crate::{sse::Decoder, test_support, Protocol};
+    use ash_core::{Content, Item, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -573,7 +578,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
-        assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+        assert_eq!(decoder.finalize().unwrap().1, Some(StopReason::EndTurn));
     }
 
     #[test]
@@ -584,7 +589,10 @@ mod tests {
                 r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
             )
             .unwrap();
-        assert_eq!(max_tokens.finalize().unwrap().1, StopReason::MaxTokens);
+        assert_eq!(
+            max_tokens.finalize().unwrap().1,
+            Some(StopReason::MaxTokens)
+        );
 
         let mut unknown = ResponsesDecoder::default();
         unknown
@@ -594,7 +602,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unknown.finalize().unwrap().1,
-            StopReason::Other("content_filter".to_string())
+            Some(StopReason::Other("content_filter".to_string()))
         );
     }
 
@@ -687,45 +695,32 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::assistant(vec![
-                ContentBlock::Thought {
-                    text: "private reasoning".into(),
-                    elapsed_seconds: 2,
-                },
-                ContentBlock::Text("visible answer".into()),
-            ])],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![
+            Item::Thought {
+                text: "private reasoning".into(),
+                elapsed_seconds: 2,
+            },
+            Item::Text("visible answer".into()),
+        ]);
 
         let body = ResponsesAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["input"][0]["role"], "assistant");
-        assert_eq!(body["input"][0]["content"], "visible answer");
-        assert_eq!(body["input"][1]["type"], "reasoning");
-        assert_eq!(body["input"][1]["summary"][0]["text"], "private reasoning");
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"], "visible answer");
+        assert_eq!(body["input"][2]["type"], "reasoning");
+        assert_eq!(body["input"][2]["summary"][0]["text"], "private reasoning");
     }
 
     #[test]
     fn preserves_text_only_tool_error_wire_format() {
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::tool_result(
-                ToolCallId::from_provider("call"),
-                Err("permission denied".into()),
-                Vec::new(),
-            )],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![test_support::tool_result(
+            "call",
+            Err("permission denied".into()),
+        )]);
 
         let body = ResponsesAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["input"][0]["output"], "Error: permission denied");
+        assert_eq!(body["input"][2]["output"], "Error: permission denied");
     }
 
     #[test]
@@ -735,30 +730,27 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![
-                crate::test_support::tool_result("first", Vec::new()),
-                crate::test_support::tool_result(
+        let request = test_support::request(vec![
+            test_support::tool_result("first", Ok(test_support::output("first", Vec::new()))),
+            test_support::tool_result(
+                "second",
+                Ok(test_support::output(
                     "second",
                     vec![Content::Image {
                         media_type: "image/png".into(),
                         data: vec![1, 2, 3],
                     }],
-                ),
-            ],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+                )),
+            ),
+        ]);
 
         let body = ResponsesAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["input"][0]["type"], "function_call_output");
-        assert_eq!(body["input"][1]["type"], "function_call_output");
-        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][4]["type"], "function_call_output");
+        assert_eq!(body["input"][5]["role"], "user");
         assert_eq!(
-            body["input"][2]["content"][0]["image_url"],
+            body["input"][5]["content"][0]["image_url"],
             "data:image/png;base64,AQID"
         );
     }

@@ -7,7 +7,7 @@ mod sse;
 
 use std::{borrow::Cow, sync::Arc};
 
-use ash_core::{Content, ContentBlock, Message, MessageContent, ProtocolError, ToolCallId};
+use ash_core::{Content, Input, ModelContext, Step};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -136,145 +136,53 @@ pub fn create_adapter(cfg: ProviderConfig) -> Arc<dyn ModelClient> {
     }
 }
 
-struct ProjectedMessages<'a> {
-    system: Option<String>,
-    messages: Vec<&'a Message>,
-}
-
-/// Validate the provider-neutral content and lift system messages to the
-/// provider's privileged instruction field.
-fn project_request_messages(
-    request: &ModelRequest,
-) -> Result<ProjectedMessages<'_>, ProtocolError> {
-    let mut system_parts = request.system.iter().cloned().collect::<Vec<_>>();
-    let mut messages = Vec::with_capacity(request.messages.len());
-
-    for message in &request.messages {
-        match &message.content {
-            MessageContent::System(contents) => {
-                let text = contents
-                    .iter()
-                    .map(|content| match content {
-                        Content::Text(value) => Ok(value.as_str()),
-                        Content::Image { .. } => Err(ProtocolError::InvalidRequest(
-                            "system messages cannot contain images".to_string(),
-                        )),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join("\n");
-                system_parts.push(text);
-            }
-            MessageContent::User(_)
-            | MessageContent::ToolResult { .. }
-            | MessageContent::Assistant(_) => messages.push(message),
-        }
-    }
-
-    Ok(ProjectedMessages {
-        system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
-        messages,
-    })
-}
-
-/// A maximal run of consecutive tool-result messages grouped for one adapter
-/// request, so providers that key results to calls can emit them as a block.
-pub(crate) struct ToolResultGroup<'a> {
-    pub(crate) results: Vec<ToolResultRef<'a>>,
-}
-
-impl<'a> ToolResultGroup<'a> {
-    pub(crate) fn attachments(&self) -> impl Iterator<Item = &'a Content> + '_ {
-        self.results
-            .iter()
-            .flat_map(|result| result.attachments.iter())
-    }
-}
-
-pub(crate) struct ToolResultRef<'a> {
-    pub(crate) id: &'a ToolCallId,
-    pub(crate) output: &'a str,
-    pub(crate) is_error: bool,
-    pub(crate) attachments: &'a [Content],
-}
-
-fn consecutive_tool_results<'a>(messages: &[&'a Message], start: usize) -> ToolResultGroup<'a> {
-    let mut results = Vec::new();
-    let mut index = start;
-    while let Some(message) = messages.get(index) {
-        let MessageContent::ToolResult {
-            id,
-            result,
-            attachments: result_attachments,
-            ..
-        } = &message.content
-        else {
-            break;
-        };
-        let (output, is_error) = match result {
-            Ok(output) => (output.as_str(), false),
-            Err(error) => (error.as_str(), true),
-        };
-        results.push(ToolResultRef {
-            id,
-            output,
-            is_error,
-            attachments: result_attachments,
-        });
-        index += 1;
-    }
-    ToolResultGroup { results }
-}
-
-/// One request-building step over the projected history: a user turn, an
-/// assistant turn, or a maximal run of tool results.
-pub(crate) enum MessageGroup<'a> {
-    User(&'a [Content]),
-    Assistant(&'a [ContentBlock]),
-    ToolResults(ToolResultGroup<'a>),
-}
-
-/// Iterate over the projected history, merging consecutive tool results.
-pub(crate) fn message_groups<'a>(
-    messages: &'a [&'a Message],
-) -> impl Iterator<Item = MessageGroup<'a>> + 'a {
-    let mut index = 0;
-    std::iter::from_fn(move || loop {
-        let message = *messages.get(index)?;
-        match &message.content {
-            MessageContent::User(contents) => {
-                index += 1;
-                return Some(MessageGroup::User(contents));
-            }
-            MessageContent::Assistant(blocks) => {
-                index += 1;
-                return Some(MessageGroup::Assistant(blocks));
-            }
-            MessageContent::System(_) => {
-                index += 1;
-            }
-            MessageContent::ToolResult { .. } => {
-                let group = consecutive_tool_results(messages, index);
-                index += group.results.len();
-                return Some(MessageGroup::ToolResults(group));
-            }
-        }
-    })
+pub(crate) fn context_turns(context: &ModelContext) -> impl Iterator<Item = (&Input, &[Step])> {
+    context
+        .turns()
+        .iter()
+        .map(|turn| (&turn.input, turn.steps.as_slice()))
+        .chain(context.current())
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use ash_core::{Content, Message, ToolCallId};
+    use ash_core::{
+        Content, Input, Item, ModelContext, ModelId, ModelRequest, Step, ToolCall, ToolCallId,
+        ToolOutput,
+    };
 
-    /// A provider-neutral tool-result message shared by the adapter tests.
-    pub fn tool_result(text: &str, attachments: Vec<Content>) -> Message {
-        Message::tool_result(ToolCallId::new(), Ok(text.into()), attachments)
+    pub fn request(items: Vec<Item>) -> ModelRequest {
+        ModelRequest {
+            model: ModelId::new("test"),
+            system: None,
+            context: ModelContext::default()
+                .with_current(Input::user("question"), vec![Step { items }]),
+            tools: Vec::new(),
+            max_tokens: None,
+        }
+    }
+
+    pub fn tool_result(id: &str, result: Result<ToolOutput, String>) -> Item {
+        Item::ToolCall(ToolCall {
+            id: ToolCallId::from_provider(id),
+            name: "tool".to_string(),
+            arguments: serde_json::json!({}),
+            result,
+        })
+    }
+
+    pub fn output(text: &str, attachments: Vec<Content>) -> ToolOutput {
+        ToolOutput {
+            text: text.to_string(),
+            attachments,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash_core::{Content, ModelId};
+    use ash_core::Content;
 
     #[test]
     fn protocol_display_uses_the_stable_configuration_names() {
@@ -359,49 +267,5 @@ mod tests {
             ]),
             "one\ntwo"
         );
-    }
-
-    #[test]
-    fn request_projection_lifts_system_messages_without_reordering_history() {
-        let user = Message::user("question");
-        let assistant = Message::assistant_text("answer");
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: Some("base rules".to_string()),
-            messages: vec![
-                user.clone(),
-                Message::system("extension rules"),
-                assistant.clone(),
-            ],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
-
-        let projected = project_request_messages(&request).unwrap();
-
-        assert_eq!(
-            projected.system.as_deref(),
-            Some("base rules\n\nextension rules")
-        );
-        assert_eq!(projected.messages, vec![&user, &assistant]);
-    }
-
-    #[test]
-    fn request_projection_rejects_system_images() {
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::system_content(vec![Content::Image {
-                media_type: "image/png".into(),
-                data: vec![1],
-            }])],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
-
-        assert!(matches!(
-            project_request_messages(&request),
-            Err(ProtocolError::InvalidRequest(_))
-        ));
     }
 }

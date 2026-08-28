@@ -107,6 +107,10 @@ impl Runtime {
         self.model.as_ref()
     }
 
+    pub(crate) fn model_handle(&self) -> Arc<dyn ModelClient> {
+        Arc::clone(&self.model)
+    }
+
     pub(crate) fn session_store_handle(&self) -> Arc<JsonlSessionStore> {
         Arc::clone(&self.session_store)
     }

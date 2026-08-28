@@ -60,20 +60,17 @@ cargo run -p ash-cli -- \
 `instructions` 等请求结构字段不能覆盖。
 
 模型上下文窗口默认是 1M token，可用 `--max-context-tokens` 或
-`ASH_MAX_CONTEXT_TOKENS` 覆盖；底栏会按该上限显示上下文百分比。Ash 使用每 4 个字符约
-1 token 的轻量估算，不引入 tokenizer 依赖。该估算只用于模型调用前的 context preflight
-和底栏占用率。当前 Turn 的 `Working` 行按每次模型调用返回的协议 usage 累加输入、输出，
-并显示精确工具调用数与生成速度；Turn 结束后的 `Worked` 行读取 JSONL 中持久化的最终统计。
-服务端未返回 usage 时不会用本地估算回填输入或输出。
+`ASH_MAX_CONTEXT_TOKENS` 覆盖。Ash 使用每 4 个字符约 1 token 的轻量估算，不引入 tokenizer
+依赖；该估算只用于模型调用前的 context preflight 和自动压缩判断。Turn 结束后的 `Worked`
+行显示本轮所有模型请求返回的输入、输出 token、生成速度和实际工具调用数；服务端未返回
+usage 时不会用本地估算回填。
 
-估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文，并持久化一条
-隐藏的 compaction checkpoint。原始消息、终端 scrollback 和会话标题保持不变。压缩器
-保留最近两个完整用户轮次，让同一个模型在禁用工具的独立请求中把更早历史整理为结构化
-摘要；再次压缩会更新已有摘要。摘要输入中的旧工具输出最多保留 2,000 字符，图片只保留
-媒体类型和大小。模型调用前还会保护最近两个轮次及约 40K token 的近期工具结果；更旧
-结果累计可释放超过 20K token 时会先清理，清理后仍达到 80% 才生成摘要。工具刚执行完
-写入会话前仍有 64 KiB 的运行时上限。交互模式下可用 `/compact` 随时主动更新隐藏的
-模型上下文。
+估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文。压缩器使用固定
+system prompt，在一次不带工具、未指定业务输出上限的独立请求中摘要全部已完成 Turn；当前
+正在运行的 input 和 steps 始终留在摘要外。再次压缩只发送旧摘要之后新增的 Turn。原始
+Conversation、终端 scrollback 和会话标题保持完整，只有模型上下文使用 checkpoint。摘要
+prompt 会限制工具文本且不携带附件；工具刚执行完写入会话前仍有 64 KiB 的运行时上限。
+交互模式下可用 `/compact` 随时主动更新 checkpoint。
 
 单次输出模式：
 
@@ -125,10 +122,11 @@ Session ID：
 <session-id>.jsonl
 ```
 
-普通新会话的文件在第一次提交消息时才会创建；带继承历史的 fork 会立即写入新文件。
-首行只保存格式版本、时间戳、Session ID、root ID、parent ID 和标题；后续按顺序追加完整用户
-消息、Assistant 消息、工具结果和 Turn 结束状态。压缩时只追加摘要和近期历史起点；
-恢复会话后，UI 重放完整消息，模型请求则使用该 checkpoint 构造压缩上下文。恢复时
+普通新会话的文件在第一个 Turn 完成时才会创建；带非空历史的 fork 会立即写入新文件。
+持久化只有三种记录：`Init { identity, created_at, title }`、`Turn { turn, summary }` 和
+`Checkpoint { summary }`。首行 `Init` 不夹带历史；后续每个完整 Turn 单独占一行。恢复时
+按记录位置推导 checkpoint 覆盖的 Turn，UI 重放完整 Conversation，模型请求只读取未被摘要
+覆盖的 Turn。旧格式不读取或迁移。恢复时
 沿用当前运行配置，不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此
 API Key、访问令牌和自定义接口地址内容不会写入文件。
 
@@ -151,7 +149,7 @@ Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重
 - `agent`：创建命名 Agent、提交初始 `message`，立即返回 accepted 和 Turn ID
 - `message_agent`：向现有命名 Agent 提交 FIFO follow-up，立即返回 accepted 和 Turn ID
 - `wait_agent`：返回当前全部未读结果；仍有任务但暂无结果时等待下一次完成
-- `list_agents`：读取当前根 Session 下 Agent 的 idle/running 状态和累计协议 usage
+- `list_agents`：读取当前根 Session 下 Agent 的 idle/running 状态
 - `remove_agent`：删除没有运行任务和未读结果的 Agent
 
 每个 child 自己保存 pending Turn 和未读结果；`wait_agent` 是唯一消费结果的入口，没有队列
@@ -173,7 +171,7 @@ child 与 root 使用同一套普通 Session 和 JSONL 持久化规则，保留�
 滚动、选择和复制因此保持可用。当前用户消息、流式 Thought、工具与回答只存在于本轮 live
 viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随最新内容。
 
-收到 `TurnCompleted` 后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
+收到携带完整 `Turn` 的 `Finished` 事件后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
 随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
 resize 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并立即释放
 Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。`/new`、

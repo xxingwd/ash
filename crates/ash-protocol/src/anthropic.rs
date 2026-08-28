@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use ash_core::{ContentBlock, ProtocolError, StopReason};
+use ash_core::{Item, ProtocolError, Step, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    base64_image, message_groups, model_config,
-    pending_calls::{build_usage, PendingCall},
-    project_request_messages, sse, MessageGroup, ProviderConfig,
+    base64_image, context_turns, model_config,
+    pending_calls::{usage_event, PendingCall},
+    sse, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -40,77 +40,25 @@ impl AnthropicAdapter {
     }
 
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
-        let projected = project_request_messages(req)?;
         let mut messages = Vec::new();
-        for group in message_groups(&projected.messages) {
-            match group {
-                MessageGroup::User(contents) => {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": contents
-                            .iter()
-                            .map(|content| match content {
-                                ash_core::Content::Text(text) => {
-                                    json!({"type": "text", "text": text})
-                                }
-                                ash_core::Content::Image { media_type, data } => {
-                                    anthropic_image_block(media_type, data)
-                                }
-                            })
-                            .collect::<Vec<Value>>(),
-                    }));
-                }
-                MessageGroup::Assistant(blocks) => {
-                    let content: Vec<Value> = blocks
-                        .iter()
-                        .map(|block| match block {
-                            ContentBlock::Text(text) => json!({"type": "text", "text": text}),
-                            ContentBlock::Thought { text, .. } => json!({
-                                "type": "thinking",
-                                "thinking": text,
-                            }),
-                            ContentBlock::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            } => json!({
-                                "type": "tool_use",
-                                "id": id.as_str(),
-                                "name": name,
-                                "input": arguments,
-                            }),
-                        })
-                        .collect();
-                    if !content.is_empty() {
-                        messages.push(json!({"role": "assistant", "content": content}));
+        if let Some(summary) = req.context.summary() {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": summary}],
+            }));
+        }
+        for (input, steps) in context_turns(&req.context) {
+            messages.push(json!({
+                "role": "user",
+                "content": input.content.iter().map(|content| match content {
+                    ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
+                    ash_core::Content::Image { media_type, data } => {
+                        anthropic_image_block(media_type, data)
                     }
-                }
-                MessageGroup::ToolResults(group) => {
-                    let content: Vec<Value> = group
-                        .results
-                        .into_iter()
-                        .map(|result| {
-                            let mut content = vec![json!({"type": "text", "text": result.output})];
-                            content.extend(result.attachments.iter().map(|attachment| {
-                                match attachment {
-                                    ash_core::Content::Text(text) => {
-                                        json!({"type": "text", "text": text})
-                                    }
-                                    ash_core::Content::Image { media_type, data } => {
-                                        anthropic_image_block(media_type, data)
-                                    }
-                                }
-                            }));
-                            json!({
-                                "type": "tool_result",
-                                "tool_use_id": result.id.as_str(),
-                                "content": content,
-                                "is_error": result.is_error,
-                            })
-                        })
-                        .collect();
-                    messages.push(json!({"role": "user", "content": content}));
-                }
+                }).collect::<Vec<Value>>(),
+            }));
+            for step in steps {
+                push_step(&mut messages, step);
             }
         }
 
@@ -132,7 +80,7 @@ impl AnthropicAdapter {
             "stream": true,
             "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
         });
-        if let Some(system) = &projected.system {
+        if let Some(system) = &req.system {
             body["system"] = json!(system);
         }
         if !tools.is_empty() {
@@ -140,6 +88,57 @@ impl AnthropicAdapter {
         }
         model_config::apply_from_env(&mut body)?;
         Ok(body)
+    }
+}
+
+fn push_step(messages: &mut Vec<Value>, step: &Step) {
+    let assistant = step
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Text(text) => json!({"type": "text", "text": text}),
+            Item::Thought { text, .. } => json!({"type": "thinking", "thinking": text}),
+            Item::ToolCall(call) => json!({
+                "type": "tool_use",
+                "id": call.id.as_str(),
+                "name": call.name,
+                "input": call.arguments,
+            }),
+        })
+        .collect::<Vec<_>>();
+    if !assistant.is_empty() {
+        messages.push(json!({"role": "assistant", "content": assistant}));
+    }
+
+    let results = step
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall(call) => Some(call),
+            Item::Text(_) | Item::Thought { .. } => None,
+        })
+        .map(|call| {
+            let (text, attachments, is_error) = match &call.result {
+                Ok(output) => (output.text.as_str(), output.attachments.as_slice(), false),
+                Err(error) => (error.as_str(), &[][..], true),
+            };
+            let mut content = vec![json!({"type": "text", "text": text})];
+            content.extend(attachments.iter().map(|attachment| match attachment {
+                ash_core::Content::Text(text) => json!({"type": "text", "text": text}),
+                ash_core::Content::Image { media_type, data } => {
+                    anthropic_image_block(media_type, data)
+                }
+            }));
+            json!({
+                "type": "tool_result",
+                "tool_use_id": call.id.as_str(),
+                "content": content,
+                "is_error": is_error,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !results.is_empty() {
+        messages.push(json!({"role": "user", "content": results}));
     }
 }
 
@@ -202,21 +201,18 @@ impl sse::Decoder for AnthropicDecoder {
         Ok(sse::DecodeResult::Continue(items))
     }
 
-    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
-        Ok((
-            Vec::new(),
-            self.completed_stop.unwrap_or(StopReason::Truncated),
-        ))
+    fn finalize(self) -> Result<(Vec<ModelEvent>, Option<StopReason>), ProtocolError> {
+        Ok((Vec::new(), self.completed_stop))
     }
 }
 
 impl AnthropicDecoder {
     fn message_start(event: &Value, items: &mut Vec<ModelEvent>) {
         if let Some(usage) = event["message"].get("usage") {
-            items.push(ModelEvent::Usage(build_usage(
+            items.push(usage_event(
                 usage["input_tokens"].as_u64().unwrap_or(0),
                 usage["output_tokens"].as_u64().unwrap_or(0),
-            )));
+            ));
         }
     }
 
@@ -287,10 +283,7 @@ impl AnthropicDecoder {
 
     fn message_delta(&mut self, event: &Value, items: &mut Vec<ModelEvent>) {
         if let Some(usage) = event.get("usage") {
-            items.push(ModelEvent::Usage(build_usage(
-                0,
-                usage["output_tokens"].as_u64().unwrap_or(0),
-            )));
+            items.push(usage_event(0, usage["output_tokens"].as_u64().unwrap_or(0)));
         }
         if let Some(reason) = event["delta"]["stop_reason"]
             .as_str()
@@ -351,8 +344,8 @@ impl AnthropicDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
+    use crate::{sse::Decoder, test_support, Protocol};
+    use ash_core::{Content, Item, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -411,7 +404,7 @@ mod tests {
         let result = decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
-        assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+        assert_eq!(decoder.finalize().unwrap().1, Some(StopReason::EndTurn));
     }
 
     #[test]
@@ -426,7 +419,9 @@ mod tests {
 
         assert_eq!(
             decoder.finalize().unwrap().1,
-            StopReason::Other("model_context_window_exceeded".to_string())
+            Some(StopReason::Other(
+                "model_context_window_exceeded".to_string()
+            ))
         );
     }
 
@@ -438,7 +433,7 @@ mod tests {
             .unwrap();
         decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
 
-        assert_eq!(decoder.finalize().unwrap().1, StopReason::MaxTokens);
+        assert_eq!(decoder.finalize().unwrap().1, Some(StopReason::MaxTokens));
     }
 
     #[test]
@@ -508,13 +503,7 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: Vec::new(),
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(Vec::new());
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
 
@@ -528,13 +517,8 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: Vec::new(),
-            tools: Vec::new(),
-            max_tokens: Some(1_024),
-        };
+        let mut request = test_support::request(Vec::new());
+        request.max_tokens = Some(1_024);
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
 
@@ -548,23 +532,17 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::assistant(vec![
-                ContentBlock::Thought {
-                    text: "private reasoning".into(),
-                    elapsed_seconds: 2,
-                },
-                ContentBlock::Text("visible answer".into()),
-            ])],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![
+            Item::Thought {
+                text: "private reasoning".into(),
+                elapsed_seconds: 2,
+            },
+            Item::Text("visible answer".into()),
+        ]);
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
 
-        let content = &body["messages"][0]["content"];
+        let content = &body["messages"][1]["content"];
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "private reasoning");
         assert_eq!(content[1]["type"], "text");
@@ -573,50 +551,29 @@ mod tests {
 
     #[test]
     fn groups_consecutive_tool_results_into_one_user_message() {
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![
-                Message::tool_result(
-                    ToolCallId::from_provider("call_1"),
-                    Ok("first".into()),
-                    Vec::new(),
-                ),
-                Message::tool_result(
-                    ToolCallId::from_provider("call_2"),
-                    Ok("second".into()),
-                    Vec::new(),
-                ),
-            ],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![
+            test_support::tool_result("call_1", Ok(test_support::output("first", Vec::new()))),
+            test_support::tool_result("call_2", Ok(test_support::output("second", Vec::new()))),
+        ]);
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
-        assert_eq!(body["messages"][0]["content"][0]["tool_use_id"], "call_1");
-        assert_eq!(body["messages"][0]["content"][1]["tool_use_id"], "call_2");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(body["messages"][2]["content"][1]["tool_use_id"], "call_2");
     }
 
     #[test]
     fn sends_raw_tool_error_with_is_error() {
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::tool_result(
-                ToolCallId::from_provider("call"),
-                Err("permission denied".into()),
-                Vec::new(),
-            )],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![test_support::tool_result(
+            "call",
+            Err("permission denied".into()),
+        )]);
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
-        let result = &body["messages"][0]["content"][0];
+        let result = &body["messages"][2]["content"][0];
 
         assert_eq!(result["content"][0]["text"], "permission denied");
         assert_eq!(result["is_error"], true);
@@ -629,29 +586,25 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::tool_result(
-                ToolCallId::from_provider("call"),
-                Ok("Read image file [image/png]".into()),
+        let request = test_support::request(vec![test_support::tool_result(
+            "call",
+            Ok(test_support::output(
+                "Read image file [image/png]",
                 vec![Content::Image {
                     media_type: "image/png".into(),
                     data: vec![1, 2, 3],
                 }],
-            )],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+            )),
+        )]);
 
         let body = AnthropicAdapter::build_request(&request).unwrap();
 
         assert_eq!(
-            body["messages"][0]["content"][0]["content"][1]["type"],
+            body["messages"][2]["content"][0]["content"][1]["type"],
             "image"
         );
         assert_eq!(
-            body["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            body["messages"][2]["content"][0]["content"][1]["source"]["data"],
             "AQID"
         );
     }

@@ -1,9 +1,0 @@
----
-source: crates/ash-core/tests/snapshots.rs
-expression: event
----
-{
-  "Live": {
-    "TextDelta": "Hello"
-  }
-}

@@ -1,4 +1,4 @@
-mod message_history;
+mod input_history;
 mod modes;
 
 use ash_protocol::Protocol;

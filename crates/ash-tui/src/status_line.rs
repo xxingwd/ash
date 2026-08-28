@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use ash_core::Usage;
 use unicode_width::UnicodeWidthStr;
 
 use crate::text_width::truncate_end;
@@ -32,11 +31,11 @@ pub fn format_token_count(tokens: u64) -> String {
     }
 }
 
-pub fn format_token_usage(usage: Usage) -> String {
+pub fn format_token_usage(input_tokens: u64, output_tokens: u64) -> String {
     format!(
         "{} in / {} out",
-        format_token_count(usage.input_tokens),
-        format_token_count(usage.output_tokens),
+        format_token_count(input_tokens),
+        format_token_count(output_tokens),
     )
 }
 
@@ -131,14 +130,7 @@ mod tests {
         assert_eq!(format_token_count(999), "999");
         assert_eq!(format_token_count(12_345), "12.3k");
         assert_eq!(format_token_count(1_234_567), "1.2M");
-        assert_eq!(
-            format_token_usage(Usage {
-                input_tokens: 12_345,
-                output_tokens: 678,
-                tool_calls: 1,
-            }),
-            "12.3k in / 678 out"
-        );
+        assert_eq!(format_token_usage(12_345, 678), "12.3k in / 678 out");
         assert_eq!(format_token_rate(250, 2_000).as_deref(), Some("125 tok/s"));
         assert_eq!(format_token_rate(1, 300).as_deref(), Some("3.3 tok/s"));
         assert_eq!(format_token_rate(1, 0), None);

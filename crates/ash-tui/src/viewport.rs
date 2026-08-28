@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::{ForkPoint, SessionSummary};
+use ash_core::SessionSummary;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
@@ -10,12 +10,15 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    app::AppState,
     block_layout::{layout_stack, StackItem},
+    fork_picker::ForkOption,
     live_block::{render_grouped_tool, LiveBlock},
     menu::MenuView,
+    operation::ActivityView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
-    status_line::{compact_path, fit_status_left, format_token_rate, format_token_usage},
+    status_line::{compact_path, fit_status_left, format_elapsed},
     text_width::truncate_end,
     SubagentView, SubagentViewState,
 };
@@ -24,7 +27,6 @@ const FOOTER_ROWS: u16 = 1;
 const MAX_COMPOSER_ROWS: u16 = 8;
 const MENU_MAX_ROWS: usize = 8;
 const SCREEN_SPACING: u16 = 1;
-const TURN_STATS_STATUS_WIDTH: u16 = 80;
 const SUBAGENTS_MAX_ROWS: usize = 4;
 const FOOTER_SIDE_PADDING: u16 = 2;
 const FOOTER_COLUMN_GAP: u16 = 3;
@@ -33,6 +35,7 @@ const COMMAND_NAME_PREFIX_COLUMNS: usize = 3;
 const MENU_COLUMN_GAP: usize = 2;
 const MENU_PREFIX_COLUMNS: usize = 2;
 const SESSION_CREATED_MIN_LEFT_COLUMNS: usize = 8;
+const TERMINAL_SAFE_COLUMN: u16 = 1;
 pub const COMPOSER_TEXT_COLUMN: u16 = 2;
 
 pub fn drawable_width(terminal_width: u16) -> u16 {
@@ -41,7 +44,7 @@ pub fn drawable_width(terminal_width: u16) -> u16 {
 }
 
 #[derive(Clone, Copy)]
-pub struct ViewportInput<'a> {
+struct ViewportInput<'a> {
     pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
     pub(crate) transcript: &'a [LiveBlock],
@@ -49,7 +52,6 @@ pub struct ViewportInput<'a> {
     pub(crate) busy: bool,
     pub(crate) status_header: &'a str,
     pub(crate) elapsed: &'a str,
-    pub(crate) turn_stats: Option<ash_core::TurnStats>,
     pub(crate) prompt_lines: &'a [String],
     pub(crate) prompt_cursor_row: u16,
     pub(crate) prompt_cursor_column: u16,
@@ -57,8 +59,6 @@ pub struct ViewportInput<'a> {
     pub(crate) model: &'a str,
     pub(crate) protocol: &'a str,
     pub(crate) working_dir: &'a Path,
-    pub(crate) context_tokens: Option<u64>,
-    pub(crate) context_limit: Option<u64>,
     pub(crate) tools_expanded: bool,
     pub(crate) subagents: &'a [SubagentView],
 }
@@ -89,7 +89,44 @@ impl ViewportFrame {
     }
 }
 
-pub fn render(input: ViewportInput<'_>) -> ViewportFrame {
+pub(crate) fn render(state: &AppState, width: u16, height: u16) -> ViewportFrame {
+    let elapsed = format_elapsed(state.status.elapsed_seconds());
+    let (busy, status_header) = match state.operation.activity_view() {
+        ActivityView::Idle => (false, ""),
+        ActivityView::Active { header, .. } => (true, header),
+    };
+    let status_header = sanitize_single_line(status_header);
+    let model = sanitize_single_line(&state.model);
+    let protocol = sanitize_single_line(&state.protocol);
+    let prompt = state.input.view(composer_text_width(width));
+    render_view(ViewportInput {
+        terminal_width: width,
+        terminal_height: height,
+        transcript: state.blocks.pending(),
+        scroll_top: state.scroll_top,
+        busy,
+        status_header: &status_header,
+        elapsed: &elapsed,
+        prompt_lines: &prompt.lines,
+        prompt_cursor_row: prompt.cursor_row,
+        prompt_cursor_column: prompt.cursor_column,
+        menu: state.menu.view(),
+        model: &model,
+        protocol: &protocol,
+        working_dir: &state.working_dir,
+        tools_expanded: state.tools_expanded,
+        subagents: &state.subagents,
+    })
+}
+
+pub(crate) fn composer_text_width(terminal_width: u16) -> u16 {
+    terminal_width
+        .saturating_sub(COMPOSER_TEXT_COLUMN)
+        .saturating_sub(TERMINAL_SAFE_COLUMN)
+        .max(1)
+}
+
+fn render_view(input: ViewportInput<'_>) -> ViewportFrame {
     let terminal_width = input.terminal_width.max(1);
     let terminal_height = input.terminal_height.max(1);
     let width = drawable_width(input.terminal_width);
@@ -443,20 +480,9 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let metrics = format!(
-            "  {} · {} tools",
-            format_token_usage(subagent.usage),
-            subagent.usage.tool_calls
-        );
         let prefix_width = UnicodeWidthStr::width(state_symbol).saturating_add(1);
-        let metrics_width = UnicodeWidthStr::width(metrics.as_str());
         let available = usize::from(area.width).saturating_sub(prefix_width);
-        let name_width = UnicodeWidthStr::width(subagent.name.as_str());
-        let fixed = if name_width.saturating_add(metrics_width) <= available {
-            format!("{}{metrics}", subagent.name)
-        } else {
-            truncate_end(&subagent.name, available)
-        };
+        let fixed = truncate_end(&subagent.name, available);
         let spans = vec![
             Span::styled(
                 format!("{state_symbol} "),
@@ -508,7 +534,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let mut spans = vec![
+    let spans = vec![
         Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(
             input.status_header.to_string(),
@@ -519,28 +545,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
             Style::default().add_modifier(Modifier::DIM),
         ),
     ];
-    if input.terminal_width >= TURN_STATS_STATUS_WIDTH {
-        if let Some(stats) = input.turn_stats.map(format_turn_stats) {
-            spans.push(Span::styled(
-                stats,
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-    }
     buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
-}
-
-fn format_turn_stats(stats: ash_core::TurnStats) -> String {
-    let mut value = format!(
-        "  {} · {} tools",
-        format_token_usage(stats.usage),
-        stats.usage.tool_calls,
-    );
-    if let Some(rate) = format_token_rate(stats.usage.output_tokens, stats.generation_ms) {
-        value.push_str(" · ");
-        value.push_str(&rate);
-    }
-    value
 }
 
 fn render_composer(area: Rect, prompt: &PromptWindow<'_>, buffer: &mut Buffer) {
@@ -585,17 +590,8 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     }
     let path = compact_path(input.working_dir);
     let protocol = (!input.protocol.is_empty()).then_some(input.protocol);
-    let context = context_display(input.context_tokens, input.context_limit);
-    let candidates = [
-        (context.clone(), protocol),
-        (context, None),
-        (None, protocol),
-    ];
-    let (context, protocol) = candidates
-        .into_iter()
-        .find(|(context, protocol)| footer_right_fits(area, context.as_ref(), *protocol))
-        .unwrap_or((None, None));
-    let right_width = footer_right_width(context.as_ref(), protocol);
+    let protocol = protocol.filter(|protocol| footer_right_fits(area, protocol));
+    let right_width = footer_right_width(protocol);
     let left_width = if right_width > 0 {
         area.width
             .saturating_sub(right_width)
@@ -617,60 +613,17 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         spans.push(Span::styled(path, Style::default().fg(Color::Green)));
     }
     buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
-    if right_width > 0 {
-        let mut spans = Vec::new();
-        let has_context = context.is_some();
-        if let Some(context) = context {
-            spans.push(Span::styled(
-                context.text,
-                Style::default().fg(context.color),
-            ));
-        }
-        if has_context && protocol.is_some() {
-            spans.push(Span::styled(
-                " · ",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        if let Some(protocol) = protocol {
-            spans.push(Span::styled(protocol, Style::default().fg(Color::Cyan)));
-        }
+    if let Some(protocol) = protocol {
         let right_x = area.x.saturating_add(
             area.width
                 .saturating_sub(right_width.saturating_add(FOOTER_SIDE_PADDING)),
         );
-        buffer.set_line(right_x, area.y, &Line::from(spans), right_width);
+        buffer.set_string(right_x, area.y, protocol, Style::default().fg(Color::Cyan));
     }
 }
 
-#[derive(Clone)]
-struct ContextDisplay {
-    text: String,
-    color: Color,
-}
-
-fn context_display(
-    context_tokens: Option<u64>,
-    context_limit: Option<u64>,
-) -> Option<ContextDisplay> {
-    let tokens = context_tokens?;
-    let limit = context_limit.filter(|limit| *limit > 0)?;
-    let percent = tokens.saturating_mul(100) / limit;
-    let text = if percent > 100 {
-        "100%+".to_string()
-    } else {
-        format!("{percent}%")
-    };
-    let color = match percent {
-        0..=69 => Color::Green,
-        70..=84 => Color::Yellow,
-        _ => Color::Red,
-    };
-    Some(ContextDisplay { text, color })
-}
-
-fn footer_right_fits(area: Rect, context: Option<&ContextDisplay>, protocol: Option<&str>) -> bool {
-    let right_width = footer_right_width(context, protocol);
+fn footer_right_fits(area: Rect, protocol: &str) -> bool {
+    let right_width = footer_right_width(Some(protocol));
     right_width > 0
         && area.width
             >= right_width
@@ -679,16 +632,10 @@ fn footer_right_fits(area: Rect, context: Option<&ContextDisplay>, protocol: Opt
                 .saturating_add(FOOTER_MIN_LEFT_WIDTH)
 }
 
-fn footer_right_width(context: Option<&ContextDisplay>, protocol: Option<&str>) -> u16 {
-    let context_width = context.map_or(0, |context| {
-        u16::try_from(UnicodeWidthStr::width(context.text.as_str())).unwrap_or(u16::MAX)
-    });
-    let protocol_width = protocol.map_or(0, |protocol| {
+fn footer_right_width(protocol: Option<&str>) -> u16 {
+    protocol.map_or(0, |protocol| {
         u16::try_from(UnicodeWidthStr::width(protocol)).unwrap_or(u16::MAX)
-    });
-    context_width
-        .saturating_add(protocol_width)
-        .saturating_add(u16::from(context_width > 0 && protocol_width > 0) * 3)
+    })
 }
 
 fn render_command_menu(
@@ -770,7 +717,7 @@ fn render_session_menu(
     );
 }
 
-fn render_fork_menu(area: Rect, points: &[ForkPoint], selected: usize, buffer: &mut Buffer) {
+fn render_fork_menu(area: Rect, points: &[ForkOption], selected: usize, buffer: &mut Buffer) {
     let prompt_width = usize::from(area.width).saturating_sub(MENU_PREFIX_COLUMNS);
     render_menu_rows(
         area,
@@ -853,7 +800,7 @@ fn menu_window(items_len: usize, selected: usize, max_visible: usize) -> Option<
 mod tests {
     use std::path::Path;
 
-    use ash_core::{MessageId, SessionId};
+    use ash_core::{SessionId, TurnId};
 
     use super::*;
     fn row_text(buffer: &Buffer, y: u16) -> String {
@@ -873,8 +820,8 @@ mod tests {
         text.trim_end().to_string()
     }
 
-    fn status_text(width: u16, header: &str, stats: Option<ash_core::TurnStats>) -> String {
-        let frame = render(ViewportInput {
+    fn status_text(width: u16, header: &str) -> String {
+        let frame = render_view(ViewportInput {
             terminal_width: width,
             terminal_height: 8,
             transcript: &[],
@@ -882,7 +829,6 @@ mod tests {
             busy: true,
             status_header: header,
             elapsed: "2s",
-            turn_stats: stats,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -890,8 +836,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -942,7 +886,7 @@ mod tests {
     #[test]
     fn places_status_composer_and_footer_after_short_content() {
         let blocks = [LiveBlock::assistant(1, "answer".to_string())];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
             transcript: &blocks,
@@ -950,7 +894,6 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "2s",
-            turn_stats: None,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -958,9 +901,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -982,45 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn full_render_uses_terminal_width_for_working_stats_breakpoint() {
-        let running = ash_core::TurnStats {
-            usage: ash_core::Usage {
-                input_tokens: 12_000,
-                output_tokens: 2_200,
-                tool_calls: 8,
-            },
-            generation_ms: 2_000,
-        };
-        let starting = ash_core::TurnStats {
-            generation_ms: 0,
-            ..running
-        };
-
-        let starting_wide = status_text(TURN_STATS_STATUS_WIDTH, "Working", Some(starting));
-        assert_eq!(
-            starting_wide,
-            "• Working (2s)  12.0k in / 2.2k out · 8 tools"
-        );
-        let running_wide = status_text(TURN_STATS_STATUS_WIDTH, "Working", Some(running));
-        assert_eq!(
-            running_wide,
-            "• Working (2s)  12.0k in / 2.2k out · 8 tools · 1100 tok/s"
-        );
-
-        let narrow = status_text(TURN_STATS_STATUS_WIDTH - 1, "Working", Some(running));
-        assert_eq!(narrow, "• Working (2s)");
-    }
-
-    #[test]
-    fn activity_without_turn_progress_omits_zero_stats() {
-        assert_eq!(
-            status_text(TURN_STATS_STATUS_WIDTH, "Working", None),
-            "• Working (2s)"
-        );
-        assert_eq!(
-            status_text(TURN_STATS_STATUS_WIDTH, "Compacting", None),
-            "• Compacting (2s)"
-        );
+    fn activity_status_shows_the_current_operation() {
+        assert_eq!(status_text(80, "Working"), "• Working (2s)");
+        assert_eq!(status_text(80, "Compacting"), "• Compacting (2s)");
     }
 
     #[test]
@@ -1031,24 +935,14 @@ mod tests {
                 root_id: ash_core::SessionId::new(),
                 name: "inspect_glob".to_string(),
                 state: SubagentViewState::Running,
-                usage: ash_core::Usage {
-                    input_tokens: 12_000,
-                    output_tokens: 2_200,
-                    tool_calls: 8,
-                },
             },
             SubagentView {
                 root_id: ash_core::SessionId::new(),
                 name: "fix_bash".to_string(),
                 state: SubagentViewState::Running,
-                usage: ash_core::Usage {
-                    input_tokens: 5_400,
-                    output_tokens: 700,
-                    tool_calls: 3,
-                },
             },
         ];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
             transcript: &blocks,
@@ -1056,7 +950,6 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "2s",
-            turn_stats: None,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1064,9 +957,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &subagents,
         });
@@ -1074,11 +964,7 @@ mod tests {
         assert_eq!(frame.viewport_height, 10);
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "› draft");
         assert!(row_text(&frame.buffer, 6).contains("inspect_glob"));
-        assert!(row_text(&frame.buffer, 6).contains("12.0k in / 2.2k out · 8 tools"));
-        assert!(!row_text(&frame.buffer, 6).contains("explorer"));
         assert!(row_text(&frame.buffer, 7).contains("fix_bash"));
-        assert!(row_text(&frame.buffer, 7).contains("5.4k in / 700 out · 3 tools"));
-        assert!(!row_text(&frame.buffer, 7).contains("worker"));
     }
 
     #[test]
@@ -1088,9 +974,8 @@ mod tests {
             root_id: ash_core::SessionId::new(),
             name: "inspect_glob".to_string(),
             state: SubagentViewState::Idle,
-            usage: ash_core::Usage::default(),
         }];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
             transcript: &blocks,
@@ -1098,7 +983,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1106,9 +990,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &subagents,
         });
@@ -1125,13 +1006,11 @@ mod tests {
                 root_id,
                 name: "idle".to_string(),
                 state: SubagentViewState::Idle,
-                usage: ash_core::Usage::default(),
             },
             SubagentView {
                 root_id,
                 name: "running".to_string(),
                 state: SubagentViewState::Running,
-                usage: ash_core::Usage::default(),
             },
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 38, 2));
@@ -1144,16 +1023,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_rows_hide_usage_before_truncating_names() {
+    fn subagent_rows_preserve_names_when_they_fit() {
         let agent = SubagentView {
             root_id: ash_core::SessionId::new(),
             name: "a_very_long_agent_name_that_would_hide_usage".to_string(),
             state: SubagentViewState::Idle,
-            usage: ash_core::Usage {
-                input_tokens: 12_000,
-                output_tokens: 700,
-                tool_calls: 3,
-            },
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 54, 1));
 
@@ -1161,7 +1035,6 @@ mod tests {
 
         let row = row_text(&buffer, 0);
         assert!(row.contains("a_very_long_agent_name_that_would_hide_usage"));
-        assert!(!row.contains("12.0k in / 700 out · 3 tools"));
     }
 
     #[test]
@@ -1172,7 +1045,6 @@ mod tests {
                 root_id,
                 name: format!("agent_{index}"),
                 state: SubagentViewState::Idle,
-                usage: ash_core::Usage::default(),
             })
             .collect::<Vec<_>>();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 5));
@@ -1203,7 +1075,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &["/".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 1,
@@ -1211,14 +1082,11 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         };
-        let baseline = render(input);
-        let frame = render(ViewportInput {
+        let baseline = render_view(input);
+        let frame = render_view(ViewportInput {
             menu: MenuView::Commands {
                 items: &menu,
                 selected: 1,
@@ -1265,7 +1133,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1273,14 +1140,11 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         };
-        let baseline = render(input);
-        let frame = render(ViewportInput {
+        let baseline = render_view(input);
+        let frame = render_view(ViewportInput {
             menu: MenuView::Sessions {
                 items: &sessions,
                 selected: 1,
@@ -1307,16 +1171,16 @@ mod tests {
     #[test]
     fn fork_picker_renders_prompts_as_single_lines() {
         let points = [
-            ForkPoint {
-                message_id: MessageId::new(),
+            ForkOption {
+                turn_id: TurnId::new(),
                 prompt: "latest prompt\ncontinued".to_string(),
             },
-            ForkPoint {
-                message_id: MessageId::new(),
+            ForkOption {
+                turn_id: TurnId::new(),
                 prompt: "older prompt".to_string(),
             },
         ];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 50,
             terminal_height: 10,
             transcript: &[],
@@ -1324,7 +1188,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1335,9 +1198,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1351,7 +1211,7 @@ mod tests {
         let mut reasoning = LiveBlock::reasoning(1);
         assert!(reasoning.append_reasoning_source("inspect first"));
         let blocks = [reasoning];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
             transcript: &blocks,
@@ -1359,7 +1219,6 @@ mod tests {
             busy: true,
             status_header: "Thinking",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1367,9 +1226,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1383,7 +1239,7 @@ mod tests {
             1,
             crate::history_block::HistoryBlock::info("restored output"),
         )];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 24,
             transcript: &blocks,
@@ -1391,7 +1247,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1399,9 +1254,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1420,7 +1272,7 @@ mod tests {
             LiveBlock::history(1, crate::history_block::HistoryBlock::user("hello")),
             LiveBlock::history(2, crate::history_block::HistoryBlock::info("after")),
         ];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 40,
             terminal_height: 16,
             transcript: &blocks,
@@ -1428,7 +1280,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1436,9 +1287,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1457,7 +1305,7 @@ mod tests {
             crate::history_block::HistoryBlock::info("before"),
         )];
         let prompt = ["one".to_string(), "two".to_string(), "three".to_string()];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 40,
             terminal_height: 16,
             transcript: &blocks,
@@ -1465,7 +1313,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &prompt,
             prompt_cursor_row: 2,
             prompt_cursor_column: 5,
@@ -1473,9 +1320,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1495,7 +1339,7 @@ mod tests {
         let prompt = (0..10)
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>();
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 40,
             terminal_height: 16,
             transcript: &[],
@@ -1503,7 +1347,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &prompt,
             prompt_cursor_row: 9,
             prompt_cursor_column: 6,
@@ -1511,9 +1354,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1535,7 +1375,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 40,
             terminal_height: 10,
             transcript: &blocks,
@@ -1543,7 +1383,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1551,9 +1390,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1578,7 +1414,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 40,
             terminal_height: 10,
             transcript: &blocks,
@@ -1586,7 +1422,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1594,9 +1429,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1605,24 +1437,6 @@ mod tests {
         assert_eq!(row_text(&frame.buffer, 0), "• entry 2");
         assert_eq!(row_text(&frame.buffer, 4), "• entry 4");
         assert_eq!(row_text(&frame.buffer, frame.cursor_row), "›");
-    }
-
-    #[test]
-    fn context_display_uses_only_the_bounded_percentage() {
-        let normal = context_display(Some(50), Some(100)).expect("context percentage");
-        assert_eq!(normal.text, "50%");
-        assert_eq!(normal.color, Color::Green);
-
-        let warning = context_display(Some(75), Some(100)).expect("context percentage");
-        assert_eq!(warning.text, "75%");
-        assert_eq!(warning.color, Color::Yellow);
-
-        let full = context_display(Some(101), Some(100)).expect("context percentage");
-        assert_eq!(full.text, "100%+");
-        assert_eq!(full.color, Color::Red);
-
-        assert!(context_display(Some(12_345), None).is_none());
-        assert!(context_display(Some(12_345), Some(0)).is_none());
     }
 
     #[test]
@@ -1667,7 +1481,7 @@ mod tests {
             .into_iter()
             .map(|group| group.source.len())
             .collect::<Vec<_>>();
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 16,
             transcript: &blocks,
@@ -1675,7 +1489,6 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1683,8 +1496,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });
@@ -1750,7 +1561,7 @@ mod tests {
             "read".to_string(),
             serde_json::json!({"path": "/workspace/src/inline.rs"}),
         )];
-        let frame = render(ViewportInput {
+        let frame = render_view(ViewportInput {
             terminal_width: 80,
             terminal_height: 8,
             transcript: &blocks,
@@ -1758,7 +1569,6 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "1s",
-            turn_stats: None,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1766,8 +1576,6 @@ mod tests {
             model: "mock",
             protocol: "openai",
             working_dir: Path::new("/tmp/ash"),
-            context_tokens: None,
-            context_limit: None,
             tools_expanded: false,
             subagents: &[],
         });

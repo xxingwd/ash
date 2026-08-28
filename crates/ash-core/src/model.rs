@@ -4,7 +4,7 @@ use derive_more::{Display, From, Into};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::{Message, ProtocolError, StopReason, ToolCallId, ToolDefinition};
+use crate::{ModelContext, ProtocolError, StopReason, ToolCallId, ToolDefinition};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, From, Into, Display)]
 pub struct ModelId(String);
@@ -24,17 +24,9 @@ impl ModelId {
 pub struct ModelRequest {
     pub model: ModelId,
     pub system: Option<String>,
-    pub messages: Vec<Message>,
+    pub context: ModelContext,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
-}
-
-/// Provider-reported token usage for one model request. A stream may split
-/// fields across reports or repeat cumulative snapshots.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ModelUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 /// Provider-neutral streaming event. Incremental by nature; only a terminal
@@ -48,7 +40,10 @@ pub enum ModelEvent {
         name: String,
         arguments: serde_json::Value,
     },
-    Usage(ModelUsage),
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     Stop(StopReason),
 }
 

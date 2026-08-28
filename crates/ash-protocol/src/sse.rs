@@ -12,7 +12,7 @@ pub trait Decoder: Send + 'static {
     fn decode(&mut self, data: &str) -> Result<DecodeResult, ProtocolError>;
 
     /// Consume all decoder state after EOF or a provider-specific wire close.
-    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError>;
+    fn finalize(self) -> Result<(Vec<ModelEvent>, Option<StopReason>), ProtocolError>;
 }
 
 #[derive(Default)]
@@ -31,7 +31,7 @@ impl StreamEventCounts {
             ModelEvent::Text(_) => self.text_deltas += 1,
             ModelEvent::Reasoning(_) => self.reasoning_deltas += 1,
             ModelEvent::ToolCall { .. } => self.tool_calls += 1,
-            ModelEvent::Usage(_) => self.usage_reports += 1,
+            ModelEvent::Usage { .. } => self.usage_reports += 1,
             ModelEvent::Stop(_) => self.stop_events += 1,
         }
     }
@@ -78,17 +78,19 @@ where
         }
 
         let (items, stop) = decoder.finalize()?;
-        let provider_terminated = stop != StopReason::Truncated;
+        let provider_terminated = stop.is_some();
         for item in items {
             validate_nonterminal(&item)?;
             log_model_event(&item);
             counts.observe(&item);
             yield item;
         }
-        let stop = ModelEvent::Stop(stop);
-        log_model_event(&stop);
-        counts.observe(&stop);
-        yield stop;
+        if let Some(stop) = stop {
+            let stop = ModelEvent::Stop(stop);
+            log_model_event(&stop);
+            counts.observe(&stop);
+            yield stop;
+        }
 
         tracing::debug!(
             frames = counts.frames,
@@ -202,17 +204,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_without_terminal_marker_reports_truncated() {
+    async fn eof_without_terminal_marker_has_no_stop() {
         let events =
             run_completions_stream("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
                 .await;
-        assert_eq!(
-            events,
-            vec![
-                ModelEvent::Text("hi".into()),
-                ModelEvent::Stop(StopReason::Truncated),
-            ]
-        );
+        assert_eq!(events, vec![ModelEvent::Text("hi".into())]);
     }
 
     #[tokio::test]
@@ -231,18 +227,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_marker_without_finish_reason_is_truncated() {
+    async fn done_marker_without_finish_reason_has_no_stop() {
         let events = run_completions_stream(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        assert_eq!(
-            events,
-            vec![
-                ModelEvent::Text("hi".into()),
-                ModelEvent::Stop(StopReason::Truncated),
-            ]
-        );
+        assert_eq!(events, vec![ModelEvent::Text("hi".into())]);
     }
 
     #[tokio::test]
@@ -258,10 +248,10 @@ mod tests {
             events,
             vec![
                 ModelEvent::Text("hi".into()),
-                ModelEvent::Usage(ash_core::ModelUsage {
+                ModelEvent::Usage {
                     input_tokens: 12,
                     output_tokens: 3,
-                }),
+                },
                 ModelEvent::Stop(StopReason::EndTurn),
             ]
         );
@@ -281,10 +271,10 @@ mod tests {
             events,
             vec![
                 ModelEvent::Text("hi".into()),
-                ModelEvent::Usage(ash_core::ModelUsage {
+                ModelEvent::Usage {
                     input_tokens: 12,
                     output_tokens: 3,
-                }),
+                },
                 ModelEvent::Stop(StopReason::EndTurn),
             ]
         );
@@ -310,20 +300,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_done_without_completed_is_truncated() {
+    async fn responses_done_without_completed_has_no_stop() {
         let events = run_responses_stream(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
              data: [DONE]\n\n",
         )
         .await;
 
-        assert_eq!(
-            events,
-            vec![
-                ModelEvent::Text("hi".into()),
-                ModelEvent::Stop(StopReason::Truncated),
-            ]
-        );
+        assert_eq!(events, vec![ModelEvent::Text("hi".into())]);
     }
 
     #[tokio::test]
@@ -355,10 +339,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            without_message_stop,
-            vec![ModelEvent::Stop(StopReason::Truncated)]
-        );
+        assert!(without_message_stop.is_empty());
         assert_eq!(
             with_message_stop,
             vec![ModelEvent::Stop(StopReason::EndTurn)]

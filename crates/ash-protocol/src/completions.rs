@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use ash_core::{ContentBlock, ProtocolError, StopReason};
+use ash_core::{Item, ProtocolError, Step, StopReason};
 use reqwest::Client;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    content_value, image_data_url, message_groups, model_config,
-    pending_calls::{build_usage, PendingCall},
-    project_request_messages, sse, text_tool_result, MessageGroup, ProviderConfig,
+    content_value, context_turns, image_data_url, model_config,
+    pending_calls::{usage_event, PendingCall},
+    sse, text_tool_result, ProviderConfig,
 };
 use ash_core::{ModelClient, ModelEvent, ModelRequest, ModelStream};
 
@@ -28,63 +28,17 @@ impl CompletionsAdapter {
     }
 
     fn build_request(req: &ModelRequest) -> Result<Value, ProtocolError> {
-        let projected = project_request_messages(req)?;
         let mut messages = Vec::new();
-        if let Some(system) = &projected.system {
+        if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
         }
-        for group in message_groups(&projected.messages) {
-            match group {
-                MessageGroup::User(contents) => {
-                    messages.push(json!({"role": "user", "content": chat_content(contents)}));
-                }
-                MessageGroup::Assistant(blocks) => {
-                    let mut text = String::new();
-                    let mut reasoning = String::new();
-                    let mut calls = Vec::new();
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text(t) => text.push_str(t),
-                            ContentBlock::Thought { text: r, .. } => reasoning.push_str(r),
-                            ContentBlock::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            } => calls.push(json!({
-                                "id": id.as_str(),
-                                "type": "function",
-                                "function": {"name": name, "arguments": arguments.to_string()},
-                            })),
-                        }
-                    }
-                    let mut value = json!({"role": "assistant", "content": text});
-                    if !reasoning.is_empty() {
-                        value["reasoning_content"] = json!(reasoning);
-                    }
-                    if !calls.is_empty() {
-                        value["tool_calls"] = json!(calls);
-                    }
-                    if !text.is_empty() || !reasoning.is_empty() || !calls.is_empty() {
-                        messages.push(value);
-                    }
-                }
-                MessageGroup::ToolResults(group) => {
-                    for result in &group.results {
-                        let output = text_tool_result(result.output, result.is_error);
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": result.id.as_str(),
-                            "content": output,
-                        }));
-                    }
-                    let attachments = group.attachments().collect::<Vec<_>>();
-                    if !attachments.is_empty() {
-                        messages.push(json!({
-                            "role": "user",
-                            "content": chat_attachments(&attachments),
-                        }));
-                    }
-                }
+        if let Some(summary) = req.context.summary() {
+            messages.push(json!({"role": "assistant", "content": summary}));
+        }
+        for (input, steps) in context_turns(&req.context) {
+            messages.push(json!({"role": "user", "content": chat_content(&input.content)}));
+            for step in steps {
+                push_step(&mut messages, step);
             }
         }
 
@@ -117,6 +71,58 @@ impl CompletionsAdapter {
         }
         model_config::apply_from_env(&mut body)?;
         Ok(body)
+    }
+}
+
+fn push_step(messages: &mut Vec<Value>, step: &Step) {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls = Vec::new();
+    for item in &step.items {
+        match item {
+            Item::Text(value) => text.push_str(value),
+            Item::Thought { text: value, .. } => reasoning.push_str(value),
+            Item::ToolCall(call) => calls.push(json!({
+                "id": call.id.as_str(),
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments.to_string()},
+            })),
+        }
+    }
+    let mut assistant = json!({"role": "assistant", "content": text});
+    if !reasoning.is_empty() {
+        assistant["reasoning_content"] = json!(reasoning);
+    }
+    if !calls.is_empty() {
+        assistant["tool_calls"] = json!(calls);
+    }
+    if !text.is_empty() || !reasoning.is_empty() || !calls.is_empty() {
+        messages.push(assistant);
+    }
+
+    let mut attachments = Vec::new();
+    for call in step.items.iter().filter_map(|item| match item {
+        Item::ToolCall(call) => Some(call),
+        Item::Text(_) | Item::Thought { .. } => None,
+    }) {
+        let (output, is_error) = match &call.result {
+            Ok(output) => {
+                attachments.extend(output.attachments.iter());
+                (output.text.as_str(), false)
+            }
+            Err(error) => (error.as_str(), true),
+        };
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id.as_str(),
+            "content": text_tool_result(output, is_error),
+        }));
+    }
+    if !attachments.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": chat_attachments(&attachments),
+        }));
     }
 }
 
@@ -194,10 +200,10 @@ impl sse::Decoder for CompletionsDecoder {
             .map_err(|error| ProtocolError::InvalidResponse(error.to_string()))?;
         let mut items = Vec::new();
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
-            items.push(ModelEvent::Usage(build_usage(
+            items.push(usage_event(
                 usage["prompt_tokens"].as_u64().unwrap_or(0),
                 usage["completion_tokens"].as_u64().unwrap_or(0),
-            )));
+            ));
         }
 
         let Some(choice) = chunk["choices"]
@@ -245,24 +251,24 @@ impl sse::Decoder for CompletionsDecoder {
         Ok(sse::DecodeResult::Continue(items))
     }
 
-    fn finalize(self) -> Result<(Vec<ModelEvent>, StopReason), ProtocolError> {
+    fn finalize(self) -> Result<(Vec<ModelEvent>, Option<StopReason>), ProtocolError> {
         let Self { calls, stop } = self;
         let Some(stop) = stop else {
-            return Ok((Vec::new(), StopReason::Truncated));
+            return Ok((Vec::new(), None));
         };
         let items = calls
             .into_values()
             .map(|call| call.finish("Chat Completions"))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((items, stop))
+        Ok((items, Some(stop)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sse::Decoder, Protocol};
-    use ash_core::{Content, ContentBlock, Message, ModelId, ToolCallId};
+    use crate::{sse::Decoder, test_support, Protocol};
+    use ash_core::{Content, Item, ToolCall, ToolCallId};
     use secrecy::SecretString;
 
     #[test]
@@ -288,7 +294,7 @@ mod tests {
                 arguments: json!({"command": "pwd"}),
             }]
         );
-        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(stop, Some(StopReason::EndTurn));
     }
 
     #[test]
@@ -300,7 +306,7 @@ mod tests {
 
         assert_eq!(
             decoder.finalize().unwrap().1,
-            StopReason::Other("content_filter".to_string())
+            Some(StopReason::Other("content_filter".to_string()))
         );
     }
 
@@ -357,26 +363,20 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::assistant(vec![
-                ContentBlock::Thought {
-                    text: "private reasoning".into(),
-                    elapsed_seconds: 2,
-                },
-                ContentBlock::Text("visible answer".into()),
-            ])],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![
+            Item::Thought {
+                text: "private reasoning".into(),
+                elapsed_seconds: 2,
+            },
+            Item::Text("visible answer".into()),
+        ]);
 
         let body = CompletionsAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["messages"][0]["role"], "assistant");
-        assert_eq!(body["messages"][0]["content"], "visible answer");
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(body["messages"][1]["content"], "visible answer");
         assert_eq!(
-            body["messages"][0]["reasoning_content"],
+            body["messages"][1]["reasoning_content"],
             "private reasoning"
         );
     }
@@ -391,27 +391,22 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::assistant(vec![
-                ContentBlock::Thought {
-                    text: "step reasoning".into(),
-                    elapsed_seconds: 2,
-                },
-                ContentBlock::ToolCall {
-                    id: ToolCallId::from_provider("call_1"),
-                    name: "bash".into(),
-                    arguments: serde_json::json!({"command": "pwd"}),
-                },
-            ])],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![
+            Item::Thought {
+                text: "step reasoning".into(),
+                elapsed_seconds: 2,
+            },
+            Item::ToolCall(ToolCall {
+                id: ToolCallId::from_provider("call_1"),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "pwd"}),
+                result: Ok(test_support::output("", Vec::new())),
+            }),
+        ]);
 
         let body = CompletionsAdapter::build_request(&request).unwrap();
 
-        let message = &body["messages"][0];
+        let message = &body["messages"][1];
         assert_eq!(message["role"], "assistant");
         assert_eq!(message["content"], "");
         assert_eq!(message["reasoning_content"], "step reasoning");
@@ -421,21 +416,14 @@ mod tests {
 
     #[test]
     fn preserves_text_only_tool_error_wire_format() {
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![Message::tool_result(
-                ToolCallId::from_provider("call"),
-                Err("permission denied".into()),
-                Vec::new(),
-            )],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+        let request = test_support::request(vec![test_support::tool_result(
+            "call",
+            Err("permission denied".into()),
+        )]);
 
         let body = CompletionsAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["messages"][0]["content"], "Error: permission denied");
+        assert_eq!(body["messages"][2]["content"], "Error: permission denied");
     }
 
     #[test]
@@ -445,30 +433,27 @@ mod tests {
             api_key: SecretString::from("test"),
             base_url: None,
         });
-        let request = ModelRequest {
-            model: ModelId::new("test"),
-            system: None,
-            messages: vec![
-                crate::test_support::tool_result("first", Vec::new()),
-                crate::test_support::tool_result(
+        let request = test_support::request(vec![
+            test_support::tool_result("first", Ok(test_support::output("first", Vec::new()))),
+            test_support::tool_result(
+                "second",
+                Ok(test_support::output(
                     "second",
                     vec![Content::Image {
                         media_type: "image/png".into(),
                         data: vec![1, 2, 3],
                     }],
-                ),
-            ],
-            tools: Vec::new(),
-            max_tokens: None,
-        };
+                )),
+            ),
+        ]);
 
         let body = CompletionsAdapter::build_request(&request).unwrap();
 
-        assert_eq!(body["messages"][0]["role"], "tool");
-        assert_eq!(body["messages"][1]["role"], "tool");
-        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][4]["role"], "user");
         assert_eq!(
-            body["messages"][2]["content"][0]["image_url"]["url"],
+            body["messages"][4]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AQID"
         );
     }

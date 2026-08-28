@@ -17,11 +17,10 @@ impl ActivityView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackgroundAction {
     ListSessions,
-    ListForkPoints,
     Resume,
     Fork,
     Compact,
-    Rollback,
+    Undo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,9 +129,8 @@ impl OperationState {
     }
 
     pub(crate) fn complete_turn(&mut self) {
-        let current = std::mem::take(&mut self.current);
-        if let Operation::Background(action) = current {
-            self.current = Operation::Background(action);
+        if matches!(self.current, Operation::Turn(_)) {
+            self.current = Operation::Idle;
         }
     }
 
@@ -243,14 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn rollback_is_a_background_action() {
+    fn undo_is_a_background_action() {
         let mut state = OperationState::default();
-        state.start_background(BackgroundAction::Rollback);
+        state.start_background(BackgroundAction::Undo);
 
         assert_eq!(state.submission_policy(), None);
         assert!(!state.shows_activity());
 
-        state.finish_background(BackgroundAction::Rollback);
+        state.finish_background(BackgroundAction::Undo);
         assert!(!state.is_busy());
     }
 }

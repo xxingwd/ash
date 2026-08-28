@@ -1,19 +1,19 @@
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use ash_core::{
-    CancellationToken, ContentBlock, LiveEvent, Message, ModelClient, ModelEvent, ModelRequest,
-    ModelStream, ModelUsage, SessionEventKind, SessionIdentity, StopReason, ToolCallId,
-    ToolContext, ToolDefinition, ToolError, ToolOutput, ToolTimeout, TurnStats, Usage,
+    AshError, CancellationToken, Conversation, Input, Item, ModelClient, ModelEvent, ModelRequest,
+    ModelStream, ProtocolError, SessionEvent, Step, StopReason, ToolCall, ToolCallId, ToolContext,
+    ToolError, ToolOutput, ToolTimeout, Turn, TurnId, TurnResult, TurnStats,
 };
 use futures::{future::join_all, StreamExt};
-use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::{
-    context::{
-        apply_summary, estimate_request_tokens, needs_compaction, plan_compaction,
-        prune_tool_outputs, summary_output_tokens,
-    },
-    log::{ContextCheckpoint, LogEntry},
+    context::{estimate_request_tokens, estimate_tokens, needs_compaction},
     Agent,
 };
 
@@ -23,332 +23,332 @@ const AGENT_OUTPUT_TRUNCATION_NOTICE: &str = "\n... tool output truncated by the
 const MAX_RETRIES: u32 = 5;
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(10);
-const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding sessions. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
+pub(crate) const COMPACTION_SYSTEM_PROMPT: &str = "You are an anchored context summarization assistant for coding sessions. Summarize only the supplied conversation history. Do not answer the conversation. Preserve exact technical details and respond in the conversation's language.";
 
-#[derive(Clone)]
-struct PendingToolCall {
-    id: ToolCallId,
-    name: String,
-    arguments: serde_json::Value,
+#[derive(Clone, Debug)]
+enum ContentBlock {
+    Text(String),
+    Thought {
+        text: String,
+        elapsed_seconds: u64,
+    },
+    ToolCall {
+        id: ToolCallId,
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
-/// What the turn loop should do after one model/tool step.
-enum Step {
-    More,
-    Done(StopReason),
+enum ModelResponse {
+    Stopped {
+        content: Vec<ContentBlock>,
+        reason: StopReason,
+        stats: TurnStats,
+    },
+    Truncated {
+        content: Vec<ContentBlock>,
+        stats: TurnStats,
+    },
+    Cancelled {
+        stats: TurnStats,
+    },
+    Failed {
+        error: ProtocolError,
+        stats: TurnStats,
+    },
 }
 
-/// How a step responds to a retryable model failure.
-enum RetryAction {
-    /// Ready to re-issue the request.
-    Retry,
-    /// Cancelled during the backoff; the turn must abort.
-    Abort,
-}
-
-struct CollectedResponse {
-    message: Option<Message>,
-    usage: Usage,
-    generation_ms: u64,
-    outcome: ResponseOutcome,
-}
-
-enum ResponseOutcome {
-    Finished(StopReason),
-    ToolCalls(Vec<PendingToolCall>),
-    Cancelled,
-    Failed(ash_core::ProtocolError),
-}
-
-enum StreamExit {
-    Exhausted,
-    Cancelled,
-    Failed(ash_core::ProtocolError),
-}
-
-#[derive(Clone, Copy)]
-enum OpenResponseBlock {
-    Thought,
-    Text,
-}
-
-#[derive(Debug)]
-pub(crate) struct CompactedContext {
-    pub(crate) messages: Vec<Message>,
-    pub(crate) update: ash_core::ContextUpdate,
+impl ModelResponse {
+    const fn stats(&self) -> TurnStats {
+        match self {
+            Self::Stopped { stats, .. }
+            | Self::Truncated { stats, .. }
+            | Self::Cancelled { stats }
+            | Self::Failed { stats, .. } => *stats,
+        }
+    }
 }
 
 pub(crate) struct EngineOutcome {
-    pub(crate) entries: Vec<LogEntry>,
-    pub(crate) result: Result<StopReason, ash_core::AshError>,
-    pub(crate) stats: TurnStats,
+    pub(crate) turn: Arc<Turn>,
+    pub(crate) summary: Option<String>,
+    pub(crate) error: Option<AshError>,
 }
 
-struct AgentTurnRunner<'a> {
-    agent: &'a Agent,
-    tx: mpsc::Sender<SessionEventKind>,
-    cancel: CancellationToken,
-    identity: SessionIdentity,
-    model: &'a dyn ModelClient,
-    tool_defs: Vec<ToolDefinition>,
-    entries: Vec<LogEntry>,
-    stats: TurnStats,
-}
-
-pub(crate) async fn run_agent_turn(
+pub(crate) async fn run_turn(
     model: &dyn ModelClient,
     agent: &Agent,
-    messages: &mut Vec<Message>,
-    identity: SessionIdentity,
-    tx: mpsc::Sender<SessionEventKind>,
-    cancel: CancellationToken,
+    conversation: &Conversation,
+    id: TurnId,
+    input: Input,
+    events: mpsc::Sender<SessionEvent>,
+    context: ToolContext,
 ) -> EngineOutcome {
-    AgentTurnRunner::new(agent, model, identity, tx, cancel)
-        .run(messages)
-        .await
+    TurnRunner {
+        model,
+        agent,
+        conversation,
+        id,
+        input,
+        events,
+        context,
+        steps: Vec::new(),
+        stats: TurnStats::default(),
+        pending_summary: None,
+    }
+    .run()
+    .await
 }
 
-impl<'a> AgentTurnRunner<'a> {
-    fn new(
-        agent: &'a Agent,
-        model: &'a dyn ModelClient,
-        identity: SessionIdentity,
-        tx: mpsc::Sender<SessionEventKind>,
-        cancel: CancellationToken,
-    ) -> Self {
-        let tool_defs = agent.tool_definitions();
-        Self {
-            agent,
-            tx,
-            cancel,
-            identity,
-            model,
-            tool_defs,
-            entries: Vec::new(),
-            stats: TurnStats::default(),
-        }
-    }
+struct TurnRunner<'a> {
+    model: &'a dyn ModelClient,
+    agent: &'a Agent,
+    conversation: &'a Conversation,
+    id: TurnId,
+    input: Input,
+    events: mpsc::Sender<SessionEvent>,
+    context: ToolContext,
+    steps: Vec<Step>,
+    stats: TurnStats,
+    pending_summary: Option<String>,
+}
 
-    async fn run(mut self, messages: &mut Vec<Message>) -> EngineOutcome {
-        let result = self.run_result(messages).await;
+impl TurnRunner<'_> {
+    async fn run(mut self) -> EngineOutcome {
+        let (result, error) = self.run_loop().await;
         EngineOutcome {
-            entries: self.entries,
-            result,
-            stats: self.stats,
+            turn: Arc::new(Turn {
+                id: self.id,
+                input: self.input,
+                steps: self.steps,
+                result,
+                stats: self.stats,
+            }),
+            summary: self.pending_summary,
+            error,
         }
     }
 
-    async fn run_result(
-        &mut self,
-        messages: &mut Vec<Message>,
-    ) -> Result<StopReason, ash_core::AshError> {
+    async fn run_loop(&mut self) -> (TurnResult, Option<AshError>) {
         loop {
-            if self.cancel.is_cancelled() {
-                return Ok(StopReason::Aborted);
+            if self.context.cancellation.is_cancelled() {
+                return (TurnResult::Cancelled, None);
             }
-            debug!("calling LLM");
-            if let Step::Done(reason) = self.step(messages).await? {
-                return Ok(reason);
-            }
-        }
-    }
-
-    /// Run one model call plus any tool calls it produced.
-    /// Returns `Step::More` to continue the turn or `Step::Done` to stop it.
-    ///
-    /// Safe failures (network errors, upstream 5xx, rate limits, truncated
-    /// streams) are retried up to `MAX_RETRIES` times. A retry is only
-    /// taken before any tool call was executed: the partial output is
-    /// discarded and the identical request is re-issued, so retries never
-    /// repeat side effects.
-    async fn step(&mut self, messages: &mut Vec<Message>) -> Result<Step, ash_core::AshError> {
-        let mut retries = 0u32;
-        loop {
-            self.prepare_context(messages).await?;
-
-            let mut stream = self.model.stream(ModelRequest {
-                model: self.agent.model().clone(),
-                system: self.agent.system_prompt().map(str::to_string),
-                messages: messages.clone(),
-                tools: self.tool_defs.clone(),
-                max_tokens: None,
-            })?;
-            let CollectedResponse {
-                message,
-                usage,
-                generation_ms,
-                outcome,
-            } = collect_response(&mut stream, Some(&self.tx), &self.cancel, self.stats).await;
-
-            let request_stats = TurnStats {
-                usage,
-                generation_ms,
-            };
-            self.stats = self.stats.saturating_add(request_stats);
-            send_progress(&self.tx, self.stats);
-
-            // Retry only safe, retryable failures before any side effect.
-            // A truncated stream produced no terminal marker from the
-            // provider; without tool calls the request is idempotent, so
-            // re-issuing it is safe. Other failures retry only when the
-            // transport itself is the likely culprit.
-            let retry = match &outcome {
-                ResponseOutcome::Failed(error) => retryable(error),
-                ResponseOutcome::Finished(StopReason::Truncated) => true,
-                _ => false,
-            };
-            match self.maybe_retry(&mut retries, retry).await {
-                Some(RetryAction::Abort) => return Ok(Step::Done(StopReason::Aborted)),
-                Some(RetryAction::Retry) => continue,
-                None => {}
+            if let Err(error) = self.prepare_context().await {
+                return match error {
+                    AshError::Cancelled => (TurnResult::Cancelled, None),
+                    error => (TurnResult::Failed(error.to_string()), Some(error)),
+                };
             }
 
-            if let Some(message) = message {
-                self.record_message(messages, message);
-            }
-
-            return self.finish_outcome(messages, outcome).await;
-        }
-    }
-
-    /// Retry a safe, retryable model failure before any tool side effect.
-    /// Cancellation during the backoff aborts the turn.
-    async fn maybe_retry(&mut self, retries: &mut u32, retry: bool) -> Option<RetryAction> {
-        if !retry || *retries >= MAX_RETRIES {
-            return None;
-        }
-        let delay = retry_delay(*retries, RETRY_BASE, RETRY_MAX);
-        debug!(
-            retries = *retries,
-            ?delay,
-            "retrying model call after retryable failure"
-        );
-        tokio::select! {
-            () = self.cancel.cancelled() => return Some(RetryAction::Abort),
-            () = tokio::time::sleep(delay) => {}
-        }
-        *retries += 1;
-        Some(RetryAction::Retry)
-    }
-
-    /// Consume the response outcome into the next step or a terminal error.
-    async fn finish_outcome(
-        &mut self,
-        messages: &mut Vec<Message>,
-        outcome: ResponseOutcome,
-    ) -> Result<Step, ash_core::AshError> {
-        match outcome {
-            ResponseOutcome::Failed(error) => Err(error.into()),
-            ResponseOutcome::Cancelled => Ok(Step::Done(StopReason::Aborted)),
-            ResponseOutcome::ToolCalls(calls) => {
-                self.execute_tool_calls(messages, calls).await;
-                if self.cancel.is_cancelled() {
-                    return Ok(Step::Done(StopReason::Aborted));
+            let mut retries = 0;
+            let response = loop {
+                debug!(turn_id = %self.id, "calling model");
+                let response = match self.model.stream(self.request()) {
+                    Ok(mut stream) => {
+                        collect_response(
+                            &mut stream,
+                            Some((&self.events, self.id)),
+                            &self.context.cancellation,
+                        )
+                        .await
+                    }
+                    Err(error) => ModelResponse::Failed {
+                        error,
+                        stats: TurnStats::default(),
+                    },
+                };
+                let retry = matches!(&response, ModelResponse::Truncated { .. })
+                    || matches!(&response, ModelResponse::Failed { error, .. } if retryable(error));
+                self.stats = self.stats.saturating_add(response.stats());
+                if !retry || retries >= MAX_RETRIES {
+                    break response;
                 }
-                Ok(Step::More)
+                let delay = retry_delay(retries, RETRY_BASE, RETRY_MAX);
+                debug!(turn_id = %self.id, retries, ?delay, "retrying model call");
+                tokio::select! {
+                    biased;
+                    () = self.context.cancellation.cancelled() => {
+                        return (TurnResult::Cancelled, None);
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+                retries += 1;
+            };
+
+            match response {
+                ModelResponse::Cancelled { .. } => return (TurnResult::Cancelled, None),
+                ModelResponse::Failed { error, .. } => {
+                    let error: AshError = error.into();
+                    return (TurnResult::Failed(error.to_string()), Some(error));
+                }
+                ModelResponse::Truncated { content, .. } => {
+                    self.push_without_tools(content);
+                    return (TurnResult::Truncated, None);
+                }
+                ModelResponse::Stopped {
+                    content,
+                    reason,
+                    stats: _,
+                } => {
+                    if reason != StopReason::EndTurn || !has_tool_calls(&content) {
+                        self.push_without_tools(content);
+                        return (TurnResult::Stopped(reason), None);
+                    }
+                    let step = self.execute_tools(content).await;
+                    if !step.items.is_empty() {
+                        self.steps.push(step);
+                    }
+                    if self.context.cancellation.is_cancelled() {
+                        return (TurnResult::Cancelled, None);
+                    }
+                }
             }
-            ResponseOutcome::Finished(reason) => Ok(Step::Done(reason)),
         }
     }
 
-    async fn prepare_context(
-        &mut self,
-        messages: &mut Vec<Message>,
-    ) -> Result<(), ash_core::AshError> {
-        if let Some(pruned) = prune_tool_outputs(messages) {
-            *messages = pruned;
+    fn request(&self) -> ModelRequest {
+        ModelRequest {
+            model: self.agent.model().clone(),
+            system: self.agent.system_prompt().map(str::to_string),
+            context: self.model_context(),
+            tools: self.agent.tool_definitions(),
+            max_tokens: None,
         }
-        let mut estimated_input_tokens =
-            estimate_request_tokens(self.agent.system_prompt(), messages, &self.tool_defs);
-        let update = if needs_compaction(estimated_input_tokens, self.agent.max_context_tokens()) {
-            let (result, stats) =
-                compact_context(self.agent, messages, self.model, &self.cancel).await;
-            self.stats = self.stats.saturating_add(stats);
-            if stats != TurnStats::default() {
-                send_progress(&self.tx, self.stats);
-            }
-            match result? {
-                Some(compacted) => {
-                    estimated_input_tokens =
-                        usize::try_from(compacted.update.after_tokens).unwrap_or(usize::MAX);
-                    *messages = compacted.messages;
-                    Some(compacted.update)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        send_live(
-            &self.tx,
-            SessionEventKind::ContextChanged {
-                tokens: sat_u64(estimated_input_tokens),
-            },
+    }
+
+    fn model_context(&self) -> ash_core::ModelContext {
+        self.pending_summary
+            .as_ref()
+            .map_or_else(
+                || self.conversation.context(),
+                |summary| self.conversation.context_with_summary(summary),
+            )
+            .with_current(self.input.clone(), self.steps.clone())
+    }
+
+    async fn prepare_context(&mut self) -> Result<(), AshError> {
+        if self.pending_summary.is_some() {
+            return Ok(());
+        }
+        let tools = self.agent.tool_definitions();
+        let before =
+            estimate_request_tokens(self.agent.system_prompt(), &self.model_context(), &tools);
+        if !needs_compaction(before, self.agent.max_context_tokens()) {
+            return Ok(());
+        }
+        let Some((summary, stats)) = compact(
+            self.model,
+            self.agent,
+            self.conversation,
+            &self.context.cancellation,
         )
-        .await;
-        let Some(update) = update else {
+        .await?
+        else {
             return Ok(());
         };
-        self.entries
-            .push(LogEntry::Checkpoint(ContextCheckpoint::from_model_context(
-                messages,
-            )?));
-        send_live(&self.tx, SessionEventKind::ContextCompacted(update)).await;
+        self.stats = self.stats.saturating_add(stats);
+        let after = estimate_request_tokens(
+            self.agent.system_prompt(),
+            &self
+                .conversation
+                .context_with_summary(&summary)
+                .with_current(self.input.clone(), self.steps.clone()),
+            &tools,
+        );
+        if after < before {
+            self.pending_summary = Some(summary);
+        }
         Ok(())
     }
 
-    fn record_message(&mut self, messages: &mut Vec<Message>, message: Message) {
-        self.entries.push(LogEntry::Message(message.clone()));
-        messages.push(message);
-    }
-
-    /// Run one model response's calls concurrently against the same context.
-    /// `join_all` preserves provider order for the durable tool-result messages.
-    async fn execute_tool_calls(
-        &mut self,
-        messages: &mut Vec<Message>,
-        calls: Vec<PendingToolCall>,
-    ) {
-        self.stats.usage.tool_calls = self
-            .stats
-            .usage
-            .tool_calls
-            .saturating_add(sat_u64(calls.len()));
-        send_progress(&self.tx, self.stats);
-
-        let results = join_all(calls.into_iter().map(|call| self.execute_tool_call(call))).await;
-
-        for message in results {
-            self.record_message(messages, message);
+    fn push_without_tools(&mut self, content: Vec<ContentBlock>) {
+        let items = content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(Item::Text(text)),
+                ContentBlock::Thought {
+                    text,
+                    elapsed_seconds,
+                } => Some(Item::Thought {
+                    text,
+                    elapsed_seconds,
+                }),
+                ContentBlock::ToolCall { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            self.steps.push(Step { items });
         }
     }
 
-    async fn execute_tool_call(&self, call: PendingToolCall) -> Message {
-        send_live(
-            &self.tx,
-            SessionEventKind::Live(LiveEvent::ToolStarted {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            }),
+    async fn execute_tools(&self, content: Vec<ContentBlock>) -> Step {
+        let calls = content.iter().filter_map(|block| match block {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
+        });
+        let results = join_all(
+            calls.map(|(id, name, arguments)| self.execute_tool_call(id, name, arguments)),
         )
         .await;
-        let result = limit_tool_result(self.execute_tool(&call.name, call.arguments.clone()).await);
-        let (result, attachments) = match result {
-            Ok(ToolOutput { text, attachments }) => (Ok(text), attachments),
-            Err(error) => (Err(error.to_string()), Vec::new()),
-        };
-        send_live(
-            &self.tx,
-            SessionEventKind::Live(LiveEvent::ToolFinished {
-                id: call.id.clone(),
-                name: call.name,
-                arguments: call.arguments,
-                result: result.clone(),
-            }),
+        let mut results = results.into_iter();
+        let items = content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(Item::Text(text)),
+                ContentBlock::Thought {
+                    text,
+                    elapsed_seconds,
+                } => Some(Item::Thought {
+                    text,
+                    elapsed_seconds,
+                }),
+                ContentBlock::ToolCall { .. } => results.next().map(Item::ToolCall),
+            })
+            .collect();
+        Step { items }
+    }
+
+    async fn execute_tool_call(
+        &self,
+        id: ToolCallId,
+        name: String,
+        arguments: serde_json::Value,
+    ) -> ToolCall {
+        send_event(
+            &self.events,
+            SessionEvent::ToolStarted {
+                turn_id: self.id,
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
         )
         .await;
-        Message::tool_result(call.id, result, attachments)
+        let result = limit_tool_result(self.execute_tool(&name, arguments.clone()).await)
+            .map_err(|error| error.to_string());
+        send_event(
+            &self.events,
+            SessionEvent::ToolFinished {
+                turn_id: self.id,
+                id: id.clone(),
+                result: result
+                    .as_ref()
+                    .map(|output| output.text.clone())
+                    .map_err(Clone::clone),
+            },
+        )
+        .await;
+        ToolCall {
+            id,
+            name,
+            arguments,
+            result,
+        }
     }
 
     async fn execute_tool(
@@ -364,8 +364,8 @@ impl<'a> AgentTurnRunner<'a> {
             ToolTimeout::Disabled => None,
         };
         let context = ToolContext {
-            identity: self.identity,
-            cancellation: self.cancel.clone(),
+            identity: self.context.identity,
+            cancellation: self.context.cancellation.clone(),
             deadline: timeout.map(|timeout| Instant::now() + timeout),
         };
         context
@@ -374,188 +374,141 @@ impl<'a> AgentTurnRunner<'a> {
     }
 }
 
-pub(crate) async fn compact_context(
-    agent: &Agent,
-    messages: &[Message],
+pub(crate) async fn compact(
     model: &dyn ModelClient,
-    cancel: &CancellationToken,
-) -> (
-    Result<Option<CompactedContext>, ash_core::AshError>,
-    TurnStats,
-) {
-    let tools = agent.tool_definitions();
-    let before_tokens = estimate_request_tokens(agent.system_prompt(), messages, &tools);
-    let Some(plan) = plan_compaction(messages, agent.max_context_tokens()) else {
-        return (Ok(None), TurnStats::default());
+    agent: &Agent,
+    conversation: &Conversation,
+    cancellation: &CancellationToken,
+) -> Result<Option<(String, TurnStats)>, AshError> {
+    let Some(prompt) = conversation.compact_prompt() else {
+        return Ok(None);
     };
-    let summary_messages = vec![Message::user(&plan.summary_prompt)];
-    let mut stream = match model.stream(ModelRequest {
+    if estimate_tokens(COMPACTION_SYSTEM_PROMPT).saturating_add(estimate_tokens(&prompt))
+        > agent.max_context_tokens()
+    {
+        return Err(ProtocolError::InvalidRequest(
+            "conversation is too large to compact without dropping history".to_string(),
+        )
+        .into());
+    }
+    let mut stream = model.stream(ModelRequest {
         model: agent.model().clone(),
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-        messages: summary_messages,
+        context: ash_core::ModelContext::default().with_current(Input::user(prompt), Vec::new()),
         tools: Vec::new(),
-        max_tokens: Some(summary_output_tokens(agent.max_context_tokens())),
-    }) {
-        Ok(stream) => stream,
-        Err(error) => return (Err(error.into()), TurnStats::default()),
-    };
-    let response = collect_response(&mut stream, None, cancel, TurnStats::default()).await;
-    let stats = TurnStats {
-        usage: response.usage,
-        generation_ms: response.generation_ms,
-    };
-    let result = match response.outcome {
-        ResponseOutcome::Cancelled => Err(ash_core::AshError::Cancelled),
-        ResponseOutcome::Failed(error) => Err(error.into()),
-        ResponseOutcome::ToolCalls(_) => Err(ash_core::ProtocolError::InvalidResponse(
-            "compaction model unexpectedly requested a tool".to_string(),
-        )
-        .into()),
-        ResponseOutcome::Finished(reason) if reason != StopReason::EndTurn => {
-            Err(ash_core::ProtocolError::InvalidResponse(format!(
-                "compaction model stopped before completing the summary: {reason}"
-            ))
-            .into())
-        }
-        ResponseOutcome::Finished(_) => {
-            let summary = response
-                .message
-                .as_ref()
-                .and_then(Message::visible_text)
-                .unwrap_or_default();
+        max_tokens: None,
+    })?;
+    match collect_response(&mut stream, None, cancellation).await {
+        ModelResponse::Stopped {
+            content,
+            reason: StopReason::EndTurn,
+            stats,
+        } if !has_tool_calls(&content) => {
+            let summary = content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) if !text.trim().is_empty() => Some(text.as_str()),
+                    ContentBlock::Text(_)
+                    | ContentBlock::Thought { .. }
+                    | ContentBlock::ToolCall { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             if summary.trim().is_empty() {
-                Err(ash_core::ProtocolError::InvalidResponse(
+                return Err(ProtocolError::InvalidResponse(
                     "compaction model returned an empty summary".to_string(),
                 )
-                .into())
-            } else {
-                let compacted_messages = apply_summary(&summary, plan.tail);
-                let after_tokens =
-                    estimate_request_tokens(agent.system_prompt(), &compacted_messages, &tools);
-                if after_tokens >= before_tokens {
-                    Ok(None)
-                } else {
-                    Ok(Some(CompactedContext {
-                        messages: compacted_messages,
-                        update: ash_core::ContextUpdate {
-                            before_tokens: sat_u64(before_tokens),
-                            after_tokens: sat_u64(after_tokens),
-                            dropped_messages: sat_u64(plan.compacted_messages),
-                        },
-                    }))
-                }
+                .into());
             }
+            Ok(Some((summary, stats)))
         }
-    };
-    (result, stats)
-}
-
-/// Send one live event to the session actor. A closed receiver means the
-/// session is shutting down (or already gone): the turn keeps running to a
-/// result, but its streaming preview has nowhere to go. Log instead of
-/// failing the turn silently.
-async fn send_live(tx: &mpsc::Sender<SessionEventKind>, kind: SessionEventKind) {
-    if let Err(error) = tx.send(kind).await {
-        tracing::warn!(%error, "dropping live event: session event receiver closed");
-    }
-}
-
-/// Progress is an ephemeral full snapshot. Dropping one under backpressure is
-/// safe because the next snapshot or the durable TurnCompleted event converges.
-fn send_progress(tx: &mpsc::Sender<SessionEventKind>, stats: TurnStats) {
-    match tx.try_send(SessionEventKind::TurnProgress(stats)) {
-        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::warn!("dropping turn progress: session event receiver closed");
-        }
+        ModelResponse::Stopped { reason, .. } => Err(ProtocolError::InvalidResponse(format!(
+            "compaction model stopped before completing the summary: {reason}"
+        ))
+        .into()),
+        ModelResponse::Truncated { .. } => Err(ProtocolError::InvalidResponse(
+            "compaction model returned a truncated summary".to_string(),
+        )
+        .into()),
+        ModelResponse::Cancelled { .. } => Err(AshError::Cancelled),
+        ModelResponse::Failed { error, .. } => Err(error.into()),
     }
 }
 
 async fn collect_response(
     stream: &mut ModelStream,
-    tx: Option<&mpsc::Sender<SessionEventKind>>,
-    cancel: &CancellationToken,
-    settled_stats: TurnStats,
-) -> CollectedResponse {
+    events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
+    cancellation: &CancellationToken,
+) -> ModelResponse {
     let mut accumulator = ResponseAccumulator::new();
-    let stream_exit = loop {
+    loop {
         let next = tokio::select! {
-            () = cancel.cancelled() => break StreamExit::Cancelled,
+            biased;
+            () = cancellation.cancelled() => return accumulator.cancelled(),
             next = stream.next() => next,
         };
         let Some(item) = next else {
-            break StreamExit::Exhausted;
+            return accumulator.finish();
         };
-        let item = match item {
-            Ok(item) => item,
-            Err(error) => break StreamExit::Failed(error),
-        };
-        if accumulator.apply(tx, item).await {
-            if let Some(tx) = tx {
-                accumulator.publish_progress(tx, settled_stats);
-            }
+        match item {
+            Ok(item) => accumulator.apply(events, item).await,
+            Err(error) => return accumulator.failed(error),
         }
-    };
-    accumulator.finish(stream_exit)
+    }
 }
 
-/// Incremental state accumulated while reading one model stream.
 struct ResponseAccumulator {
-    blocks: Vec<ContentBlock>,
+    content: Vec<ContentBlock>,
     thought_started_at: Option<Instant>,
     first_output_at: Option<Instant>,
-    stop_reason: Option<StopReason>,
-    usage: Usage,
-    open_block: Option<OpenResponseBlock>,
+    stop: Option<StopReason>,
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 impl ResponseAccumulator {
     fn new() -> Self {
         Self {
-            blocks: Vec::new(),
+            content: Vec::new(),
             thought_started_at: None,
             first_output_at: None,
-            stop_reason: None,
-            usage: Usage::default(),
-            open_block: None,
+            stop: None,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
-    /// Fold one stream item into the accumulator, forwarding live deltas.
-    /// Returns whether provider-reported usage changed.
     async fn apply(
         &mut self,
-        tx: Option<&mpsc::Sender<SessionEventKind>>,
-        item: ModelEvent,
-    ) -> bool {
-        let previous_usage = self.usage;
-        match item {
-            ModelEvent::Text(delta) => {
+        events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
+        event: ModelEvent,
+    ) {
+        match event {
+            ModelEvent::Text(text) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
-                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
-                match self.blocks.last_mut() {
-                    Some(ContentBlock::Text(text)) => text.push_str(&delta),
-                    _ => self.blocks.push(ContentBlock::Text(delta.clone())),
+                self.finish_thought();
+                match self.content.last_mut() {
+                    Some(ContentBlock::Text(existing)) => existing.push_str(&text),
+                    _ => self.content.push(ContentBlock::Text(text.clone())),
                 }
-                self.open_block = Some(OpenResponseBlock::Text);
-                if let Some(tx) = tx {
-                    send_live(tx, SessionEventKind::Live(LiveEvent::TextDelta(delta))).await;
+                if let Some((events, turn_id)) = events {
+                    send_event(events, SessionEvent::Text { turn_id, text }).await;
                 }
             }
-            ModelEvent::Reasoning(delta) => {
+            ModelEvent::Reasoning(text) => {
                 self.first_output_at.get_or_insert_with(Instant::now);
-                if let Some(ContentBlock::Thought { text, .. }) = self.blocks.last_mut() {
-                    text.push_str(&delta);
-                } else {
-                    self.thought_started_at = Some(Instant::now());
-                    self.blocks.push(ContentBlock::Thought {
-                        text: delta.clone(),
-                        elapsed_seconds: 0,
-                    });
+                match self.content.last_mut() {
+                    Some(ContentBlock::Thought { text: existing, .. }) => existing.push_str(&text),
+                    _ => {
+                        self.thought_started_at = Some(Instant::now());
+                        self.content.push(ContentBlock::Thought {
+                            text: text.clone(),
+                            elapsed_seconds: 0,
+                        });
+                    }
                 }
-                self.open_block = Some(OpenResponseBlock::Thought);
-                if let Some(tx) = tx {
-                    send_live(tx, SessionEventKind::Live(LiveEvent::ReasoningDelta(delta))).await;
+                if let Some((events, turn_id)) = events {
+                    send_event(events, SessionEvent::Thought { turn_id, text }).await;
                 }
             }
             ModelEvent::ToolCall {
@@ -564,191 +517,118 @@ impl ResponseAccumulator {
                 arguments,
             } => {
                 self.first_output_at.get_or_insert_with(Instant::now);
-                let block = ContentBlock::ToolCall {
+                self.finish_thought();
+                self.content.push(ContentBlock::ToolCall {
                     id,
                     name,
                     arguments,
-                };
-                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
-                self.open_block = None;
-                self.blocks.push(block);
+                });
             }
-            ModelEvent::Usage(reported) => {
-                self.usage = merge_request_usage(self.usage, reported);
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                self.input_tokens = self.input_tokens.max(input_tokens);
+                self.output_tokens = self.output_tokens.max(output_tokens);
             }
             ModelEvent::Stop(reason) => {
-                finish_open_thought(&mut self.blocks, &mut self.thought_started_at);
-                self.open_block = None;
-                self.stop_reason = Some(reason);
+                self.finish_thought();
+                self.stop = Some(reason);
             }
         }
-        self.usage != previous_usage
     }
 
-    fn publish_progress(&self, tx: &mpsc::Sender<SessionEventKind>, settled_stats: TurnStats) {
-        let request_stats = TurnStats {
-            usage: self.usage,
+    fn finish(mut self) -> ModelResponse {
+        self.finish_thought();
+        let stats = self.stats();
+        match self.stop {
+            Some(reason) => ModelResponse::Stopped {
+                content: self.content,
+                reason,
+                stats,
+            },
+            None => {
+                self.content
+                    .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+                ModelResponse::Truncated {
+                    content: self.content,
+                    stats,
+                }
+            }
+        }
+    }
+
+    fn cancelled(mut self) -> ModelResponse {
+        self.finish_thought();
+        ModelResponse::Cancelled {
+            stats: self.stats(),
+        }
+    }
+
+    fn failed(mut self, error: ProtocolError) -> ModelResponse {
+        self.finish_thought();
+        ModelResponse::Failed {
+            error,
+            stats: self.stats(),
+        }
+    }
+
+    fn stats(&self) -> TurnStats {
+        TurnStats {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
             generation_ms: elapsed_generation_ms(self.first_output_at),
+        }
+    }
+
+    fn finish_thought(&mut self) {
+        let Some(started) = self.thought_started_at.take() else {
+            return;
         };
-        let stats = settled_stats.saturating_add(request_stats);
-        send_progress(tx, stats);
-    }
-
-    /// Finalize the accumulated blocks into a response, applying truncation
-    /// and cancellation rules and extracting pending tool calls.
-    fn finish(self, stream_exit: StreamExit) -> CollectedResponse {
-        let Self {
-            mut blocks,
-            mut thought_started_at,
-            first_output_at,
-            stop_reason,
-            usage,
-            open_block,
-        } = self;
-        if matches!(stream_exit, StreamExit::Cancelled) {
-            discard_open_block(&mut blocks, open_block, &mut thought_started_at);
-        } else {
-            finish_open_thought(&mut blocks, &mut thought_started_at);
-        }
-
-        // Defense in depth for truncated streams: the protocol adapters emit
-        // `Stop(Truncated)` when a stream ends without a terminal marker, but any
-        // stream that simply runs out without ever signalling a stop is treated
-        // as truncated here rather than as a clean `EndTurn`.
-        let exhausted = matches!(stream_exit, StreamExit::Exhausted);
-        let accepts_tools = exhausted && matches!(stop_reason.as_ref(), Some(StopReason::EndTurn));
-        if !accepts_tools {
-            blocks.retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
-        }
-        let calls = if accepts_tools {
-            pending_tool_calls(&blocks)
-        } else {
-            Vec::new()
-        };
-        let outcome = response_action(stream_exit, calls, stop_reason);
-        let message = (exhausted && !blocks.is_empty()).then(|| Message::assistant(blocks));
-
-        CollectedResponse {
-            message,
-            usage,
-            generation_ms: elapsed_generation_ms(first_output_at),
-            outcome,
+        if let Some(ContentBlock::Thought {
+            elapsed_seconds, ..
+        }) = self.content.last_mut()
+        {
+            *elapsed_seconds = started.elapsed().as_secs();
         }
     }
 }
 
-fn sat_u64(value: impl TryInto<u64>) -> u64 {
-    value.try_into().unwrap_or(u64::MAX)
-}
-
-fn merge_request_usage(current: Usage, reported: ModelUsage) -> Usage {
-    Usage {
-        // Provider reports may split input/output across events or repeat a
-        // cumulative snapshot. Reconcile one request before turns add calls.
-        input_tokens: current.input_tokens.max(reported.input_tokens),
-        output_tokens: current.output_tokens.max(reported.output_tokens),
-        tool_calls: 0,
-    }
-}
-
-fn pending_tool_calls(blocks: &[ContentBlock]) -> Vec<PendingToolCall> {
-    blocks
+fn has_tool_calls(content: &[ContentBlock]) -> bool {
+    content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } => Some(PendingToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            }),
-            ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
-        })
-        .collect()
+        .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
+}
+
+async fn send_event(events: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+    if let Err(error) = events.send(event).await {
+        tracing::warn!(%error, "dropping session event: receiver closed");
+    }
 }
 
 fn elapsed_generation_ms(first_output_at: Option<Instant>) -> u64 {
-    first_output_at.map_or(0, |started| sat_u64(started.elapsed().as_millis()))
+    first_output_at.map_or(0, |started| {
+        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+    })
 }
 
-/// Map a stream exit plus any accumulated tool calls to the turn outcome.
-/// Priority is explicit: stream failure > cancellation > incomplete stream >
-/// completed tool calls > normal stop. Tool calls are never executed unless
-/// the stream ended cleanly.
-fn response_action(
-    stream_exit: StreamExit,
-    calls: Vec<PendingToolCall>,
-    stop_reason: Option<StopReason>,
-) -> ResponseOutcome {
-    match stream_exit {
-        StreamExit::Failed(error) => ResponseOutcome::Failed(error),
-        StreamExit::Cancelled => ResponseOutcome::Cancelled,
-        StreamExit::Exhausted => match (stop_reason, calls) {
-            (None | Some(StopReason::Truncated), _) => {
-                ResponseOutcome::Finished(StopReason::Truncated)
-            }
-            (Some(StopReason::EndTurn), calls) if !calls.is_empty() => {
-                ResponseOutcome::ToolCalls(calls)
-            }
-            (Some(reason), _) => ResponseOutcome::Finished(reason),
-        },
-    }
-}
-
-/// Error classification for the retry path. Only transport-level failures are
-/// retried: request/network errors, explicitly retryable upstream statuses,
-/// and rate limits. Auth, request-shaping, and response-shaping errors are
-/// never retried because re-issuing them cannot succeed.
-const fn retryable(error: &ash_core::ProtocolError) -> bool {
+const fn retryable(error: &ProtocolError) -> bool {
     matches!(
         error,
-        ash_core::ProtocolError::Request(_) | ash_core::ProtocolError::RateLimited
+        ProtocolError::Request(_) | ProtocolError::RateLimited
     ) || matches!(
         error,
-        ash_core::ProtocolError::Upstream {
+        ProtocolError::Upstream {
             status: 500 | 502 | 503 | 504 | 520..=524 | 529,
             ..
         }
     )
 }
 
-/// Exponential backoff for the `attempt`-th retry (0-based): `base * 2^attempt`,
-/// capped at `max`.
 fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
-    let base_ms = sat_u64(base.as_millis());
-    let max_ms = sat_u64(max.as_millis());
-    let millis = base_ms.saturating_mul(1u64 << attempt.min(20)).min(max_ms);
-    Duration::from_millis(millis)
-}
-
-fn finish_open_thought(blocks: &mut [ContentBlock], started_at: &mut Option<Instant>) {
-    let Some(started) = started_at.take() else {
-        return;
-    };
-    if let Some(ContentBlock::Thought {
-        elapsed_seconds, ..
-    }) = blocks.last_mut()
-    {
-        *elapsed_seconds = started.elapsed().as_secs();
-    }
-}
-
-fn discard_open_block(
-    blocks: &mut Vec<ContentBlock>,
-    open_block: Option<OpenResponseBlock>,
-    thought_started_at: &mut Option<Instant>,
-) {
-    let matches_open = match (open_block, blocks.last()) {
-        (Some(OpenResponseBlock::Thought), Some(ContentBlock::Thought { .. }))
-        | (Some(OpenResponseBlock::Text), Some(ContentBlock::Text(_))) => true,
-        (None | Some(OpenResponseBlock::Thought | OpenResponseBlock::Text), _) => false,
-    };
-    if matches_open {
-        blocks.pop();
-    }
-    thought_started_at.take();
+    let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(base_ms.saturating_mul(1_u64 << attempt.min(20)).min(max_ms))
 }
 
 fn limit_tool_result(result: Result<ToolOutput, ToolError>) -> Result<ToolOutput, ToolError> {
@@ -788,759 +668,226 @@ fn limit_tool_output(output: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::sync::Mutex as StdMutex;
 
-    use ash_core::{
-        define_tool, MessageContent, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
-        ModelUsage, SessionId, Tool, ToolCallId, ToolContext, ToolError,
-    };
-    use futures::StreamExt;
+    use ash_core::{define_tool, ModelId};
 
     use super::*;
 
     struct MockModel {
-        responses: Mutex<VecDeque<Vec<Result<ModelEvent, ash_core::ProtocolError>>>>,
-        requests: Arc<Mutex<Vec<ModelRequest>>>,
+        response: StdMutex<Option<Vec<Result<ModelEvent, ProtocolError>>>>,
+        requests: StdMutex<Vec<ModelRequest>>,
+    }
+
+    struct PendingModel {
+        started: tokio::sync::Notify,
+    }
+
+    impl ModelClient for PendingModel {
+        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ProtocolError> {
+            self.started.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
     }
 
     impl MockModel {
-        fn events(responses: impl IntoIterator<Item = Vec<ModelEvent>>) -> Self {
+        fn new(events: impl IntoIterator<Item = ModelEvent>) -> Self {
             Self {
-                responses: Mutex::new(
-                    responses
-                        .into_iter()
-                        .map(|events| events.into_iter().map(Ok).collect())
-                        .collect(),
-                ),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                response: StdMutex::new(Some(events.into_iter().map(Ok).collect())),
+                requests: StdMutex::new(Vec::new()),
             }
         }
     }
 
     impl ModelClient for MockModel {
-        fn stream(&self, request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
+        fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProtocolError> {
             self.requests.lock().unwrap().push(request);
-            let response = self.responses.lock().unwrap().pop_front().unwrap();
+            let response = self.response.lock().unwrap().take().unwrap();
             Ok(Box::pin(futures::stream::iter(response)))
         }
     }
 
-    struct PendingModel;
-
-    impl ModelClient for PendingModel {
-        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ash_core::ProtocolError> {
-            Ok(Box::pin(futures::stream::pending()))
-        }
+    fn settled_turn(input: &str) -> Arc<Turn> {
+        Arc::new(Turn {
+            id: TurnId::new(),
+            input: Input::user(input),
+            steps: Vec::new(),
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: TurnStats::default(),
+        })
     }
 
-    fn agent(tools: Vec<Arc<dyn Tool>>) -> Agent {
-        Agent::new(ModelId::new("test-model"), tools)
-            .with_max_context_tokens(200_000)
-            .with_tool_timeout(Duration::from_secs(1))
-    }
-
-    async fn run(
-        model: &dyn ModelClient,
-        agent: &Agent,
-        messages: &mut Vec<Message>,
-        cancel: CancellationToken,
-    ) -> EngineOutcome {
-        let (tx, _rx) = mpsc::channel(64);
-        run_agent_turn(
-            model,
-            agent,
-            messages,
-            SessionIdentity::root(SessionId::new()),
-            tx,
-            cancel,
-        )
-        .await
-    }
-
-    struct ConcurrentTool {
-        barrier: tokio::sync::Barrier,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for ConcurrentTool {
-        fn name(&self) -> &'static str {
-            "concurrent"
-        }
-
-        fn description(&self) -> &'static str {
-            "concurrent"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"]
-            })
-        }
-
-        async fn execute(
-            &self,
-            _context: ToolContext,
-            arguments: serde_json::Value,
-        ) -> Result<ToolOutput, ToolError> {
-            let value = arguments["value"]
-                .as_str()
-                .ok_or_else(|| ToolError::Execution("missing value".to_string()))?;
-            self.barrier.wait().await;
-            Ok(value.to_string().into())
-        }
-    }
-
-    struct BlockingTool;
-
-    #[async_trait::async_trait]
-    impl Tool for BlockingTool {
-        fn name(&self) -> &'static str {
-            "blocking"
-        }
-
-        fn description(&self) -> &'static str {
-            "blocking"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            _context: ToolContext,
-            _arguments: serde_json::Value,
-        ) -> Result<ToolOutput, ToolError> {
-            futures::future::pending().await
-        }
-    }
-
-    struct SlowUnboundedTool;
-
-    #[async_trait::async_trait]
-    impl Tool for SlowUnboundedTool {
-        fn name(&self) -> &'static str {
-            "slow_unbounded"
-        }
-
-        fn description(&self) -> &'static str {
-            "slow unbounded"
-        }
-
-        fn timeout(&self) -> ToolTimeout {
-            ToolTimeout::Disabled
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            context: ToolContext,
-            _arguments: serde_json::Value,
-        ) -> Result<ToolOutput, ToolError> {
-            assert!(context.deadline.is_none());
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok("done".into())
-        }
-    }
-
-    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelEvent {
-        ModelEvent::ToolCall {
-            id: ToolCallId::from_provider(id),
-            name: name.to_string(),
-            arguments,
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_calls_run_concurrently_and_results_keep_provider_order() {
-        let model = MockModel::events([
-            vec![
-                tool_call("first", "concurrent", serde_json::json!({"value": "first"})),
-                tool_call(
-                    "second",
-                    "concurrent",
-                    serde_json::json!({"value": "second"}),
-                ),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-            vec![ModelEvent::Stop(StopReason::EndTurn)],
-        ]);
-        let tool: Arc<dyn Tool> = Arc::new(ConcurrentTool {
-            barrier: tokio::sync::Barrier::new(2),
-        });
-        let mut messages = vec![Message::user("run both")];
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            run(
-                &model,
-                &agent(vec![tool]),
-                &mut messages,
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        assert_eq!(outcome.stats.usage.tool_calls, 2);
-        let results = messages
-            .iter()
-            .filter_map(|message| match &message.content {
-                MessageContent::ToolResult { result, .. } => result.as_ref().ok().cloned(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(results, ["first", "second"]);
-    }
-
-    #[tokio::test]
-    async fn session_timeout_bounds_regular_tools() {
-        let model = MockModel::events([
-            vec![
-                tool_call("call", "blocking", serde_json::json!({})),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-            vec![ModelEvent::Stop(StopReason::EndTurn)],
-        ]);
-        let definition =
-            agent(vec![Arc::new(BlockingTool)]).with_tool_timeout(Duration::from_millis(5));
-        let mut messages = vec![Message::user("run")];
-
-        let outcome = run(&model, &definition, &mut messages, CancellationToken::new()).await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        assert!(messages.iter().any(|message| {
-            matches!(
-                &message.content,
-                MessageContent::ToolResult { result: Err(error), .. }
-                    if error.contains("deadline exceeded")
-            )
-        }));
-    }
-
-    #[tokio::test]
-    async fn disabled_tool_timeout_can_outlive_the_agent_limit() {
-        let model = MockModel::events([
-            vec![
-                tool_call("call", "slow_unbounded", serde_json::json!({})),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-            vec![ModelEvent::Stop(StopReason::EndTurn)],
-        ]);
-        let definition =
-            agent(vec![Arc::new(SlowUnboundedTool)]).with_tool_timeout(Duration::from_millis(1));
-        let mut messages = vec![Message::user("run")];
-
-        let outcome = run(&model, &definition, &mut messages, CancellationToken::new()).await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        assert!(messages.iter().any(|message| {
-            matches!(
-                &message.content,
-                MessageContent::ToolResult { result: Ok(output), .. } if output == "done"
-            )
-        }));
-    }
-
-    #[tokio::test]
-    async fn provider_usage_is_used_without_a_local_fallback() {
-        let model = MockModel::events([vec![
-            ModelEvent::Text("hello".to_string()),
-            ModelEvent::Usage(ModelUsage {
-                input_tokens: 120,
-                output_tokens: 25,
-            }),
-            ModelEvent::Stop(StopReason::EndTurn),
-        ]]);
-        let definition = agent(Vec::new());
-        let mut messages = vec![Message::user("question")];
-
-        let outcome = run(&model, &definition, &mut messages, CancellationToken::new()).await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        assert_eq!(outcome.stats.usage.input_tokens, 120);
-        assert_eq!(outcome.stats.usage.output_tokens, 25);
-    }
-
-    #[tokio::test]
-    async fn one_turn_adds_protocol_usage_from_each_model_call() {
-        let model = MockModel::events([
-            vec![
-                ModelEvent::Usage(ModelUsage {
-                    input_tokens: 100,
-                    output_tokens: 10,
-                }),
-                tool_call("call", "echo", serde_json::json!({})),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-            vec![
-                ModelEvent::Usage(ModelUsage {
-                    input_tokens: 130,
-                    output_tokens: 0,
-                }),
-                ModelEvent::Text("done".to_string()),
-                ModelEvent::Usage(ModelUsage {
-                    input_tokens: 0,
-                    output_tokens: 5,
-                }),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-        ]);
-        let echo = define_tool("echo", "echo", |_, ()| async { Ok("ok") }).unwrap();
-        let mut messages = vec![Message::user("question")];
-
-        let outcome = run(
-            &model,
-            &agent(vec![echo]),
-            &mut messages,
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
+    #[test]
+    fn retry_delay_grows_and_caps() {
         assert_eq!(
-            outcome.stats.usage,
-            Usage {
-                input_tokens: 230,
-                output_tokens: 15,
-                tool_calls: 1,
-            }
+            retry_delay(0, Duration::from_secs(1), Duration::from_secs(10)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_delay(9, Duration::from_secs(1), Duration::from_secs(10)),
+            Duration::from_secs(10)
         );
     }
 
-    #[tokio::test]
-    async fn automatic_compaction_uses_the_shared_collector_and_protocol_usage() {
-        let model = MockModel::events([
-            vec![
-                ModelEvent::Text("summary".to_string()),
-                ModelEvent::Usage(ModelUsage {
-                    input_tokens: 10,
-                    output_tokens: 3,
-                }),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-            vec![
-                ModelEvent::Text("done".to_string()),
-                ModelEvent::Usage(ModelUsage {
-                    input_tokens: 20,
-                    output_tokens: 4,
-                }),
-                ModelEvent::Stop(StopReason::EndTurn),
-            ],
-        ]);
-        let requests = Arc::clone(&model.requests);
-        let definition = agent(Vec::new())
-            .with_system_prompt("system")
-            .with_max_context_tokens(1_000);
-        let mut messages = vec![
-            Message::user(&format!("old request {}", "x".repeat(10_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent request"),
-        ];
-
-        let outcome = run(&model, &definition, &mut messages, CancellationToken::new()).await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].system.as_deref(),
-            Some(COMPACTION_SYSTEM_PROMPT)
-        );
-        assert!(matches!(
-            requests[1].messages.first().map(|message| &message.content),
-            Some(MessageContent::Assistant(_))
-        ));
-        assert_eq!(outcome.stats.usage.input_tokens, 30);
-        assert_eq!(outcome.stats.usage.output_tokens, 7);
+    #[test]
+    fn large_tool_output_keeps_valid_utf8_tail() {
+        let source = "a".repeat(MAX_AGENT_OUTPUT_BYTES) + "中文tail";
+        let output = limit_tool_output(source);
+        assert!(output.contains(AGENT_OUTPUT_TRUNCATION_NOTICE));
+        assert!(output.ends_with("中文tail"));
     }
 
     #[tokio::test]
-    async fn compaction_rejects_tool_calls() {
-        let model = MockModel::events([vec![
-            ModelEvent::Usage(ModelUsage {
-                input_tokens: 7,
-                output_tokens: 2,
-            }),
-            tool_call("call", "read", serde_json::json!({})),
-            ModelEvent::Stop(StopReason::EndTurn),
-        ]]);
-        let definition = agent(Vec::new()).with_max_context_tokens(100);
-        let messages = vec![
-            Message::user(&format!("old {}", "x".repeat(12_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent"),
-        ];
-
-        let (result, stats) =
-            compact_context(&definition, &messages, &model, &CancellationToken::new()).await;
-
-        assert!(result.unwrap_err().to_string().contains("requested a tool"));
-        assert_eq!(stats.usage.tool_calls, 0);
-        assert_eq!(stats.usage.input_tokens, 7);
-        assert_eq!(stats.usage.output_tokens, 2);
-    }
-
-    #[tokio::test]
-    async fn compaction_rejects_an_empty_summary() {
-        let model = MockModel::events([vec![ModelEvent::Stop(StopReason::EndTurn)]]);
-        let definition = agent(Vec::new()).with_max_context_tokens(100);
-        let messages = vec![
-            Message::user(&format!("old {}", "x".repeat(12_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent"),
-        ];
-
-        let (result, _) =
-            compact_context(&definition, &messages, &model, &CancellationToken::new()).await;
-
-        assert!(result.unwrap_err().to_string().contains("empty summary"));
-    }
-
-    #[tokio::test]
-    async fn compaction_rejects_a_truncated_summary() {
-        let model = MockModel::events([vec![ModelEvent::Text("partial".to_string())]]);
-        let definition = agent(Vec::new()).with_max_context_tokens(100);
-        let messages = vec![
-            Message::user(&format!("old {}", "x".repeat(12_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent"),
-        ];
-
-        let (result, _) =
-            compact_context(&definition, &messages, &model, &CancellationToken::new()).await;
-
-        assert!(result.unwrap_err().to_string().contains("Truncated"));
-    }
-
-    #[tokio::test]
-    async fn compaction_honors_cancellation() {
-        let definition = agent(Vec::new()).with_max_context_tokens(100);
-        let messages = vec![
-            Message::user(&format!("old {}", "x".repeat(12_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent"),
-        ];
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        let (result, _) = compact_context(&definition, &messages, &PendingModel, &cancel).await;
-
-        assert!(matches!(result, Err(ash_core::AshError::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn compaction_discards_a_summary_that_does_not_reduce_context() {
-        let model = MockModel::events([vec![
-            ModelEvent::Text("z".repeat(20_000)),
-            ModelEvent::Usage(ModelUsage {
-                input_tokens: 8,
-                output_tokens: 5_000,
-            }),
-            ModelEvent::Stop(StopReason::EndTurn),
-        ]]);
-        let definition = agent(Vec::new()).with_max_context_tokens(100);
-        let messages = vec![
-            Message::user(&format!("old {}", "x".repeat(12_000))),
-            Message::assistant_text("old answer"),
-            Message::user("recent"),
-        ];
-
-        let (result, stats) =
-            compact_context(&definition, &messages, &model, &CancellationToken::new()).await;
-
-        assert!(result.unwrap().is_none());
-        assert_eq!(stats.usage.output_tokens, 5_000);
-    }
-
-    #[tokio::test]
-    async fn unfinished_stream_keeps_text_and_discards_tool_calls() {
+    async fn truncated_response_drops_tools_but_keeps_reported_usage() {
         let mut stream: ModelStream = Box::pin(futures::stream::iter([
             Ok(ModelEvent::Text("partial".to_string())),
-            Ok(tool_call("call", "read", serde_json::json!({}))),
-        ]));
-        let (tx, _rx) = mpsc::channel(8);
-
-        let response = collect_response(
-            &mut stream,
-            Some(&tx),
-            &CancellationToken::new(),
-            TurnStats::default(),
-        )
-        .await;
-
-        let message = response.message.unwrap();
-        assert_eq!(
-            message.content,
-            MessageContent::Assistant(vec![ContentBlock::Text("partial".to_string())])
-        );
-        assert!(matches!(
-            response.outcome,
-            ResponseOutcome::Finished(StopReason::Truncated)
-        ));
-    }
-
-    #[tokio::test]
-    async fn turn_progress_is_published_when_protocol_usage_changes() {
-        let mut stream: ModelStream = Box::pin(futures::stream::iter([
-            Ok(ModelEvent::Text("answer".to_string())),
-            Ok(ModelEvent::Usage(ModelUsage {
-                input_tokens: 100,
-                output_tokens: 0,
-            })),
-            Ok(ModelEvent::Usage(ModelUsage {
-                input_tokens: 100,
-                output_tokens: 0,
-            })),
-            Ok(ModelEvent::Usage(ModelUsage {
-                input_tokens: 0,
-                output_tokens: 25,
-            })),
-            Ok(ModelEvent::Stop(StopReason::EndTurn)),
-        ]));
-        let (tx, mut rx) = mpsc::channel(16);
-        let settled = TurnStats {
-            usage: Usage {
-                input_tokens: 7,
+            Ok(ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call"),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            }),
+            Ok(ModelEvent::Usage {
+                input_tokens: 12,
                 output_tokens: 3,
-                tool_calls: 2,
+            }),
+        ]));
+
+        let response = collect_response(&mut stream, None, &CancellationToken::new()).await;
+
+        let ModelResponse::Truncated { content, stats } = response else {
+            panic!("expected truncated response");
+        };
+        assert!(matches!(content.as_slice(), [ContentBlock::Text(text)] if text == "partial"));
+        assert_eq!(stats.input_tokens, 12);
+        assert_eq!(stats.output_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn non_end_turn_never_executes_a_tool_call() {
+        let model = MockModel::new([
+            ModelEvent::Text("partial".to_string()),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call"),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
             },
-            generation_ms: 10,
-        };
+            ModelEvent::Stop(StopReason::Other("unknown".to_string())),
+        ]);
+        let agent = Agent::new(ModelId::new("model"), Vec::new());
+        let (events, _) = mpsc::channel(8);
 
-        let response =
-            collect_response(&mut stream, Some(&tx), &CancellationToken::new(), settled).await;
-
-        drop(tx);
-        let mut progress = Vec::new();
-        while let Some(event) = rx.recv().await {
-            if let SessionEventKind::TurnProgress(stats) = event {
-                progress.push(stats.usage);
-            }
-        }
-
-        assert!(matches!(
-            response.outcome,
-            ResponseOutcome::Finished(StopReason::EndTurn)
-        ));
-        assert_eq!(
-            progress,
-            [
-                Usage {
-                    input_tokens: 107,
-                    output_tokens: 3,
-                    tool_calls: 2,
-                },
-                Usage {
-                    input_tokens: 107,
-                    output_tokens: 28,
-                    tool_calls: 2,
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn truncated_stop_keeps_text_and_discards_tool_calls() {
-        let mut stream: ModelStream = Box::pin(futures::stream::iter([
-            Ok(ModelEvent::Text("partial".to_string())),
-            Ok(tool_call("call", "read", serde_json::json!({}))),
-            Ok(ModelEvent::Stop(StopReason::Truncated)),
-        ]));
-
-        let response = collect_response(
-            &mut stream,
-            None,
-            &CancellationToken::new(),
-            TurnStats::default(),
+        let outcome = run_turn(
+            &model,
+            &agent,
+            &Conversation::new(),
+            TurnId::new(),
+            Input::user("hello"),
+            events,
+            ToolContext {
+                identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                cancellation: CancellationToken::new(),
+                deadline: None,
+            },
         )
         .await;
 
-        let message = response.message.unwrap();
         assert_eq!(
-            message.content,
-            MessageContent::Assistant(vec![ContentBlock::Text("partial".to_string())])
+            outcome.turn.result,
+            TurnResult::Stopped(StopReason::Other("unknown".to_string()))
         );
-        assert!(matches!(
-            response.outcome,
-            ResponseOutcome::Finished(StopReason::Truncated)
-        ));
+        assert_eq!(outcome.turn.visible_text().as_deref(), Some("partial"));
+        assert!(!outcome.turn.has_tools());
     }
 
     #[tokio::test]
-    async fn unknown_stop_keeps_text_and_discards_tool_calls() {
-        let mut stream: ModelStream = Box::pin(futures::stream::iter([
-            Ok(ModelEvent::Text("partial".to_string())),
-            Ok(tool_call("call", "read", serde_json::json!({}))),
-            Ok(ModelEvent::Stop(StopReason::Other(
-                "content_filter".to_string(),
-            ))),
-        ]));
-
-        let response = collect_response(
-            &mut stream,
-            None,
-            &CancellationToken::new(),
-            TurnStats::default(),
-        )
-        .await;
-
-        let message = response.message.unwrap();
-        assert_eq!(
-            message.content,
-            MessageContent::Assistant(vec![ContentBlock::Text("partial".to_string())])
-        );
-        assert!(matches!(
-            response.outcome,
-            ResponseOutcome::Finished(StopReason::Other(reason)) if reason == "content_filter"
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancellation_discards_the_unfinished_response() {
-        let mut stream: ModelStream = Box::pin(
-            futures::stream::iter([Ok(ModelEvent::Text("partial".to_string()))])
-                .chain(futures::stream::pending()),
-        );
-        let (tx, mut rx) = mpsc::channel(8);
-        let cancel = CancellationToken::new();
-        let waiting = collect_response(&mut stream, Some(&tx), &cancel, TurnStats::default());
-        tokio::pin!(waiting);
-
-        tokio::select! {
-            _ = rx.recv() => cancel.cancel(),
-            _ = &mut waiting => panic!("collector completed before cancellation"),
-        }
-        let response = waiting.await;
-
-        assert!(response.message.is_none());
-        assert!(matches!(response.outcome, ResponseOutcome::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn retryable_transport_failure_is_retried() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let model = MockModel {
-            responses: Mutex::new(VecDeque::from([
-                vec![Err(ash_core::ProtocolError::Request("reset".to_string()))],
-                vec![Ok(ModelEvent::Stop(StopReason::EndTurn))],
-            ])),
-            requests: Arc::clone(&requests),
-        };
-        let definition = agent(Vec::new());
-        let mut messages = vec![Message::user("question")];
-
-        let outcome = run(&model, &definition, &mut messages, CancellationToken::new()).await;
-
-        assert_eq!(outcome.result.unwrap(), StopReason::EndTurn);
-        assert_eq!(requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn cancellation_stops_a_tool_without_an_internal_timeout() {
-        let model = MockModel::events([vec![
-            tool_call("call", "blocking", serde_json::json!({})),
+    async fn compact_request_has_only_the_fixed_prompt() {
+        let model = MockModel::new([
+            ModelEvent::Text("summary".to_string()),
             ModelEvent::Stop(StopReason::EndTurn),
-        ]]);
-        let definition = agent(vec![Arc::new(BlockingTool)]).with_tool_timeout(Duration::MAX);
-        let mut messages = vec![Message::user("run")];
-        let cancel = CancellationToken::new();
-        cancel.cancel();
+        ]);
+        let tool = define_tool("read", "read", |_, ()| async { Ok("unused") }).unwrap();
+        let agent = Agent::new(ModelId::new("model"), vec![tool]);
+        let mut conversation = Conversation::new();
+        conversation.push(settled_turn("remember this"), None);
 
-        let outcome = run(&model, &definition, &mut messages, cancel).await;
+        let result = compact(&model, &agent, &conversation, &CancellationToken::new())
+            .await
+            .unwrap();
 
-        assert_eq!(outcome.result.unwrap(), StopReason::Aborted);
-        assert_eq!(outcome.stats.usage.tool_calls, 0);
+        assert_eq!(
+            result.map(|(summary, _)| summary),
+            Some("summary".to_string())
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.system.as_deref(), Some(COMPACTION_SYSTEM_PROMPT));
+        assert!(request.tools.is_empty());
+        assert_eq!(request.max_tokens, None);
+        assert!(request.context.summary().is_none());
+        assert!(request.context.turns().is_empty());
+        let (input, steps) = request.context.current().unwrap();
+        assert!(input.text().contains("remember this"));
+        assert!(steps.is_empty());
     }
 
-    #[test]
-    fn response_action_requires_a_complete_stream_before_tool_execution() {
-        let call = PendingToolCall {
-            id: ToolCallId::from_provider("call"),
-            name: "read".to_string(),
-            arguments: serde_json::json!({}),
+    #[tokio::test]
+    async fn compact_rejects_tool_calls_even_with_end_turn() {
+        let model = MockModel::new([
+            ModelEvent::Text("summary".to_string()),
+            ModelEvent::ToolCall {
+                id: ToolCallId::from_provider("call"),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ModelEvent::Stop(StopReason::EndTurn),
+        ]);
+        let agent = Agent::new(ModelId::new("model"), Vec::new());
+        let mut conversation = Conversation::new();
+        conversation.push(settled_turn("remember this"), None);
+
+        assert!(
+            compact(&model, &agent, &conversation, &CancellationToken::new(),)
+                .await
+                .is_err()
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_automatic_compaction_is_not_a_failure() {
+        let model = PendingModel {
+            started: tokio::sync::Notify::new(),
         };
-        assert!(matches!(
-            response_action(
-                StreamExit::Exhausted,
-                vec![call.clone()],
-                Some(StopReason::EndTurn),
-            ),
-            ResponseOutcome::ToolCalls(_)
-        ));
-        assert!(matches!(
-            response_action(StreamExit::Exhausted, vec![call], None),
-            ResponseOutcome::Finished(StopReason::Truncated)
-        ));
-        assert!(matches!(
-            response_action(
-                StreamExit::Exhausted,
-                vec![PendingToolCall {
-                    id: ToolCallId::from_provider("truncated"),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({}),
-                }],
-                Some(StopReason::Truncated),
-            ),
-            ResponseOutcome::Finished(StopReason::Truncated)
-        ));
-        assert!(matches!(
-            response_action(StreamExit::Cancelled, Vec::new(), None),
-            ResponseOutcome::Cancelled
-        ));
-        assert!(matches!(
-            response_action(
-                StreamExit::Exhausted,
-                vec![PendingToolCall {
-                    id: ToolCallId::from_provider("other"),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({}),
-                }],
-                Some(StopReason::Other("content_filter".to_string())),
-            ),
-            ResponseOutcome::Finished(StopReason::Other(reason)) if reason == "content_filter"
-        ));
-    }
+        let agent = Agent::new(ModelId::new("model"), Vec::new()).with_max_context_tokens(1_000);
+        let mut conversation = Conversation::new();
+        conversation.push(settled_turn(&"x".repeat(3_200)), None);
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let (events, _) = mpsc::channel(8);
+        let context = ToolContext {
+            identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+            cancellation,
+            deadline: None,
+        };
 
-    #[test]
-    fn truncates_large_tool_output_without_splitting_utf8() {
-        let source = "a".repeat(MAX_AGENT_OUTPUT_BYTES) + "中文🙂tail";
-        let truncated = limit_tool_output(source);
-        assert!(truncated.contains(AGENT_OUTPUT_TRUNCATION_NOTICE));
-        assert!(truncated.ends_with("中文🙂tail"));
-        assert!(truncated.len() <= MAX_AGENT_OUTPUT_BYTES + AGENT_OUTPUT_TRUNCATION_NOTICE.len());
-    }
+        let (outcome, ()) = tokio::join!(
+            run_turn(
+                &model,
+                &agent,
+                &conversation,
+                TurnId::new(),
+                Input::user("current"),
+                events,
+                context,
+            ),
+            async {
+                model.started.notified().await;
+                cancel.cancel();
+            }
+        );
 
-    #[test]
-    fn retry_delay_grows_exponentially_and_caps_at_max() {
-        let base = Duration::from_secs(1);
-        let max = Duration::from_secs(10);
-        assert_eq!(retry_delay(0, base, max), Duration::from_secs(1));
-        assert_eq!(retry_delay(3, base, max), Duration::from_secs(8));
-        assert_eq!(retry_delay(9, base, max), Duration::from_secs(10));
-    }
-
-    #[test]
-    fn retries_only_explicitly_allowed_upstream_statuses() {
-        assert!(retryable(&ash_core::ProtocolError::RateLimited));
-        assert!(retryable(&ash_core::ProtocolError::Upstream {
-            status: 503,
-            message: "unavailable".to_string(),
-        }));
-        assert!(!retryable(&ash_core::ProtocolError::Auth));
-        assert!(!retryable(&ash_core::ProtocolError::Upstream {
-            status: 400,
-            message: "bad request".to_string(),
-        }));
+        assert_eq!(outcome.turn.result, TurnResult::Cancelled);
+        assert!(outcome.error.is_none());
     }
 }

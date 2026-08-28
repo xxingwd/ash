@@ -1,11 +1,8 @@
-use ash_core::{ModelEvent, ModelUsage, ProtocolError, ToolCallId};
+use ash_core::{ModelEvent, ProtocolError, ToolCallId};
 use serde_json::{json, Value};
 
-/// Shared construction of provider-neutral usage records. Stream decoders
-/// report token counts under provider-specific field names; once those are
-/// read, every protocol builds the same `ModelUsage` shape.
-pub const fn build_usage(input_tokens: u64, output_tokens: u64) -> ModelUsage {
-    ModelUsage {
+pub const fn usage_event(input_tokens: u64, output_tokens: u64) -> ModelEvent {
+    ModelEvent::Usage {
         input_tokens,
         output_tokens,
     }
@@ -268,10 +265,10 @@ mod tests {
 
     #[test]
     fn usage_helper_is_provider_neutral() {
-        let usage = build_usage(120, 25);
+        let usage = usage_event(120, 25);
         assert_eq!(
             usage,
-            ModelUsage {
+            ModelEvent::Usage {
                 input_tokens: 120,
                 output_tokens: 25,
             }

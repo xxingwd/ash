@@ -13,7 +13,6 @@ mod menu;
 mod operation;
 mod picker;
 mod scrollback;
-mod session_picker;
 mod slash_command;
 mod status_line;
 mod subagent;
