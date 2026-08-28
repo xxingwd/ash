@@ -250,19 +250,15 @@ impl LiveBlock {
     }
 
     pub(crate) fn finish_tool(&mut self, id: &ToolCallId, output: String, is_error: bool) -> bool {
-        let LiveBlockKind::Tool {
-            state: ToolState::Running { id: running_id },
-            ..
-        } = &self.kind
-        else {
+        let LiveBlockKind::Tool { state, .. } = &mut self.kind else {
+            return false;
+        };
+        let ToolState::Running { id: running_id } = state else {
             return false;
         };
         if running_id != id {
             return false;
         }
-        let LiveBlockKind::Tool { state, .. } = &mut self.kind else {
-            unreachable!("tool state changed while completing it");
-        };
         *state = ToolState::Finished { output, is_error };
         self.invalidate();
         true
@@ -406,9 +402,20 @@ impl LiveBlock {
                 state: ReasoningState::Finished { elapsed_seconds },
             } => render_thought(source, *elapsed_seconds, width, expanded),
             LiveBlockKind::Reasoning {
-                state: ReasoningState::Running { .. },
-                ..
-            } => unreachable!("running reasoning is rendered through the streaming cache"),
+                source,
+                state: ReasoningState::Running { started_at },
+            } => {
+                let content_width = width.saturating_sub(BULLET_PREFIX_COLUMNS).max(1);
+                let mut markdown = StreamingMarkdownCache::default();
+                let tail = markdown.update(source, content_width);
+                render_running_reasoning(
+                    started_at.elapsed().as_secs(),
+                    width,
+                    expanded,
+                    &markdown,
+                    &tail,
+                )
+            }
             LiveBlockKind::Tool {
                 name,
                 arguments,
@@ -666,20 +673,31 @@ fn markdown_line<'a>(
 /// each row in order. Shared by every tool renderer so the stacking logic
 /// lives in one place.
 fn stack_rows(rows: &[Buffer], width: u16) -> Buffer {
-    let total_height: u16 = rows.iter().map(|row| row.area.height).sum();
+    let total_height = rows
+        .iter()
+        .fold(0_u16, |height, row| height.saturating_add(row.area.height));
     let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), total_height.max(1)));
     let mut y = 0;
     for row in rows {
+        if y >= total_height {
+            break;
+        }
         for row_y in 0..row.area.height {
+            let Some(target_y) = y
+                .checked_add(row_y)
+                .filter(|target_y| *target_y < total_height)
+            else {
+                break;
+            };
             for x in 0..row.area.width {
                 if let Some(cell) = row.cell((x, row_y)) {
-                    if let Some(target) = buffer.cell_mut((x, y + row_y)) {
+                    if let Some(target) = buffer.cell_mut((x, target_y)) {
                         *target = cell.clone();
                     }
                 }
             }
         }
-        y += row.area.height;
+        y = y.saturating_add(row.area.height).min(total_height);
     }
     buffer
 }
@@ -1273,6 +1291,29 @@ mod tests {
         assert!(block.finish_reasoning());
         assert_eq!(row_text(&block.render(40, false), 0), "• Thought for 0s");
         assert!(!block.is_unfinished_response_for_turn(test_turn(7)));
+    }
+
+    #[test]
+    fn running_reasoning_has_a_safe_uncached_render() {
+        let mut block = LiveBlock::reasoning(1);
+        assert!(block.append_reasoning_source("inspect first"));
+
+        let rendered = block.render_uncached(40, false);
+
+        assert_eq!(row_text(&rendered, 0), "• Thinking (0s)");
+        assert_eq!(row_text(&rendered, 1), "  inspect first");
+    }
+
+    #[test]
+    fn stacking_rows_saturates_at_the_buffer_height_limit() {
+        let rows = [
+            Buffer::empty(Rect::new(0, 0, 1, 40_000)),
+            Buffer::empty(Rect::new(0, 0, 1, 40_000)),
+        ];
+
+        let rendered = stack_rows(&rows, 1);
+
+        assert_eq!(rendered.area.height, u16::MAX);
     }
 
     #[test]

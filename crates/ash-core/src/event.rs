@@ -180,11 +180,14 @@ pub enum SessionEventKind {
 pub enum StopReason {
     EndTurn,
     MaxTokens,
+    #[display("Other({_0})")]
+    Other(String),
     Aborted,
     /// The model stream ended before the provider signalled a normal terminal
-    /// state (no `finish_reason`, `message_stop`, `response.completed`, or
-    /// `[DONE]`). Partial output may have been produced; the turn is not a
-    /// clean stop and is eligible for a safe retry by the engine.
+    /// state (no `finish_reason`, `message_stop`, `response.completed`,
+    /// `response.incomplete`, or `[DONE]`). Partial output may have been
+    /// produced; the turn is not a clean stop and is eligible for a safe retry
+    /// by the engine.
     Truncated,
 }
 

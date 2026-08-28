@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 
 use crate::{
     content_value, image_data_url, message_groups, model_config,
-    pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall},
     project_request_messages, sse, text_tool_result, MessageGroup, ProviderConfig,
 };
@@ -237,8 +236,11 @@ impl sse::Decoder for CompletionsDecoder {
         }
 
         if let Some(reason) = choice["finish_reason"].as_str() {
-            // Compatible providers may repeat or revise this in trailing chunks.
-            self.stop = Some(stop_reason(reason));
+            self.stop = Some(match reason {
+                "stop" | "tool_calls" | "function_call" => StopReason::EndTurn,
+                "length" => StopReason::MaxTokens,
+                other => StopReason::Other(other.to_string()),
+            });
         }
         Ok(sse::DecodeResult::Continue(items))
     }
@@ -287,6 +289,19 @@ mod tests {
             }]
         );
         assert_eq!(stop, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn preserves_unknown_finish_reason() {
+        let mut decoder = CompletionsDecoder::default();
+        decoder
+            .decode(r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#)
+            .unwrap();
+
+        assert_eq!(
+            decoder.finalize().unwrap().1,
+            StopReason::Other("content_filter".to_string())
+        );
     }
 
     #[test]

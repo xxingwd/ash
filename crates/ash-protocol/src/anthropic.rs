@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 
 use crate::{
     base64_image, message_groups, model_config,
-    pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall},
     project_request_messages, sse, MessageGroup, ProviderConfig,
 };
@@ -297,7 +296,11 @@ impl AnthropicDecoder {
             .as_str()
             .filter(|reason| !reason.trim().is_empty())
         {
-            self.announced_stop = Some(stop_reason(reason));
+            self.announced_stop = Some(match reason {
+                "end_turn" | "tool_use" | "stop_sequence" => StopReason::EndTurn,
+                "max_tokens" => StopReason::MaxTokens,
+                other => StopReason::Other(other.to_string()),
+            });
         }
     }
 
@@ -409,6 +412,33 @@ mod tests {
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
         assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn preserves_unknown_stop_reason() {
+        let mut decoder = AnthropicDecoder::default();
+        decoder
+            .decode(
+                r#"{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"}}"#,
+            )
+            .unwrap();
+        decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
+
+        assert_eq!(
+            decoder.finalize().unwrap().1,
+            StopReason::Other("model_context_window_exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_max_tokens_stop_reason() {
+        let mut decoder = AnthropicDecoder::default();
+        decoder
+            .decode(r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#)
+            .unwrap();
+        decoder.decode(r#"{"type":"message_stop"}"#).unwrap();
+
+        assert_eq!(decoder.finalize().unwrap().1, StopReason::MaxTokens);
     }
 
     #[test]

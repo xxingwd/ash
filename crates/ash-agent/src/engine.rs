@@ -616,12 +616,11 @@ impl ResponseAccumulator {
         // stream that simply runs out without ever signalling a stop is treated
         // as truncated here rather than as a clean `EndTurn`.
         let exhausted = matches!(stream_exit, StreamExit::Exhausted);
-        let truncated =
-            exhausted && matches!(stop_reason.as_ref(), None | Some(StopReason::Truncated));
-        if truncated {
+        let accepts_tools = exhausted && matches!(stop_reason.as_ref(), Some(StopReason::EndTurn));
+        if !accepts_tools {
             blocks.retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
         }
-        let calls = if exhausted && !truncated {
+        let calls = if accepts_tools {
             pending_tool_calls(&blocks)
         } else {
             Vec::new()
@@ -690,7 +689,9 @@ fn response_action(
             (None | Some(StopReason::Truncated), _) => {
                 ResponseOutcome::Finished(StopReason::Truncated)
             }
-            (Some(_), calls) if !calls.is_empty() => ResponseOutcome::ToolCalls(calls),
+            (Some(StopReason::EndTurn), calls) if !calls.is_empty() => {
+                ResponseOutcome::ToolCalls(calls)
+            }
             (Some(reason), _) => ResponseOutcome::Finished(reason),
         },
     }
@@ -1377,6 +1378,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_stop_keeps_text_and_discards_tool_calls() {
+        let mut stream: ModelStream = Box::pin(futures::stream::iter([
+            Ok(ModelEvent::Text("partial".to_string())),
+            Ok(tool_call("call", "read", serde_json::json!({}))),
+            Ok(ModelEvent::Stop(StopReason::Other(
+                "content_filter".to_string(),
+            ))),
+        ]));
+
+        let response = collect_response(
+            &mut stream,
+            None,
+            &CancellationToken::new(),
+            TurnStats::default(),
+        )
+        .await;
+
+        let message = response.message.unwrap();
+        assert_eq!(
+            message.content,
+            MessageContent::Assistant(vec![ContentBlock::Text("partial".to_string())])
+        );
+        assert!(matches!(
+            response.outcome,
+            ResponseOutcome::Finished(StopReason::Other(reason)) if reason == "content_filter"
+        ));
+    }
+
+    #[tokio::test]
     async fn cancellation_discards_the_unfinished_response() {
         let mut stream: ModelStream = Box::pin(
             futures::stream::iter([Ok(ModelEvent::Text("partial".to_string()))])
@@ -1467,6 +1497,18 @@ mod tests {
         assert!(matches!(
             response_action(StreamExit::Cancelled, Vec::new(), None),
             ResponseOutcome::Cancelled
+        ));
+        assert!(matches!(
+            response_action(
+                StreamExit::Exhausted,
+                vec![PendingToolCall {
+                    id: ToolCallId::from_provider("other"),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                Some(StopReason::Other("content_filter".to_string())),
+            ),
+            ResponseOutcome::Finished(StopReason::Other(reason)) if reason == "content_filter"
         ));
     }
 

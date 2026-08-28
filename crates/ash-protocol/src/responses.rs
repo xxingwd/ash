@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 
 use crate::{
     content_value, image_data_url, message_groups, model_config,
-    pending_calls::stop_reason,
     pending_calls::{build_usage, PendingCall},
     project_request_messages, sse, text_tool_result, MessageGroup, ProviderConfig,
 };
@@ -276,7 +275,23 @@ impl sse::Decoder for ResponsesDecoder {
             }
             "response.output_item.done" => self.output_item_done(&event, &mut items)?,
             "response.completed" => {
-                self.completed(&event, &mut items)?;
+                self.finish(&event, &mut items, StopReason::EndTurn)?;
+                return Ok(sse::DecodeResult::Close(items));
+            }
+            "response.incomplete" => {
+                let reason = event["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidResponse(
+                            "Responses incomplete event is missing a reason".to_string(),
+                        )
+                    })?;
+                let stop = match reason {
+                    "max_output_tokens" => StopReason::MaxTokens,
+                    other => StopReason::Other(other.to_string()),
+                };
+                self.finish(&event, &mut items, stop)?;
                 return Ok(sse::DecodeResult::Close(items));
             }
             "error" | "response.failed" => return Err(Self::stream_error(&event)),
@@ -387,14 +402,15 @@ impl ResponsesDecoder {
         Ok(())
     }
 
-    fn completed(
+    fn finish(
         &mut self,
         event: &Value,
         items: &mut Vec<ModelEvent>,
+        stop: StopReason,
     ) -> Result<(), ProtocolError> {
         if !self.calls.is_empty() {
             return Err(ProtocolError::InvalidResponse(
-                "Responses API completed with an unfinished tool call".to_string(),
+                "Responses API stopped with an unfinished tool call".to_string(),
             ));
         }
         let response = &event["response"];
@@ -405,11 +421,7 @@ impl ResponsesDecoder {
                 usage["output_tokens"].as_u64().unwrap_or(0),
             )));
         }
-        self.completed = Some(stop_reason(
-            response["incomplete_details"]["reason"]
-                .as_str()
-                .unwrap_or(""),
-        ));
+        self.completed = Some(stop);
         Ok(())
     }
 
@@ -562,6 +574,36 @@ mod tests {
 
         assert!(matches!(result, sse::DecodeResult::Close(items) if items.is_empty()));
         assert_eq!(decoder.finalize().unwrap().1, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn incomplete_response_preserves_known_and_unknown_reasons() {
+        let mut max_tokens = ResponsesDecoder::default();
+        max_tokens
+            .decode(
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(max_tokens.finalize().unwrap().1, StopReason::MaxTokens);
+
+        let mut unknown = ResponsesDecoder::default();
+        unknown
+            .decode(
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            unknown.finalize().unwrap().1,
+            StopReason::Other("content_filter".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_response_without_a_reason() {
+        let result =
+            ResponsesDecoder::default().decode(r#"{"type":"response.incomplete","response":{}}"#);
+
+        assert!(matches!(result, Err(ProtocolError::InvalidResponse(_))));
     }
 
     #[test]

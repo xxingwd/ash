@@ -1,4 +1,4 @@
-use ash_core::{ModelEvent, ModelUsage, ProtocolError, StopReason, ToolCallId};
+use ash_core::{ModelEvent, ModelUsage, ProtocolError, ToolCallId};
 use serde_json::{json, Value};
 
 /// Shared construction of provider-neutral usage records. Stream decoders
@@ -8,20 +8,6 @@ pub const fn build_usage(input_tokens: u64, output_tokens: u64) -> ModelUsage {
     ModelUsage {
         input_tokens,
         output_tokens,
-    }
-}
-
-/// Shared mapping from a provider's "ran out of tokens" signal to the
-/// provider-neutral `StopReason`. The reason strings cover the three supported
-/// providers; anything else is a normal end of turn.
-pub fn stop_reason(provider_reason: &str) -> StopReason {
-    if matches!(
-        provider_reason,
-        "length" | "max_tokens" | "max_output_tokens"
-    ) {
-        StopReason::MaxTokens
-    } else {
-        StopReason::EndTurn
     }
 }
 
@@ -281,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_and_stop_reason_helpers_are_provider_neutral() {
+    fn usage_helper_is_provider_neutral() {
         let usage = build_usage(120, 25);
         assert_eq!(
             usage,
@@ -290,10 +276,5 @@ mod tests {
                 output_tokens: 25,
             }
         );
-
-        assert_eq!(stop_reason("length"), StopReason::MaxTokens);
-        assert_eq!(stop_reason("max_tokens"), StopReason::MaxTokens);
-        assert_eq!(stop_reason("max_output_tokens"), StopReason::MaxTokens);
-        assert_eq!(stop_reason("stop"), StopReason::EndTurn);
     }
 }
