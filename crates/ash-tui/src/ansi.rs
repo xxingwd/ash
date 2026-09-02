@@ -250,9 +250,9 @@ pub fn parse_ansi_line(line: &str) -> Line<'static> {
     }
 }
 
-/// Wrap a highlighted `Line` to a display width, splitting at the last space
-/// that fits on each row so long tokens stay intact. Styles are preserved per
-/// character, so syntax colors survive the wrap.
+/// Wrap a highlighted `Line` at the display width. No word-break heuristic:
+/// characters fill each row until the next one no longer fits. Styles are
+/// preserved per character, so syntax colors survive the wrap.
 pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     // Flatten the line into (style, char) pairs.
@@ -272,13 +272,6 @@ pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'st
             .max(1)
     };
 
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<(Style, String)> = Vec::new();
-    let mut current_width = 0usize;
-    // Byte index (into `current`) where the next row can break at the last
-    // breakable space.
-    let mut last_break: Option<usize> = None;
-
     let flush = |rows: &mut Vec<Line<'static>>, segment: &[(Style, String)]| {
         let mut row = Line::default();
         for (s, c) in segment {
@@ -287,26 +280,19 @@ pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'st
         rows.push(row);
     };
 
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<(Style, String)> = Vec::new();
+    let mut current_width = 0usize;
+
     for (style, text) in chars {
         let cw = char_width(&text);
-        let is_space = text == " ";
         if current_width > 0 && current_width + cw > width {
-            // Row is full. Break at the last space if one was seen, else here.
-            let split = last_break.unwrap_or(current.len());
-            flush(&mut rows, &current[..split]);
-            // The remainder after the split becomes the start of the next row.
-            current = current.split_off(split);
+            flush(&mut rows, &current);
+            current.clear();
             current_width = 0;
-            for (_, c) in &current {
-                current_width += char_width(c);
-            }
-            last_break = current.iter().rposition(|(_, c)| c == " ");
         }
         current.push((style, text));
         current_width += cw;
-        if is_space {
-            last_break = Some(current.len());
-        }
     }
     if !current.is_empty() {
         flush(&mut rows, &current);
@@ -561,5 +547,22 @@ mod wrap_hl_tests {
                 .sum();
             assert!(w <= 10, "line too wide: {w}");
         }
+    }
+
+    fn plain(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn wraps_at_column_width_without_word_breaks() {
+        let line = parse_ansi_line("Edit /home/user/file.rs");
+        let wrapped = wrap_highlighted_line(&line, 10);
+        assert_eq!(
+            wrapped.iter().map(plain).collect::<Vec<_>>(),
+            vec!["Edit /home", "/user/file", ".rs"]
+        );
     }
 }

@@ -879,14 +879,21 @@ fn render_bash_command_line_with_action(
         let content_width = width
             .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
             .max(1);
-        let shown = truncate_command_lines(&mut highlighted, expanded);
+        let mut wrapped = Vec::new();
+        for line in highlighted {
+            wrapped.extend(crate::ansi::wrap_highlighted_line(
+                &line,
+                usize::from(content_width),
+            ));
+        }
+        let shown = truncate_command_lines(&mut wrapped, expanded);
         let mut continuation = Buffer::empty(Rect::new(
             0,
             0,
             width.max(1),
             u16::try_from(shown).unwrap_or(u16::MAX),
         ));
-        for (offset, line) in highlighted.into_iter().enumerate() {
+        for (offset, line) in wrapped.into_iter().enumerate() {
             // Dim the pipe prefix so it matches the `└` output corner; the
             // command text itself keeps its syntax colors.
             let mut spans = vec![Span::styled(
@@ -898,7 +905,7 @@ fn render_bash_command_line_with_action(
                 0,
                 u16::try_from(offset).unwrap_or(u16::MAX),
                 &Line::from(spans),
-                content_width,
+                width.max(1),
             );
         }
         (title, Some(continuation), 1)
@@ -947,13 +954,18 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     if lines.is_empty() {
         return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
     }
+    let wrap_width = usize::from(width.max(1));
+    let rows: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|line| crate::ansi::wrap_highlighted_line(&line, wrap_width))
+        .collect();
     let mut buffer = Buffer::empty(Rect::new(
         0,
         0,
         width.max(1),
-        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        u16::try_from(rows.len()).unwrap_or(u16::MAX),
     ));
-    for (offset, line) in lines.into_iter().enumerate() {
+    for (offset, line) in rows.into_iter().enumerate() {
         buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &line, width);
     }
     buffer
@@ -1712,8 +1724,7 @@ mod generic_output_tests {
             "match".to_string(),
             false,
         );
-        // Generic titles wrap at the renderer's current width, like bash
-        // command lines do.
+        // Generic titles wrap at the column width, like bash command lines.
         let rendered = block.render(30, false);
         assert!(rendered.area.height > 2);
         let bash_block = LiveBlock::tool(
