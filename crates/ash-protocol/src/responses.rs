@@ -441,7 +441,9 @@ impl ResponsesDecoder {
                 status: 503,
                 message: message.to_string(),
             },
-            Some("rate_limit_exceeded" | "rate_limit_error") => ProtocolError::RateLimited,
+            Some("rate_limit_exceeded" | "rate_limit_error") => ProtocolError::RateLimited {
+                message: message.to_string(),
+            },
             _ => ProtocolError::InvalidResponse(
                 code.map_or_else(|| message.to_string(), |code| format!("{code}: {message}")),
             ),
@@ -636,7 +638,10 @@ mod tests {
         let result = decoder
             .decode(r#"{"type":"error","code":"rate_limit_exceeded","message":"Slow down"}"#);
 
-        assert!(matches!(result, Err(ProtocolError::RateLimited)));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::RateLimited { message }) if message == "Slow down"
+        ));
     }
 
     #[test]

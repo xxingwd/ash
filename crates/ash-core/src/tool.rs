@@ -120,7 +120,7 @@ pub trait Tool: Send + Sync {
     ) -> std::result::Result<ToolOutput, ToolError>;
 }
 
-pub struct FnTool<Args, F, Fut, Output> {
+struct FnTool<Args, F, Fut, Output> {
     name: String,
     description: String,
     schema: serde_json::Value,
@@ -130,7 +130,7 @@ pub struct FnTool<Args, F, Fut, Output> {
 }
 
 /// Build a tool from a function. The function must be `Send + Sync + 'static`
-/// and take one `Args` argument (see [`FnTool`]).
+/// and take one typed `Args` argument.
 ///
 /// # Errors
 ///
@@ -167,6 +167,7 @@ where
     Fut: std::future::Future<Output = std::result::Result<Output, ToolError>> + Send + 'static,
     Output: Into<ToolOutput> + Send + Sync + 'static,
 {
+    validate_definition(name, description)?;
     let schema = schemars::schema_for!(Args);
     let schema_value = serde_json::to_value(schema).map_err(|error| {
         ToolError::Execution(format!(
@@ -182,6 +183,20 @@ where
         execute: f,
         _phantom: std::marker::PhantomData,
     }))
+}
+
+fn validate_definition(name: &str, description: &str) -> Result<(), ToolError> {
+    if name.trim().is_empty() {
+        return Err(ToolError::Execution(
+            "tool name cannot be empty".to_string(),
+        ));
+    }
+    if description.trim().is_empty() {
+        return Err(ToolError::Execution(
+            "tool description cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -237,5 +252,23 @@ mod tests {
         let result = context.run(std::future::ready(())).await;
 
         assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[test]
+    fn define_tool_rejects_empty_metadata() {
+        let empty_name = define_tool(" ", "description", |_, _: ()| async {
+            Ok::<_, ToolError>("ok")
+        });
+        let empty_description =
+            define_tool("name", "\t", |_, _: ()| async { Ok::<_, ToolError>("ok") });
+
+        assert!(matches!(
+            empty_name,
+            Err(ToolError::Execution(message)) if message == "tool name cannot be empty"
+        ));
+        assert!(matches!(
+            empty_description,
+            Err(ToolError::Execution(message)) if message == "tool description cannot be empty"
+        ));
     }
 }

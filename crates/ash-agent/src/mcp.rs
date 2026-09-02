@@ -59,7 +59,7 @@ impl Tool for McpToolAdapter {
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         let arguments: Option<JsonObject> = serde_json::from_value(args)
-            .map_err(|e| ToolError::Execution(format!("invalid args: {e}")))?;
+            .map_err(|error| ToolError::Execution(format!("invalid args: {error}")))?;
 
         let mut request = CallToolRequestParams::new(self.name.clone());
         if let Some(arguments) = arguments {
@@ -68,16 +68,16 @@ impl Tool for McpToolAdapter {
         let result = ctx
             .run(self.connection.peer.call_tool(request))
             .await?
-            .map_err(|e| ToolError::Execution(format!("MCP call failed: {e}")))?;
+            .map_err(|error| ToolError::Execution(format!("MCP call failed: {error}")))?;
 
-        let mut output = String::new();
-        for item in &result.content {
-            if let Some(text_block) = item.as_text() {
-                output.push_str(&text_block.text);
-            } else {
-                output.push_str("[non-text content]");
-            }
-        }
+        let output = result
+            .content
+            .iter()
+            .map(|item| {
+                item.as_text()
+                    .map_or("[non-text content]", |text| text.text.as_str())
+            })
+            .collect::<String>();
 
         if result.is_error.unwrap_or(false) {
             Err(ToolError::Execution(output))

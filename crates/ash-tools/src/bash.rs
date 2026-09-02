@@ -1,7 +1,6 @@
 use std::{
     fmt::Write as _,
     io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -12,7 +11,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
 
+use crate::path::Workspace;
 use crate::truncate::{self, LimitKind, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+
+#[cfg(test)]
+use std::path::Path;
 
 #[derive(Deserialize, JsonSchema)]
 struct BashArgs {
@@ -26,7 +29,7 @@ struct BashArgs {
     timeout: Option<f64>,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "bash",
         "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
@@ -35,14 +38,14 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
             let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
             async move {
-                run_command(&working_dir, args, cancellation, deadline?).await
+                run_command(working_dir, args, cancellation, deadline?).await
             }
         },
     )
 }
 
 async fn run_command(
-    working_dir: &Path,
+    working_dir: Arc<Workspace>,
     args: BashArgs,
     cancellation: CancellationToken,
     deadline: Instant,
@@ -54,10 +57,10 @@ async fn run_command(
         .transpose()?;
     let cwd = match args.cwd {
         Some(requested) => {
-            let working_dir = working_dir.to_path_buf();
-            crate::path::run_blocking(move || resolve_cwd(&working_dir, &requested)).await?
+            let working_dir = Arc::clone(&working_dir);
+            crate::path::run_blocking(move || working_dir.resolve_dir(&requested)).await?
         }
-        None => working_dir.to_path_buf(),
+        None => working_dir.root().to_path_buf(),
     };
     crate::path::ensure_running(&cancellation, deadline)?;
     let stdout = tempfile::Builder::new()
@@ -92,10 +95,10 @@ async fn run_command(
     if output.success() {
         Ok(rendered)
     } else {
-        Err(ToolError::Execution(format!(
-            "{rendered}\n\nCommand exited with {}",
-            exit_description(output)
-        )))
+        Err(ToolError::CommandFailed {
+            status: exit_description(output),
+            output: rendered,
+        })
     }
 }
 
@@ -187,37 +190,6 @@ impl Drop for ManagedChild {
     fn drop(&mut self) {
         self.kill_processes();
     }
-}
-
-fn resolve_cwd(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
-    let candidate = crate::path::WorkspacePath::new(root, requested)?
-        .full_path()
-        .to_path_buf();
-    let workspace = std::fs::canonicalize(root).map_err(|error| {
-        ToolError::Execution(format!(
-            "cannot resolve working directory {}: {error}",
-            root.display()
-        ))
-    })?;
-    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
-        ToolError::Execution(format!(
-            "cannot access working directory {}: {error}",
-            candidate.display()
-        ))
-    })?;
-    if !resolved.starts_with(&workspace) {
-        return Err(ToolError::Execution(format!(
-            "working directory is outside the session working directory: {}",
-            resolved.display()
-        )));
-    }
-    if !resolved.is_dir() {
-        return Err(ToolError::Execution(format!(
-            "working directory is not a directory: {}",
-            resolved.display()
-        )));
-    }
-    Ok(resolved)
 }
 
 fn render_files(
@@ -495,7 +467,7 @@ mod tests {
         cwd: Option<&str>,
         timeout: Option<f64>,
     ) -> Result<String, ToolError> {
-        let tool = tool(Arc::new(root.to_path_buf())).unwrap();
+        let tool = tool(Workspace::new(root).unwrap()).unwrap();
         let mut args = serde_json::Map::new();
         args.insert("command".into(), serde_json::Value::String(command.into()));
         if let Some(cwd) = cwd {
@@ -584,6 +556,21 @@ mod tests {
         assert!(error.to_string().contains("not a directory"));
     }
 
+    #[tokio::test]
+    async fn reports_nonzero_exit_as_a_typed_error() {
+        let root = tempfile::tempdir().unwrap();
+
+        let error = run_in(root.path(), "printf failure >&2; exit 7", None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::CommandFailed { status, output }
+                if status == "7" && output.contains("failure")
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_cwd_symlink_that_resolves_outside_working_dir() {
@@ -645,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_execution_terminates_background_descendants() {
         let root = tempfile::tempdir().unwrap();
-        let tool = tool(Arc::new(root.path().to_path_buf())).unwrap();
+        let tool = tool(Workspace::new(root.path()).unwrap()).unwrap();
         let task = tokio::spawn(async move {
             tool.execute(
                 test_context(),
@@ -673,7 +660,7 @@ mod tests {
     async fn cancelled_execution_terminates_the_command() {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().to_path_buf();
-        let tool = tool(Arc::new(root_path.clone())).unwrap();
+        let tool = tool(Workspace::new(&root_path).unwrap()).unwrap();
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let spawned = tokio::spawn(async move {

@@ -22,4 +22,4 @@ mod viewport;
 mod welcome_card;
 
 pub use app::{App, UiCommand, UiError, UiEvent};
-pub use subagent::{SubagentView, SubagentViewState};
+pub use subagent::{SubagentUpdate, SubagentUpdateKind, SubagentView, SubagentViewState};

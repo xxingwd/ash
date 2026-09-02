@@ -1,12 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use crate::path::Workspace;
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteArgs {
@@ -21,7 +19,7 @@ struct WriteResult {
     path: PathBuf,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "write",
         "Write complete content to a file. Creates missing parent directories and overwrites an existing file; use edit for local changes.",
@@ -46,18 +44,18 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
 }
 
 async fn write_file(
-    root: &Path,
+    workspace: &Workspace,
     requested: &str,
     content: &str,
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<WriteResult, ToolError> {
-    let root = root.to_path_buf();
     let requested = requested.to_string();
     let content = content.to_string();
+    crate::path::ensure_running(&cancellation, deadline)?;
+    let path = workspace.path(&requested)?;
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
-        let path = crate::path::WorkspacePath::new(&root, &requested)?;
         path.atomic_write(content.as_bytes(), None, &cancellation, deadline)?;
         Ok(WriteResult {
             path: path.full_path().to_path_buf(),
@@ -74,8 +72,9 @@ mod tests {
     #[tokio::test]
     async fn creates_parent_directories_and_overwrites_files() {
         let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
         let added = write_file(
-            root.path(),
+            &workspace,
             "src/new.rs",
             "first",
             CancellationToken::new(),
@@ -84,7 +83,7 @@ mod tests {
         .await
         .unwrap();
         let updated = write_file(
-            root.path(),
+            &workspace,
             "src/new.rs",
             "second",
             CancellationToken::new(),
@@ -109,6 +108,7 @@ mod tests {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
         let path = root.path().join("existing.txt");
         std::fs::OpenOptions::new()
             .write(true)
@@ -118,7 +118,7 @@ mod tests {
             .unwrap();
 
         write_file(
-            root.path(),
+            &workspace,
             "existing.txt",
             "changed",
             CancellationToken::new(),
@@ -137,31 +137,41 @@ mod tests {
     #[tokio::test]
     async fn rejects_symlink_writes_outside_the_workdir() {
         let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("secret.txt");
         std::fs::write(&target, "secret").unwrap();
         std::os::unix::fs::symlink(&target, root.path().join("link.txt")).unwrap();
 
-        assert!(write_file(
-            root.path(),
+        let error = write_file(
+            &workspace,
             "link.txt",
             "changed",
             CancellationToken::new(),
             Instant::now() + Duration::from_mins(1),
         )
         .await
-        .is_err());
+        .unwrap_err();
+
+        let full_path = root.path().join("link.txt");
+        assert!(matches!(
+            error,
+            ToolError::Execution(message)
+                if message == "cannot write file: symbolic links are not writable"
+                    && !message.contains(&full_path.display().to_string())
+        ));
         assert_eq!(std::fs::read_to_string(target).unwrap(), "secret");
     }
 
     #[tokio::test]
     async fn cancelled_write_does_not_create_the_file() {
         let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
         let error = write_file(
-            root.path(),
+            &workspace,
             "new.txt",
             "content",
             cancellation,

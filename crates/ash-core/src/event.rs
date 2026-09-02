@@ -3,7 +3,7 @@ use std::sync::Arc;
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
-use crate::{ToolCallId, Turn, TurnId};
+use crate::{ToolCallId, Turn, TurnId, TurnStats};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -15,6 +15,15 @@ pub enum SessionEvent {
     Thought {
         turn_id: TurnId,
         text: String,
+    },
+    Progress {
+        turn_id: TurnId,
+        stats: TurnStats,
+    },
+    Context {
+        turn_id: TurnId,
+        tokens: u64,
+        limit: u64,
     },
     ToolStarted {
         turn_id: TurnId,

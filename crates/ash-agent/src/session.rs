@@ -350,12 +350,59 @@ fn reject_busy<T>(reply: oneshot::Sender<Result<T, AshError>>) {
 
 fn publish(events: &broadcast::Sender<SessionEvent>, event: SessionEvent) {
     match &event {
-        SessionEvent::Text { .. } | SessionEvent::Thought { .. } => {
-            tracing::debug!(?event, "session event");
+        SessionEvent::Started(turn_id) => tracing::info!(%turn_id, "turn started"),
+        SessionEvent::Text { turn_id, text } => {
+            tracing::debug!(%turn_id, chars = text.len(), "text streamed")
         }
-        _ => tracing::info!(?event, "session event"),
+        SessionEvent::Thought { turn_id, text } => {
+            tracing::debug!(%turn_id, chars = text.len(), "thought streamed")
+        }
+        SessionEvent::Progress { turn_id, stats } => tracing::debug!(
+            %turn_id,
+            input_tokens = stats.input_tokens,
+            output_tokens = stats.output_tokens,
+            generation_ms = stats.generation_ms,
+            "turn progress"
+        ),
+        SessionEvent::Context {
+            turn_id,
+            tokens,
+            limit,
+        } => tracing::debug!(%turn_id, tokens, limit, "context estimated"),
+        SessionEvent::ToolStarted {
+            turn_id, id, name, ..
+        } => {
+            tracing::info!(%turn_id, %id, tool = %name, "tool started")
+        }
+        SessionEvent::ToolFinished {
+            turn_id,
+            id,
+            result,
+        } => match result {
+            Ok(output) => tracing::info!(%turn_id, %id, chars = output.len(), "tool finished"),
+            Err(_) => tracing::warn!(%turn_id, %id, "tool failed"),
+        },
+        SessionEvent::Finished(turn) => tracing::info!(
+            turn_id = %turn.id,
+            tools = turn.tool_calls().count(),
+            result = turn_result_label(&turn.result),
+            "turn finished"
+        ),
+        SessionEvent::Discarded { turn_id, error } if error.is_some() => {
+            tracing::warn!(%turn_id, "turn discarded with an error")
+        }
+        SessionEvent::Discarded { turn_id, .. } => tracing::info!(%turn_id, "turn discarded"),
     }
     let _ = events.send(event);
+}
+
+fn turn_result_label(result: &TurnResult) -> &'static str {
+    match result {
+        TurnResult::Stopped(_) => "stopped",
+        TurnResult::Cancelled => "cancelled",
+        TurnResult::Truncated => "truncated",
+        TurnResult::Failed(_) => "failed",
+    }
 }
 
 pub(crate) struct SessionActorState {

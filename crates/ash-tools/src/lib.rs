@@ -13,6 +13,8 @@ mod write;
 use ash_core::{Tool, ToolError};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
+use crate::path::Workspace;
+
 /// Build the default tool set for the given working directory.
 ///
 /// # Errors
@@ -23,7 +25,8 @@ pub fn tools(
     working_dir: impl Into<PathBuf>,
     enabled: Option<&[String]>,
 ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
-    let tools = all_tools(&Arc::new(working_dir.into()))?;
+    let workspace = Workspace::new(working_dir.into())?;
+    let tools = all_tools(&workspace)?;
     let Some(names) = enabled else {
         return Ok(tools);
     };
@@ -51,14 +54,14 @@ pub fn tools(
         .collect())
 }
 
-fn all_tools(working_dir: &Arc<PathBuf>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+fn all_tools(workspace: &Arc<Workspace>) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
     let tools = vec![
-        read::tool(Arc::clone(working_dir))?,
-        glob::tool(Arc::clone(working_dir))?,
-        grep::tool(Arc::clone(working_dir))?,
-        bash::tool(Arc::clone(working_dir))?,
-        edit::tool(Arc::clone(working_dir))?,
-        write::tool(Arc::clone(working_dir))?,
+        read::tool(Arc::clone(workspace))?,
+        glob::tool(Arc::clone(workspace))?,
+        grep::tool(Arc::clone(workspace))?,
+        bash::tool(Arc::clone(workspace))?,
+        edit::tool(Arc::clone(workspace))?,
+        write::tool(Arc::clone(workspace))?,
         webfetch::tool()?,
     ];
     Ok(tools)

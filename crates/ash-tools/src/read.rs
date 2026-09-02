@@ -1,16 +1,10 @@
-use std::{
-    fmt::Write as _,
-    io::Read,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{fmt::Write as _, io::Read, num::NonZeroUsize, path::Path, sync::Arc, time::Instant};
 
 use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::path::Workspace;
 use crate::truncate::{self, LimitKind, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 #[derive(Deserialize, JsonSchema)]
@@ -128,7 +122,7 @@ impl TextReadState {
     }
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "read",
         "Read a text file or image. Text is truncated to 2000 lines or 50KB; use offset and limit to continue. Images are resized to 2000px / 5MB. Supported images: jpg, png, gif, webp, and bmp.",
@@ -153,31 +147,27 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
 }
 
 async fn read_file(
-    root: &Path,
+    workspace: &Workspace,
     requested: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<ToolOutput, ToolError> {
-    let root = root.to_path_buf();
     let requested = requested.to_string();
+    crate::path::ensure_running(&cancellation, deadline)?;
+    let path = workspace.path(&requested)?;
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
-        let path = crate::path::WorkspacePath::new(&root, &requested)?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
         crate::path::ensure_running(&cancellation, deadline)?;
-        let mut file = path.open_with(&options).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot read {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
+        let mut file = path
+            .open_with(&options)
+            .map_err(|error| ToolError::Execution(format!("cannot read file: {error}")))?;
         if let Some(media_type) = image_media_type(path.full_path()) {
             let bytes = crate::path::read_limited(
                 &mut file,
-                path.full_path(),
                 crate::image::MAX_IMAGE_INGEST_BYTES,
                 &cancellation,
                 deadline,
@@ -397,7 +387,7 @@ mod tests {
             .unwrap();
 
         let output = read_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "image.png",
             None,
             None,
@@ -423,7 +413,7 @@ mod tests {
             .unwrap();
 
         let output = read_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "wide.png",
             None,
             None,
@@ -456,7 +446,7 @@ mod tests {
             .unwrap();
 
         let error = read_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "huge.png",
             None,
             None,
@@ -483,7 +473,7 @@ mod tests {
         cancellation.cancel();
 
         let error = read_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "notes.txt",
             None,
             None,
@@ -494,5 +484,31 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ToolError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn missing_file_error_omits_the_full_path() {
+        let root = tempfile::tempdir().unwrap();
+        let requested = "missing/go.mod";
+
+        let error = read_file(
+            &Workspace::new(root.path()).unwrap(),
+            requested,
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap_err();
+
+        let full_path = root.path().join(requested);
+        assert!(matches!(
+            error,
+            ToolError::Execution(message)
+                if message.starts_with("cannot read file:")
+                    && !message.contains(&full_path.display().to_string())
+                    && !message.contains(requested)
+        ));
     }
 }

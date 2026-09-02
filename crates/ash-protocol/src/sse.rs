@@ -8,6 +8,8 @@ pub enum DecodeResult {
     Close(Vec<ModelEvent>),
 }
 
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+
 pub trait Decoder: Send + 'static {
     fn decode(&mut self, data: &str) -> Result<DecodeResult, ProtocolError>;
 
@@ -47,24 +49,26 @@ where
             .await
             .map_err(|error| ProtocolError::Request(error.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            Err(map_status(status))?;
-        }
-        let mut source = response.bytes_stream().eventsource();
+        let mut source = if !status.is_success() {
+            let message = read_error_body(response).await;
+            Err(map_status(status, message))
+        } else {
+            Ok(response.bytes_stream().eventsource())
+        }?;
         let mut wire_closed = false;
         let mut counts = StreamEventCounts::default();
         while let Some(event) = source.next().await {
             let event = event.map_err(|error| ProtocolError::Request(error.to_string()))?;
             counts.frames += 1;
             let result = decoder.decode(&event.data).map_err(|error| {
-                tracing::warn!(%error, data = %event.data, "sse decode failed");
+                tracing::warn!(%error, event_bytes = event.data.len(), "sse decode failed");
                 error
             })?;
             let (items, closes_wire) = match result {
                 DecodeResult::Continue(items) => (items, false),
                 DecodeResult::Close(items) => (items, true),
             };
-            tracing::debug!(closes_wire, data = %event.data, "sse event");
+            tracing::debug!(closes_wire, event_bytes = event.data.len(), "sse event");
             for item in items {
                 validate_nonterminal(&item)?;
                 log_model_event(&item);
@@ -106,14 +110,19 @@ where
     })
 }
 
-/// Log the non-streaming model events from the wire. Text and reasoning
-/// deltas are already visible in the raw SSE data and the agent event log,
-/// so only the structural events (tool calls, usage, stop) are logged here
-/// to keep the stream readable.
+/// Log only structural model events. Text and reasoning deltas are omitted so
+/// tracing never receives model content or tool arguments.
 fn log_model_event(item: &ModelEvent) {
     match item {
         ModelEvent::Text(_) | ModelEvent::Reasoning(_) => {}
-        other => tracing::debug!(?other, "model event"),
+        ModelEvent::ToolCall { id, name, .. } => {
+            tracing::debug!(tool_call_id = %id, tool = %name, "model tool call")
+        }
+        ModelEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } => tracing::debug!(%input_tokens, %output_tokens, "model usage"),
+        ModelEvent::Stop(reason) => tracing::debug!(reason = %reason, "model stop"),
     }
 }
 
@@ -127,13 +136,36 @@ fn validate_nonterminal(item: &ModelEvent) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn map_status(status: reqwest::StatusCode) -> ProtocolError {
+async fn read_error_body(response: reqwest::Response) -> String {
+    let mut body = Vec::with_capacity(MAX_ERROR_BODY_BYTES.min(1024));
+    let mut source = response.bytes_stream();
+    while let Some(chunk) = source.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() == MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    let message = String::from_utf8_lossy(&body).trim().to_string();
+    if message.is_empty() {
+        "request rejected before the event stream opened".to_string()
+    } else {
+        message
+    }
+}
+
+fn map_status(status: reqwest::StatusCode, message: String) -> ProtocolError {
     match status {
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => ProtocolError::Auth,
-        reqwest::StatusCode::TOO_MANY_REQUESTS => ProtocolError::RateLimited,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            ProtocolError::Auth { message }
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ProtocolError::RateLimited { message },
         _ => ProtocolError::Upstream {
             status: status.as_u16(),
-            message: "request rejected before the event stream opened".into(),
+            message,
         },
     }
 }
@@ -344,5 +376,33 @@ mod tests {
             with_message_stop,
             vec![ModelEvent::Stop(StopReason::EndTurn)]
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_http_error_details_without_unbounded_body_reads() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = "invalid api key";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let request = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .bearer_auth("test-key")
+            .json(&serde_json::json!({"model": "test", "stream": true}));
+        let mut stream = super::stream(request, crate::anthropic::AnthropicDecoder::default());
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::Auth { message } if message == "invalid api key"
+        ));
+        server.await.unwrap();
     }
 }

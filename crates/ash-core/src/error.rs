@@ -56,10 +56,10 @@ pub enum SessionError {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ProtocolError {
-    #[error("auth failed")]
-    Auth,
-    #[error("rate limited")]
-    RateLimited,
+    #[error("auth failed: {message}")]
+    Auth { message: String },
+    #[error("rate limited: {message}")]
+    RateLimited { message: String },
     #[error("upstream {status}: {message}")]
     Upstream { status: u16, message: String },
     #[error("request failed: {0}")]
@@ -74,6 +74,8 @@ pub enum ProtocolError {
 pub enum ToolError {
     #[error("{0}")]
     Execution(String),
+    #[error("command exited with {status}: {output}")]
+    CommandFailed { status: String, output: String },
     #[error("timeout after {0:?}")]
     Timeout(Duration),
     #[error("deadline exceeded")]

@@ -1,12 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use ash_core::{define_tool, CancellationToken, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use crate::path::Workspace;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +28,7 @@ struct EditResult {
     path: PathBuf,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "edit",
         "Edit one file using one or more exact replacements. Every edits[].oldText must be unique and non-overlapping in the original file; replacements are not applied incrementally.",
@@ -55,43 +53,31 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
 }
 
 async fn edit_file(
-    root: &Path,
+    workspace: &Workspace,
     requested: &str,
     edits: Vec<Replacement>,
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<EditResult, ToolError> {
-    let root = root.to_path_buf();
     let requested = requested.to_string();
+    crate::path::ensure_running(&cancellation, deadline)?;
+    let path = workspace.path(&requested)?;
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
-        let path = crate::path::WorkspacePath::new(&root, &requested)?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
         crate::path::ensure_running(&cancellation, deadline)?;
-        let mut file = path.open_with(&options).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot open {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
+        let mut file = path
+            .open_with(&options)
+            .map_err(|error| ToolError::Execution(format!("cannot open file: {error}")))?;
 
         let permissions = file
             .metadata()
-            .map_err(|error| {
-                ToolError::Execution(format!(
-                    "cannot inspect {}: {error}",
-                    path.full_path().display()
-                ))
-            })?
+            .map_err(|error| ToolError::Execution(format!("cannot inspect file: {error}")))?
             .permissions();
-        let raw = crate::path::read_all(&mut file, path.full_path(), &cancellation, deadline)?;
+        let raw = crate::path::read_all(&mut file, &cancellation, deadline)?;
         let original = String::from_utf8(raw).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot read {}: {}",
-                path.full_path().display(),
-                error.utf8_error()
-            ))
+            ToolError::Execution(format!("cannot read file: {}", error.utf8_error()))
         })?;
         let (bom, content) = original
             .strip_prefix('\u{feff}')
@@ -236,7 +222,7 @@ mod tests {
         std::fs::write(root.path().join("input.txt"), "one\r\ntwo\r\n").unwrap();
 
         let result = edit_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "input.txt",
             vec![replacement("one\ntwo", "three")],
             CancellationToken::new(),
@@ -259,7 +245,7 @@ mod tests {
         std::fs::write(root.path().join("large.txt"), content).unwrap();
 
         let result = edit_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "large.txt",
             vec![replacement("needle", "changed")],
             CancellationToken::new(),
@@ -285,7 +271,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
 
         edit_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "script.sh",
             vec![replacement("old", "new")],
             CancellationToken::new(),
@@ -308,7 +294,7 @@ mod tests {
         cancellation.cancel();
 
         let error = edit_file(
-            root.path(),
+            &Workspace::new(root.path()).unwrap(),
             "input.txt",
             vec![replacement("old", "new")],
             cancellation,
@@ -322,5 +308,30 @@ mod tests {
             std::fs::read_to_string(root.path().join("input.txt")).unwrap(),
             "old\n"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_file_error_omits_the_full_path() {
+        let root = tempfile::tempdir().unwrap();
+        let requested = "missing/input.txt";
+
+        let error = edit_file(
+            &Workspace::new(root.path()).unwrap(),
+            requested,
+            vec![replacement("old", "new")],
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap_err();
+
+        let full_path = root.path().join(requested);
+        assert!(matches!(
+            error,
+            ToolError::Execution(message)
+                if message.starts_with("cannot open file:")
+                    && !message.contains(&full_path.display().to_string())
+                    && !message.contains(requested)
+        ));
     }
 }

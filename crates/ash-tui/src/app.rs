@@ -2,7 +2,9 @@ use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(test)]
 use ash_core::SessionError;
-use ash_core::{AshError, Conversation, Input, SessionEvent, SessionId, SessionSummary, TurnId};
+use ash_core::{
+    AshError, Conversation, Input, SessionEvent, SessionId, SessionSummary, TurnId, TurnStats,
+};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -15,7 +17,7 @@ use crate::{
     operation::{BackgroundAction, OperationState, SubmissionPolicy, TurnStartOutcome},
     picker::PickerState,
     slash_command::{self, ParsedInput, SlashCommand},
-    SubagentView,
+    SubagentUpdate, SubagentUpdateKind, SubagentView, SubagentViewState,
 };
 
 /// Pace complete assistant lines so streaming remains readable rather than
@@ -67,6 +69,7 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Session(SessionEvent),
+    Subagent(SubagentUpdate),
     ConversationChanged {
         session_id: SessionId,
         conversation: Conversation,
@@ -86,7 +89,6 @@ pub(crate) struct AppState {
     pub(crate) input: InputState,
     pub(crate) operation: OperationState,
     pub(crate) menu: ComposerMenuState,
-    pub(crate) subagent_rx: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
     pub(crate) subagents: Vec<SubagentView>,
     pub(crate) session_id: Option<SessionId>,
     pub(crate) conversation: Conversation,
@@ -96,6 +98,10 @@ pub(crate) struct AppState {
     pub(crate) scroll_top: Option<u16>,
     pub(crate) next_block_id: u64,
     pub(crate) status: StatusState,
+    pub(crate) turn_stats: Option<TurnStats>,
+    pub(crate) context_tokens: Option<u64>,
+    pub(crate) context_limit: Option<u64>,
+    pub(crate) tool_calls: usize,
     pub(crate) current_turn_id: Option<TurnId>,
     pub(crate) reasoning_block_id: Option<u64>,
     pub(crate) assistant_block_id: Option<u64>,
@@ -129,7 +135,6 @@ impl AppState {
             input: InputState::with_history(input_history),
             operation: OperationState::default(),
             menu: ComposerMenuState::default(),
-            subagent_rx: None,
             subagents: Vec::new(),
             session_id: None,
             conversation: Conversation::new(),
@@ -139,53 +144,66 @@ impl AppState {
             scroll_top: None,
             next_block_id: 1,
             status: StatusState::default(),
+            turn_stats: None,
+            context_tokens: None,
+            context_limit: None,
+            tool_calls: 0,
             current_turn_id: None,
             reasoning_block_id: None,
             assistant_block_id: None,
         }
     }
 
-    fn refresh_subagents(&mut self) -> bool {
-        let Some(receiver) = &mut self.subagent_rx else {
-            return false;
-        };
-        match receiver.has_changed() {
-            Ok(true) => {
-                let subagents = visible_subagents(&receiver.borrow_and_update(), self.session_id);
-                self.replace_subagents(subagents)
-            }
-            Ok(false) => false,
-            // The monitor channel closed: no further snapshots will arrive, so
-            // stop tracking subagents instead of freezing the last stale list.
-            Err(_) => {
-                self.subagent_rx = None;
-                if self.subagents.is_empty() {
-                    false
-                } else {
-                    self.subagents.clear();
-                    true
-                }
-            }
-        }
-    }
-
     fn select_session(&mut self, session_id: SessionId, conversation: Conversation) -> bool {
+        let changed = self.session_id != Some(session_id);
         self.session_id = Some(session_id);
         self.conversation = conversation;
         self.inputs.clear();
-        let subagents = self.subagent_rx.as_ref().map_or_else(Vec::new, |receiver| {
-            visible_subagents(&receiver.borrow(), self.session_id)
-        });
-        self.replace_subagents(subagents)
+        self.turn_stats = None;
+        self.context_tokens = None;
+        self.context_limit = None;
+        self.tool_calls = 0;
+        changed
     }
 
-    fn replace_subagents(&mut self, subagents: Vec<SubagentView>) -> bool {
-        if self.subagents == subagents {
-            false
-        } else {
-            self.subagents = subagents;
-            true
+    fn update_subagent(&mut self, update: SubagentUpdate) {
+        let identity = |agent: &SubagentView| {
+            agent.root_id == update.root_id && agent.session_id == update.session_id
+        };
+        if matches!(update.kind, SubagentUpdateKind::Removed) {
+            self.subagents.retain(|agent| !identity(agent));
+            return;
         }
+
+        let position = self.subagents.iter().position(identity).unwrap_or_else(|| {
+            self.subagents
+                .retain(|agent| agent.root_id != update.root_id || agent.name != update.name);
+            self.subagents.push(SubagentView {
+                root_id: update.root_id,
+                session_id: update.session_id,
+                name: update.name.clone(),
+                state: SubagentViewState::Running,
+                stats: TurnStats::default(),
+                context_tokens: None,
+                context_limit: None,
+                tool_calls: 0,
+                active_turn: None,
+            });
+            self.subagents.len() - 1
+        });
+        let agent = &mut self.subagents[position];
+        match update.kind {
+            SubagentUpdateKind::StateChanged(state) => agent.state = state,
+            SubagentUpdateKind::Session(event) => update_subagent_session(agent, event),
+            SubagentUpdateKind::Removed => {}
+        }
+        self.subagents.sort_by(|left, right| {
+            right
+                .state
+                .is_active()
+                .cmp(&left.state.is_active())
+                .then_with(|| left.name.cmp(&right.name))
+        });
     }
 
     fn queue_input(&mut self, turn_id: TurnId, input: String) {
@@ -232,12 +250,52 @@ impl AppState {
     }
 }
 
-fn visible_subagents(subagents: &[SubagentView], root_id: Option<SessionId>) -> Vec<SubagentView> {
-    subagents
-        .iter()
-        .filter(|subagent| Some(subagent.root_id) == root_id)
-        .cloned()
-        .collect()
+fn update_subagent_session(agent: &mut SubagentView, event: SessionEvent) {
+    match event {
+        SessionEvent::Started(turn_id) => {
+            agent.active_turn = Some(turn_id);
+            agent.stats = TurnStats::default();
+            agent.context_tokens = None;
+            agent.context_limit = None;
+            agent.tool_calls = 0;
+        }
+        SessionEvent::Progress { turn_id, stats } if agent.active_turn == Some(turn_id) => {
+            agent.stats = stats;
+        }
+        SessionEvent::Context {
+            turn_id,
+            tokens,
+            limit,
+        } if agent.active_turn == Some(turn_id) => {
+            agent.context_tokens = Some(tokens);
+            agent.context_limit = Some(limit);
+        }
+        SessionEvent::ToolStarted { turn_id, .. } if agent.active_turn == Some(turn_id) => {
+            agent.tool_calls = agent.tool_calls.saturating_add(1);
+        }
+        SessionEvent::Finished(turn) if agent.active_turn == Some(turn.id) => {
+            agent.active_turn = None;
+            agent.stats = turn.stats;
+            agent.context_tokens = None;
+            agent.context_limit = None;
+            agent.tool_calls = turn.tool_calls().count();
+        }
+        SessionEvent::Discarded { turn_id, .. } if agent.active_turn == Some(turn_id) => {
+            agent.active_turn = None;
+            agent.stats = TurnStats::default();
+            agent.context_tokens = None;
+            agent.context_limit = None;
+            agent.tool_calls = 0;
+        }
+        SessionEvent::Text { .. }
+        | SessionEvent::Thought { .. }
+        | SessionEvent::Progress { .. }
+        | SessionEvent::Context { .. }
+        | SessionEvent::ToolStarted { .. }
+        | SessionEvent::ToolFinished { .. }
+        | SessionEvent::Finished(_)
+        | SessionEvent::Discarded { .. } => {}
+    }
 }
 
 pub struct App {
@@ -245,7 +303,6 @@ pub struct App {
     model: String,
     working_dir: PathBuf,
     input_history: Vec<String>,
-    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
 }
 
 impl App {
@@ -256,22 +313,12 @@ impl App {
             model,
             working_dir,
             input_history: Vec::new(),
-            subagent_monitor: None,
         }
     }
 
     #[must_use]
     pub fn with_input_history(mut self, input_history: Vec<String>) -> Self {
         self.input_history = input_history;
-        self
-    }
-
-    #[must_use]
-    pub fn with_subagent_monitor(
-        mut self,
-        subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
-    ) -> Self {
-        self.subagent_monitor = subagent_monitor;
         self
     }
 
@@ -294,7 +341,6 @@ impl App {
             self.model,
             self.working_dir,
         );
-        state.subagent_rx = self.subagent_monitor.take();
         let mut keys = EventStream::new();
         let mut status_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + STATUS_INTERVAL,
@@ -308,9 +354,6 @@ impl App {
             tokio::select! {
                 _ = status_tick.tick() => {
                     let mut effect = RenderPlan::None;
-                    if state.refresh_subagents() {
-                        effect = effect.merge(RenderPlan::Redraw);
-                    }
                     if state.operation.shows_activity() {
                         effect = effect.merge(state.refresh_status());
                     }
@@ -352,6 +395,11 @@ fn handle_ui_event(
 ) -> anyhow::Result<LoopAction> {
     match event {
         UiEvent::Session(event) => handle_session_event(state, terminal, event),
+        UiEvent::Subagent(update) => {
+            state.update_subagent(update);
+            state.apply(terminal, RenderPlan::Redraw)?;
+            Ok(LoopAction::Continue)
+        }
         UiEvent::CommandFailed(error) => {
             state.finish_command_failure();
             let plan = state.error(&error).merge(RenderPlan::Redraw);
@@ -430,6 +478,10 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
                 RenderPlan::None
             };
             state.track_turn(turn_id);
+            state.turn_stats = None;
+            state.context_tokens = None;
+            state.context_limit = None;
+            state.tool_calls = 0;
             let start = state.operation.turn_started();
             let effect = state.turn_started().merge(input_effect);
             let action = match start {
@@ -452,12 +504,29 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             let effect = state.thinking(&text);
             (effect, LoopAction::Continue)
         }
+        SessionEvent::Progress { turn_id, stats }
+            if state.current_turn_id() == Some(turn_id)
+                && state.operation.accepts_live_output() =>
+        {
+            state.turn_stats = Some(stats);
+            (RenderPlan::Redraw, LoopAction::Continue)
+        }
+        SessionEvent::Context {
+            turn_id,
+            tokens,
+            limit,
+        } if state.current_turn_id() == Some(turn_id) && state.operation.accepts_live_output() => {
+            state.context_tokens = Some(tokens);
+            state.context_limit = Some(limit);
+            (RenderPlan::Redraw, LoopAction::Continue)
+        }
         SessionEvent::ToolStarted {
             turn_id,
             id,
             name,
             arguments,
         } if state.current_turn_id() == Some(turn_id) && state.operation.accepts_live_output() => {
+            state.tool_calls = state.tool_calls.saturating_add(1);
             let effect = state.tool_started(id, name, arguments);
             (effect, LoopAction::Continue)
         }
@@ -481,6 +550,10 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             }
             state.track_turn(turn.id);
             state.operation.complete_turn();
+            state.turn_stats = None;
+            state.context_tokens = None;
+            state.context_limit = None;
+            state.tool_calls = 0;
             state.finish_turn(turn.id);
             state.conversation.push(Arc::clone(&turn), None);
             let effect = state.commit_turn(&turn);
@@ -492,6 +565,10 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
         {
             let input = state.finish_turn(turn_id);
             state.operation.complete_turn();
+            state.turn_stats = None;
+            state.context_tokens = None;
+            state.context_limit = None;
+            state.tool_calls = 0;
             if let Some(input) = input {
                 state.input.restore_submission(input);
             }
@@ -503,6 +580,8 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
         }
         SessionEvent::Text { .. }
         | SessionEvent::Thought { .. }
+        | SessionEvent::Progress { .. }
+        | SessionEvent::Context { .. }
         | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. }
         | SessionEvent::Discarded { .. } => (RenderPlan::None, LoopAction::Continue),
@@ -1060,28 +1139,94 @@ mod tests {
     }
 
     #[test]
-    fn session_selection_filters_subagents_by_root() {
+    fn subagent_events_are_scoped_by_root_and_session() {
         let first = SessionId::new();
         let second = SessionId::new();
-        let (_, receiver) = tokio::sync::watch::channel(vec![
-            SubagentView {
-                root_id: first,
-                name: "first".to_string(),
-                state: SubagentViewState::Running,
-            },
-            SubagentView {
-                root_id: second,
-                name: "second".to_string(),
-                state: SubagentViewState::Running,
-            },
-        ]);
+        let first_child = SessionId::new();
+        let second_child = SessionId::new();
         let mut state = test_state();
-        state.subagent_rx = Some(receiver);
+        state.update_subagent(SubagentUpdate {
+            root_id: first,
+            session_id: first_child,
+            name: "first".to_string(),
+            kind: SubagentUpdateKind::StateChanged(SubagentViewState::Running),
+        });
+        state.update_subagent(SubagentUpdate {
+            root_id: second,
+            session_id: second_child,
+            name: "second".to_string(),
+            kind: SubagentUpdateKind::StateChanged(SubagentViewState::Running),
+        });
 
         assert!(state.select_session(first, Conversation::new()));
-        assert_eq!(state.subagents[0].name, "first");
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|agent| agent.root_id == first)
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
         assert!(state.select_session(second, Conversation::new()));
-        assert_eq!(state.subagents[0].name, "second");
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|agent| agent.root_id == second)
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+    }
+
+    #[test]
+    fn child_session_events_project_live_stats_and_tool_count() {
+        let root_id = SessionId::new();
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut state = test_state();
+        let update = |kind| SubagentUpdate {
+            root_id,
+            session_id,
+            name: "worker".to_string(),
+            kind,
+        };
+
+        state.update_subagent(update(SubagentUpdateKind::StateChanged(
+            SubagentViewState::Running,
+        )));
+        state.update_subagent(update(SubagentUpdateKind::Session(SessionEvent::Started(
+            turn_id,
+        ))));
+        let stats = TurnStats {
+            input_tokens: 120,
+            output_tokens: 25,
+            generation_ms: 200,
+        };
+        state.update_subagent(update(SubagentUpdateKind::Session(
+            SessionEvent::Progress { turn_id, stats },
+        )));
+        state.update_subagent(update(SubagentUpdateKind::Session(SessionEvent::Context {
+            turn_id,
+            tokens: 800,
+            limit: 1_000,
+        })));
+        state.update_subagent(update(SubagentUpdateKind::Session(
+            SessionEvent::ToolStarted {
+                turn_id,
+                id: ash_core::ToolCallId::new(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        )));
+
+        let agent = &state.subagents[0];
+        assert_eq!(agent.active_turn, Some(turn_id));
+        assert_eq!(agent.stats, stats);
+        assert_eq!(agent.context_tokens, Some(800));
+        assert_eq!(agent.context_limit, Some(1_000));
+        assert_eq!(agent.tool_calls, 1);
     }
 
     #[test]

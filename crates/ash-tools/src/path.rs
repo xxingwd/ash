@@ -1,7 +1,10 @@
 use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
@@ -14,15 +17,114 @@ const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 const IO_BUFFER_BYTES: usize = 8 * 1024;
 
 pub struct WorkspacePath {
-    dir: Dir,
+    dir: Arc<Dir>,
     relative: PathBuf,
     full_path: PathBuf,
 }
 
 pub struct SearchPath {
-    dir: Dir,
+    dir: Arc<Dir>,
     workspace: PathBuf,
     full_path: PathBuf,
+}
+
+/// Capability for filesystem operations rooted at one canonical workspace.
+/// The directory handle is opened once and shared by all built-in tools.
+pub(crate) struct Workspace {
+    root: PathBuf,
+    dir: Arc<Dir>,
+}
+
+impl Workspace {
+    pub(crate) fn new(root: impl AsRef<Path>) -> Result<Arc<Self>, ToolError> {
+        let requested = root.as_ref();
+        let root = std::fs::canonicalize(requested).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot resolve working directory {}: {error}",
+                requested.display()
+            ))
+        })?;
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot access working directory {}: {error}",
+                root.display()
+            ))
+        })?;
+        Ok(Arc::new(Self {
+            root,
+            dir: Arc::new(dir),
+        }))
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn path(&self, requested: &str) -> Result<WorkspacePath, ToolError> {
+        let relative = relative_path(&self.root, requested)?;
+        let full_path = self.root.join(&relative);
+        Ok(WorkspacePath {
+            dir: Arc::clone(&self.dir),
+            relative,
+            full_path,
+        })
+    }
+
+    pub(crate) fn search_path(&self, requested: &str) -> Result<SearchPath, ToolError> {
+        let path = self.path(requested)?;
+        let metadata = std::fs::symlink_metadata(path.full_path()).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot access {}: {error}",
+                path.full_path().display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ToolError::Execution(format!(
+                "search path cannot be a symbolic link: {}",
+                path.full_path().display()
+            )));
+        }
+        let full_path = std::fs::canonicalize(path.full_path()).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot resolve {}: {error}",
+                path.full_path().display()
+            ))
+        })?;
+        if !full_path.starts_with(&self.root) {
+            return Err(ToolError::Execution(format!(
+                "path is outside working directory: {}",
+                full_path.display()
+            )));
+        }
+        Ok(SearchPath {
+            dir: Arc::clone(&self.dir),
+            workspace: self.root.clone(),
+            full_path,
+        })
+    }
+
+    pub(crate) fn resolve_dir(&self, requested: &str) -> Result<PathBuf, ToolError> {
+        let candidate = self.path(requested)?.full_path().to_path_buf();
+        let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+            ToolError::Execution(format!(
+                "cannot access working directory {}: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !resolved.starts_with(&self.root) {
+            return Err(ToolError::Execution(format!(
+                "working directory is outside the session working directory: {}",
+                resolved.display()
+            )));
+        }
+        if !resolved.is_dir() {
+            return Err(ToolError::Execution(format!(
+                "working directory is not a directory: {}",
+                resolved.display()
+            )));
+        }
+        Ok(resolved)
+    }
 }
 
 pub fn file_walker(root: &Path) -> WalkBuilder {
@@ -49,16 +151,14 @@ pub fn ensure_running(
 
 pub fn read_all(
     reader: &mut impl Read,
-    path: &Path,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<Vec<u8>, ToolError> {
-    read_limited(reader, path, usize::MAX, cancellation, deadline)
+    read_limited(reader, usize::MAX, cancellation, deadline)
 }
 
 pub fn read_limited(
     reader: &mut impl Read,
-    path: &Path,
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
@@ -67,16 +167,15 @@ pub fn read_limited(
     let mut buffer = [0_u8; IO_BUFFER_BYTES];
     loop {
         ensure_running(cancellation, deadline)?;
-        let count = reader.read(&mut buffer).map_err(|error| {
-            ToolError::Execution(format!("cannot read {}: {error}", path.display()))
-        })?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| ToolError::Execution(format!("cannot read file: {error}")))?;
         if count == 0 {
             return Ok(output);
         }
         if output.len().saturating_add(count) > max_bytes {
             return Err(ToolError::Execution(format!(
-                "{} exceeds the {} read limit",
-                path.display(),
+                "file exceeds the {} read limit",
                 crate::truncate::format_size(max_bytes)
             )));
         }
@@ -87,63 +186,22 @@ pub fn read_limited(
 fn write_all(
     writer: &mut impl Write,
     content: &[u8],
-    path: &Path,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<(), ToolError> {
     for chunk in content.chunks(IO_BUFFER_BYTES) {
         ensure_running(cancellation, deadline)?;
-        writer.write_all(chunk).map_err(|error| {
-            ToolError::Execution(format!("cannot write {}: {error}", path.display()))
-        })?;
+        writer
+            .write_all(chunk)
+            .map_err(|error| ToolError::Execution(format!("cannot write file: {error}")))?;
     }
     Ok(())
 }
 
 impl SearchPath {
+    #[cfg(test)]
     pub(crate) fn new(root: &Path, requested: &str) -> Result<Self, ToolError> {
-        let workspace = std::fs::canonicalize(root).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot resolve working directory {}: {error}",
-                root.display()
-            ))
-        })?;
-        let path = WorkspacePath::new(&workspace, requested)?;
-        let metadata = std::fs::symlink_metadata(path.full_path()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot access {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ToolError::Execution(format!(
-                "search path cannot be a symbolic link: {}",
-                path.full_path().display()
-            )));
-        }
-        let full_path = std::fs::canonicalize(path.full_path()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot resolve {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
-        if !full_path.starts_with(&workspace) {
-            return Err(ToolError::Execution(format!(
-                "path is outside working directory: {}",
-                full_path.display()
-            )));
-        }
-        let dir = Dir::open_ambient_dir(&workspace, ambient_authority()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot access working directory {}: {error}",
-                workspace.display()
-            ))
-        })?;
-        Ok(Self {
-            dir,
-            workspace,
-            full_path,
-        })
+        Workspace::new(root)?.search_path(requested)
     }
 
     pub(crate) fn full_path(&self) -> &Path {
@@ -176,29 +234,9 @@ impl SearchPath {
 }
 
 impl WorkspacePath {
+    #[cfg(test)]
     pub(crate) fn new(root: &Path, requested: &str) -> Result<Self, ToolError> {
-        let absolute_root = if root.is_absolute() {
-            root.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|error| {
-                    ToolError::Execution(format!("cannot resolve working directory: {error}"))
-                })?
-                .join(root)
-        };
-        let relative = relative_path(&absolute_root, requested)?;
-        let dir = Dir::open_ambient_dir(root, ambient_authority()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot access working directory {}: {error}",
-                root.display()
-            ))
-        })?;
-        let full_path = absolute_root.join(&relative);
-        Ok(Self {
-            dir,
-            relative,
-            full_path,
-        })
+        Workspace::new(root)?.path(requested)
     }
 
     pub(crate) fn full_path(&self) -> &Path {
@@ -221,9 +259,7 @@ impl WorkspacePath {
     ) -> Result<(), ToolError> {
         ensure_running(cancellation, deadline)?;
         let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
-        self.dir
-            .create_dir_all(parent)
-            .map_err(|error| self.write_error(&error))?;
+        self.dir.create_dir_all(parent).map_err(write_error)?;
         ensure_running(cancellation, deadline)?;
 
         let permissions = self.prepare_permissions(permissions)?;
@@ -244,7 +280,7 @@ impl WorkspacePath {
             let file = match self.dir.open_with(&temp, &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(self.write_error(&error)),
+                Err(error) => return Err(write_error(error)),
             };
             let result = self.commit_temp_file(
                 file,
@@ -261,8 +297,7 @@ impl WorkspacePath {
         }
 
         Err(ToolError::Execution(format!(
-            "cannot write {}: could not allocate a temporary file after {MAX_TEMP_FILE_ATTEMPTS} attempts",
-            self.full_path.display()
+            "cannot write file: could not allocate a temporary file after {MAX_TEMP_FILE_ATTEMPTS} attempts"
         )))
     }
 
@@ -278,15 +313,12 @@ impl WorkspacePath {
             return Ok(Some(permissions));
         }
         match self.dir.symlink_metadata(&self.relative) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                Err(ToolError::Execution(format!(
-                    "cannot write {}: symbolic links are not writable",
-                    self.full_path.display()
-                )))
-            }
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(ToolError::Execution(
+                "cannot write file: symbolic links are not writable".into(),
+            )),
             Ok(metadata) => Ok(Some(metadata.permissions())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(self.write_error(&error)),
+            Err(error) => Err(write_error(error)),
         }
     }
 
@@ -304,24 +336,21 @@ impl WorkspacePath {
     ) -> Result<(), ToolError> {
         if let Some(permissions) = permissions {
             file.set_permissions(permissions.clone())
-                .map_err(|error| self.write_error(&error))?;
+                .map_err(write_error)?;
         }
-        write_all(&mut file, content, &self.full_path, cancellation, deadline)?;
+        write_all(&mut file, content, cancellation, deadline)?;
         ensure_running(cancellation, deadline)?;
-        file.sync_all().map_err(|error| self.write_error(&error))?;
+        file.sync_all().map_err(write_error)?;
         drop(file);
         ensure_running(cancellation, deadline)?;
         self.dir
             .rename(temp, &self.dir, &self.relative)
-            .map_err(|error| self.write_error(&error))
+            .map_err(write_error)
     }
+}
 
-    fn write_error(&self, error: &std::io::Error) -> ToolError {
-        ToolError::Execution(format!(
-            "cannot write {}: {error}",
-            self.full_path.display()
-        ))
-    }
+fn write_error(error: std::io::Error) -> ToolError {
+    ToolError::Execution(format!("cannot write file: {error}"))
 }
 
 pub async fn run_blocking<T>(
@@ -454,7 +483,6 @@ mod tests {
 
         let error = read_limited(
             &mut reader,
-            Path::new("file"),
             8,
             &cancellation,
             Instant::now() + Duration::from_mins(1),
@@ -477,7 +505,6 @@ mod tests {
 
         let error = read_all(
             &mut reader,
-            Path::new("file"),
             &cancellation,
             Instant::now() + Duration::from_mins(1),
         )
@@ -497,7 +524,6 @@ mod tests {
         let error = write_all(
             &mut writer,
             &vec![b'x'; IO_BUFFER_BYTES + 1],
-            Path::new("file"),
             &cancellation,
             Instant::now() + Duration::from_mins(1),
         )

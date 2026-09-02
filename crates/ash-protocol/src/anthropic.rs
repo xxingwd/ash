@@ -319,8 +319,12 @@ impl AnthropicDecoder {
             .as_str()
             .unwrap_or("Anthropic stream error");
         match error_type {
-            Some("authentication_error" | "permission_error") => ProtocolError::Auth,
-            Some("rate_limit_error") => ProtocolError::RateLimited,
+            Some("authentication_error" | "permission_error") => ProtocolError::Auth {
+                message: message.to_string(),
+            },
+            Some("rate_limit_error") => ProtocolError::RateLimited {
+                message: message.to_string(),
+            },
             Some("api_error") => ProtocolError::Upstream {
                 status: 500,
                 message: message.to_string(),
@@ -449,7 +453,10 @@ mod tests {
             overloaded,
             Err(ProtocolError::Upstream { status: 529, message }) if message == "Overloaded"
         ));
-        assert!(matches!(rate_limited, Err(ProtocolError::RateLimited)));
+        assert!(matches!(
+            rate_limited,
+            Err(ProtocolError::RateLimited { message }) if message == "Slow down"
+        ));
     }
 
     #[test]

@@ -1,16 +1,11 @@
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{fmt::Write as _, sync::Arc, time::Instant};
 
 use ash_core::{define_tool, CancellationToken, Tool, ToolError};
 use ignore::overrides::OverrideBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::path::SearchPath;
+use crate::path::Workspace;
 
 const MAX_RESULTS: usize = 100;
 
@@ -22,7 +17,7 @@ struct GlobArgs {
     path: Option<String>,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "glob",
         "Find files by glob pattern inside the working directory. Respects ignore files and returns at most 100 workspace-relative paths.",
@@ -33,7 +28,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
             async move {
                 let deadline = deadline?;
                 crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
-                    find_files(
+                    find_files_in_workspace(
                         &root,
                         args.path.as_deref().unwrap_or("."),
                         &args.pattern,
@@ -47,8 +42,8 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     )
 }
 
-fn find_files(
-    root: &Path,
+fn find_files_in_workspace(
+    workspace: &Workspace,
     requested: &str,
     pattern: &str,
     cancellation: &CancellationToken,
@@ -58,7 +53,7 @@ fn find_files(
     if pattern.is_empty() {
         return Err(ToolError::Execution("pattern cannot be empty".into()));
     }
-    let search = SearchPath::new(root, requested)?;
+    let search = workspace.search_path(requested)?;
     if !search.full_path().is_dir() {
         return Err(ToolError::Execution(format!(
             "glob path must be a directory: {}",
@@ -114,6 +109,18 @@ fn find_files(
         );
     }
     Ok(output)
+}
+
+#[cfg(test)]
+fn find_files(
+    root: &std::path::Path,
+    requested: &str,
+    pattern: &str,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<String, ToolError> {
+    let workspace = Workspace::new(root)?;
+    find_files_in_workspace(&workspace, requested, pattern, cancellation, deadline)
 }
 
 #[cfg(test)]

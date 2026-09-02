@@ -6,10 +6,10 @@ use ash_agent::{
     build_system_prompt, skill_tool, Agent, Runtime, Session, Skill, TurnHandle,
     DEFAULT_MAX_CONTEXT_TOKENS,
 };
-use ash_collab::{SubagentState, SubagentTreeSnapshot};
+use ash_collab::{SubagentEvent, SubagentEventKind, SubagentState};
 use ash_core::{Conversation, ModelId, SessionEvent, SessionId, TurnId, TurnResult};
 use ash_protocol::{create_adapter, Protocol, ProviderConfig};
-use ash_tui::{SubagentView, SubagentViewState, UiCommand, UiEvent};
+use ash_tui::{SubagentUpdate, SubagentUpdateKind, SubagentViewState, UiCommand, UiEvent};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
 use secrecy::SecretString;
@@ -25,6 +25,7 @@ struct InteractiveController {
     runtime: Runtime,
     event_tx: tokio::sync::mpsc::Sender<UiEvent>,
     command_rx: tokio::sync::mpsc::Receiver<UiCommand>,
+    subagent_events: tokio::sync::broadcast::Receiver<SubagentEvent>,
     history_store: InputHistory,
 }
 
@@ -60,7 +61,7 @@ struct AgentSetup {
     runtime: Runtime,
     protocol: String,
     working_dir: PathBuf,
-    subagent_monitor: Option<tokio::sync::watch::Receiver<Vec<SubagentView>>>,
+    subagent_events: tokio::sync::broadcast::Receiver<SubagentEvent>,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -117,48 +118,32 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
     .collect::<Vec<_>>()
     .join("\n\n");
     let agent = agent.with_system_prompt(system_prompt);
-    let subagent_monitor = Some(map_subagent_monitor(control.subscribe()));
+    let subagent_events = control.events();
 
     Ok(AgentSetup {
         agent,
         runtime,
         protocol,
         working_dir,
-        subagent_monitor,
+        subagent_events,
     })
 }
 
-fn map_subagent_monitor(
-    mut source: tokio::sync::watch::Receiver<Vec<SubagentTreeSnapshot>>,
-) -> tokio::sync::watch::Receiver<Vec<SubagentView>> {
-    let (target, receiver) = tokio::sync::watch::channel(subagent_views(&source.borrow()));
-    tokio::spawn(async move {
-        while source.changed().await.is_ok() {
-            if target
-                .send(subagent_views(&source.borrow_and_update()))
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    receiver
-}
-
-fn subagent_views(trees: &[SubagentTreeSnapshot]) -> Vec<SubagentView> {
-    trees
-        .iter()
-        .flat_map(|tree| {
-            tree.agents.iter().map(|snapshot| SubagentView {
-                root_id: tree.root_id,
-                name: snapshot.name.clone(),
-                state: match snapshot.state {
-                    SubagentState::Idle => SubagentViewState::Idle,
-                    SubagentState::Running => SubagentViewState::Running,
-                },
-            })
-        })
-        .collect()
+fn subagent_update(event: SubagentEvent) -> SubagentUpdate {
+    let kind = match event.kind {
+        SubagentEventKind::StateChanged(state) => SubagentUpdateKind::StateChanged(match state {
+            SubagentState::Idle => SubagentViewState::Idle,
+            SubagentState::Running => SubagentViewState::Running,
+        }),
+        SubagentEventKind::Session(event) => SubagentUpdateKind::Session(event),
+        SubagentEventKind::Removed => SubagentUpdateKind::Removed,
+    };
+    SubagentUpdate {
+        root_id: event.root_id,
+        session_id: event.session_id,
+        name: event.name,
+        kind,
+    }
 }
 
 fn resolve_protocol(cli: &Cli) -> Result<Protocol> {
@@ -299,7 +284,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         runtime,
         protocol,
         working_dir,
-        subagent_monitor,
+        subagent_events,
     } = setup;
     let model = agent.model().as_str().to_string();
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(16);
@@ -313,9 +298,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
             Vec::new()
         }
     };
-    let app = ash_tui::App::new(protocol, model, working_dir)
-        .with_input_history(input_history)
-        .with_subagent_monitor(subagent_monitor);
+    let app = ash_tui::App::new(protocol, model, working_dir).with_input_history(input_history);
     let app_handle = tokio::spawn(async move { app.run(event_rx, command_tx).await });
     let session = runtime.start(&agent);
 
@@ -325,6 +308,7 @@ async fn run_interactive(setup: AgentSetup) -> Result<()> {
         runtime,
         event_tx,
         command_rx,
+        subagent_events,
         history_store,
     }
     .run()
@@ -356,6 +340,8 @@ impl InteractiveController {
                             SessionEvent::Started(_)
                             | SessionEvent::Text { .. }
                             | SessionEvent::Thought { .. }
+                            | SessionEvent::Progress { .. }
+                            | SessionEvent::Context { .. }
                             | SessionEvent::ToolStarted { .. }
                             | SessionEvent::ToolFinished { .. } => {}
                         }
@@ -363,6 +349,18 @@ impl InteractiveController {
                     }
                     Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                     None => break,
+                },
+                event = self.subagent_events.recv() => match event {
+                    Ok(event) => {
+                        let _ = self
+                            .event_tx
+                            .send(UiEvent::Subagent(subagent_update(event)))
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "subagent event receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 command = self.command_rx.recv() => {
                     let Some(command) = command else { break };

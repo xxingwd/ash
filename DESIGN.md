@@ -138,6 +138,12 @@ with cancellation-aware exponential backoff before any tool side effect. Each re
 usage is added directly to the current `TurnStats`, including discarded retry attempts; missing usage
 is zero. No session-wide usage is stored or reconstructed.
 
+When a provider reports changed usage, the collector adds it to the usage from earlier model calls
+in the same turn and emits a `Progress` snapshot. The request preflight estimates the final outbound
+context after any compaction and emits a `Context` event only when that `(tokens, limit)` snapshot
+changes. There is no polling loop or session-wide status query. Neither transient event is persisted;
+the final `Turn` remains canonical.
+
 Cancellation without an executed tool and without a queued successor discards the running turn and
 writes no record. If the turn already has a tool result or a later turn depends on it, cancellation is
 committed once as `TurnResult::Cancelled`. A process crash never creates an interrupted turn.
@@ -154,9 +160,10 @@ pub struct ToolContext {
 }
 ```
 
-Calls from one accepted model response execute concurrently. Ordered buffering preserves their wire
-order in the resulting `Step`. `ToolContext::run` gives cancellation stable priority over deadlines;
-the agent timeout applies unless a tool explicitly disables it.
+Calls from one accepted model response execute concurrently in bounded batches of eight. Batch joins
+preserve their wire order in the resulting `Step` while preventing an unbounded fan-out. `ToolContext::run`
+gives cancellation stable priority over deadlines; the agent timeout applies unless a tool explicitly
+disables it.
 
 ## Collaboration
 
@@ -169,15 +176,20 @@ Submitting work is synchronous with the controller lock and uses the session's b
 A short-lived task waits for each `TurnHandle`, publishes its settled result, and wakes waiters. Waiting
 consumes available completions but does not cancel child work.
 
+`AgentControl` subscribes once to each child session and wraps activity events with root ID, child
+session ID, and name. A controller broadcast carries those facts to embedding applications. Pending
+counts remain the authority for running/idle state; there is no child status query or watch snapshot.
+
 ## Events and TUI
 
-`SessionEvent` has seven facts: started, text, thought, tool started, tool finished, finished, and
-discarded. Transient events carry `TurnId`; completion carries the canonical `Arc<Turn>`. There are no
-live usage, context, or projection events. `Discarded.error` is present only when a completed turn
-could not be persisted, so event-only consumers do not mistake storage failure for cancellation.
+`SessionEvent` has nine facts: started, text, thought, progress, context, tool started, tool finished,
+finished, and discarded. Transient events carry `TurnId`; progress is a replaceable full `TurnStats`
+snapshot, and context is a request-level token estimate plus configured limit. Completion carries the
+canonical `Arc<Turn>`. `Discarded.error` is present only when a completed turn could not be persisted,
+so event-only consumers do not mistake storage failure for cancellation.
 
 The TUI has one business-state owner, `AppState`. Events mutate it directly and produce a small
 `RenderPlan` describing terminal IO. `TerminalUi` owns only the terminal surface. Rendering borrows
-state and never stores a second conversation, operation, menu, stats, or transcript model. On finish,
+state and never stores a second conversation, operation, menu, stats, or transcript copy. On finish,
 streamed blocks are replaced by blocks derived from the canonical turn; on resume, the same conversion
 is applied to `Conversation::turns()`.

@@ -3,15 +3,19 @@ use std::{
     sync::Arc,
 };
 
-use crate::snapshot::{SubagentSnapshot, SubagentState, SubagentTreeSnapshot};
+use crate::{
+    event::{SubagentEvent, SubagentEventKind},
+    snapshot::{SubagentSnapshot, SubagentState},
+};
 use ash_agent::{Agent, Runtime, Session, TurnHandle};
 use ash_core::{
-    define_tool, define_tool_with_timeout, SessionId, Tool, ToolContext, ToolError, ToolTimeout,
-    TurnId, TurnResult,
+    define_tool, define_tool_with_timeout, SessionEvent, SessionId, Tool, ToolContext, ToolError,
+    ToolTimeout, TurnId, TurnResult,
 };
+use futures::{Stream, StreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 const MAX_AGENT_NAME_CHARS: usize = 64;
 const COLLABORATION_TOOL_NAMES: [&str; 5] = [
@@ -32,7 +36,7 @@ struct ControlInner {
     updates: Notify,
     runtime: Runtime,
     definition: Agent,
-    subagent_tx: watch::Sender<Vec<SubagentTreeSnapshot>>,
+    subagent_tx: broadcast::Sender<SubagentEvent>,
 }
 
 #[derive(Default)]
@@ -67,14 +71,18 @@ struct AgentCompletion {
 }
 
 impl AgentEntry {
+    fn state(&self) -> SubagentState {
+        if self.pending.is_empty() {
+            SubagentState::Idle
+        } else {
+            SubagentState::Running
+        }
+    }
+
     fn snapshot(&self, name: &str) -> SubagentSnapshot {
         SubagentSnapshot {
             name: name.to_string(),
-            state: if self.pending.is_empty() {
-                SubagentState::Idle
-            } else {
-                SubagentState::Running
-            },
+            state: self.state(),
         }
     }
 
@@ -145,22 +153,8 @@ impl ControlInner {
         )
     }
 
-    fn publish(&self, root_id: SessionId, agents: Vec<SubagentSnapshot>) {
-        self.subagent_tx.send_modify(|trees| {
-            match (
-                trees.binary_search_by_key(&root_id, |tree| tree.root_id),
-                agents.is_empty(),
-            ) {
-                (Ok(index), true) => {
-                    trees.remove(index);
-                }
-                (Ok(index), false) => trees[index].agents = agents,
-                (Err(_), true) => {}
-                (Err(index), false) => {
-                    trees.insert(index, SubagentTreeSnapshot { root_id, agents });
-                }
-            }
-        });
+    fn publish(&self, event: SubagentEvent) {
+        let _ = self.subagent_tx.send(event);
     }
 }
 
@@ -194,7 +188,7 @@ struct WaitAgentArgs {}
 
 impl AgentControl {
     fn new(runtime: Runtime, definition: Agent) -> Self {
-        let (subagent_tx, _) = watch::channel(Vec::new());
+        let (subagent_tx, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(ControlInner {
                 state: Mutex::new(ControlState::default()),
@@ -206,9 +200,9 @@ impl AgentControl {
         }
     }
 
-    /// Subscribe to root-scoped projections of all agents owned by this controller.
+    /// Subscribe to routed activity from all child sessions owned by this controller.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<Vec<SubagentTreeSnapshot>> {
+    pub fn events(&self) -> broadcast::Receiver<SubagentEvent> {
         self.inner.subagent_tx.subscribe()
     }
 
@@ -287,7 +281,7 @@ impl AgentControl {
         let root_id = identity.root_id();
         let group = self.inner.group_or_insert(root_id).await;
 
-        let (turn, turn_id) = {
+        let (turn, turn_id, session_id, events, state) = {
             let mut group = group.lock().await;
             if group.agents.contains_key(&name) {
                 return Err(ToolError::Execution(format!(
@@ -298,6 +292,8 @@ impl AgentControl {
                 .inner
                 .runtime
                 .start_child(&self.inner.definition, identity);
+            let session_id = session.id();
+            let events = session.events();
             let mut entry = AgentEntry {
                 session,
                 pending: HashSet::new(),
@@ -305,11 +301,13 @@ impl AgentControl {
             };
             let turn = entry.submit(args.message)?;
             let turn_id = turn.id();
+            let state = entry.state();
             group.agents.insert(name.clone(), entry);
-            self.inner.publish(root_id, group.snapshots());
-            (turn, turn_id)
+            (turn, turn_id, session_id, events, state)
         };
 
+        self.publish_state(root_id, session_id, &name, state);
+        self.forward_events(root_id, session_id, name.clone(), events);
         self.forward_completion(root_id, name.clone(), turn);
         json_output(&AcceptedTurn {
             name,
@@ -332,7 +330,7 @@ impl AgentControl {
             .await
             .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
 
-        let (turn, turn_id) = {
+        let (turn, turn_id, session_id, state) = {
             let mut group = group.lock().await;
             let entry = group
                 .agents
@@ -340,10 +338,10 @@ impl AgentControl {
                 .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
             let turn = entry.submit(args.message)?;
             let turn_id = turn.id();
-            self.inner.publish(root_id, group.snapshots());
-            (turn, turn_id)
+            (turn, turn_id, entry.session.id(), entry.state())
         };
 
+        self.publish_state(root_id, session_id, &name, state);
         self.forward_completion(root_id, name.clone(), turn);
         json_output(&AcceptedTurn {
             name,
@@ -371,7 +369,7 @@ impl AgentControl {
             .group(context.identity.root_id())
             .await
             .ok_or_else(|| ToolError::Execution(format!("agent not found: {name}")))?;
-        {
+        let session_id = {
             let mut group = group.lock().await;
             let entry = group
                 .agents
@@ -387,10 +385,16 @@ impl AgentControl {
                     "agent has unread results: {name}"
                 )));
             }
+            let session_id = entry.session.id();
             group.agents.remove(&name);
-            self.inner
-                .publish(context.identity.root_id(), group.snapshots());
-        }
+            session_id
+        };
+        self.inner.publish(SubagentEvent {
+            root_id: context.identity.root_id(),
+            session_id,
+            name: name.clone(),
+            kind: SubagentEventKind::Removed,
+        });
         json_output(&RemovedAgent {
             name,
             removed: true,
@@ -439,7 +443,7 @@ impl AgentControl {
             let Some(group) = inner.group(root_id).await else {
                 return;
             };
-            {
+            let (session_id, state) = {
                 let mut group = group.lock().await;
                 let Some(entry) = group.agents.get_mut(&name) else {
                     return;
@@ -452,10 +456,76 @@ impl AgentControl {
                 if !changed {
                     return;
                 }
-                inner.publish(root_id, group.snapshots());
-            }
+                (entry.session.id(), entry.state())
+            };
+            inner.publish(SubagentEvent {
+                root_id,
+                session_id,
+                name,
+                kind: SubagentEventKind::StateChanged(state),
+            });
             inner.updates.notify_waiters();
         });
+    }
+
+    fn publish_state(
+        &self,
+        root_id: SessionId,
+        session_id: SessionId,
+        name: &str,
+        state: SubagentState,
+    ) {
+        self.inner.publish(SubagentEvent {
+            root_id,
+            session_id,
+            name: name.to_string(),
+            kind: SubagentEventKind::StateChanged(state),
+        });
+    }
+
+    fn forward_events<S, E>(
+        &self,
+        root_id: SessionId,
+        session_id: SessionId,
+        name: String,
+        mut events: S,
+    ) where
+        S: Stream<Item = Result<SessionEvent, E>> + Unpin + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "child session event receiver lagged");
+                        continue;
+                    }
+                };
+                let Some(event) = activity_event(event) else {
+                    continue;
+                };
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                inner.publish(SubagentEvent {
+                    root_id,
+                    session_id,
+                    name: name.clone(),
+                    kind: SubagentEventKind::Session(event),
+                });
+            }
+        });
+    }
+}
+
+fn activity_event(event: SessionEvent) -> Option<SessionEvent> {
+    match event {
+        SessionEvent::Text { .. }
+        | SessionEvent::Thought { .. }
+        | SessionEvent::ToolFinished { .. } => None,
+        event => Some(event),
     }
 }
 
@@ -554,9 +624,8 @@ mod tests {
 
     use ash_core::{
         CancellationToken, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
-        SessionIdentity, StopReason,
+        SessionIdentity, StopReason, TurnStats,
     };
-    use futures::StreamExt as _;
     use tempfile::TempDir;
 
     use super::*;
@@ -643,7 +712,82 @@ mod tests {
         let blocked = control.inner.group_or_insert(blocked_root).await;
         let _blocked = blocked.lock().await;
 
-        control.inner.publish(other_root, Vec::new());
+        control.inner.publish(SubagentEvent {
+            root_id: other_root,
+            session_id: SessionId::new(),
+            name: "other".to_string(),
+            kind: SubagentEventKind::StateChanged(SubagentState::Idle),
+        });
+    }
+
+    #[tokio::test]
+    async fn child_session_context_and_progress_are_wrapped_with_identity() {
+        let directory = TempDir::new().unwrap();
+        let control = control(
+            Arc::new(MockModel::new([vec![
+                ModelEvent::Text("answer".to_string()),
+                ModelEvent::Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                },
+                ModelEvent::Stop(StopReason::EndTurn),
+            ]])),
+            &directory,
+        );
+        let identity = identity();
+        let mut events = control.events();
+
+        control
+            .create(
+                context(identity),
+                AgentArgs {
+                    name: "worker".to_string(),
+                    message: "inspect".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(
+                    event.kind,
+                    SubagentEventKind::Session(SessionEvent::Context { .. })
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("child context event");
+        assert_eq!(context.root_id, identity.root_id());
+        assert_eq!(context.name, "worker");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(
+                    event.kind,
+                    SubagentEventKind::Session(SessionEvent::Progress {
+                        stats: TurnStats {
+                            input_tokens: 12,
+                            output_tokens: 3,
+                            ..
+                        },
+                        ..
+                    })
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("child progress event");
+
+        assert_eq!(event.root_id, identity.root_id());
+        assert_ne!(event.session_id, event.root_id);
+        assert_eq!(event.name, "worker");
     }
 
     #[test]

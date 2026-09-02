@@ -12,7 +12,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::path::SearchPath;
+use crate::path::{SearchPath, Workspace};
 
 const MAX_MATCHES: usize = 100;
 const MAX_LINE_CHARS: usize = 500;
@@ -48,7 +48,7 @@ enum LineRead {
     Oversized,
 }
 
-pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
+pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "grep",
         "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
@@ -59,7 +59,7 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
             async move {
                 let deadline = deadline?;
                 crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
-                    search(
+                    search_in_workspace(
                         &root,
                         args.path.as_deref().unwrap_or("."),
                         &args.pattern,
@@ -74,8 +74,8 @@ pub fn tool(working_dir: Arc<PathBuf>) -> Result<Arc<dyn Tool>, ToolError> {
     )
 }
 
-fn search(
-    root: &Path,
+fn search_in_workspace(
+    workspace: &Workspace,
     requested: &str,
     pattern: &str,
     include: Option<&str>,
@@ -88,7 +88,7 @@ fn search(
     }
     let regex = Regex::new(pattern)
         .map_err(|error| ToolError::Execution(format!("invalid regular expression: {error}")))?;
-    let search = SearchPath::new(root, requested)?;
+    let search = workspace.search_path(requested)?;
     let mut matches = Vec::new();
     let progress = collect_matches(
         &search,
@@ -99,6 +99,26 @@ fn search(
         deadline,
     )?;
     render_matches(matches, progress, cancellation, deadline)
+}
+
+#[cfg(test)]
+fn search(
+    root: &std::path::Path,
+    requested: &str,
+    pattern: &str,
+    include: Option<&str>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<String, ToolError> {
+    let workspace = Workspace::new(root)?;
+    search_in_workspace(
+        &workspace,
+        requested,
+        pattern,
+        include,
+        cancellation,
+        deadline,
+    )
 }
 
 /// Collects up to `MAX_MATCHES` matching lines from a single file or a whole

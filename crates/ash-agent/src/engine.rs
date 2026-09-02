@@ -95,6 +95,7 @@ pub(crate) async fn run_turn(
         steps: Vec::new(),
         stats: TurnStats::default(),
         pending_summary: None,
+        last_context: None,
     }
     .run()
     .await
@@ -111,6 +112,7 @@ struct TurnRunner<'a> {
     steps: Vec<Step>,
     stats: TurnStats,
     pending_summary: Option<String>,
+    last_context: Option<(u64, u64)>,
 }
 
 impl TurnRunner<'_> {
@@ -134,22 +136,26 @@ impl TurnRunner<'_> {
             if self.context.cancellation.is_cancelled() {
                 return (TurnResult::Cancelled, None);
             }
-            if let Err(error) = self.prepare_context().await {
-                return match error {
-                    AshError::Cancelled => (TurnResult::Cancelled, None),
-                    error => (TurnResult::Failed(error.to_string()), Some(error)),
-                };
-            }
+            let request = match self.prepare_request().await {
+                Ok(request) => request,
+                Err(error) => {
+                    return match error {
+                        AshError::Cancelled => (TurnResult::Cancelled, None),
+                        error => (TurnResult::Failed(error.to_string()), Some(error)),
+                    };
+                }
+            };
 
             let mut retries = 0;
             let response = loop {
                 debug!(turn_id = %self.id, "calling model");
-                let response = match self.model.stream(self.request()) {
+                let response = match self.model.stream(request.clone()) {
                     Ok(mut stream) => {
                         collect_response(
                             &mut stream,
                             Some((&self.events, self.id)),
                             &self.context.cancellation,
+                            self.stats,
                         )
                         .await
                     }
@@ -227,39 +233,57 @@ impl TurnRunner<'_> {
             .with_current(self.input.clone(), self.steps.clone())
     }
 
-    async fn prepare_context(&mut self) -> Result<(), AshError> {
-        if self.pending_summary.is_some() {
-            return Ok(());
-        }
+    async fn prepare_request(&mut self) -> Result<ModelRequest, AshError> {
         let tools = self.agent.tool_definitions();
         let before =
             estimate_request_tokens(self.agent.system_prompt(), &self.model_context(), &tools);
-        if !needs_compaction(before, self.agent.max_context_tokens()) {
-            return Ok(());
+        if self.pending_summary.is_none()
+            && needs_compaction(before, self.agent.max_context_tokens())
+        {
+            if let Some((summary, stats)) = compact(
+                self.model,
+                self.agent,
+                self.conversation,
+                &self.context.cancellation,
+            )
+            .await?
+            {
+                self.stats = self.stats.saturating_add(stats);
+                let after = estimate_request_tokens(
+                    self.agent.system_prompt(),
+                    &self
+                        .conversation
+                        .context_with_summary(&summary)
+                        .with_current(self.input.clone(), self.steps.clone()),
+                    &tools,
+                );
+                if after < before {
+                    self.pending_summary = Some(summary);
+                }
+            }
         }
-        let Some((summary, stats)) = compact(
-            self.model,
-            self.agent,
-            self.conversation,
-            &self.context.cancellation,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        self.stats = self.stats.saturating_add(stats);
-        let after = estimate_request_tokens(
-            self.agent.system_prompt(),
-            &self
-                .conversation
-                .context_with_summary(&summary)
-                .with_current(self.input.clone(), self.steps.clone()),
-            &tools,
-        );
-        if after < before {
-            self.pending_summary = Some(summary);
+
+        let request = self.request();
+        let tokens = u64::try_from(estimate_request_tokens(
+            request.system.as_deref(),
+            &request.context,
+            &request.tools,
+        ))
+        .unwrap_or(u64::MAX);
+        let limit = u64::try_from(self.agent.max_context_tokens()).unwrap_or(u64::MAX);
+        if self.last_context != Some((tokens, limit)) {
+            self.last_context = Some((tokens, limit));
+            send_event(
+                &self.events,
+                SessionEvent::Context {
+                    turn_id: self.id,
+                    tokens,
+                    limit,
+                },
+            )
+            .await;
         }
-        Ok(())
+        Ok(request)
     }
 
     fn push_without_tools(&mut self, content: Vec<ContentBlock>) {
@@ -283,6 +307,8 @@ impl TurnRunner<'_> {
     }
 
     async fn execute_tools(&self, content: Vec<ContentBlock>) -> Step {
+        const MAX_PARALLEL_TOOLS: usize = 8;
+
         let calls = content.iter().filter_map(|block| match block {
             ContentBlock::ToolCall {
                 id,
@@ -291,10 +317,14 @@ impl TurnRunner<'_> {
             } => Some((id.clone(), name.clone(), arguments.clone())),
             ContentBlock::Text(_) | ContentBlock::Thought { .. } => None,
         });
-        let results = join_all(
-            calls.map(|(id, name, arguments)| self.execute_tool_call(id, name, arguments)),
-        )
-        .await;
+        let mut pending = calls
+            .map(|(id, name, arguments)| self.execute_tool_call(id, name, arguments))
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let batch = pending.drain(..pending.len().min(MAX_PARALLEL_TOOLS));
+            results.extend(join_all(batch).await);
+        }
         let mut results = results.into_iter();
         let items = content
             .into_iter()
@@ -398,7 +428,7 @@ pub(crate) async fn compact(
         tools: Vec::new(),
         max_tokens: None,
     })?;
-    match collect_response(&mut stream, None, cancellation).await {
+    match collect_response(&mut stream, None, cancellation, TurnStats::default()).await {
         ModelResponse::Stopped {
             content,
             reason: StopReason::EndTurn,
@@ -439,6 +469,7 @@ async fn collect_response(
     stream: &mut ModelStream,
     events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
     cancellation: &CancellationToken,
+    settled_stats: TurnStats,
 ) -> ModelResponse {
     let mut accumulator = ResponseAccumulator::new();
     loop {
@@ -451,7 +482,7 @@ async fn collect_response(
             return accumulator.finish();
         };
         match item {
-            Ok(item) => accumulator.apply(events, item).await,
+            Ok(item) => accumulator.apply(events, settled_stats, item).await,
             Err(error) => return accumulator.failed(error),
         }
     }
@@ -481,6 +512,7 @@ impl ResponseAccumulator {
     async fn apply(
         &mut self,
         events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
+        settled_stats: TurnStats,
         event: ModelEvent,
     ) {
         match event {
@@ -528,8 +560,21 @@ impl ResponseAccumulator {
                 input_tokens,
                 output_tokens,
             } => {
+                let previous = (self.input_tokens, self.output_tokens);
                 self.input_tokens = self.input_tokens.max(input_tokens);
                 self.output_tokens = self.output_tokens.max(output_tokens);
+                if previous != (self.input_tokens, self.output_tokens) {
+                    if let Some((events, turn_id)) = events {
+                        send_event(
+                            events,
+                            SessionEvent::Progress {
+                                turn_id,
+                                stats: settled_stats.saturating_add(self.stats()),
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
             ModelEvent::Stop(reason) => {
                 self.finish_thought();
@@ -615,7 +660,7 @@ fn elapsed_generation_ms(first_output_at: Option<Instant>) -> u64 {
 const fn retryable(error: &ProtocolError) -> bool {
     matches!(
         error,
-        ProtocolError::Request(_) | ProtocolError::RateLimited
+        ProtocolError::Request(_) | ProtocolError::RateLimited { .. }
     ) || matches!(
         error,
         ProtocolError::Upstream {
@@ -638,6 +683,10 @@ fn limit_tool_result(result: Result<ToolOutput, ToolError>) -> Result<ToolOutput
             Ok(output)
         }
         Err(ToolError::Execution(output)) => Err(ToolError::Execution(limit_tool_output(output))),
+        Err(ToolError::CommandFailed { status, output }) => Err(ToolError::CommandFailed {
+            status,
+            output: limit_tool_output(output),
+        }),
         Err(error) => Err(error),
     }
 }
@@ -668,19 +717,30 @@ fn limit_tool_output(output: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        },
+    };
 
     use ash_core::{define_tool, ModelId};
 
     use super::*;
 
     struct MockModel {
-        response: StdMutex<Option<Vec<Result<ModelEvent, ProtocolError>>>>,
+        responses: StdMutex<VecDeque<Vec<Result<ModelEvent, ProtocolError>>>>,
         requests: StdMutex<Vec<ModelRequest>>,
     }
 
     struct PendingModel {
         started: tokio::sync::Notify,
+    }
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct ToolTestArgs {
+        index: usize,
     }
 
     impl ModelClient for PendingModel {
@@ -693,7 +753,7 @@ mod tests {
     impl MockModel {
         fn new(events: impl IntoIterator<Item = ModelEvent>) -> Self {
             Self {
-                response: StdMutex::new(Some(events.into_iter().map(Ok).collect())),
+                responses: StdMutex::new(VecDeque::from([events.into_iter().map(Ok).collect()])),
                 requests: StdMutex::new(Vec::new()),
             }
         }
@@ -702,7 +762,7 @@ mod tests {
     impl ModelClient for MockModel {
         fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProtocolError> {
             self.requests.lock().unwrap().push(request);
-            let response = self.response.lock().unwrap().take().unwrap();
+            let response = self.responses.lock().unwrap().pop_front().unwrap();
             Ok(Box::pin(futures::stream::iter(response)))
         }
     }
@@ -752,7 +812,13 @@ mod tests {
             }),
         ]));
 
-        let response = collect_response(&mut stream, None, &CancellationToken::new()).await;
+        let response = collect_response(
+            &mut stream,
+            None,
+            &CancellationToken::new(),
+            TurnStats::default(),
+        )
+        .await;
 
         let ModelResponse::Truncated { content, stats } = response else {
             panic!("expected truncated response");
@@ -760,6 +826,96 @@ mod tests {
         assert!(matches!(content.as_slice(), [ContentBlock::Text(text)] if text == "partial"));
         assert_eq!(stats.input_tokens, 12);
         assert_eq!(stats.output_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn progress_is_published_only_when_usage_changes() {
+        let mut stream: ModelStream = Box::pin(futures::stream::iter([
+            Ok(ModelEvent::Text("answer".to_string())),
+            Ok(ModelEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 0,
+            }),
+            Ok(ModelEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 0,
+            }),
+            Ok(ModelEvent::Usage {
+                input_tokens: 0,
+                output_tokens: 3,
+            }),
+            Ok(ModelEvent::Stop(StopReason::EndTurn)),
+        ]));
+        let (events, mut receiver) = mpsc::channel(8);
+        let turn_id = TurnId::new();
+        let settled = TurnStats {
+            input_tokens: 7,
+            output_tokens: 2,
+            generation_ms: 10,
+        };
+
+        let response = collect_response(
+            &mut stream,
+            Some((&events, turn_id)),
+            &CancellationToken::new(),
+            settled,
+        )
+        .await;
+        drop(events);
+
+        let mut progress = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            if let SessionEvent::Progress { stats, .. } = event {
+                progress.push((stats.input_tokens, stats.output_tokens));
+            }
+        }
+
+        assert!(matches!(
+            response,
+            ModelResponse::Stopped {
+                reason: StopReason::EndTurn,
+                ..
+            }
+        ));
+        assert_eq!(progress, [(19, 2), (19, 5)]);
+    }
+
+    #[tokio::test]
+    async fn context_is_published_for_each_model_request() {
+        let model = MockModel::new([ModelEvent::Stop(StopReason::EndTurn)]);
+        let agent = Agent::new(ModelId::new("model"), Vec::new()).with_max_context_tokens(1_000);
+        let (events, mut receiver) = mpsc::channel(8);
+        let turn_id = TurnId::new();
+
+        let outcome = run_turn(
+            &model,
+            &agent,
+            &Conversation::new(),
+            turn_id,
+            Input::user("hello"),
+            events.clone(),
+            ToolContext {
+                identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                cancellation: CancellationToken::new(),
+                deadline: None,
+            },
+        )
+        .await;
+        drop(events);
+
+        let events = receiver.recv().await.expect("context event");
+        assert!(matches!(
+            events,
+            SessionEvent::Context {
+                turn_id: event_turn,
+                tokens,
+                limit: 1_000,
+            } if event_turn == turn_id && tokens > 0
+        ));
+        assert_eq!(
+            outcome.turn.result,
+            TurnResult::Stopped(StopReason::EndTurn)
+        );
     }
 
     #[tokio::test]
@@ -797,6 +953,73 @@ mod tests {
         );
         assert_eq!(outcome.turn.visible_text().as_deref(), Some("partial"));
         assert!(!outcome.turn.has_tools());
+    }
+
+    #[tokio::test]
+    async fn bounds_parallel_tool_execution_without_reordering_results() {
+        const TOOL_CALLS: usize = 10;
+        const MAX_PARALLEL_TOOLS: usize = 8;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let tool_active = Arc::clone(&active);
+        let tool_maximum = Arc::clone(&maximum);
+        let tool = define_tool("test", "test", move |_, args: ToolTestArgs| {
+            let tool_active = Arc::clone(&tool_active);
+            let tool_maximum = Arc::clone(&tool_maximum);
+            let index = args.index;
+            async move {
+                let current = tool_active.fetch_add(1, Ordering::SeqCst) + 1;
+                tool_maximum.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tool_active.fetch_sub(1, Ordering::SeqCst);
+                Ok(index.to_string())
+            }
+        })
+        .unwrap();
+        let calls = (0..TOOL_CALLS)
+            .map(|index| {
+                Ok(ModelEvent::ToolCall {
+                    id: ToolCallId::from_provider(format!("call-{index}")),
+                    name: "test".to_string(),
+                    arguments: serde_json::json!({ "index": index }),
+                })
+            })
+            .chain([Ok(ModelEvent::Stop(StopReason::EndTurn))])
+            .collect::<Vec<_>>();
+        let model = MockModel {
+            responses: StdMutex::new(VecDeque::from([
+                calls,
+                vec![
+                    Ok(ModelEvent::Text("complete".to_string())),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                ],
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        };
+        let agent = Agent::new(ModelId::new("model"), vec![tool]);
+        let (events, _) = mpsc::channel(TOOL_CALLS * 2);
+        let conversation = Conversation::new();
+        let run = run_turn(
+            &model,
+            &agent,
+            &conversation,
+            TurnId::new(),
+            Input::user("run tools"),
+            events,
+            ToolContext {
+                identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                cancellation: CancellationToken::new(),
+                deadline: None,
+            },
+        );
+        let outcome = run.await;
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(maximum.load(Ordering::SeqCst), MAX_PARALLEL_TOOLS);
+        for (index, call) in outcome.turn.tool_calls().enumerate() {
+            assert!(matches!(&call.result, Ok(output) if output.text == index.to_string()));
+        }
+        assert_eq!(outcome.turn.tool_calls().count(), TOOL_CALLS);
     }
 
     #[tokio::test]
