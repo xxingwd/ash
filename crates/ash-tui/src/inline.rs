@@ -566,6 +566,7 @@ impl TerminalUi {
                 &pending,
                 render_width,
                 tools_expanded,
+                &state.working_dir,
             )?;
             terminal.render_viewport(state, width, height)?;
             Ok(inserted)
@@ -599,6 +600,7 @@ impl TerminalUi {
                 &committed,
                 render_width,
                 tools_expanded,
+                &state.working_dir,
             )?;
             terminal.render_viewport(state, width, height)?;
             Ok(inserted)
@@ -783,9 +785,12 @@ fn insert_history_blocks(
     blocks: &[LiveBlock],
     render_width: u16,
     tools_expanded: bool,
+    working_dir: &std::path::Path,
 ) -> io::Result<usize> {
     let mut inserted = 0;
-    for group in viewport::grouped_transcript(blocks, render_width, tools_expanded) {
+    for group in
+        viewport::grouped_transcript(blocks, render_width, tools_expanded, Some(working_dir))
+    {
         if let Err(source) = surface.insert_buffer(&group.buffer, 1) {
             return Err(PartialInsert { inserted, source }.into());
         }

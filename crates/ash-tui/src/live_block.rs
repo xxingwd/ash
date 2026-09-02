@@ -301,7 +301,17 @@ impl LiveBlock {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn render(&self, width: u16, expanded: bool) -> Arc<Buffer> {
+        self.render_in(width, expanded, None)
+    }
+
+    pub(crate) fn render_in(
+        &self,
+        width: u16,
+        expanded: bool,
+        working_dir: Option<&std::path::Path>,
+    ) -> Arc<Buffer> {
         let width = width.max(1);
         let source_len = self.source_len();
         let elapsed_seconds = self.running_elapsed_seconds();
@@ -368,7 +378,7 @@ impl LiveBlock {
                 );
                 (buffer, Some(markdown))
             }
-            _ => (self.render_uncached(width, expanded), None),
+            _ => (self.render_uncached(width, expanded, working_dir), None),
         };
         let buffer = Arc::new(buffer);
         self.cache.replace(Some(RenderCache {
@@ -386,7 +396,12 @@ impl LiveBlock {
         self.cache.replace(None);
     }
 
-    fn render_uncached(&self, width: u16, expanded: bool) -> Buffer {
+    fn render_uncached(
+        &self,
+        width: u16,
+        expanded: bool,
+        working_dir: Option<&std::path::Path>,
+    ) -> Buffer {
         match &self.kind {
             LiveBlockKind::Welcome(working_dir) => render_welcome(width, working_dir),
             LiveBlockKind::History(block) => block.render(width),
@@ -416,12 +431,20 @@ impl LiveBlock {
                 name,
                 arguments,
                 state: ToolState::Running { .. },
-            } => render_running_tool(name, arguments, width, expanded),
+            } => render_running_tool(name, arguments, width, expanded, working_dir),
             LiveBlockKind::Tool {
                 name,
                 arguments,
                 state: ToolState::Finished { output, is_error },
-            } => render_tool(name, arguments, output, *is_error, width, expanded),
+            } => render_tool(
+                name,
+                arguments,
+                output,
+                *is_error,
+                width,
+                expanded,
+                working_dir,
+            ),
         }
     }
 
@@ -705,19 +728,20 @@ fn render_tool(
     is_error: bool,
     width: u16,
     expanded: bool,
+    working_dir: Option<&std::path::Path>,
 ) -> Buffer {
     let output_presentation = match tool_renderer(name, is_error) {
         ToolRenderer::Bash => {
             return render_bash_tool(name, arguments, output, is_error, width, expanded);
         }
         ToolRenderer::Edit => {
-            if let Some(rendered) = render_edit_tool(arguments, width) {
+            if let Some(rendered) = render_edit_tool(arguments, width, working_dir) {
                 return rendered;
             }
             OutputPresentation::Preview
         }
         ToolRenderer::Write => {
-            if let Some(rendered) = render_write_tool(arguments, width) {
+            if let Some(rendered) = render_write_tool(arguments, width, working_dir) {
                 return rendered;
             }
             OutputPresentation::Preview
@@ -763,8 +787,22 @@ fn render_tool_output_summary(output: &str, width: u16) -> Option<Buffer> {
         .map(|summary| render_tool_output(summary, width, false))
 }
 
-fn render_running_tool(name: &str, arguments: &Value, width: u16, expanded: bool) -> Buffer {
-    let (action, detail) = tool_call_summary(name, arguments);
+fn render_running_tool(
+    name: &str,
+    arguments: &Value,
+    width: u16,
+    expanded: bool,
+    working_dir: Option<&std::path::Path>,
+) -> Buffer {
+    let (action, mut detail) = tool_call_summary(name, arguments);
+    if matches!(
+        tool_renderer(name, false),
+        ToolRenderer::Edit | ToolRenderer::Write
+    ) {
+        if let Some(working_dir) = working_dir {
+            detail = crate::tool_display::workspace_path(&detail, working_dir);
+        }
+    }
     if matches!(tool_renderer(name, false), ToolRenderer::Bash) {
         let (title, continuation, _) =
             render_bash_command_line_with_action(arguments, &action, Color::Cyan, width, expanded);
@@ -1025,8 +1063,15 @@ fn render_tool_title_with_color(action: &str, detail: &str, color: Color, width:
     buffer
 }
 
-fn render_edit_tool(arguments: &Value, width: u16) -> Option<Buffer> {
+fn render_edit_tool(
+    arguments: &Value,
+    width: u16,
+    working_dir: Option<&std::path::Path>,
+) -> Option<Buffer> {
     let path = tool_argument(arguments, "path")?;
+    let path = working_dir.map_or(path.clone(), |working_dir| {
+        crate::tool_display::workspace_path(&path, working_dir)
+    });
     let edits = arguments.get("edits")?.as_array()?;
     let mut lines = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
@@ -1044,8 +1089,15 @@ fn render_edit_tool(arguments: &Value, width: u16) -> Option<Buffer> {
     ))
 }
 
-fn render_write_tool(arguments: &Value, width: u16) -> Option<Buffer> {
+fn render_write_tool(
+    arguments: &Value,
+    width: u16,
+    working_dir: Option<&std::path::Path>,
+) -> Option<Buffer> {
     let path = tool_argument(arguments, "path")?;
+    let path = working_dir.map_or(path.clone(), |working_dir| {
+        crate::tool_display::workspace_path(&path, working_dir)
+    });
     let content = tool_argument(arguments, "content")?;
     let mut lines = Vec::new();
     extend_change_lines(&mut lines, '+', &content);
@@ -1306,7 +1358,7 @@ mod tests {
         let mut block = LiveBlock::reasoning(1);
         assert!(block.append_reasoning_source("inspect first"));
 
-        let rendered = block.render_uncached(40, false);
+        let rendered = block.render_uncached(40, false, None);
 
         assert_eq!(row_text(&rendered, 0), "• Thinking (0s)");
         assert_eq!(row_text(&rendered, 1), "  inspect first");
@@ -1570,6 +1622,19 @@ mod tests {
 
         assert_eq!(row_text(&edit, 0), "• Edit /workspace/src/main.rs (+1 -1)");
         assert_eq!(row_text(&write, 0), "• Write /workspace/src/new.rs (+2 -0)");
+
+        let relative = LiveBlock::tool(
+            4,
+            "edit".to_string(),
+            serde_json::json!({
+                "path": "/workspace/src/main.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+            String::new(),
+            false,
+        )
+        .render_in(80, false, Some(std::path::Path::new("/workspace")));
+        assert_eq!(row_text(&relative, 0), "• Edit src/main.rs (+1 -1)");
         assert_eq!(edit.cell((2, 1)).expect("deleted line").fg, Color::Red);
         assert_eq!(edit.cell((2, 2)).expect("added line").fg, Color::Green);
         assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);

@@ -151,7 +151,12 @@ fn render_view(input: ViewportInput<'_>) -> ViewportFrame {
         .unwrap_or(u16::MAX)
         .clamp(1, MAX_COMPOSER_ROWS);
 
-    let rendered_groups = grouped_transcript(input.transcript, width, input.tools_expanded);
+    let rendered_groups = grouped_transcript(
+        input.transcript,
+        width,
+        input.tools_expanded,
+        Some(input.working_dir),
+    );
     let items = rendered_groups
         .iter()
         .map(|group| StackItem::block(group.buffer.area.height))
@@ -229,11 +234,12 @@ pub(crate) struct RenderedTranscriptGroup<'a> {
     pub(crate) buffer: Arc<Buffer>,
 }
 
-pub(crate) fn grouped_transcript(
-    blocks: &[LiveBlock],
+pub(crate) fn grouped_transcript<'a>(
+    blocks: &'a [LiveBlock],
     width: u16,
     expanded: bool,
-) -> Vec<RenderedTranscriptGroup<'_>> {
+    working_dir: Option<&Path>,
+) -> Vec<RenderedTranscriptGroup<'a>> {
     blocks
         .chunk_by(|left, right| {
             left.grouped_tool_name(expanded)
@@ -242,7 +248,7 @@ pub(crate) fn grouped_transcript(
         })
         .map(|source| {
             let buffer = if let [block] = source {
-                block.render(width, expanded)
+                block.render_in(width, expanded, working_dir)
             } else {
                 let name = source
                     .first()
@@ -1798,7 +1804,7 @@ mod tests {
                 false,
             ),
         ];
-        let source_lengths = grouped_transcript(&blocks, 79, false)
+        let source_lengths = grouped_transcript(&blocks, 79, false, None)
             .into_iter()
             .map(|group| group.source.len())
             .collect::<Vec<_>>();
@@ -1827,7 +1833,7 @@ mod tests {
 
         assert_eq!(source_lengths, [2, 2, 1]);
         assert_eq!(
-            grouped_transcript(&blocks, 79, true)
+            grouped_transcript(&blocks, 79, true, None)
                 .into_iter()
                 .map(|group| group.source.len())
                 .collect::<Vec<_>>(),
@@ -1866,7 +1872,7 @@ mod tests {
             ),
         ];
 
-        let groups = grouped_transcript(&blocks, 79, false);
+        let groups = grouped_transcript(&blocks, 79, false, None);
 
         assert_eq!(groups.len(), 3);
         assert!(groups.iter().all(|group| group.source.len() == 1));

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -134,6 +135,24 @@ fn raw_path_argument(arguments: &Value) -> String {
         .and_then(Value::as_str)
         .map(sanitize_single_line)
         .unwrap_or_default()
+}
+
+/// Drop the workspace prefix when `path` is inside `working_dir`. Paths outside
+/// the workspace stay absolute. Matching is on path components, so
+/// `/tmp/workspace-other` is not treated as inside `/tmp/workspace`.
+pub fn workspace_path(path: &str, working_dir: &Path) -> String {
+    let normalized = sanitize_single_line(path);
+    Path::new(&normalized)
+        .strip_prefix(working_dir)
+        .ok()
+        .map(|relative| {
+            if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            }
+        })
+        .unwrap_or_else(|| normalized.replace('\\', "/"))
 }
 
 fn short_path_argument(arguments: &Value) -> String {
@@ -387,5 +406,25 @@ mod tests {
             tool_renderer("custom_tool", false),
             ToolRenderer::Generic(OutputPresentation::Preview)
         );
+    }
+
+    #[test]
+    fn workspace_path_strips_the_working_directory_prefix() {
+        use std::path::Path;
+        let root = Path::new("/home/user/workspace/project");
+        assert_eq!(
+            workspace_path(
+                "/home/user/workspace/project/docs/design.md",
+                root,
+            ),
+            "docs/design.md"
+        );
+        assert_eq!(workspace_path("/etc/hosts", root), "/etc/hosts");
+        assert_eq!(
+            workspace_path("/home/user/workspace/other/file.rs", root),
+            "/home/user/workspace/other/file.rs"
+        );
+        assert_eq!(workspace_path("docs/local.md", root), "docs/local.md");
+        assert_eq!(workspace_path(root.to_str().unwrap(), root), ".");
     }
 }
