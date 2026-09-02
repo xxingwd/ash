@@ -20,6 +20,7 @@ mod text_width;
 mod tool_display;
 mod viewport;
 mod welcome_card;
+mod wrap;
 
 pub use app::{App, UiCommand, UiError, UiEvent};
 pub use subagent::{SubagentUpdate, SubagentUpdateKind, SubagentView, SubagentViewState};

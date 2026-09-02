@@ -1,8 +1,8 @@
+use crate::wrap::wrap_plain_text;
 use ratatui::{
     style::{Modifier, Style},
     text::Span,
 };
-use unicode_width::UnicodeWidthChar;
 
 pub fn sanitize_terminal_text(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
@@ -58,27 +58,7 @@ pub fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
 }
 
 pub fn wrap_text(text: &str, width: u16) -> Vec<String> {
-    let width = usize::from(width.max(1));
-    let mut lines = Vec::new();
-    for source_line in text.split('\n') {
-        let source_line = source_line.strip_suffix('\r').unwrap_or(source_line);
-        let mut line = String::new();
-        let mut line_width = 0;
-        for character in source_line.chars() {
-            let character_width = character.width().unwrap_or(0);
-            if line_width > 0 && line_width + character_width > width {
-                lines.push(std::mem::take(&mut line));
-                line_width = 0;
-            }
-            line.push(character);
-            line_width += character_width;
-        }
-        lines.push(line);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+    wrap_plain_text(text, usize::from(width.max(1)))
 }
 
 #[cfg(test)]

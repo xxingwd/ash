@@ -250,54 +250,10 @@ pub fn parse_ansi_line(line: &str) -> Line<'static> {
     }
 }
 
-/// Wrap a highlighted `Line` at the display width. No word-break heuristic:
-/// characters fill each row until the next one no longer fits. Styles are
-/// preserved per character, so syntax colors survive the wrap.
+/// Wrap a highlighted `Line` with the shared token rule: whitespace and CJK
+/// break, other tokens stay intact until they exceed the row width.
 pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    // Flatten the line into (style, char) pairs.
-    let mut chars: Vec<(Style, String)> = Vec::new();
-    for span in &line.spans {
-        for character in span.content.chars() {
-            chars.push((span.style, character.to_string()));
-        }
-    }
-    if chars.is_empty() {
-        return vec![Line::default()];
-    }
-
-    let char_width = |text: &str| {
-        unicode_width::UnicodeWidthChar::width(text.chars().next().unwrap_or(' '))
-            .unwrap_or(0)
-            .max(1)
-    };
-
-    let flush = |rows: &mut Vec<Line<'static>>, segment: &[(Style, String)]| {
-        let mut row = Line::default();
-        for (s, c) in segment {
-            row.spans.push(Span::styled(c.clone(), *s));
-        }
-        rows.push(row);
-    };
-
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<(Style, String)> = Vec::new();
-    let mut current_width = 0usize;
-
-    for (style, text) in chars {
-        let cw = char_width(&text);
-        if current_width > 0 && current_width + cw > width {
-            flush(&mut rows, &current);
-            current.clear();
-            current_width = 0;
-        }
-        current.push((style, text));
-        current_width += cw;
-    }
-    if !current.is_empty() {
-        flush(&mut rows, &current);
-    }
-    rows
+    crate::wrap::wrap_styled_line(line, width)
 }
 
 /// Render tool output for display: the first `head` lines, then an ellipsis
@@ -557,12 +513,12 @@ mod wrap_hl_tests {
     }
 
     #[test]
-    fn wraps_at_column_width_without_word_breaks() {
+    fn wraps_at_spaces_and_hard_breaks_overlong_tokens() {
         let line = parse_ansi_line("Edit /home/user/file.rs");
         let wrapped = wrap_highlighted_line(&line, 10);
         assert_eq!(
             wrapped.iter().map(plain).collect::<Vec<_>>(),
-            vec!["Edit /home", "/user/file", ".rs"]
+            vec!["Edit", "/home/user", "/file.rs"]
         );
     }
 }

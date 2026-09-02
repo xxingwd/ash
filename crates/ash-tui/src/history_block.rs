@@ -82,12 +82,9 @@ fn render_user(text: &str, width: u16) -> Buffer {
         0
     };
     let content_width = width.saturating_sub(content_x).max(1);
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    let content_height = u16::try_from(paragraph.line_count(content_width))
-        .unwrap_or(u16::MAX)
-        .max(1);
-    let area = Rect::new(0, 0, width, content_height);
-    let mut buffer = Buffer::empty(area);
+    let rows = wrap_text(text, content_width);
+    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
 
     if show_prefix {
         buffer.set_string(
@@ -97,10 +94,10 @@ fn render_user(text: &str, width: u16) -> Buffer {
             Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
         );
     }
-    paragraph.render(
-        Rect::new(content_x, 0, content_width, content_height),
-        &mut buffer,
-    );
+    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
+        let y = u16::try_from(index).unwrap_or(u16::MAX);
+        buffer.set_string(content_x, y, row, Style::default());
+    }
     buffer
 }
 

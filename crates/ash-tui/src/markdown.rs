@@ -1,3 +1,4 @@
+use crate::wrap::{wrap_graphemes_with_widths, WrapGrapheme};
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event as MarkdownEvent, HeadingLevel, LinkType, Options, Parser, Tag,
     TagEnd,
@@ -1144,9 +1145,6 @@ fn wrap_verbatim(
     output
 }
 
-// `pending_whitespace` is refilled on later iterations, so draining keeps
-// the allocation while `into_iter` would move the buffer out of the loop.
-#[allow(clippy::iter_with_drain)]
 fn wrap_words(
     spans: Vec<StyledSpan>,
     initial: &[StyledSpan],
@@ -1154,69 +1152,36 @@ fn wrap_words(
     width: usize,
 ) -> Vec<RenderedLine> {
     let styled = styled_graphemes(spans);
-    let graphemes = &styled.graphemes;
-    let (mut current, mut current_width) = prefixed_line(initial);
-    let mut content_width = 0usize;
+    let prefix_width = styled_width(initial);
+    let continuation_width = styled_width(continuation);
+    let first_width = width.saturating_sub(prefix_width).max(1);
+    let rest_width = width.saturating_sub(continuation_width).max(1);
+    let graphemes = styled
+        .graphemes
+        .into_iter()
+        .map(|grapheme| WrapGrapheme {
+            cluster: styled.text[grapheme.range.clone()].to_string(),
+            width: grapheme.width,
+            whitespace: grapheme.whitespace,
+            style: grapheme.style,
+        })
+        .collect::<Vec<_>>();
+
     let mut output = Vec::new();
-    let mut pending_whitespace = Vec::new();
-    let mut index = 0usize;
-
-    while index < graphemes.len() {
-        if graphemes[index].whitespace {
-            pending_whitespace.push(graphemes[index].clone());
-            index += 1;
-            continue;
+    for (index, row) in wrap_graphemes_with_widths(&graphemes, first_width, rest_width)
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = if index == 0 { initial } else { continuation };
+        let (mut line, _) = prefixed_line(prefix);
+        for grapheme in row {
+            push_styled_text(&mut line.spans, &grapheme.cluster, grapheme.style);
         }
-
-        let word_start = index;
-        while index < graphemes.len() && !graphemes[index].whitespace {
-            index += 1;
-        }
-        let word = &graphemes[word_start..index];
-        let word_width = word.iter().map(|grapheme| grapheme.width).sum::<usize>();
-        let whitespace_width = pending_whitespace
-            .iter()
-            .map(|grapheme| grapheme.width)
-            .sum::<usize>();
-
-        if content_width > 0
-            && current_width
-                .saturating_add(whitespace_width)
-                .saturating_add(word_width)
-                > width
-        {
-            output.push(std::mem::take(&mut current));
-            let prefixed = prefixed_line(continuation);
-            current = prefixed.0;
-            current_width = prefixed.1;
-            content_width = 0;
-        }
-
-        if content_width > 0 {
-            for grapheme in pending_whitespace.drain(..) {
-                append_grapheme(&mut current, &styled.text, &grapheme);
-                current_width += grapheme.width;
-                content_width += grapheme.width;
-            }
-        } else {
-            pending_whitespace.clear();
-        }
-
-        for grapheme in word {
-            if content_width > 0 && current_width.saturating_add(grapheme.width) > width {
-                output.push(std::mem::take(&mut current));
-                let prefixed = prefixed_line(continuation);
-                current = prefixed.0;
-                current_width = prefixed.1;
-                content_width = 0;
-            }
-            append_grapheme(&mut current, &styled.text, grapheme);
-            current_width += grapheme.width;
-            content_width += grapheme.width;
-        }
+        output.push(line);
     }
-
-    output.push(current);
+    if output.is_empty() {
+        output.push(prefixed_line(initial).0);
+    }
     output
 }
 
