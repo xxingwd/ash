@@ -979,24 +979,71 @@ fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usi
 /// ANSI colors from the tool (e.g. colored bash output) survive into the
 /// rendered spans.
 fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
-    use crate::ansi::split_output;
+    use crate::ansi::parse_ansi_line;
 
     const FIRST_PREFIX: &str = "  └ ";
     const SUBSEQUENT_PREFIX: &str = "    ";
-    let lines = if expanded {
-        split_output(output, usize::MAX, 0, FIRST_PREFIX, SUBSEQUENT_PREFIX, true)
+    let source_lines: Vec<&str> = output.lines().collect();
+    let total = source_lines.len();
+    let selected = if expanded || total <= crate::ansi::COLLAPSED_MAX_LINES {
+        source_lines.into_iter().map(Some).collect::<Vec<_>>()
     } else {
         let half = crate::ansi::COLLAPSED_MAX_LINES / 2;
-        split_output(output, half, half, FIRST_PREFIX, SUBSEQUENT_PREFIX, true)
+        let omitted = total - half * 2;
+        let mut lines = source_lines[..half]
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>();
+        lines.push(None);
+        lines.extend(source_lines[total - half..].iter().copied().map(Some));
+        let _ = omitted;
+        lines
     };
-    if lines.is_empty() {
+    let omitted = total.saturating_sub(selected.iter().filter(|line| line.is_some()).count());
+    let wrap_width = usize::from(width.max(1));
+    let mut rows = Vec::new();
+    for (index, line) in selected.into_iter().enumerate() {
+        let prefix = if index == 0 {
+            FIRST_PREFIX
+        } else {
+            SUBSEQUENT_PREFIX
+        };
+        let hanging = Line::from(vec![Span::raw(" ".repeat(prefix.chars().count()))]);
+        let prefix_line = {
+            let mut line = Line::from(prefix.to_string());
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            line
+        };
+        let content = match line {
+            Some(text) => {
+                let mut parsed = parse_ansi_line(text);
+                for span in &mut parsed.spans {
+                    span.style = span.style.add_modifier(Modifier::DIM);
+                }
+                parsed
+            }
+            None => {
+                let mut ellipsis =
+                    Line::from(format!("… +{omitted} lines (truncated for display)"));
+                for span in &mut ellipsis.spans {
+                    span.style = span.style.add_modifier(Modifier::DIM);
+                }
+                ellipsis
+            }
+        };
+        rows.extend(crate::ansi::wrap_highlighted_line_with_prefix(
+            &content,
+            prefix_line,
+            hanging,
+            wrap_width,
+        ));
+    }
+    if rows.is_empty() {
         return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
     }
-    let wrap_width = usize::from(width.max(1));
-    let rows: Vec<Line<'static>> = lines
-        .into_iter()
-        .flat_map(|line| crate::ansi::wrap_highlighted_line(&line, wrap_width))
-        .collect();
     let mut buffer = Buffer::empty(Rect::new(
         0,
         0,
@@ -1038,19 +1085,22 @@ fn display_label(label: &str) -> String {
 
 fn render_tool_title_with_color(action: &str, detail: &str, color: Color, width: u16) -> Buffer {
     let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled("•", bullet_style), Span::raw(" ")];
-    spans.push(Span::styled(
+    let mut prefix = vec![Span::styled("•", bullet_style), Span::raw(" ")];
+    prefix.push(Span::styled(
         display_label(action),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     if !detail.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::raw(detail.to_string()));
+        prefix.push(Span::raw(" "));
     }
-    let line = Line::from(spans);
-    // Wrap long titles (e.g. a long grep pattern or path) instead of letting
-    // `set_line` truncate them, consistent with the bash command line.
-    let rows = crate::ansi::wrap_highlighted_line(&line, usize::from(width.max(1)));
+    let prefix = Line::from(prefix);
+    let hanging = Line::from(vec![Span::raw(" ".repeat(prefix.width()))]);
+    let rows = crate::ansi::wrap_highlighted_line_with_prefix(
+        &Line::from(detail.to_string()),
+        prefix,
+        hanging,
+        usize::from(width.max(1)),
+    );
     let mut buffer = Buffer::empty(Rect::new(
         0,
         0,
@@ -1800,6 +1850,34 @@ mod generic_output_tests {
             false,
         );
         assert!(bash_block.render(30, false).area.height > 2);
+    }
+
+    #[test]
+    fn grouped_tool_title_hangs_continuation_under_the_detail() {
+        let rendered = render_grouped_tool(
+            "read",
+            &[
+                "runtime_registry.go".to_string(),
+                "core.go".to_string(),
+                "catalog.go".to_string(),
+                "config_store.go".to_string(),
+                "manager.go".to_string(),
+                "dispatcher.go".to_string(),
+            ],
+            false,
+            40,
+        );
+        let first = row_text(&rendered, 0);
+        let second = row_text(&rendered, 1);
+        assert!(first.starts_with("• Read "), "{first:?}");
+        assert!(rendered.area.height >= 2, "{first:?}\n{second:?}");
+        let indent = "• Read ".chars().count();
+        assert_eq!(
+            &second[..indent],
+            " ".repeat(indent),
+            "{first:?}\n{second:?}"
+        );
+        assert!(!second[indent..].starts_with(' '), "{second:?}");
     }
 
     #[test]

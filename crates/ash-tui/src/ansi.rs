@@ -9,7 +9,9 @@
 //! so the agent still receives the full tool output for reasoning.
 
 use ansi_to_tui::IntoText;
-use ratatui::style::{Modifier, Style};
+#[cfg(test)]
+use ratatui::style::Modifier;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// Display budget for a collapsed block: tool output, bash command
@@ -256,6 +258,16 @@ pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'st
     crate::wrap::wrap_styled_line(line, width)
 }
 
+pub fn wrap_highlighted_line_with_prefix(
+    line: &Line<'static>,
+    prefix: Line<'static>,
+    hanging: Line<'static>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    crate::wrap::wrap_styled_line_with_prefix(line, prefix, hanging, width)
+}
+
+#[cfg(test)]
 /// Render tool output for display: the first `head` lines, then an ellipsis
 /// marker, then the last `tail` lines when the output is too long. Each shown
 /// line is parsed for ANSI colors and dimmed to visually recede behind the
@@ -312,6 +324,7 @@ pub fn split_with_ellipsis<T>(mut items: Vec<T>, head: usize, tail: usize, ellip
     selected
 }
 
+#[cfg(test)]
 fn prefix_line(line: &mut Line<'static>, prefix: &str, dim: bool) {
     let mut spans = Vec::with_capacity(line.spans.len() + 1);
     spans.push(Span::raw(prefix.to_string()));

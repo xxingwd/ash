@@ -42,14 +42,47 @@ pub fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
 }
 
 pub fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    wrap_styled_line_with_prefix(line, Line::default(), Line::default(), width)
+}
+
+/// Wrap `line` into rows of `width`, placing `prefix` on the first row and
+/// `hanging` on every continuation row. Prefixes occupy width; the remaining
+/// columns are used for content.
+pub fn wrap_styled_line_with_prefix(
+    line: &Line<'static>,
+    prefix: Line<'static>,
+    hanging: Line<'static>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let graphemes = styled_line_graphemes(line);
-    if graphemes.is_empty() {
-        return vec![Line::default()];
-    }
-    wrap_graphemes(&graphemes, width)
-        .into_iter()
-        .map(line_from_graphemes)
+    let prefix_width = line_width(&prefix);
+    let hanging_width = line_width(&hanging);
+    let first_width = width.saturating_sub(prefix_width).max(1);
+    let rest_width = width.saturating_sub(hanging_width).max(1);
+    let rows = if graphemes.is_empty() {
+        vec![Vec::new()]
+    } else {
+        wrap_graphemes_with_widths(&graphemes, first_width, rest_width)
+    };
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut spans = if index == 0 {
+                prefix.spans.clone()
+            } else {
+                hanging.spans.clone()
+            };
+            spans.extend(line_from_graphemes(row).spans);
+            Line::from(spans)
+        })
         .collect()
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 pub fn wrap_graphemes<S: Clone>(
@@ -284,5 +317,25 @@ mod tests {
     #[test]
     fn preserves_source_newlines() {
         assert_eq!(wrap("one\ntwo", 80), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn hanging_prefix_aligns_continuation_rows() {
+        let rows = wrap_styled_line_with_prefix(
+            &Line::from("one two three four"),
+            Line::from("Read "),
+            Line::from("     "),
+            12,
+        );
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, vec!["Read one two", "     three", "     four"]);
     }
 }
