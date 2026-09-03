@@ -14,9 +14,10 @@ use ash_core::{ToolCallId, TurnId};
 use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
-    scrollback::{sanitize_terminal_text, wrap_text},
+    scrollback::sanitize_terminal_text,
     tool_display::{tool_call_summary, tool_renderer, OutputPresentation, ToolRenderer},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
+    wrap::render_hanging_lines,
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
@@ -913,40 +914,16 @@ fn render_bash_command_line_with_action(
         (title, None, 1)
     } else {
         const CONTINUATION_PREFIX: &str = "  │ ";
-        let prefix_width = UnicodeWidthStr::width(CONTINUATION_PREFIX);
-        let content_width = width
-            .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
-            .max(1);
-        let mut wrapped = Vec::new();
-        for line in highlighted {
-            wrapped.extend(crate::ansi::wrap_highlighted_line(
-                &line,
-                usize::from(content_width),
-            ));
-        }
-        let shown = truncate_command_lines(&mut wrapped, expanded);
-        let mut continuation = Buffer::empty(Rect::new(
-            0,
-            0,
-            width.max(1),
-            u16::try_from(shown).unwrap_or(u16::MAX),
-        ));
-        for (offset, line) in wrapped.into_iter().enumerate() {
-            // Dim the pipe prefix so it matches the `└` output corner; the
-            // command text itself keeps its syntax colors.
-            let mut spans = vec![Span::styled(
-                CONTINUATION_PREFIX,
-                Style::default().add_modifier(Modifier::DIM),
-            )];
-            spans.extend(line.spans);
-            continuation.set_line(
-                0,
-                u16::try_from(offset).unwrap_or(u16::MAX),
-                &Line::from(spans),
-                width.max(1),
-            );
-        }
-        (title, Some(continuation), 1)
+        let prefix = Line::from(vec![Span::styled(
+            CONTINUATION_PREFIX,
+            Style::default().add_modifier(Modifier::DIM),
+        )]);
+        truncate_command_lines(&mut highlighted, expanded);
+        let wrapped = highlighted
+            .into_iter()
+            .map(|line| (prefix.clone(), line))
+            .collect::<Vec<_>>();
+        (title, Some(render_hanging_lines(wrapped, width)), 1)
     }
 }
 
@@ -1001,7 +978,6 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
         lines
     };
     let omitted = total.saturating_sub(selected.iter().filter(|line| line.is_some()).count());
-    let wrap_width = usize::from(width.max(1));
     let mut rows = Vec::new();
     for (index, line) in selected.into_iter().enumerate() {
         let prefix = if index == 0 {
@@ -1009,7 +985,6 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
         } else {
             SUBSEQUENT_PREFIX
         };
-        let hanging = Line::from(vec![Span::raw(" ".repeat(prefix.chars().count()))]);
         let prefix_line = {
             let mut line = Line::from(prefix.to_string());
             for span in &mut line.spans {
@@ -1034,26 +1009,9 @@ fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
                 ellipsis
             }
         };
-        rows.extend(crate::ansi::wrap_highlighted_line_with_prefix(
-            &content,
-            prefix_line,
-            hanging,
-            wrap_width,
-        ));
+        rows.push((prefix_line, content));
     }
-    if rows.is_empty() {
-        return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
-    }
-    let mut buffer = Buffer::empty(Rect::new(
-        0,
-        0,
-        width.max(1),
-        u16::try_from(rows.len()).unwrap_or(u16::MAX),
-    ));
-    for (offset, line) in rows.into_iter().enumerate() {
-        buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &line, width);
-    }
-    buffer
+    render_hanging_lines(rows, width)
 }
 
 fn render_tool_title(action: &str, detail: &str, is_error: bool, width: u16) -> Buffer {
@@ -1093,24 +1051,10 @@ fn render_tool_title_with_color(action: &str, detail: &str, color: Color, width:
     if !detail.is_empty() {
         prefix.push(Span::raw(" "));
     }
-    let prefix = Line::from(prefix);
-    let hanging = Line::from(vec![Span::raw(" ".repeat(prefix.width()))]);
-    let rows = crate::ansi::wrap_highlighted_line_with_prefix(
-        &Line::from(detail.to_string()),
-        prefix,
-        hanging,
-        usize::from(width.max(1)),
-    );
-    let mut buffer = Buffer::empty(Rect::new(
-        0,
-        0,
-        width.max(1),
-        u16::try_from(rows.len()).unwrap_or(u16::MAX),
-    ));
-    for (offset, row) in rows.into_iter().enumerate() {
-        buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &row, width);
-    }
-    buffer
+    render_hanging_lines(
+        [(Line::from(prefix), Line::from(detail.to_string()))],
+        width,
+    )
 }
 
 fn render_edit_tool(
@@ -1171,7 +1115,7 @@ fn render_file_change(
     lines: &[String],
     width: u16,
 ) -> Buffer {
-    let title = Line::from(vec![
+    let prefix = Line::from(vec![
         Span::styled(
             "•",
             Style::default()
@@ -1184,14 +1128,20 @@ fn render_file_change(
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::raw(path.to_string()),
-        Span::raw(" ("),
-        Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
-        Span::raw(" "),
-        Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
-        Span::raw(")"),
     ]);
-    render_change_block(&title, lines, width)
+    let detail = format!("{path} (+{added} -{removed})");
+    let title = render_hanging_lines([(prefix, Line::from(detail))], width);
+    let gutter = Line::from(vec![Span::raw("  ")]);
+    let body = render_hanging_lines(
+        lines.iter().map(|line| {
+            (
+                gutter.clone(),
+                Line::from(Span::styled(line.clone(), change_line_style(line))),
+            )
+        }),
+        width,
+    );
+    stack_rows(&[title, body], width)
 }
 
 fn changed_line_counts(lines: &[String]) -> (usize, usize) {
@@ -1204,42 +1154,6 @@ fn changed_line_counts(lines: &[String]) -> (usize, usize) {
             (added, removed)
         }
     })
-}
-
-fn render_change_block(title: &Line<'static>, lines: &[String], width: u16) -> Buffer {
-    let title_rows = crate::ansi::wrap_highlighted_line(title, usize::from(width.max(1)));
-    let content_x = if width > BULLET_PREFIX_COLUMNS {
-        BULLET_PREFIX_COLUMNS
-    } else {
-        0
-    };
-    let content_width = width.saturating_sub(content_x).max(1);
-    let mut rendered = Vec::new();
-    for line in lines {
-        let style = change_line_style(line);
-        for row in wrap_text(line, content_width) {
-            rendered.push((row, style));
-        }
-    }
-
-    let height = u16::try_from(rendered.len().saturating_add(title_rows.len()))
-        .unwrap_or(u16::MAX)
-        .max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
-    let title_height = title_rows.len();
-    for (index, row) in title_rows.into_iter().enumerate() {
-        let Ok(y) = u16::try_from(index) else {
-            break;
-        };
-        buffer.set_line(0, y, &row, width);
-    }
-    for (index, (line, style)) in rendered.iter().enumerate() {
-        let Ok(y) = u16::try_from(index.saturating_add(title_height)) else {
-            break;
-        };
-        buffer.set_string(content_x, y, line, *style);
-    }
-    buffer
 }
 
 fn change_line_style(line: &str) -> Style {

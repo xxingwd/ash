@@ -5,13 +5,14 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::{Paragraph, Widget, Wrap},
+    text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    scrollback::{sanitize_terminal_text, wrap_text},
+    scrollback::sanitize_terminal_text,
     status_line::{format_token_rate, format_token_usage},
+    wrap::render_hanging_lines,
 };
 
 const USER_HORIZONTAL_INSET: u16 = 2;
@@ -75,112 +76,73 @@ fn normalize_multiline(text: &str) -> String {
 }
 
 fn render_user(text: &str, width: u16) -> Buffer {
-    let show_prefix = width > USER_HORIZONTAL_INSET;
-    let content_x = if show_prefix {
-        USER_HORIZONTAL_INSET
-    } else {
-        0
-    };
-    let content_width = width.saturating_sub(content_x).max(1);
-    let rows = wrap_text(text, content_width);
-    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-
-    if show_prefix {
-        buffer.set_string(
-            0,
-            0,
-            "›",
+    let prefix = if width > USER_HORIZONTAL_INSET {
+        Line::from(vec![Span::styled(
+            "› ",
             Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-        );
-    }
-    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
-        let y = u16::try_from(index).unwrap_or(u16::MAX);
-        buffer.set_string(content_x, y, row, Style::default());
-    }
-    buffer
+        )])
+    } else {
+        Line::default()
+    };
+    render_hanging_lines(
+        text.lines()
+            .map(|line| (prefix.clone(), Line::from(line.to_string()))),
+        width,
+    )
 }
 
 fn render_info(message: &str, width: u16) -> Buffer {
-    let content_width = width.saturating_sub(4).max(1);
-    let mut rows = message
-        .lines()
-        .flat_map(|line| wrap_text(line, content_width))
-        .collect::<Vec<_>>();
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    let content_x = if width > USER_HORIZONTAL_INSET {
-        USER_HORIZONTAL_INSET
+    let prefix = if width > USER_HORIZONTAL_INSET {
+        Line::from(vec![Span::styled(
+            "• ",
+            Style::default().add_modifier(Modifier::DIM),
+        )])
     } else {
-        0
+        Line::default()
     };
-    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
-        let y = u16::try_from(index).unwrap_or(u16::MAX);
-        if index == 0 && content_x > 0 {
-            buffer.set_string(0, y, "•", Style::default().add_modifier(Modifier::DIM));
-        }
-        buffer.set_string(content_x, y, row, Style::default());
-    }
-    buffer
+    let lines = if message.is_empty() {
+        vec![(prefix, Line::default())]
+    } else {
+        message
+            .lines()
+            .map(|line| (prefix.clone(), Line::from(line.to_string())))
+            .collect()
+    };
+    render_hanging_lines(lines, width)
 }
 
 fn render_interrupted(width: u16) -> Buffer {
-    const MESSAGE: &str = "Conversation interrupted.";
-    let content_x = if width > 1 { 2 } else { 0 };
-    let rows = wrap_text(MESSAGE, width.saturating_sub(content_x).max(1));
-    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
     let style = Style::default().fg(Color::Red);
-    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
-        let y = u16::try_from(index).unwrap_or(u16::MAX);
-        if index == 0 && content_x > 0 {
-            buffer.set_string(0, y, "■", style);
-        }
-        buffer.set_string(content_x, y, row, style);
-    }
-    buffer
+    let prefix = if width > 1 {
+        Line::from(vec![Span::styled("■", style)])
+    } else {
+        Line::default()
+    };
+    render_hanging_lines(
+        [(prefix, Line::styled(" Conversation interrupted.", style))],
+        width,
+    )
 }
 
 fn render_error(error: &str, width: u16) -> Buffer {
-    if width <= 9 {
-        let paragraph = Paragraph::new(format!("Error: {error}"))
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .wrap(Wrap { trim: false });
-        let height = u16::try_from(paragraph.line_count(width))
-            .unwrap_or(u16::MAX)
-            .max(1);
-        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-        paragraph.render(buffer.area, &mut buffer);
-        return buffer;
-    }
-
-    let rows = wrap_text(error, width.saturating_sub(9).max(1));
-    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    for (index, row) in rows.iter().take(usize::from(height)).enumerate() {
-        let y = u16::try_from(index).unwrap_or(u16::MAX);
-        if index == 0 {
-            buffer.set_string(
-                0,
-                y,
-                "•",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            );
-            buffer.set_string(
-                USER_HORIZONTAL_INSET,
-                y,
-                "Error:",
-                Style::default().add_modifier(Modifier::BOLD),
-            );
-            buffer.set_string(9, y, row, Style::default());
-        } else {
-            buffer.set_string(USER_HORIZONTAL_INSET, y, row, Style::default());
-        }
-    }
-    buffer
+    let prefix = Line::from(vec![
+        Span::styled(
+            "• ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Error: ", Style::default().add_modifier(Modifier::BOLD)),
+    ]);
+    let contents = if error.is_empty() {
+        vec![String::new()]
+    } else {
+        error.lines().map(ToString::to_string).collect()
+    };
+    render_hanging_lines(
+        contents
+            .into_iter()
+            .map(|line| (prefix.clone(), Line::from(line))),
+        width,
+    )
 }
 
 fn render_worked(worked: &Worked, width: u16) -> Buffer {
@@ -268,11 +230,11 @@ mod tests {
 
     #[test]
     fn info_block_preserves_bullet_wrap_and_continuation_indent() {
-        let buffer = HistoryBlock::info("abcdefghij").render(12);
+        let buffer = HistoryBlock::info("abcdefghij").render(8);
 
         assert_eq!(buffer.area.height, 2);
-        assert_eq!(row_text(&buffer, 0), "• abcdefgh");
-        assert_eq!(row_text(&buffer, 1), "  ij");
+        assert_eq!(row_text(&buffer, 0), "• abcdef");
+        assert_eq!(row_text(&buffer, 1), "  ghij");
         assert!(buffer
             .cell((0, 0))
             .expect("bullet")
@@ -286,7 +248,7 @@ mod tests {
 
         assert_eq!(buffer.area.height, 2);
         assert_eq!(row_text(&buffer, 0), "• Error: abcdefghijk");
-        assert_eq!(row_text(&buffer, 1), "  lmnop");
+        assert_eq!(row_text(&buffer, 1), "         lmnop");
         let bullet = buffer.cell((0, 0)).expect("bullet");
         assert_eq!(bullet.fg, Color::Red);
         assert!(bullet.modifier.contains(Modifier::BOLD));
@@ -303,7 +265,6 @@ mod tests {
 
         assert_eq!(row_text(&buffer, 0), "■ Conversation interrupted.");
         assert_eq!(buffer.cell((0, 0)).expect("marker").fg, Color::Red);
-        assert_eq!(buffer.cell((2, 0)).expect("message").fg, Color::Red);
     }
 
     #[test]

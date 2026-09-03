@@ -258,15 +258,6 @@ pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'st
     crate::wrap::wrap_styled_line(line, width)
 }
 
-pub fn wrap_highlighted_line_with_prefix(
-    line: &Line<'static>,
-    prefix: Line<'static>,
-    hanging: Line<'static>,
-    width: usize,
-) -> Vec<Line<'static>> {
-    crate::wrap::wrap_styled_line_with_prefix(line, prefix, hanging, width)
-}
-
 #[cfg(test)]
 /// Render tool output for display: the first `head` lines, then an ellipsis
 /// marker, then the last `tail` lines when the output is too long. Each shown

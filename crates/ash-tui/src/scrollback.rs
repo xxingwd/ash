@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::wrap::wrap_plain_text;
 use ratatui::{
     style::{Modifier, Style},
@@ -57,6 +58,7 @@ pub fn content_row_prefix(first: bool) -> Vec<Span<'static>> {
     }
 }
 
+#[cfg(test)]
 pub fn wrap_text(text: &str, width: u16) -> Vec<String> {
     wrap_plain_text(text, usize::from(width.max(1)))
 }

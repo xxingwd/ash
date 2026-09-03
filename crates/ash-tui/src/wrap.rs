@@ -4,6 +4,8 @@
 //! intact until they are wider than a full row, then they hard-break.
 
 use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
     style::Style,
     text::{Line, Span},
 };
@@ -25,6 +27,7 @@ enum TokenKind {
     Word,
 }
 
+#[cfg(test)]
 pub fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -85,6 +88,46 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
+fn hanging_spaces(prefix: &Line<'_>) -> Line<'static> {
+    Line::from(vec![Span::raw(" ".repeat(line_width(prefix)))])
+}
+
+/// Wrap one logical line with a first-row prefix and matching hanging indent.
+pub fn wrap_line_hanging(
+    content: Line<'static>,
+    prefix: Line<'static>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let hanging = hanging_spaces(&prefix);
+    wrap_styled_line_with_prefix(&content, prefix, hanging, width)
+}
+
+/// Wrap each source line, then paint into a buffer.
+pub fn render_hanging_lines(
+    lines: impl IntoIterator<Item = (Line<'static>, Line<'static>)>,
+    width: u16,
+) -> Buffer {
+    let wrap_width = usize::from(width.max(1));
+    let rows: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|(prefix, content)| wrap_line_hanging(content, prefix, wrap_width))
+        .collect();
+    if rows.is_empty() {
+        return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
+    }
+    let mut buffer = Buffer::empty(Rect::new(
+        0,
+        0,
+        width.max(1),
+        u16::try_from(rows.len()).unwrap_or(u16::MAX),
+    ));
+    for (offset, row) in rows.into_iter().enumerate() {
+        buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &row, width);
+    }
+    buffer
+}
+
+#[cfg(test)]
 pub fn wrap_graphemes<S: Clone>(
     graphemes: &[WrapGrapheme<S>],
     width: usize,
@@ -198,6 +241,7 @@ fn token_kind<S>(grapheme: &WrapGrapheme<S>) -> TokenKind {
     }
 }
 
+#[cfg(test)]
 fn plain_graphemes(text: &str) -> Vec<WrapGrapheme<()>> {
     UnicodeSegmentation::graphemes(text, true)
         .map(|cluster| WrapGrapheme {
