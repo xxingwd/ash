@@ -1,382 +1,180 @@
-# 未提交工作树审查（2026-09-01）
-
-> 口径：只审当前未提交改动，对照被覆盖前工作树里的 A1–A7 计划和已改的 `DESIGN.md`。
-> 范围：`git status` 28 文件，+1476 / −544；未跟踪 `crates/ash-collab/src/event.rs`。未跑 `cargo test --workspace`。
-> 复核：2026-09-01 二次对照源码，不是只看 diff。§1 / §3 / A4 半截 / `CommandFailed` Display 映射仍成立。A7「Completions 不走 HTTP 错误体」写错；§2 / §5 / P0.6「3 处」过重，已收窄。
-> 总判：不是 A1 收尾。已勾完的 A1/A2 上重新打开 live stats；A4 / A7 / P1 错误处理各做了半截。计划文档和实现已分叉。
-> 合入前最小集：① 修 `CommandFailed` → 工具结果字符串；② `Removed` 后禁止 Session 事件建行，remove 停 forward；③ 要么改 A1 承认 live `Progress`，要么从这批拿掉 live stats。
+# 近期代码修正计划
 
-## 改动对照计划
-
-| 计划项 | 原清单 | 这批实际做了什么 | 能否勾 |
-| --- | --- | --- | --- |
-| A1 领域 / 事件 | `[x]` | `SessionEvent` 加回 `Progress`；TUI / collab 再投影 live `TurnStats` | 否。与已勾完的 A1 验收冲突 |
-| A2 单一 `AppState` | `[x]` | `turn_stats` / `tool_calls` 进 `AppState`；`ViewportInput` 再摊两字段 | 状态仍一个 owner，但 live stats 又成镜像 |
-| A4 `Workspace` | `[ ]` | 工具组构造时打开一次 canonical root + cap-std `Dir` | 第一刀对，A4 没做完 |
-| A5 工具并发 | `[x]` | `MAX_PARALLEL_TOOLS = 8` 切批 `join_all` | 行为新增；吞吐是切批而非有界并发 |
-| A6 collab 领域方法 | `[ ]` | watch 快照 → broadcast 事件；`AgentGroup::create` 仍未抽 | 扩了 collab 面，没完成 A6 |
-| A7 `sse::stream` | `[ ]` | 错误体上限读取 + `Auth`/`RateLimited` 带 message | A7 前半；request-id / retry-after / OpenAI helper 没动。Completions **也走** `sse::stream`，HTTP 错误体路径三家共用 |
-| P0.6 路径包含性 | `[ ]` | bash cwd 检查搬进 `Workspace::resolve_dir` | 4 处变 3 处，未关 |
-| P1 `Auth`/`RateLimited` | `[ ]` | 变体加 `message: String` | 半完成：无 request-id/retry-after，仍 `Clone` |
-| P1 `CommandFailed` | `[ ]` | 新变体 + bash 使用 + 输出限长 | 类型对；持久化/展示用 Display 压扁，合同变了 |
-| A3 `Tool`/`FnTool` | `[ ]` | `FnTool` 改私有，空 name/description 拒绝 | 边角，不是 A3 |
+> 来源：2026-09-04 对当前工作树及最近提交的代码审查。
+> 目标：先修复可见的 TUI 正确性问题，再收紧统计状态模型；遵循 `AGENTS.md` 的最小设计、强类型、DRY 和显式数据流原则。
+>
+> **状态（2026-09-04 第二轮）**：P0.1、P0.2、P0.3、P1.4、P1.5、追加 9、追加 10（文档部分）、P2 的 footer 收紧与 `omitted` 清理已实现并通过 `cargo test --workspace`、`clippy -D warnings`。
+> P1.6 降级为不做：`working_dir` 是会话级固定字段（`App::new` 传入），运行期不变，缓存键缺它的实际触发条件不存在，属极端场景防御。
+> P1.7、追加 11 的 `Worked.elapsed` 显式变体、追加 8 的 `Step::tool_calls()` 收敛暂缓：收益低，待有真实需求再做。
 
-原计划「stats/event」目标：`TurnRunner -> Turn.stats`，stats 只在 turn 结束提交一次。A1 删除清单写明：实时 `TurnProgress`、collab `forward_stats`、`SubagentSnapshot.usage`、`SubagentView.usage`，子代理行只保留 name/state。
+## 实施原则
 
-这批把其中几项加回来，只换了名字：`SessionEvent::Progress`、`SubagentView.stats/tool_calls/active_turn`、controller 转发 child session 事件。`DESIGN.md` 已改成 9 个事实 + 子代理事件广播；A1 验收没改。先统一文档，否则下一刀会按过时验收把 live stats 再拆掉。
+- [ ] 保持改动聚焦，不引入新的折行依赖；继续使用现有的 `unicode-segmentation`、`unicode-width` 和 Ratatui 类型。
+- [ ] 持久化数据只保留领域事实；临时 UI 活动状态与最终 `Turn` 数据分开建模。
+- [ ] 优先使用纯转换函数：文本解析、折行、截断、前缀选择都应输入明确、返回新值；缓存写入和 Ratatui 绘制留在边界层。
+- [ ] 不做无收益的“全面函数式重写”。actor、事件循环、流式渲染中的局部可变状态是合理的。
+- [ ] 不把 TUI 状态下沉到 `ash-agent`，不通过解析展示字符串恢复领域信息。
 
----
+## P0：TUI 渲染正确性
 
-## P0 — 合入前必须修
+### 1. 按最终视觉行截断折叠内容
 
-### 1. `CommandFailed` 被 `Display` 写进 tool result
+涉及：`crates/ash-tui/src/live_block.rs`、`crates/ash-tui/src/wrap.rs`
 
-- 文件：`crates/ash-agent/src/engine.rs`（`execute_tool_call`）、`crates/ash-core/src/error.rs`、`crates/ash-tools/src/bash.rs`
-- 计划原文：增加 `ToolError::CommandFailed { status, output }`，输出限长同时处理其 output；spawn/read/join 仍走执行错误。
-- 已做：类型、bash 使用、`limit_tool_result` 限长 `CommandFailed.output`。
-- 问题：A1 已定 `ToolCall.result: Result<ToolOutput, String>`。engine 仍是 `limit_tool_result(...).map_err(|error| error.to_string())`。新 Display 是 `command exited with {status}: {output}`。以前失败文本是「stdout/stderr + 空行 + `Command exited with 7`」，现在「状态码在前、整段输出在后」。
-- 影响：下一轮模型看到的 tool result（进 `Turn`）；TUI bash 失败块（`is_error` 时把该字符串当 output 画）；任何靠文案解析退出码的下游。
-- 修法：`limit_tool_result` 之后显式格式化（输出在前、status 在后，或只把 `output` 放进 `Err(String)`），不要 `error.to_string()`。P1 要的是调用方可分支，不是把 thiserror 文案当领域字符串。不修不能勾 P1 `CommandFailed`。
+- [x] 将折叠流程统一为“解析 ANSI / 高亮 -> 按可用宽度折行 -> 按最终视觉行做 head/tail 截断 -> 渲染”。
+- [x] `render_tool_output` 不再先按 `str::lines()` 截取逻辑行；单个超长行折行后也必须受 `COLLAPSED_MAX_LINES` 限制。
+- [x] 多行命令的 continuation 部分先全部折行，再调用截断逻辑；第二个逻辑行很长时不得绕过折叠上限。
+- [x] 省略提示显示被省略的视觉行数，计算一次后直接使用，不保留 `let _ = omitted` 之类的无效中间值。
+- [x] 展开模式仍显示完整内容，并保留 ANSI 样式、高亮和原有 head/tail 顺序。
+- [x] 如一次性折行会放大超长输出的内存占用，将折行结果改为迭代式收集有限的头尾行；不要因此新增通用框架。
 
-### 2. `Removed` 之后迟到的 Session 事件会把子代理行复活
+完成标准：
 
-- 文件：`crates/ash-tui/src/app.rs`（`update_subagent`）、`crates/ash-collab/src/control.rs`（`remove` / `forward_events`）
-- 旧模型：watch 快照。最新一份列表里没有这个名字，行不会回来。
-- 新模型：TUI 自己累加事件。`update_subagent` 对任何非 `Removed` 更新都 `push` 新行（默认 `Running`）。`remove` 只发 `Removed`，不停 `forward_events`。
-- 正常 remove 前提是 pending 和 unread 都空，所以**通常没有**仍在飞的 Progress/Finished。仍成立的窗口：
-  1. `forward_events` 已从 child session 取出、但还没 `publish` 的事件，与 `Removed` 在 controller broadcast 里乱序。
-  2. CLI `event_tx`（64）里 `UiEvent::Subagent(Session)` 已排队，TUI 先处理后到的 `Removed`。
-  3. 同名重建：旧 session 的迟到 Session 事件 `session_id` 对不上新行，会再 `push` 一行旧 session（默认 Running）。这比「刚 remove 的空闲 agent」更实在。
-- 修法仍然对：只在 `StateChanged` 时建行；`Session` 只更新已存在的行；`remove` 时停掉对应 forward task（CancellationToken 或把 stream 在 remove 时 drop）。
-- 缺测试：Removed 后再来 Progress/Finished 不得建行；旧 session_id 的 Session 事件不得在新同名 agent 旁边再建一行。
+- [x] 64 KiB 的单行工具输出在折叠状态下最多占约定的内容行数，展开后内容完整。
+- [x] 超长的首条命令和后续命令都遵守相同的 continuation 行上限。
+- [x] 中英文、CJK、emoji、ANSI 彩色文本的宽度和样式没有回退。
 
----
+### 2. 修复极窄终端中的前缀吞字
 
-## P1 — 设计冲突 / 正确性
+涉及：`crates/ash-tui/src/wrap.rs`、`crates/ash-tui/src/history_block.rs`、`crates/ash-tui/src/live_block.rs`
 
-### 3. live `Progress` 和已勾完的 A1 打架
+- [x] 明确定义 `prefix_width >= width` 时的降级规则，不能在保留完整前缀后假装仍有 1 列内容宽度。
+- [x] 推荐规则：当前行放不下“前缀 + 至少一个 grapheme”时，前缀单独成行或省略装饰前缀，正文从下一行零缩进开始。
+- [x] 将该规则收敛在共享折行函数中，避免 error、tool title、history 各写一套窄宽度分支。
+- [x] 保证任何非空正文在宽度 `1..=10` 时至少有可见字符，continuation 行不能只剩空格。
 
-- 文件：`crates/ash-core/src/event.rs`、`crates/ash-agent/src/engine.rs`（`ResponseAccumulator::apply`）、`crates/ash-tui/src/app.rs`、`crates/ash-tui/src/viewport.rs`、`DESIGN.md`
-- A1 事件集是 7 个事实，明确没有 progress；删除实时 `TurnProgress`；TUI/CLI 只在 turn footer 展示最终 stats。
-- 工作树现在是 9 个事实。collector 在 usage 变化时发完整 `TurnStats` 快照（已 settle 的前几次请求 + 当前 `max` 合并），请求预检后的 `Context` 估算只在快照变化时发出。TUI：父会话 `AppState.turn_stats` / `tool_calls`，宽 ≥80 画在 status；子代理 `Started` 清零 → `Progress` 覆盖 stats → `Context` 更新占用 → `ToolStarted` 计数 → `Finished` 用 canonical `Turn` 覆盖。
-- 实现本身干净：`progress_is_published_only_when_usage_changes` 把 `max` 合并测清楚了；没有本地估算、没有 timer；最终 `Turn` 仍 canonical。这是改设计，不是完成清单。
-- 必须二选一：
-  - 承认 live `Progress` 是新产品合同：改 A1 事件列表、删除清单、stats/event 表、完成标准（旧标准「状态栏 token 数只在完成请求返回后变化」与现行 DESIGN 互斥）。
-  - 从这批拿掉 `Progress` / 子代理 live metrics，只留 `Workspace` 和协议诊断。
-- 不改文档就合，下一轮会按过时 A1 把这条当回退。
+完成标准：
 
-### 4. 有界 broadcast 上做投影，丢失后没有权威快照
+- [x] 为 `wrap_styled_line_with_prefix` 增加宽度 `1..=10` 的表驱动测试。
+- [x] 覆盖前缀等于宽度、前缀大于宽度、双宽字符和超长单词。
+- [x] error、tool title、tool output 在窄宽度下均不丢正文且不 panic。
 
-- 文件：`crates/ash-collab/src/control.rs`、`crates/ash-cli/src/modes.rs`、`crates/ash-agent/src/session.rs`
-- session 和 collab 都是 `broadcast(256)`。A1 给父会话 transient 留了 `TurnId`，漏掉 `Started` 后错位 delta 可拒。
-- 子代理：`forward_events` 遇到 child lag 是 `continue`；CLI 遇到 controller lag 只打日志。`Started` 丢了，后面的 `Progress`/`ToolStarted` 因 `active_turn` 对不上被忽略；`Finished` 丢了，行停在旧 metrics 上，只靠后来的 `StateChanged(Idle)` 改圆点。
-- idle/running 仍以 pending 为准（与 DESIGN 一致）。live tokens/tools 可丢。计划里没有「可丢的 UI 投影」这一层。
-- 修法：lag 时清掉该 child 的 metrics；或保留很小的 name/state/stats 快照通道（后者正是 A1 删掉的 watch）。先写进设计，再实现。
+### 3. 多行历史块只显示一次语义前缀
 
-### 5. 父 `Progress` 和子代理事件挤进同一个 64 容量 `event_tx`
+涉及：`crates/ash-tui/src/history_block.rs`
 
-- 文件：`crates/ash-cli/src/modes.rs`（`InteractiveController::run`）
-- controller 对 `UiEvent::Session` 和 `UiEvent::Subagent` 都 `event_tx.send().await`。子代理 usage 一密，**父会话流式输出**会被背压（同一 mpsc 里 Session Text 也要排队）。
-- 先前写成「submit/cancel 也会停」过重：`command_rx` 是 `select!` 的另一臂，command 仍会被取出；`session.submit` 走 actor 队列，不经过 `event_tx`。会被拖住的是 UI 事件送达，不是提交本身。
-- A2 要求 handler 只改 `AppState`，没有要求 collab 用量和文本 delta 抢有界 mpsc。
-- 修法：子代理通道独立，或 progress 可丢（try_send / 合并最新快照）。
+- [x] 用户输入只在第一条显式源行显示 `› `，后续显式行使用等宽 hanging indent 或空前缀。
+- [x] info 只在第一条显式源行显示 `• `。
+- [x] error 只在第一条显式源行显示 `• Error: `；后续行与正文起始列对齐。
+- [x] 软折行和显式换行使用同一 continuation 规则，避免每行重复表达同一个事件类型。
 
-### 6. `select_session` 不再按 root 丢掉 subagent 行
+完成标准：
 
-- 文件：`crates/ash-tui/src/app.rs`、`crates/ash-tui/src/inline.rs`（`refresh_status`）、`crates/ash-tui/src/viewport.rs`
-- 只在 render 时 `filter(|agent| Some(agent.root_id) == state.session_id)`。切 session / NewSession 后，别的 root 的 agent 堆在 `AppState.subagents`。
-- `refresh_status` 看未过滤列表：idle 时只要别的 root 还有行就会继续 tick。
-- A2 的 `ConversationChanged` 本应一次替换会话相关状态。
-- 修法：`select_session` / NewSession 按 `root_id` 丢掉非当前 root 的行；或 `refresh_status` 与 render 用同一过滤。
+- [x] 分别覆盖单行、多行、空行、首尾空行以及窄宽度渲染。
+- [x] 测试直接检查 Buffer 中的可见行，确保前缀只出现一次。
 
-### 7. 并行工具是切批 join，不是有界并发
+## P1：消除统计状态的双重事实源
 
-- 文件：`crates/ash-agent/src/engine.rs`（`execute_tools`）、`DESIGN.md`
-- `pending.drain(..min(8))` + `join_all`。第 9 个要等前 8 个全部结束。一个慢 bash 堵住整批，`ToolStarted` 也被拖住。
-- 顺序和上限有测试 `bounds_parallel_tool_execution_without_reordering_results`。测试用 10ms sleep 断言 `maximum == 8`，CI 负载高时可能 `< 8` 抖。
-- DESIGN 已写成「bounded batches of eight」。若坚持切批，写明吞吐权衡。否则 semaphore + 一次 `join_all` 同样保 wire order。
-- A5「只有 EndTurn 能执行 tool」这批没改，仍成立。
+涉及：`crates/ash-core/src/conversation.rs`、`crates/ash-core/src/event.rs`、`crates/ash-agent/src/engine.rs`、`crates/ash-agent/src/jsonl.rs`、`crates/ash-agent/src/session.rs`、`crates/ash-cli/src/modes.rs`、`crates/ash-tui/src/`
 
----
+### 4. 从持久化 `TurnStats` 移除 `tool_calls`
 
-## 按计划项逐条
+- [x] `TurnStats` 只保留模型返回的统计事实：`input_tokens`、`output_tokens`、`generation_ms`。
+- [x] 最终或恢复后的 turn 统一通过 `Turn::tool_calls().count()` 得到工具调用数；必要时增加一个返回饱和值 `u64` 的领域方法，避免各调用方重复转换。
+- [x] 删除 engine 完成 turn 后回写 `turn.stats.tool_calls` 的归一化。
+- [x] 删除 JSONL 读取时的 `normalize_turn_stats`，不再用可变修补维持两个字段一致。
+- [x] 旧 JSONL 中多余的 `stats.tool_calls` 应可兼容读取；新记录不再写该字段，并增加向后兼容回归测试。
 
-### A1 — 已勾，这批在拆验收
+设计约束：`Turn.steps` 是已完成工具调用的唯一持久化事实源，不能再构造出 `steps` 与计数互相矛盾的 `Turn`。
 
-- 原验收：stats 只在一个 turn 内累计并持久化到 `Turn`，不存在 session usage、实时 stats 镜像或分支 usage；公开事件 7 个事实；子代理行只保留 name/state。
-- 这批：第 8 个事实 `Progress`，第 9 个事实 `Context`；TUI / 子代理行镜像 live `TurnStats`、变化后的上下文占用和 `tool_calls`。
-- 正向：最终 `Turn` 仍 canonical；Progress 不落盘；usage 用 `max` 合并且只在变化时发；session 日志改成 turn id + 长度，不再 `?event` dump 内容。
-- 结论：要么改 A1 文档承认 live snapshot，要么撤回 Progress / 子代理 metrics。不能维持「A1 已完成」同时合这批 UI。
+### 5. 用独立快照建模实时活动
 
-### A2 — 已勾，状态 owner 还在，镜像字段回来了
+- [x] 在 `ash-core` 定义小而扁平的临时值类型，例如：
 
-- `AppState` 仍是唯一业务状态。`with_subagent_monitor` / `subagent_rx` 删除，事件从 CLI 进 `UiEvent::Subagent`，符合「handler 只改 AppState」。
-- 新增 `turn_stats: Option<TurnStats>`、`tool_calls: usize`，viewport 再从 AppState 摊到 `ViewportInput`。这是本帧布局参数，和 A2「viewport 内部无状态借用视图」相容。
-- 不相容的是：这些字段是对 `Progress`/`ToolStarted` 的运行时镜像，turn 结束又清掉，和 A1「不从 items 反算、不驱动 TUI 实时状态」冲突。
-- `select_session` 清了父会话 stats，但不清他根 subagents（见 §6）。
+```rust
+pub struct TurnActivity {
+    pub stats: TurnStats,
+    pub tool_calls: u64,
+}
+```
 
-### A3 — 未开工
+- [x] `SessionEvent::Stats` 携带完整 `TurnActivity` 快照，或重命名为更准确的 `SessionEvent::Activity`；不要同时传递可累加 delta 和外部镜像计数。
+- [x] `TurnRunner` 在一个位置更新活动快照并发布，TUI / collab 收到后只做整体替换。
+- [x] 明确 `tool_calls` 的时点语义。当前是在一批工具执行完后增加，若保持该行为应命名/记录为 completed；若产品需要 started 数量，则在 `ToolStarted` 产生时更新快照并测试并发工具场景。
+- [x] turn 完成或从历史恢复时，不信任临时快照，改由 canonical `Turn` 生成 footer、CLI usage 和日志数据。
+- [x] footer 若同时需要 stats 与工具数，显式接收 `TurnActivity` 或两个有语义的参数，不把计数重新塞回 `TurnStats`。
 
-- 仅 `FnTool` 改 `pub struct` → `struct`，`define_tool` 拒绝 trim 后空的 name/description，补了测试。
-- 未删公开 `Tool` trait、`Arc<dyn Tool>`、`tool_definitions()` 每次重建、engine 线性按名查找。
-- 空元数据拒绝是正向边角，不能当 A3 开工。
+完成标准：
 
-### A4 — 第一刀，未完成
+- [x] 公共构造无法制造“最终工具列表有 N 项但持久化计数为 M”的状态。
+- [x] live stats、子代理 stats、最终 footer、恢复后的 footer 和 `--print` usage 显示一致。
+- [x] 多轮模型调用、并发工具、取消、截断、失败以及旧 JSONL 恢复均有针对性测试。
 
-目标：一次 `Arc<Workspace>`（canonical root + capability dir）；工具走 `open_read/atomic_write/walk/resolve_dir`；删 `SearchPath`、外部可构造 `WorkspacePath`、两套 `run_blocking`、各工具闭包模板、bash 私有 cwd、散落 `ensure_running`。
+## P1：缓存与视觉语义
 
-已做：
+### 6. 将工作目录纳入 LiveBlock 缓存键（已降级：不做）
 
-- `tools()` 里 `Workspace::new` 一次 canonicalize + `Dir::open_ambient_dir`
-- read/edit/write/glob/grep/bash 捕获 `Arc<Workspace>` 而不是 `Arc<PathBuf>`
-- bash cwd → `resolve_dir`；glob/grep → `search_path`
-- 测试 helper `WorkspacePath::new` / `SearchPath::new` 转发到 `Workspace`
+涉及：`crates/ash-tui/src/live_block.rs`
 
-没做：
+> 降级原因：`working_dir` 是 `App::new` 传入的会话级固定字段，会话内不变，同块同宽度换目录渲染的场景不存在；属极端情况防御，收益不抵改动。
 
-- `SearchPath`、`WorkspacePath` 仍是 crate 值对象，各工具仍自己 `open_with` / walker
-- `search_path` 和 `resolve_dir` 仍各自 `canonicalize` + `starts_with`
-- `run_blocking` / `run_tool_blocking` 还在 `path.rs`，未下沉到 `ToolContext::check` / `run_blocking`
-- read/edit/write 闭包里 `ensure_running` 三连还在
-- 没有 `Workspace::open_read/atomic_write/walk`
+- [ ] `RenderCache` 保存并比较规范化后的 `working_dir: Option<PathBuf>`，或使用等价的显式缓存键类型。
+- [ ] 缓存复用和 streaming markdown 的增量复用都要检查影响渲染的完整输入。
+- [ ] 同一 `LiveBlock`、同一宽度先后用两个工作目录渲染时，工具路径必须随目录变化。
 
-闸门：「只能增加包装而不能删除旧层，停止该项」。当前是 `Workspace` 包着旧路径对象。中间态可合，A4 条目应写成「第一刀：共享 Dir」，不要让人以为路径边界已经唯一。capability `Dir` 实际 open 仍挡 escape，TOCTOU 没削弱。
+### 7. 恢复文件变更统计的语义颜色（暂缓：低收益外观项）
 
-### A5 — 已勾；这批加切批上限
+涉及：`crates/ash-tui/src/live_block.rs`
 
-- 主链 `TurnRunner -> ModelResponse` 未改。
-- 新增 8 并行切批，见 §7。
-- compact 仍走 `collect_response(..., TurnStats::default())`，不发 Progress（events=None），合同正确。
+- [ ] `render_file_change` 使用 styled spans 组装 detail：路径保持默认样式，`+N` 为绿色，`-N` 为红色。
+- [ ] 继续走共享 hanging-wrap，不能为了颜色退回手工宽度切割。
+- [ ] 增加跨行后的样式断言，保证折行不会丢失增删颜色。
 
-### A6 — 未完成；做了另一件事
+## P2：低风险表达力清理
 
-目标：`AgentGroup::create`；create/message 不再重复维护 pending/unread。`submit`/`complete`/`pending: HashSet` 是更早的工作，这批没抽 `create`。
+- [x] `restored_turn_footer` 的所有分支都返回值，将返回类型从 `Option<HistoryBlock>` 收紧为 `HistoryBlock`，同步简化调用方。
+- [x] 清除 `render_tool_output` 中重复计算或计算后丢弃的 `omitted`。
+- [x] 抽取“折行后截断”（`wrap::truncate_rows`）与“首行前缀”（`wrap::render_prefixed_lines`）两个稳定语义的纯函数。
+- [x] 命名保持 Rust 约定，并让名称表达语义时点：`Turn::completed_tool_calls`、`TurnActivity::completed_tool_calls`。
 
-这批实际：
+## 建议实施顺序
 
-- 删 `SubagentTreeSnapshot` 和 `watch::Sender<Vec<...>>`（对齐「没有 child status query or watch snapshot」）
-- 每个 child `session.events()` 转发到 controller `broadcast(256)`
-- `activity_event` 丢掉 `Text`/`Thought`/`ToolFinished`，保留 `Started`/`Progress`/`ToolStarted`/`Finished`/`Discarded`
-- `AgentEntry::state()` 由 pending 派生，create/message/complete 后发 `StateChanged`
+1. [x] 先完成 P0.1 和 P0.2，建立统一的视觉行与窄宽度语义。
+2. [x] 再完成 P0.3，修复历史块前缀表现。
+3. [x] 单独提交统计模型修改（P1.4 和 P1.5），便于审查 JSONL 兼容性和跨 crate 数据流。
+4. [x] 最后完成 P2 中由前述修改直接暴露的冗余。
 
-这是新嵌入 API，不是 A6。代价：每个 child 一个永久 forward task，remove 后仍跑到 session 流结束（见 §2）。`list_agents` 仍返回 `SubagentSnapshot { name, state }`，和 TUI 行上 live metrics 不是同一事实源。queue full / 旧 completion / remove 前提这批没碰。create/message 仍复制提交步骤。
+## 验收
 
-同名重建时 TUI 按 `root_id+name` 清旧行、按 `session_id` 认新行——这条是对的。
+- [ ] `cargo test -p ash-tui`
+- [ ] `cargo test -p ash-core -p ash-agent -p ash-cli -p ash-collab`
+- [ ] `cargo test --workspace`
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `git diff --check`
+- [ ] 对可见 TUI 变更保留宽屏、窄屏和展开/折叠状态的终端截图，供 PR 审查。
 
-### A7 — 前半
+## 追加：统计快照改造复审（2026-09-04）
 
-目标：`sse::stream` 负责 send、错误体上限、request-id/retry-after、typed status、SSE 生命周期；OpenAI `chat_content`/`responses_content` 收 iterator。
+> 来源：对工作树中 `SessionEvent::Stats` / `TurnStats.tool_calls` 改造（未提交）的复审。
+> 其中 8、9 与上文 P1.4 / P1.5 指向同一根因：已按 P1.4 移除持久化 `tool_calls`，二者随之解决。
+> 10 的文档措辞已同步；11 部分完成。
 
-已做：
+### 8. 收敛 tool_calls 计数的重复派生（DRY）
 
-- `read_error_body` 上限 8KB；空 body 用固定文案
-- `map_status`：401/403 → `Auth { message }`，429 → `RateLimited { message }`，其余 → `Upstream { status, message }`
-- Anthropic / Responses 的 SSE error 同样带 message
-- 日志不再 dump SSE data / tool arguments（该留）
-- 测试：401 body 保留；decode 失败只记 `event_bytes`
+涉及：`crates/ash-agent/src/engine.rs:128`、`crates/ash-agent/src/engine.rs:206-219`、`crates/ash-agent/src/jsonl.rs:474-480`、`crates/ash-core/src/conversation.rs`
 
-没做：request-id / retry-after；OpenAI content/attachments 成对重复仍在。`ProtocolError: Clone` 完全没动，`Request(error.to_string())` 仍在。A7 不能勾。
+- [x] 已随 P1.4 解决：`engine.rs:128` 回写与 `jsonl.rs` 的 `normalize_turn_stats` 删除，计数统一由 `Turn::completed_tool_calls` / runner 内单点派生，不再三处重复。
 
-先前写成「Completions 不走这套 HTTP 错误体」是错的：`completions.rs:168`、`anthropic.rs:157`、`responses.rs:162` 都调用 `sse::stream`。HTTP 非成功读 body + `map_status` 三家共用。Completions 只是 SSE **decoder** 的 error 映射没改（它走 completions 自己的 `error` 帧，不是 anthropic/responses 那种 `type:error` JSON）。
+### 9. 消除 tool_calls 的“累计 + 覆盖”双路径
 
----
+涉及：`crates/ash-agent/src/engine.rs`
 
-## P0 原清单对照
+- [x] 选择“中间快照也派生”：`record_stats` 不再累计 tool_calls，批次完成后由 `publish_activity` 从 `self.steps` 派生，`run()` 不再覆盖。
+- [x] 补多轮模型调用 + 多批工具下“中间 `Activity` 快照 == 最终 turn 派生值”的一致性测试（`activity_snapshots_match_the_final_turn_across_model_rounds`）。
 
-| 项 | 状态 | 这批 |
-| --- | --- | --- |
-| 1. collab 锁跨 await | `[x]` | 未改坏 |
-| 2. JSONL fsync | `[x]` | 未改 |
-| 3. cancel/deadline 竞速 | `[x]` | 未改 |
-| 4. 吞持久化失败 | `[x]` | 未改 |
-| 5. 非正常 stop 执行 tool | `[x]` | 未改 |
-| 6. workdir 包含性 4 处 | `[ ]` | bash 的 canonicalize+starts_with 搬进 `Workspace::resolve_dir`。**仍重复的是同一模式两处**：`search_path` 与 `resolve_dir` 各自 canonicalize + `starts_with(&self.root)`，文案还不同（`path is outside working directory` vs `working directory is outside the session working directory`）。`relative_path` 是逻辑 `..` / `strip_prefix`，不是第三份 canonicalize 检查，不要和前两处算成同一个函数 |
-| 7. TUI `unreachable!()` | `[x]` | 未改 |
-| 8. 高度累加溢出 | `[x]` | 未改 |
+### 10. 明确 Stats 快照发布条件并同步 DESIGN.md
 
-P0.6 不能勾。不要先抽随后又删的 helper，继续跟 A4。
+涉及：`crates/ash-agent/src/engine.rs`、`DESIGN.md`
 
----
+- [x] DESIGN.md "Stream integrity, stats, and cancellation" 一节措辞修正为"reports non-zero usage 时发布"；发布条件保持 `input_tokens > 0 || output_tokens > 0`（具名谓词收益低，未抽取）。
+- [x] DESIGN.md "Conversation model" 一节同步：completed tool-call count 不再是持久化字段，始终由 `Turn.steps` 派生，旧记录容忍读取。
+- [ ] generation_ms-only 的 delta（累计但不发布）语义用测试或注释显式说明（暂缓）。
 
-## P1 原清单对照
+### 11. 用显式变体建模恢复态 footer
 
-### 用户可见
+涉及：`crates/ash-tui/src/history_block.rs`、`crates/ash-tui/src/inline.rs`
 
-- TUI Unicode 宽度：未动，仍 `[ ]`
-- 输入历史压缩：已 `[x]`，这批未改
-
-### 类型建模
-
-- identity / ToolFinished Result / stop Option / ToolContext::run / ActivityView / ChildSession / `Turn::has_tools`：已 `[x]`，这批未拆
-- `tool_display.rs` 硬编码 13 个工具名：未动，仍 `[ ]`，跟 A3
-
-### 错误处理
-
-- `ProtocolError: Clone`：未动，仍 `[ ]`
-- `Auth`/`RateLimited` 零载荷：半勾。有 `message`，无 request-id/retry-after。清单应改成「message 已加；元数据仍缺」
-- store 可分支错误：已 `[x]`
-- bash `CommandFailed`：类型和限长已做；engine `to_string()` 改变失败合同（见 §1）。保持 `[ ]` 直到展示字符串修好
-
-### DRY
-
-- 每请求整体克隆：未动，跟 A3
-- ash-tools 打开文件样板 ×3：未下沉到 `Workspace::open_read/atomic_write`，跟 A4
-- OverrideBuilder ×3：未动
-- `8 * 1024` 字面量：path.rs 已有 `IO_BUFFER_BYTES`，read/bash 是否统一引用这批没清
-- 闭包内 `ensure_running` 三连：read/edit/write **仍在**，edit 甚至在进 `run_tool_blocking` 前又 `ensure_running` 一次再构造 `path`
-- TUI 折行/省略号/OpenAI content：未动
-- collab create/message 重复：未抽 `AgentGroup::create`
-- bash 换行计数双实现 / glob-grep 截断提示 / 文案与常量双轨：未动
-
-### P2 / P3
-
-- P2 全未动（无 profiling，正确）
-- P3：`SubagentViewState::is_active` 现在用于排序，原「零调用」过时；`accepted: true` / `removed: true` 还在；其余未顺手
-
----
-
-## 文件级审查
-
-### `DESIGN.md`
-
-- 加了 live Progress 段落；工具改为 bounded batches of eight；collab 改为事件广播、无 watch snapshot；SessionEvent 改为九个事实，并在每次普通模型请求前发出 Context 估算事件。
-- 与工作树一致，与 A1 验收不一致。合 live stats 则 A1 文档必须一起改；不合则 DESIGN 这 23 行应回滚。
-
-### `crates/ash-core/src/event.rs`
-
-- 新增 `Progress { turn_id, stats: TurnStats }`。无 serde，符合公开流约定。
-- 一旦存在，所有 exhaust match 必须处理。CLI 已加臂；TUI 父会话 / 子代理都消费。漏 match 会编不过，这点安全。
-
-### `crates/ash-core/src/error.rs`
-
-- `Auth { message }` / `RateLimited { message }`：正向。
-- `CommandFailed { status, output }`：正向。Display 不应成为 `ToolCall.result` 的序列化格式。
-
-### `crates/ash-core/src/tool.rs`
-
-- `FnTool` 私有；空 name/description 拒绝；测试覆盖。小且干净。
-
-### `crates/ash-agent/src/engine.rs`
-
-- `collect_response` 增加 `settled_stats: TurnStats`，Progress = settled + 当前 accumulator。retry 前先 `saturating_add` 再发下一轮，live 数字含被丢弃的 attempt，与 A5「retry 计入本 Turn」一致。
-- usage 用 `max` 再比较 previous，重复帧不发 Progress。测试 `progress_is_published_only_when_usage_changes` 覆盖 (12,0)+(0,3) → (19,2) 然后 (19,5)。
-- `execute_tools` 切批 8：见 §7。
-- `limit_tool_result` 处理 `CommandFailed`：对；随后 `to_string()`：错，见 §1。
-- `MockModel` 改 `VecDeque` 多响应：测试需要，可留。
-
-### `crates/ash-agent/src/mcp.rs`
-
-- 文本块改 iterator `collect::<String>()`，多块仍无分隔（原行为）。这文件这次改过拼接，顺手加 `"\n"` 比留下粘连更值。不是阻塞。
-
-### `crates/ash-agent/src/session.rs`
-
-- `publish` 按 variant 打结构化日志，文本/thought 只记 chars。该留。
-- `Progress` 走 debug。频率等于 provider usage 帧，比文本 delta 低，可接受。
-
-### `crates/ash-protocol/src/sse.rs`
-
-- HTTP 非成功先读 body 再 `map_status`，不再丢响应体。上限 8KB，chunk 失败 break，不 panic。
-- 日志去内容：decode 失败只记 `event_bytes`；`log_model_event` 不打 Text/Reasoning/tool arguments。该留。
-- 测试绑本机 401。无 request-id/retry-after。这条 HTTP 错误体路径三家 adapter 共用（都调 `sse::stream`）。
-
-### `crates/ash-protocol/src/anthropic.rs` / `responses.rs`
-
-- SSE error 的 Auth/RateLimited 带 message。测试断言 `"Slow down"`。Completions 未改。
-
-### `crates/ash-tools/src/path.rs`
-
-- `Workspace { root, dir: Arc<Dir> }`：正确的能力对象。
-- `path()` 只做相对清洗，不在这里 canonicalize 文件（symlink 交给 cap-std open）——对。
-- `search_path()` / `resolve_dir()` 仍独立 canonicalize+starts_with，P0.6 未关。
-- `SearchPath::relative` 对 walker 路径 `strip_prefix(&self.workspace)`：walker 根是 canonicalize 后的 `full_path`，与 `workspace`（canonical root）一致时成立。
-
-### `crates/ash-tools/{read,edit,write,glob,grep,bash,lib}.rs`
-
-- 构造期共享 `Arc<Workspace>`：A4 第一刀。
-- bash 非零退出改 `CommandFailed`：类型对；展示合同见 §1。
-- bash `None => working_dir.root().to_path_buf()`：root 已 canonical，与旧 `to_path_buf` 在已 canonical 的 Arc 上等价。
-- glob/grep 测试 helper 包一层 `Workspace::new`：可接受，避免测工具重复 canonicalize 语义。
-
-### `crates/ash-collab/src/event.rs`（未跟踪）
-
-- `SubagentEvent { root_id, session_id, name, kind }`；`kind`: `StateChanged` / `Session(SessionEvent)` / `Removed`。
-- 提交时必须 `git add`。无 serde，符合「公开流无 serde」；若嵌入方要持久化这不是领域记录。
-
-### `crates/ash-collab/src/control.rs`
-
-- `broadcast::channel(256)` 替换 watch。`publish` 变成 `let _ = send`。无订阅者时事件丢——交互模式 CLI 会先 `control.events()` 再 start session，顺序目前安全；纯库调用若先 create 再 subscribe 会丢初始 StateChanged。watch 有最新值，broadcast 没有。DESIGN 已说无 watch snapshot，这是有意的，但嵌入方必须先 subscribe。
-- `forward_events`：child lag 打 warn 后 continue，投影出现空洞（见 §4）。
-- `activity_event` 过滤 Text/Thought/ToolFinished：减少总线负载，子代理行因此不能显示「正在输出」只能显示 stats/tools。产品合同要写明。
-- `futures` 从 dev-dep 升到正式依赖：`Stream` bound 需要，合理。
-- 测试 `child_session_progress_is_wrapped_with_its_identity`：覆盖 identity 包装，不覆盖 Removed 复活、不覆盖 lag。
-
-### `crates/ash-collab/src/snapshot.rs` / `lib.rs`
-
-- 删 `SubagentTreeSnapshot`。`SubagentSnapshot` 仍给 `list_agents` JSON。Deserialize 仍无 TUI 消费者（P3 死代码那条部分仍对）。
-
-### `crates/ash-cli/src/modes.rs`
-
-- 删 `map_subagent_monitor` / `subagent_views` 转换层：少一层 DTO，正向。
-- `subagent_update` 把 collab 事件译成 TUI 类型：装配层该做的，terminal 类型没进 agent。
-- print 模式不订 subagent 事件：对。
-- 交互模式 `event_tx` 容量 64 混流：见 §5。
-- `SessionEvent::Progress` 在 print 模式被 `_ => {}` 忽略：对，print 不应刷 usage。
-
-### `crates/ash-tui/src/subagent.rs`
-
-- `SubagentView` 增加 `session_id`、`stats`、`tool_calls`、`active_turn`。从「name/state 投影」变成「可累加的小会话」。A1 删除清单明确不要 `SubagentView.usage`。
-- `SubagentUpdate` / `SubagentUpdateKind` 是 CLI→TUI 的装配 DTO，可留在 tui，不要进 core。
-
-### `crates/ash-tui/src/app.rs`
-
-- `update_subagent` 建行逻辑：见 §2。同名不同 session_id 时先按 name 清旧行，这条对。
-- `update_subagent_session`：错位 turn_id 的 Progress/ToolStarted/Finished/Discarded 走通配忽略，与父会话 TurnId 守卫同构，好。
-- 父会话 Progress 要求 `current_turn_id` 匹配且 `accepts_live_output()`：与 Text/Thought 一致。
-- 测试 `subagent_events_are_scoped_by_root_and_session` 只 filter 断言，不证明 `select_session` 会丢掉他根行（事实上不会丢）。测试名略夸大。
-- `child_session_events_project_live_stats_and_tool_count` 覆盖正向路径，无 Removed、无错位 turn、无 lag。
-
-### `crates/ash-tui/src/viewport.rs`
-
-- 渲染时按 `session_id` 过滤 subagents：画面正确；状态堆见 §6。
-- `activity_metrics`：`stats == default && tool_calls == 0` 才空。只有 tool、还没有 usage 时画出 `0 in / 0 out · 3 tools`。宽不够时整段 metrics 丢掉，只留名字。
-- `TURN_STATS_STATUS_WIDTH = 80`：测试覆盖 79 vs 80。没测「仅 tool_calls」。
-- 子代理行：名字+metrics 放得下才拼，否则只截名字、宁可不显示数字。产品上可接受，应在测试里写明。
-- `TurnId` 仅测试用，import 在 `#[cfg(test)]` 里，生产编译没问题。
-
----
-
-## 正向（应保留）
-
-- SSE / session / model event 日志去内容：不打 body、不打 tool arguments、不打文本。
-- HTTP 4xx/5xx 读 body、上限 8KB、Auth/RateLimited 带 message，有测试。
-- Progress 只在 usage 实际变化时发；`max` 合并语义有测试。
-- 子代理 identity 用 `root_id + session_id`；同名重建先按 name 清旧行。
-- `FnTool` 私有、空元数据拒绝。
-- 工具组一次打开 Workspace Dir，不再每个工具 `open_ambient_dir`。
-- 删 collab watch → CLI `map_subagent_monitor` 转换层。
-- `CommandFailed` 类型本身（修好 Display 映射之后）。
-
----
-
-## 不要勾
-
-- A3、A4、A6、A7
-- P0.6 路径包含性
-- P1 `ProtocolError: Clone`、P1 Auth 完整版（request-id/retry-after）、P1 `CommandFailed`（直到 §1 修好）
-- A1 维持 `[x]` 仅当文档改为承认 live Progress；否则这批是 A1 回退，不能一边勾一边合
-
-## 建议拆提交
-
-1. `Workspace` 共享 Dir（A4 第一刀）+ bash `CommandFailed`（含 Display→tool result 的显式格式化）
-2. SSE 错误体 + `Auth`/`RateLimited { message }`（A7 切片，注明还缺 request-id）
-3. live `Progress` + 子代理事件（单独产品/设计变更，带着 A1 / DESIGN / 完成标准一起改；含 §2 复活和 §6 切 session 过滤）
-
-## 合入前验证
-
-- [ ] 修 `CommandFailed` 的工具结果字符串，补回归：非零退出的模型可见文本 / TUI 失败预览不得把 Display 整句当 output 主体
-- [ ] `Removed` 后 Progress/Finished 不得建行；remove 停 forward；补测试
-- [ ] 统一 A1 与 DESIGN 的 stats 语义，或撤回 live Progress
-- [ ] `select_session` 与 `refresh_status` 对齐当前 root
-- [ ] `git add crates/ash-collab/src/event.rs`
-- [ ] 至少跑：`bounds_parallel_tool_execution_without_reordering_results`、`progress_is_published_only_when_usage_changes`、`child_session_progress_is_wrapped_with_its_identity`、`child_session_events_project_live_stats_and_tool_count`、`reports_nonzero_exit_as_a_typed_error`、`preserves_http_error_details_without_unbounded_body_reads`
-- [ ] 再跑 `cargo fmt --all -- --check`、`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`（本审查未跑）
+- [ ] `Worked.elapsed: Option<String>` 改为 `HistoryBlock::Restored(TurnStats)` 或等价显式状态（暂缓：低收益重构；`worked`/`restored` 构造器已收口该不变量）。
+- [x] `restored_turn_footer` 返回类型收紧为 `HistoryBlock`。
+- [x] 恢复会话为每个已完成 turn 渲染 footer 分隔行的行为确认保留，并在 DESIGN.md "Events and TUI" 补充说明。

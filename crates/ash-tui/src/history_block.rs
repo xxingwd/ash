@@ -12,10 +12,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     scrollback::sanitize_terminal_text,
     status_line::{format_token_rate, format_token_usage},
-    wrap::render_hanging_lines,
+    wrap::render_prefixed_lines,
 };
-
-const USER_HORIZONTAL_INSET: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryBlock {
@@ -28,9 +26,9 @@ pub enum HistoryBlock {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Worked {
-    elapsed: String,
+    elapsed: Option<String>,
     stats: TurnStats,
-    tool_calls: usize,
+    completed_tool_calls: u64,
 }
 
 impl HistoryBlock {
@@ -50,11 +48,23 @@ impl HistoryBlock {
         Self::Interrupted
     }
 
-    pub(crate) const fn worked(elapsed: String, stats: TurnStats, tool_calls: usize) -> Self {
+    pub(crate) const fn worked(
+        elapsed: String,
+        stats: TurnStats,
+        completed_tool_calls: u64,
+    ) -> Self {
         Self::Worked(Worked {
-            elapsed,
+            elapsed: Some(elapsed),
             stats,
-            tool_calls,
+            completed_tool_calls,
+        })
+    }
+
+    pub(crate) const fn restored(stats: TurnStats, completed_tool_calls: u64) -> Self {
+        Self::Worked(Worked {
+            elapsed: None,
+            stats,
+            completed_tool_calls,
         })
     }
 
@@ -76,50 +86,39 @@ fn normalize_multiline(text: &str) -> String {
 }
 
 fn render_user(text: &str, width: u16) -> Buffer {
-    let prefix = if width > USER_HORIZONTAL_INSET {
-        Line::from(vec![Span::styled(
-            "› ",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-        )])
-    } else {
-        Line::default()
-    };
-    render_hanging_lines(
-        text.lines()
-            .map(|line| (prefix.clone(), Line::from(line.to_string()))),
+    let prefix = Line::from(vec![Span::styled(
+        "› ",
+        Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+    )]);
+    render_prefixed_lines(
+        text.lines().map(|line| Line::from(line.to_string())),
+        prefix,
         width,
     )
 }
 
 fn render_info(message: &str, width: u16) -> Buffer {
-    let prefix = if width > USER_HORIZONTAL_INSET {
-        Line::from(vec![Span::styled(
-            "• ",
-            Style::default().add_modifier(Modifier::DIM),
-        )])
-    } else {
-        Line::default()
-    };
+    let prefix = Line::from(vec![Span::styled(
+        "• ",
+        Style::default().add_modifier(Modifier::DIM),
+    )]);
     let lines = if message.is_empty() {
-        vec![(prefix, Line::default())]
+        vec![Line::default()]
     } else {
         message
             .lines()
-            .map(|line| (prefix.clone(), Line::from(line.to_string())))
+            .map(|line| Line::from(line.to_string()))
             .collect()
     };
-    render_hanging_lines(lines, width)
+    render_prefixed_lines(lines, prefix, width)
 }
 
 fn render_interrupted(width: u16) -> Buffer {
     let style = Style::default().fg(Color::Red);
-    let prefix = if width > 1 {
-        Line::from(vec![Span::styled("■", style)])
-    } else {
-        Line::default()
-    };
-    render_hanging_lines(
-        [(prefix, Line::styled(" Conversation interrupted.", style))],
+    let prefix = Line::from(vec![Span::styled("■", style)]);
+    render_prefixed_lines(
+        [Line::styled(" Conversation interrupted.", style)],
+        prefix,
         width,
     )
 }
@@ -137,12 +136,7 @@ fn render_error(error: &str, width: u16) -> Buffer {
     } else {
         error.lines().map(ToString::to_string).collect()
     };
-    render_hanging_lines(
-        contents
-            .into_iter()
-            .map(|line| (prefix.clone(), Line::from(line))),
-        width,
-    )
+    render_prefixed_lines(contents.into_iter().map(Line::from), prefix, width)
 }
 
 fn render_worked(worked: &Worked, width: u16) -> Buffer {
@@ -158,9 +152,13 @@ fn render_worked(worked: &Worked, width: u16) -> Buffer {
 }
 
 fn worked_separator(worked: &Worked, width: u16) -> String {
-    let mut label = format!("─ Worked for {}", worked.elapsed);
+    let mut label = worked.elapsed.as_ref().map_or_else(
+        || "─ Worked".to_string(),
+        |elapsed| format!("─ Worked for {elapsed}"),
+    );
     let stats = worked.stats;
-    if stats.input_tokens > 0 || stats.output_tokens > 0 || worked.tool_calls > 0 {
+    let completed_tool_calls = worked.completed_tool_calls;
+    if stats.input_tokens > 0 || stats.output_tokens > 0 || completed_tool_calls > 0 {
         let _ = write!(
             label,
             " · {}",
@@ -169,8 +167,8 @@ fn worked_separator(worked: &Worked, width: u16) -> String {
         if let Some(rate) = format_token_rate(stats.output_tokens, stats.generation_ms) {
             let _ = write!(label, " · {rate}");
         }
-        if worked.tool_calls > 0 {
-            let _ = write!(label, " · {} tools", worked.tool_calls);
+        if completed_tool_calls > 0 {
+            let _ = write!(label, " · {} tools", completed_tool_calls);
         }
     }
     label.push_str(" ─");
@@ -293,5 +291,59 @@ mod tests {
             ),
             "─ Worked f"
         );
+    }
+
+    #[test]
+    fn multiline_user_block_shows_the_prefix_once() {
+        let buffer = HistoryBlock::user("first\nsecond\n\nthird").render(20);
+
+        assert_eq!(buffer.area.height, 4);
+        assert_eq!(row_text(&buffer, 0), "› first");
+        assert_eq!(row_text(&buffer, 1), "  second");
+        assert_eq!(row_text(&buffer, 2), "");
+        assert_eq!(row_text(&buffer, 3), "  third");
+    }
+
+    #[test]
+    fn multiline_info_block_shows_the_bullet_once() {
+        let buffer = HistoryBlock::info("one\ntwo").render(20);
+
+        assert_eq!(row_text(&buffer, 0), "• one");
+        assert_eq!(row_text(&buffer, 1), "  two");
+    }
+
+    #[test]
+    fn multiline_error_block_aligns_later_lines_with_the_content() {
+        let buffer = HistoryBlock::error("boom\nbang").render(30);
+
+        assert_eq!(row_text(&buffer, 0), "• Error: boom");
+        assert_eq!(row_text(&buffer, 1), "         bang");
+    }
+
+    #[test]
+    fn multiline_blocks_survive_narrow_widths_without_losing_text() {
+        for width in 1..=10u16 {
+            let user = HistoryBlock::user("first\nsecond").render(width);
+            let error = HistoryBlock::error("boom\nbang").render(width);
+            // The 2-wide user prefix survives once width - 2 >= 2; the error
+            // label needs 11 columns and stays dropped through width 10.
+            let user_expected = if width >= 4 {
+                "›firstsecond"
+            } else {
+                "firstsecond"
+            };
+            for (label, buffer, expected) in
+                [("user", user, user_expected), ("error", error, "boombang")]
+            {
+                let rendered = (0..buffer.area.height)
+                    .map(|row| row_text(&buffer, row))
+                    .collect::<String>();
+                assert_eq!(
+                    rendered.replace(' ', ""),
+                    expected,
+                    "{label} at width {width}"
+                );
+            }
+        }
     }
 }

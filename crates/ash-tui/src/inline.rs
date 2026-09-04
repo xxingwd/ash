@@ -239,9 +239,7 @@ impl AppState {
         for turn in self.conversation.turns().to_vec() {
             self.current_turn_id = Some(turn.id);
             self.push_turn(&turn, true);
-            if let Some(footer) = restored_turn_footer(&turn.result) {
-                self.push_history_block(footer);
-            }
+            self.push_history_block(restored_turn_footer(&turn));
         }
         self.current_turn_id = None;
         self.blocks.mark_all_committed();
@@ -819,17 +817,19 @@ fn turn_footer(turn: &Turn, elapsed_seconds: u64) -> HistoryBlock {
         TurnResult::Stopped(_) | TurnResult::Truncated => HistoryBlock::worked(
             format_elapsed(elapsed_seconds),
             turn.stats,
-            turn.tool_calls().count(),
+            turn.completed_tool_calls(),
         ),
         TurnResult::Failed(error) => HistoryBlock::error(error),
     }
 }
 
-fn restored_turn_footer(result: &TurnResult) -> Option<HistoryBlock> {
-    match result {
-        TurnResult::Cancelled => Some(HistoryBlock::interrupted()),
-        TurnResult::Stopped(_) | TurnResult::Truncated => None,
-        TurnResult::Failed(error) => Some(HistoryBlock::error(error)),
+fn restored_turn_footer(turn: &Turn) -> HistoryBlock {
+    match &turn.result {
+        TurnResult::Cancelled => HistoryBlock::interrupted(),
+        TurnResult::Stopped(_) | TurnResult::Truncated => {
+            HistoryBlock::restored(turn.stats, turn.completed_tool_calls())
+        }
+        TurnResult::Failed(error) => HistoryBlock::error(error),
     }
 }
 
@@ -1020,10 +1020,7 @@ mod tests {
             stats: ash_core::TurnStats::default(),
         };
         assert_eq!(turn_footer(&turn, 3), HistoryBlock::interrupted());
-        assert_eq!(
-            restored_turn_footer(&TurnResult::Cancelled),
-            Some(HistoryBlock::interrupted())
-        );
+        assert_eq!(restored_turn_footer(&turn), HistoryBlock::interrupted());
     }
 
     #[test]
@@ -1042,18 +1039,33 @@ mod tests {
     }
 
     #[test]
-    fn restored_turns_replay_non_success_terminal_states() {
+    fn restored_turns_replay_persisted_stats_and_terminal_states() {
+        let turn = |result, stats| Turn {
+            id: test_turn(7),
+            input: ash_core::Input::user("question"),
+            steps: Vec::new(),
+            result,
+            stats,
+        };
+        let stats = ash_core::TurnStats {
+            input_tokens: 10,
+            output_tokens: 2,
+            generation_ms: 100,
+        };
         assert_eq!(
-            restored_turn_footer(&TurnResult::Stopped(ash_core::StopReason::EndTurn)),
-            None
+            restored_turn_footer(&turn(
+                TurnResult::Stopped(ash_core::StopReason::EndTurn),
+                stats,
+            )),
+            HistoryBlock::restored(stats, 0)
         );
         assert_eq!(
-            restored_turn_footer(&TurnResult::Failed("invalid response".into())),
-            Some(HistoryBlock::error("invalid response"))
+            restored_turn_footer(&turn(TurnResult::Failed("invalid response".into()), stats,)),
+            HistoryBlock::error("invalid response")
         );
         assert_eq!(
-            restored_turn_footer(&TurnResult::Cancelled),
-            Some(HistoryBlock::interrupted())
+            restored_turn_footer(&turn(TurnResult::Cancelled, stats)),
+            HistoryBlock::interrupted()
         );
     }
 }

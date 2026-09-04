@@ -16,9 +16,9 @@ pub enum SessionEvent {
         turn_id: TurnId,
         text: String,
     },
-    Progress {
+    Activity {
         turn_id: TurnId,
-        stats: TurnStats,
+        activity: TurnActivity,
     },
     Context {
         turn_id: TurnId,
@@ -41,6 +41,15 @@ pub enum SessionEvent {
         turn_id: TurnId,
         error: Option<String>,
     },
+}
+
+/// Transient snapshot of one running turn: accumulated provider statistics
+/// plus the count of completed tool calls. Consumers replace their view with
+/// each snapshot; the settled `Turn` remains canonical.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnActivity {
+    pub stats: TurnStats,
+    pub completed_tool_calls: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

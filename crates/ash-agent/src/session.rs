@@ -357,12 +357,13 @@ fn publish(events: &broadcast::Sender<SessionEvent>, event: SessionEvent) {
         SessionEvent::Thought { turn_id, text } => {
             tracing::debug!(%turn_id, chars = text.len(), "thought streamed")
         }
-        SessionEvent::Progress { turn_id, stats } => tracing::debug!(
+        SessionEvent::Activity { turn_id, activity } => tracing::debug!(
             %turn_id,
-            input_tokens = stats.input_tokens,
-            output_tokens = stats.output_tokens,
-            generation_ms = stats.generation_ms,
-            "turn progress"
+            input_tokens = activity.stats.input_tokens,
+            output_tokens = activity.stats.output_tokens,
+            generation_ms = activity.stats.generation_ms,
+            completed_tool_calls = activity.completed_tool_calls,
+            "turn activity"
         ),
         SessionEvent::Context {
             turn_id,
@@ -384,7 +385,7 @@ fn publish(events: &broadcast::Sender<SessionEvent>, event: SessionEvent) {
         },
         SessionEvent::Finished(turn) => tracing::info!(
             turn_id = %turn.id,
-            tools = turn.tool_calls().count(),
+            tools = turn.completed_tool_calls(),
             result = turn_result_label(&turn.result),
             "turn finished"
         ),

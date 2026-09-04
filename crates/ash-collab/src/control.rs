@@ -524,6 +524,7 @@ fn activity_event(event: SessionEvent) -> Option<SessionEvent> {
     match event {
         SessionEvent::Text { .. }
         | SessionEvent::Thought { .. }
+        | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. } => None,
         event => Some(event),
     }
@@ -624,7 +625,7 @@ mod tests {
 
     use ash_core::{
         CancellationToken, ModelClient, ModelEvent, ModelId, ModelRequest, ModelStream,
-        SessionIdentity, StopReason, TurnStats,
+        SessionIdentity, StopReason, TurnActivity, TurnStats,
     };
     use tempfile::TempDir;
 
@@ -721,7 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_session_context_and_progress_are_wrapped_with_identity() {
+    async fn child_session_context_and_stats_are_wrapped_with_identity() {
         let directory = TempDir::new().unwrap();
         let control = control(
             Arc::new(MockModel::new([vec![
@@ -769,10 +770,13 @@ mod tests {
                 let event = events.recv().await.unwrap();
                 if matches!(
                     event.kind,
-                    SubagentEventKind::Session(SessionEvent::Progress {
-                        stats: TurnStats {
-                            input_tokens: 12,
-                            output_tokens: 3,
+                    SubagentEventKind::Session(SessionEvent::Activity {
+                        activity: TurnActivity {
+                            stats: TurnStats {
+                                input_tokens: 12,
+                                output_tokens: 3,
+                                ..
+                            },
                             ..
                         },
                         ..
@@ -783,7 +787,7 @@ mod tests {
             }
         })
         .await
-        .expect("child progress event");
+        .expect("child activity event");
 
         assert_eq!(event.root_id, identity.root_id());
         assert_ne!(event.session_id, event.root_id);

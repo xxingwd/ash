@@ -635,6 +635,23 @@ mod tests {
         })
     }
 
+    fn tool_turn(id: u128) -> Arc<Turn> {
+        Arc::new(Turn {
+            id: ash_core::TurnId::from_u128(id),
+            input: "inspect".into(),
+            steps: vec![Step {
+                items: vec![Item::ToolCall(ToolCall {
+                    id: ToolCallId::from_provider("call"),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                    result: Ok("done".into()),
+                })],
+            }],
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: TurnStats::default(),
+        })
+    }
+
     #[tokio::test]
     async fn root_commit_is_init_then_turn() {
         let directory = TempDir::new().unwrap();
@@ -735,6 +752,38 @@ mod tests {
         let stored = store.load(id).await.unwrap().unwrap();
 
         assert_eq!(stored.conversation.turns(), &[expected]);
+    }
+
+    #[tokio::test]
+    async fn new_records_omit_the_tool_count_and_legacy_records_still_load() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let path = directory.path().join(session_filename(id));
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(tool_turn(1), None).await.unwrap();
+        drop(writer);
+
+        let data = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut records = data
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(records[1]["turn"]["stats"].get("tool_calls").is_none());
+        // Simulate a legacy record carrying the removed derived field.
+        records[1]["turn"]["stats"]["tool_calls"] = serde_json::json!(99);
+        let data = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        tokio::fs::write(&path, data).await.unwrap();
+
+        let stored = store.load(id).await.unwrap().unwrap();
+
+        let turn = &stored.conversation.turns()[0];
+        assert_eq!(turn.completed_tool_calls(), 1, "steps are canonical");
     }
 
     #[tokio::test]

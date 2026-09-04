@@ -40,8 +40,10 @@ Item
 
 `Conversation` contains only completed facts. A running turn is private `TurnRunner` state and is
 converted to one immutable `Arc<Turn>` at completion. There is no `OpenTurn`, flat message model,
-session usage accumulator, or second projection of conversation history. Tool-call count is derived
-from `Turn::tool_calls()`; `TurnStats` stores only provider input/output tokens and generation time.
+session usage accumulator, or second projection of conversation history. `TurnStats` is the durable
+statistics snapshot: provider input/output tokens and generation time. The completed tool-call count
+is never stored; it is always derived from the structured tool calls in `Turn.steps`, so no record
+can contradict them. Legacy records that still carry a count field load unchanged and ignore it.
 
 `ModelContext` is the provider-neutral request view. It combines the conversation checkpoint,
 uncovered completed turns, and an optional current input/steps overlay. Provider adapters map that
@@ -86,8 +88,9 @@ syncs file data; first creation also syncs the session directory. A final line w
 treated as an interrupted append and truncated when the session is reopened. Any malformed complete
 record, duplicate turn ID, invalid identity, or misplaced `Init` is corruption.
 
-There is deliberately no format version, legacy parser, migration, dual write, or fallback. Data from
-an older layout must be removed before running this format.
+There is deliberately no format version, alternate legacy parser, or dual write. Additive fields may
+use a Serde default only when the storage boundary can restore their exact value from canonical turn
+content; other layout changes require old data to be removed.
 
 Root listing reads only `Init`. Child sessions use the same store but cannot be resumed through the
 root path. Tree listing and deletion use `root_id` to include durable descendants.
@@ -138,11 +141,14 @@ with cancellation-aware exponential backoff before any tool side effect. Each re
 usage is added directly to the current `TurnStats`, including discarded retry attempts; missing usage
 is zero. No session-wide usage is stored or reconstructed.
 
-When a provider reports changed usage, the collector adds it to the usage from earlier model calls
-in the same turn and emits a `Progress` snapshot. The request preflight estimates the final outbound
-context after any compaction and emits a `Context` event only when that `(tokens, limit)` snapshot
-changes. There is no polling loop or session-wide status query. Neither transient event is persisted;
-the final `Turn` remains canonical.
+After each physical model response that reports non-zero usage, the runner adds that usage to
+earlier calls in the same turn and emits one `Activity` snapshot: accumulated `TurnStats` plus the
+count of tool calls completed so far, both derived in the runner. A completed tool batch likewise
+emits one snapshot with its updated count. Responses without usage stay silent. Consumers replace
+their view with this complete value; they never infer statistics from tool lifecycle events. The
+request preflight estimates the final outbound context after any compaction and emits a `Context`
+event only when that `(tokens, limit)` snapshot changes. Transient events are not persisted; the
+final `Turn` remains canonical — its tool-call count derives from `Turn.steps`.
 
 Cancellation without an executed tool and without a queued successor discards the running turn and
 writes no record. If the turn already has a tool result or a later turn depends on it, cancellation is
@@ -182,11 +188,13 @@ counts remain the authority for running/idle state; there is no child status que
 
 ## Events and TUI
 
-`SessionEvent` has nine facts: started, text, thought, progress, context, tool started, tool finished,
-finished, and discarded. Transient events carry `TurnId`; progress is a replaceable full `TurnStats`
-snapshot, and context is a request-level token estimate plus configured limit. Completion carries the
-canonical `Arc<Turn>`. `Discarded.error` is present only when a completed turn could not be persisted,
-so event-only consumers do not mistake storage failure for cancellation.
+`SessionEvent` has nine facts: started, text, thought, activity, context, tool started, tool
+finished, finished, and discarded. Transient events carry `TurnId`; activity is a replaceable
+`TurnActivity` snapshot (full `TurnStats` plus the completed tool-call count), and context is a
+request-level token estimate plus configured limit. Completion carries the canonical `Arc<Turn>`.
+`Discarded.error` is present only when a completed turn could not be persisted, so event-only
+consumers do not mistake storage failure for cancellation. A resumed session replays every settled
+turn through the same block conversion as a live finish, including its footer separator.
 
 The TUI has one business-state owner, `AppState`. Events mutate it directly and produce a small
 `RenderPlan` describing terminal IO. `TerminalUi` owns only the terminal surface. Rendering borrows

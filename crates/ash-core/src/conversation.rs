@@ -89,6 +89,17 @@ pub struct Step {
     pub items: Vec<Item>,
 }
 
+impl Step {
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.items.iter().filter_map(|item| match item {
+            Item::ToolCall(call) => Some(call),
+            Item::Text(_) | Item::Thought { .. } => None,
+        })
+    }
+}
+
+/// Durable statistics reported by the provider. The completed tool-call count
+/// is not stored here; it is always derived from `Turn.steps`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStats {
     pub input_tokens: u64,
@@ -130,10 +141,14 @@ impl Turn {
     }
 
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
-        self.items().filter_map(|item| match item {
-            Item::ToolCall(call) => Some(call),
-            Item::Text(_) | Item::Thought { .. } => None,
-        })
+        self.steps.iter().flat_map(Step::tool_calls)
+    }
+
+    /// Completed tool-call count derived from `steps`; saturates instead of
+    /// overflowing when the count exceeds `u64`.
+    #[must_use]
+    pub fn completed_tool_calls(&self) -> u64 {
+        u64::try_from(self.tool_calls().count()).unwrap_or(u64::MAX)
     }
 
     #[must_use]
@@ -339,6 +354,34 @@ mod tests {
             result: TurnResult::Stopped(StopReason::EndTurn),
             stats: TurnStats::default(),
         })
+    }
+
+    #[test]
+    fn legacy_stats_with_a_tool_call_field_still_parse_and_derive_the_count() {
+        let turn = Turn {
+            id: TurnId::from_u128(1),
+            input: Input::user("run"),
+            steps: vec![Step {
+                items: vec![Item::ToolCall(ToolCall {
+                    id: ToolCallId::from_provider("call"),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                    result: Ok("done".into()),
+                })],
+            }],
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: TurnStats {
+                input_tokens: 12,
+                output_tokens: 3,
+                generation_ms: 20,
+            },
+        };
+        let mut value = serde_json::to_value(&turn).unwrap();
+        value["stats"]["tool_calls"] = serde_json::json!(99);
+        let restored: Turn = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.stats.input_tokens, 12);
+        assert_eq!(restored.completed_tool_calls(), 1, "steps are canonical");
     }
 
     #[test]

@@ -251,7 +251,7 @@ fn print_usage(turn: &ash_core::Turn) {
         "[usage: {} in / {} out tokens, {} tools, {} ms]",
         stats.input_tokens,
         stats.output_tokens,
-        turn.tool_calls().count(),
+        turn.completed_tool_calls(),
         stats.generation_ms,
     );
 }
@@ -340,7 +340,7 @@ impl InteractiveController {
                             SessionEvent::Started(_)
                             | SessionEvent::Text { .. }
                             | SessionEvent::Thought { .. }
-                            | SessionEvent::Progress { .. }
+                            | SessionEvent::Activity { .. }
                             | SessionEvent::Context { .. }
                             | SessionEvent::ToolStarted { .. }
                             | SessionEvent::ToolFinished { .. } => {}

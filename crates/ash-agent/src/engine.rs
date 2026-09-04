@@ -6,7 +6,7 @@ use std::{
 use ash_core::{
     AshError, CancellationToken, Conversation, Input, Item, ModelClient, ModelEvent, ModelRequest,
     ModelStream, ProtocolError, SessionEvent, Step, StopReason, ToolCall, ToolCallId, ToolContext,
-    ToolError, ToolOutput, ToolTimeout, Turn, TurnId, TurnResult, TurnStats,
+    ToolError, ToolOutput, ToolTimeout, Turn, TurnActivity, TurnId, TurnResult, TurnStats,
 };
 use futures::{future::join_all, StreamExt};
 use tokio::sync::mpsc;
@@ -118,14 +118,15 @@ struct TurnRunner<'a> {
 impl TurnRunner<'_> {
     async fn run(mut self) -> EngineOutcome {
         let (result, error) = self.run_loop().await;
+        let turn = Turn {
+            id: self.id,
+            input: self.input,
+            steps: self.steps,
+            result,
+            stats: self.stats,
+        };
         EngineOutcome {
-            turn: Arc::new(Turn {
-                id: self.id,
-                input: self.input,
-                steps: self.steps,
-                result,
-                stats: self.stats,
-            }),
+            turn: Arc::new(turn),
             summary: self.pending_summary,
             error,
         }
@@ -155,7 +156,6 @@ impl TurnRunner<'_> {
                             &mut stream,
                             Some((&self.events, self.id)),
                             &self.context.cancellation,
-                            self.stats,
                         )
                         .await
                     }
@@ -166,7 +166,7 @@ impl TurnRunner<'_> {
                 };
                 let retry = matches!(&response, ModelResponse::Truncated { .. })
                     || matches!(&response, ModelResponse::Failed { error, .. } if retryable(error));
-                self.stats = self.stats.saturating_add(response.stats());
+                self.record_stats(response.stats()).await;
                 if !retry || retries >= MAX_RETRIES {
                     break response;
                 }
@@ -204,6 +204,7 @@ impl TurnRunner<'_> {
                     let step = self.execute_tools(content).await;
                     if !step.items.is_empty() {
                         self.steps.push(step);
+                        self.publish_activity().await;
                     }
                     if self.context.cancellation.is_cancelled() {
                         return (TurnResult::Cancelled, None);
@@ -234,11 +235,10 @@ impl TurnRunner<'_> {
     }
 
     async fn prepare_request(&mut self) -> Result<ModelRequest, AshError> {
-        let tools = self.agent.tool_definitions();
-        let before =
-            estimate_request_tokens(self.agent.system_prompt(), &self.model_context(), &tools);
+        let mut request = self.request();
+        let mut tokens = request_tokens(&request);
         if self.pending_summary.is_none()
-            && needs_compaction(before, self.agent.max_context_tokens())
+            && needs_compaction(tokens, self.agent.max_context_tokens())
         {
             if let Some((summary, stats)) = compact(
                 self.model,
@@ -248,28 +248,27 @@ impl TurnRunner<'_> {
             )
             .await?
             {
-                self.stats = self.stats.saturating_add(stats);
-                let after = estimate_request_tokens(
-                    self.agent.system_prompt(),
-                    &self
-                        .conversation
-                        .context_with_summary(&summary)
-                        .with_current(self.input.clone(), self.steps.clone()),
-                    &tools,
-                );
-                if after < before {
+                self.record_stats(stats).await;
+                let context = self
+                    .conversation
+                    .context_with_summary(&summary)
+                    .with_current(self.input.clone(), self.steps.clone());
+                let compacted_tokens =
+                    estimate_request_tokens(request.system.as_deref(), &context, &request.tools);
+                if compacted_tokens < tokens {
+                    request.context = context;
+                    tokens = compacted_tokens;
                     self.pending_summary = Some(summary);
                 }
             }
         }
 
-        let request = self.request();
-        let tokens = u64::try_from(estimate_request_tokens(
-            request.system.as_deref(),
-            &request.context,
-            &request.tools,
-        ))
-        .unwrap_or(u64::MAX);
+        self.publish_context(tokens).await;
+        Ok(request)
+    }
+
+    async fn publish_context(&mut self, tokens: usize) {
+        let tokens = u64::try_from(tokens).unwrap_or(u64::MAX);
         let limit = u64::try_from(self.agent.max_context_tokens()).unwrap_or(u64::MAX);
         if self.last_context != Some((tokens, limit)) {
             self.last_context = Some((tokens, limit));
@@ -283,7 +282,34 @@ impl TurnRunner<'_> {
             )
             .await;
         }
-        Ok(request)
+    }
+
+    async fn record_stats(&mut self, delta: TurnStats) {
+        self.stats = self.stats.saturating_add(delta);
+        if delta.input_tokens > 0 || delta.output_tokens > 0 {
+            self.publish_activity().await;
+        }
+    }
+
+    /// Emit the current activity snapshot; consumers replace their view with
+    /// the complete value instead of accumulating deltas.
+    async fn publish_activity(&self) {
+        let activity = TurnActivity {
+            stats: self.stats,
+            completed_tool_calls: self.completed_tool_calls(),
+        };
+        send_event(
+            &self.events,
+            SessionEvent::Activity {
+                turn_id: self.id,
+                activity,
+            },
+        )
+        .await;
+    }
+
+    fn completed_tool_calls(&self) -> u64 {
+        u64::try_from(self.steps.iter().flat_map(Step::tool_calls).count()).unwrap_or(u64::MAX)
     }
 
     fn push_without_tools(&mut self, content: Vec<ContentBlock>) {
@@ -404,6 +430,10 @@ impl TurnRunner<'_> {
     }
 }
 
+fn request_tokens(request: &ModelRequest) -> usize {
+    estimate_request_tokens(request.system.as_deref(), &request.context, &request.tools)
+}
+
 pub(crate) async fn compact(
     model: &dyn ModelClient,
     agent: &Agent,
@@ -428,7 +458,7 @@ pub(crate) async fn compact(
         tools: Vec::new(),
         max_tokens: None,
     })?;
-    match collect_response(&mut stream, None, cancellation, TurnStats::default()).await {
+    match collect_response(&mut stream, None, cancellation).await {
         ModelResponse::Stopped {
             content,
             reason: StopReason::EndTurn,
@@ -469,7 +499,6 @@ async fn collect_response(
     stream: &mut ModelStream,
     events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
     cancellation: &CancellationToken,
-    settled_stats: TurnStats,
 ) -> ModelResponse {
     let mut accumulator = ResponseAccumulator::new();
     loop {
@@ -482,7 +511,7 @@ async fn collect_response(
             return accumulator.finish();
         };
         match item {
-            Ok(item) => accumulator.apply(events, settled_stats, item).await,
+            Ok(item) => accumulator.apply(events, item).await,
             Err(error) => return accumulator.failed(error),
         }
     }
@@ -512,7 +541,6 @@ impl ResponseAccumulator {
     async fn apply(
         &mut self,
         events: Option<(&mpsc::Sender<SessionEvent>, TurnId)>,
-        settled_stats: TurnStats,
         event: ModelEvent,
     ) {
         match event {
@@ -560,21 +588,8 @@ impl ResponseAccumulator {
                 input_tokens,
                 output_tokens,
             } => {
-                let previous = (self.input_tokens, self.output_tokens);
                 self.input_tokens = self.input_tokens.max(input_tokens);
                 self.output_tokens = self.output_tokens.max(output_tokens);
-                if previous != (self.input_tokens, self.output_tokens) {
-                    if let Some((events, turn_id)) = events {
-                        send_event(
-                            events,
-                            SessionEvent::Progress {
-                                turn_id,
-                                stats: settled_stats.saturating_add(self.stats()),
-                            },
-                        )
-                        .await;
-                    }
-                }
             }
             ModelEvent::Stop(reason) => {
                 self.finish_thought();
@@ -812,13 +827,7 @@ mod tests {
             }),
         ]));
 
-        let response = collect_response(
-            &mut stream,
-            None,
-            &CancellationToken::new(),
-            TurnStats::default(),
-        )
-        .await;
+        let response = collect_response(&mut stream, None, &CancellationToken::new()).await;
 
         let ModelResponse::Truncated { content, stats } = response else {
             panic!("expected truncated response");
@@ -829,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_is_published_only_when_usage_changes() {
+    async fn usage_is_collected_once_per_response() {
         let mut stream: ModelStream = Box::pin(futures::stream::iter([
             Ok(ModelEvent::Text("answer".to_string())),
             Ok(ModelEvent::Usage {
@@ -846,29 +855,7 @@ mod tests {
             }),
             Ok(ModelEvent::Stop(StopReason::EndTurn)),
         ]));
-        let (events, mut receiver) = mpsc::channel(8);
-        let turn_id = TurnId::new();
-        let settled = TurnStats {
-            input_tokens: 7,
-            output_tokens: 2,
-            generation_ms: 10,
-        };
-
-        let response = collect_response(
-            &mut stream,
-            Some((&events, turn_id)),
-            &CancellationToken::new(),
-            settled,
-        )
-        .await;
-        drop(events);
-
-        let mut progress = Vec::new();
-        while let Some(event) = receiver.recv().await {
-            if let SessionEvent::Progress { stats, .. } = event {
-                progress.push((stats.input_tokens, stats.output_tokens));
-            }
-        }
+        let response = collect_response(&mut stream, None, &CancellationToken::new()).await;
 
         assert!(matches!(
             response,
@@ -877,7 +864,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(progress, [(19, 2), (19, 5)]);
+        assert_eq!(response.stats().input_tokens, 12);
+        assert_eq!(response.stats().output_tokens, 3);
     }
 
     #[tokio::test]
@@ -998,7 +986,7 @@ mod tests {
             requests: StdMutex::new(Vec::new()),
         };
         let agent = Agent::new(ModelId::new("model"), vec![tool]);
-        let (events, _) = mpsc::channel(TOOL_CALLS * 2);
+        let (events, mut event_rx) = mpsc::channel(64);
         let conversation = Conversation::new();
         let run = run_turn(
             &model,
@@ -1020,6 +1008,93 @@ mod tests {
             assert!(matches!(&call.result, Ok(output) if output.text == index.to_string()));
         }
         assert_eq!(outcome.turn.tool_calls().count(), TOOL_CALLS);
+        assert_eq!(outcome.turn.completed_tool_calls(), TOOL_CALLS as u64);
+        let activities = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                SessionEvent::Activity { activity, .. } => Some(activity),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].completed_tool_calls, TOOL_CALLS as u64);
+    }
+
+    #[tokio::test]
+    async fn activity_snapshots_match_the_final_turn_across_model_rounds() {
+        let tool = define_tool("test", "test", |_, index: ToolTestArgs| async move {
+            Ok(index.index.to_string())
+        })
+        .unwrap();
+        let model = MockModel {
+            responses: StdMutex::new(VecDeque::from([
+                vec![
+                    Ok(ModelEvent::ToolCall {
+                        id: ToolCallId::from_provider("call-1"),
+                        name: "test".to_string(),
+                        arguments: serde_json::json!({ "index": 1 }),
+                    }),
+                    Ok(ModelEvent::Usage {
+                        input_tokens: 10,
+                        output_tokens: 4,
+                    }),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                ],
+                vec![
+                    Ok(ModelEvent::ToolCall {
+                        id: ToolCallId::from_provider("call-2"),
+                        name: "test".to_string(),
+                        arguments: serde_json::json!({ "index": 2 }),
+                    }),
+                    Ok(ModelEvent::Usage {
+                        input_tokens: 20,
+                        output_tokens: 6,
+                    }),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                ],
+                vec![
+                    Ok(ModelEvent::Text("complete".to_string())),
+                    Ok(ModelEvent::Usage {
+                        input_tokens: 30,
+                        output_tokens: 2,
+                    }),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                ],
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        };
+        let agent = Agent::new(ModelId::new("model"), vec![tool]);
+        let (events, mut event_rx) = mpsc::channel(64);
+
+        let outcome = run_turn(
+            &model,
+            &agent,
+            &Conversation::new(),
+            TurnId::new(),
+            Input::user("run tools"),
+            events,
+            ToolContext {
+                identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                cancellation: CancellationToken::new(),
+                deadline: None,
+            },
+        )
+        .await;
+
+        let activities = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                SessionEvent::Activity { activity, .. } => Some(activity),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(activities.len(), 5, "one per reported response and batch");
+        let final_activity = TurnActivity {
+            stats: outcome.turn.stats,
+            completed_tool_calls: outcome.turn.completed_tool_calls(),
+        };
+        assert_eq!(*activities.last().unwrap(), final_activity);
+        assert_eq!(activities[0].completed_tool_calls, 0);
+        assert_eq!(activities[1].completed_tool_calls, 1);
+        assert_eq!(activities[3].completed_tool_calls, 2);
     }
 
     #[tokio::test]

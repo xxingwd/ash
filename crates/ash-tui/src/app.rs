@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, time::Duration};
 #[cfg(test)]
 use ash_core::SessionError;
 use ash_core::{
-    AshError, Conversation, Input, SessionEvent, SessionId, SessionSummary, TurnId, TurnStats,
+    AshError, Conversation, Input, SessionEvent, SessionId, SessionSummary, TurnActivity, TurnId,
 };
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -98,10 +98,9 @@ pub(crate) struct AppState {
     pub(crate) scroll_top: Option<u16>,
     pub(crate) next_block_id: u64,
     pub(crate) status: StatusState,
-    pub(crate) turn_stats: Option<TurnStats>,
+    pub(crate) turn_activity: Option<TurnActivity>,
     pub(crate) context_tokens: Option<u64>,
     pub(crate) context_limit: Option<u64>,
-    pub(crate) tool_calls: usize,
     pub(crate) current_turn_id: Option<TurnId>,
     pub(crate) reasoning_block_id: Option<u64>,
     pub(crate) assistant_block_id: Option<u64>,
@@ -144,10 +143,9 @@ impl AppState {
             scroll_top: None,
             next_block_id: 1,
             status: StatusState::default(),
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             current_turn_id: None,
             reasoning_block_id: None,
             assistant_block_id: None,
@@ -159,10 +157,9 @@ impl AppState {
         self.session_id = Some(session_id);
         self.conversation = conversation;
         self.inputs.clear();
-        self.turn_stats = None;
+        self.turn_activity = None;
         self.context_tokens = None;
         self.context_limit = None;
-        self.tool_calls = 0;
         changed
     }
 
@@ -183,10 +180,9 @@ impl AppState {
                 session_id: update.session_id,
                 name: update.name.clone(),
                 state: SubagentViewState::Running,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             });
             self.subagents.len() - 1
@@ -254,13 +250,12 @@ fn update_subagent_session(agent: &mut SubagentView, event: SessionEvent) {
     match event {
         SessionEvent::Started(turn_id) => {
             agent.active_turn = Some(turn_id);
-            agent.stats = TurnStats::default();
+            agent.activity = TurnActivity::default();
             agent.context_tokens = None;
             agent.context_limit = None;
-            agent.tool_calls = 0;
         }
-        SessionEvent::Progress { turn_id, stats } if agent.active_turn == Some(turn_id) => {
-            agent.stats = stats;
+        SessionEvent::Activity { turn_id, activity } if agent.active_turn == Some(turn_id) => {
+            agent.activity = activity;
         }
         SessionEvent::Context {
             turn_id,
@@ -270,26 +265,24 @@ fn update_subagent_session(agent: &mut SubagentView, event: SessionEvent) {
             agent.context_tokens = Some(tokens);
             agent.context_limit = Some(limit);
         }
-        SessionEvent::ToolStarted { turn_id, .. } if agent.active_turn == Some(turn_id) => {
-            agent.tool_calls = agent.tool_calls.saturating_add(1);
-        }
         SessionEvent::Finished(turn) if agent.active_turn == Some(turn.id) => {
             agent.active_turn = None;
-            agent.stats = turn.stats;
+            agent.activity = TurnActivity {
+                stats: turn.stats,
+                completed_tool_calls: turn.completed_tool_calls(),
+            };
             agent.context_tokens = None;
             agent.context_limit = None;
-            agent.tool_calls = turn.tool_calls().count();
         }
         SessionEvent::Discarded { turn_id, .. } if agent.active_turn == Some(turn_id) => {
             agent.active_turn = None;
-            agent.stats = TurnStats::default();
+            agent.activity = TurnActivity::default();
             agent.context_tokens = None;
             agent.context_limit = None;
-            agent.tool_calls = 0;
         }
         SessionEvent::Text { .. }
         | SessionEvent::Thought { .. }
-        | SessionEvent::Progress { .. }
+        | SessionEvent::Activity { .. }
         | SessionEvent::Context { .. }
         | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. }
@@ -478,10 +471,9 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
                 RenderPlan::None
             };
             state.track_turn(turn_id);
-            state.turn_stats = None;
+            state.turn_activity = None;
             state.context_tokens = None;
             state.context_limit = None;
-            state.tool_calls = 0;
             let start = state.operation.turn_started();
             let effect = state.turn_started().merge(input_effect);
             let action = match start {
@@ -504,11 +496,11 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             let effect = state.thinking(&text);
             (effect, LoopAction::Continue)
         }
-        SessionEvent::Progress { turn_id, stats }
+        SessionEvent::Activity { turn_id, activity }
             if state.current_turn_id() == Some(turn_id)
                 && state.operation.accepts_live_output() =>
         {
-            state.turn_stats = Some(stats);
+            state.turn_activity = Some(activity);
             (RenderPlan::Redraw, LoopAction::Continue)
         }
         SessionEvent::Context {
@@ -526,7 +518,6 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             name,
             arguments,
         } if state.current_turn_id() == Some(turn_id) && state.operation.accepts_live_output() => {
-            state.tool_calls = state.tool_calls.saturating_add(1);
             let effect = state.tool_started(id, name, arguments);
             (effect, LoopAction::Continue)
         }
@@ -550,10 +541,9 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             }
             state.track_turn(turn.id);
             state.operation.complete_turn();
-            state.turn_stats = None;
+            state.turn_activity = None;
             state.context_tokens = None;
             state.context_limit = None;
-            state.tool_calls = 0;
             state.finish_turn(turn.id);
             state.conversation.push(Arc::clone(&turn), None);
             let effect = state.commit_turn(&turn);
@@ -565,10 +555,9 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
         {
             let input = state.finish_turn(turn_id);
             state.operation.complete_turn();
-            state.turn_stats = None;
+            state.turn_activity = None;
             state.context_tokens = None;
             state.context_limit = None;
-            state.tool_calls = 0;
             if let Some(input) = input {
                 state.input.restore_submission(input);
             }
@@ -580,7 +569,7 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
         }
         SessionEvent::Text { .. }
         | SessionEvent::Thought { .. }
-        | SessionEvent::Progress { .. }
+        | SessionEvent::Activity { .. }
         | SessionEvent::Context { .. }
         | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. }
@@ -1199,34 +1188,28 @@ mod tests {
         state.update_subagent(update(SubagentUpdateKind::Session(SessionEvent::Started(
             turn_id,
         ))));
-        let stats = TurnStats {
-            input_tokens: 120,
-            output_tokens: 25,
-            generation_ms: 200,
+        let activity = TurnActivity {
+            stats: ash_core::TurnStats {
+                input_tokens: 120,
+                output_tokens: 25,
+                generation_ms: 200,
+            },
+            completed_tool_calls: 1,
         };
         state.update_subagent(update(SubagentUpdateKind::Session(
-            SessionEvent::Progress { turn_id, stats },
+            SessionEvent::Activity { turn_id, activity },
         )));
         state.update_subagent(update(SubagentUpdateKind::Session(SessionEvent::Context {
             turn_id,
             tokens: 800,
             limit: 1_000,
         })));
-        state.update_subagent(update(SubagentUpdateKind::Session(
-            SessionEvent::ToolStarted {
-                turn_id,
-                id: ash_core::ToolCallId::new(),
-                name: "read".to_string(),
-                arguments: serde_json::json!({}),
-            },
-        )));
-
         let agent = &state.subagents[0];
         assert_eq!(agent.active_turn, Some(turn_id));
-        assert_eq!(agent.stats, stats);
+        assert_eq!(agent.activity, activity);
         assert_eq!(agent.context_tokens, Some(800));
         assert_eq!(agent.context_limit, Some(1_000));
-        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.activity.completed_tool_calls, 1);
     }
 
     #[test]

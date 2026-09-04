@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use ash_core::{SessionSummary, TurnStats};
+use ash_core::{SessionSummary, TurnActivity};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
@@ -55,10 +55,9 @@ struct ViewportInput<'a> {
     pub(crate) busy: bool,
     pub(crate) status_header: &'a str,
     pub(crate) elapsed: &'a str,
-    pub(crate) turn_stats: Option<TurnStats>,
+    pub(crate) turn_activity: Option<TurnActivity>,
     pub(crate) context_tokens: Option<u64>,
     pub(crate) context_limit: Option<u64>,
-    pub(crate) tool_calls: usize,
     pub(crate) prompt_lines: &'a [String],
     pub(crate) prompt_cursor_row: u16,
     pub(crate) prompt_cursor_column: u16,
@@ -120,10 +119,9 @@ pub(crate) fn render(state: &AppState, width: u16, height: u16) -> ViewportFrame
         busy,
         status_header: &status_header,
         elapsed: &elapsed,
-        turn_stats: state.turn_stats,
+        turn_activity: state.turn_activity,
         context_tokens: state.context_tokens,
         context_limit: state.context_limit,
-        tool_calls: state.tool_calls,
         prompt_lines: &prompt.lines,
         prompt_cursor_row: prompt.cursor_row,
         prompt_cursor_column: prompt.cursor_column,
@@ -503,7 +501,7 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let metrics = activity_metrics(subagent.stats, subagent.tool_calls);
+        let metrics = activity_metrics(subagent.activity);
         let context = context_display(subagent.context_tokens, subagent.context_limit)
             .map(|context| format!("ctx {}", context.text));
         let metrics = match (metrics.is_empty(), context) {
@@ -589,8 +587,7 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         ),
     ];
     if input.terminal_width >= TURN_STATS_STATUS_WIDTH {
-        let stats = input.turn_stats.unwrap_or_default();
-        let metrics = activity_metrics(stats, input.tool_calls);
+        let metrics = activity_metrics(input.turn_activity.unwrap_or_default());
         if !metrics.is_empty() {
             spans.push(Span::styled(
                 format!("  {metrics}"),
@@ -601,13 +598,15 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
-fn activity_metrics(stats: TurnStats, tool_calls: usize) -> String {
-    if stats == TurnStats::default() && tool_calls == 0 {
+fn activity_metrics(activity: TurnActivity) -> String {
+    if activity == TurnActivity::default() {
         return String::new();
     }
+    let stats = activity.stats;
     let mut metrics = format!(
-        "{} · {tool_calls} tools",
+        "{} · {} tools",
         format_token_usage(stats.input_tokens, stats.output_tokens),
+        activity.completed_tool_calls,
     );
     if let Some(rate) = format_token_rate(stats.output_tokens, stats.generation_ms) {
         metrics.push_str(" · ");
@@ -951,14 +950,13 @@ mod tests {
     }
 
     fn status_text(width: u16, header: &str) -> String {
-        status_text_with_stats(width, header, None, 0)
+        status_text_with_stats(width, header, None)
     }
 
     fn status_text_with_stats(
         width: u16,
         header: &str,
-        turn_stats: Option<TurnStats>,
-        tool_calls: usize,
+        turn_activity: Option<TurnActivity>,
     ) -> String {
         let frame = render_view(ViewportInput {
             terminal_width: width,
@@ -968,10 +966,9 @@ mod tests {
             busy: true,
             status_header: header,
             elapsed: "2s",
-            turn_stats,
+            turn_activity,
             context_tokens: None,
             context_limit: None,
-            tool_calls,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1037,10 +1034,9 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "2s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1076,18 +1072,21 @@ mod tests {
 
     #[test]
     fn activity_status_shows_live_metrics_only_when_they_fit() {
-        let stats = TurnStats {
-            input_tokens: 120,
-            output_tokens: 25,
-            generation_ms: 200,
+        let activity = TurnActivity {
+            stats: ash_core::TurnStats {
+                input_tokens: 120,
+                output_tokens: 25,
+                generation_ms: 200,
+            },
+            completed_tool_calls: 3,
         };
 
         assert_eq!(
-            status_text_with_stats(79, "Working", Some(stats), 3),
+            status_text_with_stats(79, "Working", Some(activity)),
             "• Working (2s)"
         );
         assert_eq!(
-            status_text_with_stats(80, "Working", Some(stats), 3),
+            status_text_with_stats(80, "Working", Some(activity)),
             "• Working (2s)  120 in / 25 out · 3 tools · 125 tok/s"
         );
     }
@@ -1117,10 +1116,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: Some(500),
             context_limit: Some(1_000),
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1146,10 +1144,9 @@ mod tests {
                 session_id: ash_core::SessionId::new(),
                 name: "inspect_glob".to_string(),
                 state: SubagentViewState::Running,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             },
             SubagentView {
@@ -1157,10 +1154,9 @@ mod tests {
                 session_id: ash_core::SessionId::new(),
                 name: "fix_bash".to_string(),
                 state: SubagentViewState::Running,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             },
         ];
@@ -1172,10 +1168,9 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "2s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1201,10 +1196,9 @@ mod tests {
             session_id: ash_core::SessionId::new(),
             name: "inspect_glob".to_string(),
             state: SubagentViewState::Idle,
-            stats: TurnStats::default(),
+            activity: TurnActivity::default(),
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             active_turn: None,
         }];
         let frame = render_view(ViewportInput {
@@ -1215,10 +1209,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1243,10 +1236,9 @@ mod tests {
                 session_id: ash_core::SessionId::new(),
                 name: "idle".to_string(),
                 state: SubagentViewState::Idle,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             },
             SubagentView {
@@ -1254,10 +1246,9 @@ mod tests {
                 session_id: ash_core::SessionId::new(),
                 name: "running".to_string(),
                 state: SubagentViewState::Running,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             },
         ];
@@ -1277,10 +1268,9 @@ mod tests {
             session_id: ash_core::SessionId::new(),
             name: "a_very_long_agent_name_that_would_hide_usage".to_string(),
             state: SubagentViewState::Idle,
-            stats: TurnStats::default(),
+            activity: TurnActivity::default(),
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             active_turn: None,
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 54, 1));
@@ -1298,14 +1288,16 @@ mod tests {
             session_id: ash_core::SessionId::new(),
             name: "worker".to_string(),
             state: SubagentViewState::Running,
-            stats: TurnStats {
-                input_tokens: 120,
-                output_tokens: 25,
-                generation_ms: 200,
+            activity: TurnActivity {
+                stats: ash_core::TurnStats {
+                    input_tokens: 120,
+                    output_tokens: 25,
+                    generation_ms: 200,
+                },
+                completed_tool_calls: 2,
             },
             context_tokens: Some(500),
             context_limit: Some(1_000),
-            tool_calls: 2,
             active_turn: Some(TurnId::new()),
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 1));
@@ -1327,10 +1319,9 @@ mod tests {
                 session_id: ash_core::SessionId::new(),
                 name: format!("agent_{index}"),
                 state: SubagentViewState::Idle,
-                stats: TurnStats::default(),
+                activity: TurnActivity::default(),
                 context_tokens: None,
                 context_limit: None,
-                tool_calls: 0,
                 active_turn: None,
             })
             .collect::<Vec<_>>();
@@ -1362,10 +1353,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &["/".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 1,
@@ -1424,10 +1414,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1483,10 +1472,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1518,10 +1506,9 @@ mod tests {
             busy: true,
             status_header: "Thinking",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1550,10 +1537,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1587,10 +1573,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1624,10 +1609,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &prompt,
             prompt_cursor_row: 2,
             prompt_cursor_column: 5,
@@ -1662,10 +1646,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &prompt,
             prompt_cursor_row: 9,
             prompt_cursor_column: 6,
@@ -1702,10 +1685,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &["draft".to_string()],
             prompt_cursor_row: 0,
             prompt_cursor_column: 5,
@@ -1745,10 +1727,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1816,10 +1797,9 @@ mod tests {
             busy: false,
             status_header: "",
             elapsed: "0s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,
@@ -1900,10 +1880,9 @@ mod tests {
             busy: true,
             status_header: "Working",
             elapsed: "1s",
-            turn_stats: None,
+            turn_activity: None,
             context_tokens: None,
             context_limit: None,
-            tool_calls: 0,
             prompt_lines: &[],
             prompt_cursor_row: 0,
             prompt_cursor_column: 0,

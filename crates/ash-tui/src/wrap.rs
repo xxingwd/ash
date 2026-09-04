@@ -3,6 +3,8 @@
 //! Break at whitespace and CJK characters. Latin words, paths, and URLs stay
 //! intact until they are wider than a full row, then they hard-break.
 
+use std::collections::VecDeque;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -50,13 +52,25 @@ pub fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>
 
 /// Wrap `line` into rows of `width`, placing `prefix` on the first row and
 /// `hanging` on every continuation row. Prefixes occupy width; the remaining
-/// columns are used for content.
+/// columns are used for content. A prefix that would leave fewer than two
+/// columns (room for one double-width grapheme) is dropped so narrow
+/// terminals still show the content.
 pub fn wrap_styled_line_with_prefix(
     line: &Line<'static>,
     prefix: Line<'static>,
     hanging: Line<'static>,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let prefix = if width.saturating_sub(line_width(&prefix)) < 2 {
+        Line::default()
+    } else {
+        prefix
+    };
+    let hanging = if width.saturating_sub(line_width(&hanging)) < 2 {
+        Line::default()
+    } else {
+        hanging
+    };
     let graphemes = styled_line_graphemes(line);
     let prefix_width = line_width(&prefix);
     let hanging_width = line_width(&hanging);
@@ -112,6 +126,11 @@ pub fn render_hanging_lines(
         .into_iter()
         .flat_map(|(prefix, content)| wrap_line_hanging(content, prefix, wrap_width))
         .collect();
+    render_rows(rows, width)
+}
+
+/// Paint already-wrapped rows into a buffer.
+pub fn render_rows(rows: Vec<Line<'static>>, width: u16) -> Buffer {
     if rows.is_empty() {
         return Buffer::empty(Rect::new(0, 0, width.max(1), 0));
     }
@@ -125,6 +144,62 @@ pub fn render_hanging_lines(
         buffer.set_line(0, u16::try_from(offset).unwrap_or(u16::MAX), &row, width);
     }
     buffer
+}
+
+/// Render source lines where only the first row carries `prefix`; later
+/// source lines and soft-wrapped continuations align under the first row's
+/// content column.
+pub fn render_prefixed_lines(
+    lines: impl IntoIterator<Item = Line<'static>>,
+    prefix: Line<'static>,
+    width: u16,
+) -> Buffer {
+    let hanging = hanging_spaces(&prefix);
+    let mut lines = lines.into_iter();
+    let first = lines.next();
+    render_hanging_lines(
+        first
+            .into_iter()
+            .map(|line| (prefix.clone(), line))
+            .chain(lines.map(|line| (hanging.clone(), line))),
+        width,
+    )
+}
+
+/// Keep at most `limit` rows using a head/tail split: `limit / 2` head rows
+/// and `limit - limit / 2` tail rows. When rows are omitted, `ellipsis`
+/// receives the omitted count and its result replaces the middle, so the
+/// result never exceeds `limit` rows.
+pub fn truncate_rows(
+    rows: impl IntoIterator<Item = Line<'static>>,
+    limit: usize,
+    ellipsis: impl FnOnce(usize) -> Line<'static>,
+) -> Vec<Line<'static>> {
+    let head_limit = limit / 2;
+    let tail_limit = limit - head_limit;
+    let mut head: Vec<Line<'static>> = Vec::new();
+    let mut tail: VecDeque<Line<'static>> = VecDeque::new();
+    let mut omitted = 0usize;
+    for row in rows {
+        if head.len() < head_limit {
+            head.push(row);
+        } else {
+            tail.push_back(row);
+            if tail.len() > tail_limit {
+                tail.pop_front();
+                omitted += 1;
+            }
+        }
+    }
+    if omitted > 0 {
+        // Reserve one row for the ellipsis marker.
+        while tail.len() >= tail_limit && tail.pop_front().is_some() {
+            omitted += 1;
+        }
+        head.push(ellipsis(omitted));
+    }
+    head.extend(tail);
+    head
 }
 
 #[cfg(test)]
@@ -381,5 +456,111 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["Read one two", "     three", "     four"]);
+    }
+
+    fn plain(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn narrow_widths_keep_every_grapheme_visible() {
+        for width in 1..=10 {
+            let rows = wrap_styled_line_with_prefix(
+                &Line::from("abcdef ghij"),
+                Line::from("• Error: "),
+                Line::from("         "),
+                width,
+            );
+            let rendered: String = rows.iter().map(plain).collect();
+            assert_eq!(rendered.replace(' ', ""), "abcdefghij", "width {width}");
+            assert!(rows
+                .iter()
+                .all(|row| unicode_width::UnicodeWidthStr::width(plain(row).as_str()) <= width));
+        }
+    }
+
+    #[test]
+    fn prefix_equal_or_wider_than_the_row_is_dropped() {
+        let rows = wrap_styled_line_with_prefix(
+            &Line::from("abcdef"),
+            Line::from("• Error: "),
+            Line::from("         "),
+            4,
+        );
+        assert_eq!(
+            rows.iter().map(plain).collect::<Vec<_>>(),
+            vec!["abcd", "ef"]
+        );
+    }
+
+    #[test]
+    fn double_width_content_stays_visible_from_width_two() {
+        for width in 2..=10 {
+            let rows = wrap_styled_line_with_prefix(
+                &Line::from("你好世界"),
+                Line::from("› "),
+                Line::from("  "),
+                width,
+            );
+            let rendered: String = rows.iter().map(plain).collect();
+            // The 2-wide prefix survives once width - 2 >= 2.
+            let expected = if width >= 4 {
+                "›你好世界"
+            } else {
+                "你好世界"
+            };
+            assert_eq!(rendered.replace(' ', ""), expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn overlong_words_hard_break_instead_of_hiding_behind_a_prefix() {
+        let rows = wrap_styled_line_with_prefix(
+            &Line::from("/very/long/path/to/file.rs"),
+            Line::from("• Read "),
+            Line::from("       "),
+            6,
+        );
+        let rendered: String = rows.iter().map(plain).collect();
+        assert_eq!(rendered.replace(' ', ""), "/very/long/path/to/file.rs");
+    }
+
+    #[test]
+    fn truncate_rows_keeps_head_and_tail_within_the_limit() {
+        let rows = (1..=8)
+            .map(|index| Line::from(format!("row {index}")))
+            .collect::<Vec<_>>();
+        let kept = truncate_rows(rows.clone(), 5, |omitted| {
+            Line::from(format!("… +{omitted}"))
+        });
+        assert_eq!(
+            kept.iter().map(plain).collect::<Vec<_>>(),
+            vec!["row 1", "row 2", "… +4", "row 7", "row 8"]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_returns_everything_when_within_the_limit() {
+        let rows = (1..=5)
+            .map(|index| Line::from(format!("row {index}")))
+            .collect::<Vec<_>>();
+        let kept = truncate_rows(rows, 5, |_| Line::from("…"));
+        assert_eq!(kept.len(), 5);
+    }
+
+    #[test]
+    fn truncate_rows_never_panics_at_tiny_limits() {
+        let rows = (1..=3)
+            .map(|index| Line::from(format!("row {index}")))
+            .collect::<Vec<_>>();
+        for limit in 0..=2 {
+            let kept = truncate_rows(rows.clone(), limit, |omitted| {
+                Line::from(format!("… +{omitted}"))
+            });
+            assert!(kept.len() <= limit.max(1));
+        }
     }
 }

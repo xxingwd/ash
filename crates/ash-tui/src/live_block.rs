@@ -17,7 +17,7 @@ use crate::{
     scrollback::sanitize_terminal_text,
     tool_display::{tool_call_summary, tool_renderer, OutputPresentation, ToolRenderer},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
-    wrap::render_hanging_lines,
+    wrap::{render_hanging_lines, render_rows, truncate_rows, wrap_line_hanging},
 };
 
 const BULLET_PREFIX_COLUMNS: u16 = 2;
@@ -805,11 +805,12 @@ fn render_running_tool(
         }
     }
     if matches!(tool_renderer(name, false), ToolRenderer::Bash) {
-        let (title, continuation, _) =
+        let (title, continuation) =
             render_bash_command_line_with_action(arguments, &action, Color::Cyan, width, expanded);
-        return continuation.map_or(title.clone(), |continuation| {
-            stack_rows(&[title, continuation], width)
-        });
+        return match continuation {
+            Some(continuation) => stack_rows(&[title, continuation], width),
+            None => title,
+        };
     }
     render_tool_title_with_color(&action, &detail, Color::Cyan, width)
 }
@@ -826,7 +827,7 @@ fn render_bash_tool(
     width: u16,
     expanded: bool,
 ) -> Buffer {
-    let (title, continuation, _command_height) =
+    let (title, continuation) =
         render_bash_command_line(name, arguments, is_error, width, expanded);
     let mut rows: Vec<Buffer> = Vec::new();
     rows.push(title);
@@ -848,7 +849,7 @@ fn render_bash_command_line(
     is_error: bool,
     width: u16,
     expanded: bool,
-) -> (Buffer, Option<Buffer>, u16) {
+) -> (Buffer, Option<Buffer>) {
     let (action, _) = tool_call_summary(name, arguments);
     let color = if is_error { Color::Red } else { Color::Green };
     render_bash_command_line_with_action(arguments, &action, color, width, expanded)
@@ -860,7 +861,7 @@ fn render_bash_command_line_with_action(
     color: Color,
     width: u16,
     expanded: bool,
-) -> (Buffer, Option<Buffer>, u16) {
+) -> (Buffer, Option<Buffer>) {
     use crate::ansi::highlight_bash_command;
 
     let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
@@ -904,114 +905,67 @@ fn render_bash_command_line_with_action(
     // Any remaining wrapped rows become continuation lines, in order.
     let mut wrapped_tail: Vec<Line<'static>> = iter.collect();
     wrapped_tail.extend(highlighted);
-    highlighted = wrapped_tail;
 
     let header_width = width.max(1);
     let mut title = Buffer::empty(Rect::new(0, 0, header_width, 1));
     title.set_line(0, 0, &Line::from(first_spans), header_width);
 
-    if highlighted.is_empty() {
-        (title, None, 1)
-    } else {
-        const CONTINUATION_PREFIX: &str = "  │ ";
-        let prefix = Line::from(vec![Span::styled(
-            CONTINUATION_PREFIX,
-            Style::default().add_modifier(Modifier::DIM),
-        )]);
-        truncate_command_lines(&mut highlighted, expanded);
-        let wrapped = highlighted
-            .into_iter()
-            .map(|line| (prefix.clone(), line))
-            .collect::<Vec<_>>();
-        (title, Some(render_hanging_lines(wrapped, width)), 1)
+    if wrapped_tail.is_empty() {
+        return (title, None);
     }
+    const CONTINUATION_PREFIX: &str = "  │ ";
+    let prefix = dimmed(Line::from(CONTINUATION_PREFIX));
+    let rows = wrapped_tail
+        .into_iter()
+        .flat_map(|line| wrap_line_hanging(line, prefix.clone(), usize::from(width.max(1))));
+    let kept = if expanded {
+        rows.collect()
+    } else {
+        truncate_rows(rows, crate::ansi::COLLAPSED_MAX_LINES, |omitted| {
+            dimmed(Line::from(format!(
+                "{CONTINUATION_PREFIX}… +{omitted} lines (truncated for display)"
+            )))
+        })
+    };
+    (title, Some(render_rows(kept, width)))
 }
 
-/// Cap the continuation lines of a multi-line command. In compact mode only a
-/// few head/tail lines with an ellipsis marker are kept; in expanded mode the
-/// full command is shown. The first command line already lives on the title
-/// row, so this applies to the remaining lines only.
-fn truncate_command_lines(lines: &mut Vec<Line<'static>>, expanded: bool) -> usize {
-    let total = lines.len();
-    if expanded {
-        return total;
-    }
-    let limit = crate::ansi::COLLAPSED_MAX_LINES;
-    if total <= limit {
-        return total;
-    }
-    // Reserve one row for the ellipsis marker, then keep an equal head/tail.
-    let remaining = limit - 1;
-    let half = remaining / 2;
-    let omitted = total - remaining;
-    let mut ellipsis = Line::from(format!("… +{omitted} lines (truncated for display)"));
-    for span in &mut ellipsis.spans {
+/// Dim every span of a line so tool output recedes behind the title.
+fn dimmed(mut line: Line<'static>) -> Line<'static> {
+    for span in &mut line.spans {
         span.style = span.style.add_modifier(Modifier::DIM);
     }
-    *lines = crate::ansi::split_with_ellipsis(std::mem::take(lines), half, half, ellipsis);
-    limit
+    line
 }
 
-/// Render tool output as a bounded head/tail preview or in full when expanded.
-/// ANSI colors from the tool (e.g. colored bash output) survive into the
-/// rendered spans.
+/// Render tool output as a bounded head/tail preview of final *visual* rows,
+/// or in full when expanded. ANSI colors from the tool (e.g. colored bash
+/// output) survive into the rendered spans, and a single overlong source line
+/// wraps first and then obeys the same collapsed budget.
 fn render_tool_output(output: &str, width: u16, expanded: bool) -> Buffer {
     use crate::ansi::parse_ansi_line;
 
     const FIRST_PREFIX: &str = "  └ ";
     const SUBSEQUENT_PREFIX: &str = "    ";
-    let source_lines: Vec<&str> = output.lines().collect();
-    let total = source_lines.len();
-    let selected = if expanded || total <= crate::ansi::COLLAPSED_MAX_LINES {
-        source_lines.into_iter().map(Some).collect::<Vec<_>>()
-    } else {
-        let half = crate::ansi::COLLAPSED_MAX_LINES / 2;
-        let omitted = total - half * 2;
-        let mut lines = source_lines[..half]
-            .iter()
-            .copied()
-            .map(Some)
-            .collect::<Vec<_>>();
-        lines.push(None);
-        lines.extend(source_lines[total - half..].iter().copied().map(Some));
-        let _ = omitted;
-        lines
-    };
-    let omitted = total.saturating_sub(selected.iter().filter(|line| line.is_some()).count());
-    let mut rows = Vec::new();
-    for (index, line) in selected.into_iter().enumerate() {
-        let prefix = if index == 0 {
+    let wrap_width = usize::from(width.max(1));
+    let rows = output.lines().enumerate().flat_map(|(index, source)| {
+        let prefix = dimmed(Line::from(if index == 0 {
             FIRST_PREFIX
         } else {
             SUBSEQUENT_PREFIX
-        };
-        let prefix_line = {
-            let mut line = Line::from(prefix.to_string());
-            for span in &mut line.spans {
-                span.style = span.style.add_modifier(Modifier::DIM);
-            }
-            line
-        };
-        let content = match line {
-            Some(text) => {
-                let mut parsed = parse_ansi_line(text);
-                for span in &mut parsed.spans {
-                    span.style = span.style.add_modifier(Modifier::DIM);
-                }
-                parsed
-            }
-            None => {
-                let mut ellipsis =
-                    Line::from(format!("… +{omitted} lines (truncated for display)"));
-                for span in &mut ellipsis.spans {
-                    span.style = span.style.add_modifier(Modifier::DIM);
-                }
-                ellipsis
-            }
-        };
-        rows.push((prefix_line, content));
-    }
-    render_hanging_lines(rows, width)
+        }));
+        wrap_line_hanging(dimmed(parse_ansi_line(source)), prefix, wrap_width)
+    });
+    let kept = if expanded {
+        rows.collect()
+    } else {
+        truncate_rows(rows, crate::ansi::COLLAPSED_MAX_LINES, |omitted| {
+            dimmed(Line::from(format!(
+                "{SUBSEQUENT_PREFIX}… +{omitted} lines (truncated for display)"
+            )))
+        })
+    };
+    render_rows(kept, width)
 }
 
 fn render_tool_title(action: &str, detail: &str, is_error: bool, width: u16) -> Buffer {
@@ -1924,6 +1878,15 @@ mod generic_output_tests {
 mod toggle_tests {
     use super::*;
 
+    fn row_text(buffer: &Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .filter_map(|column| buffer.cell((column, row)))
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
     #[test]
     fn toggle_expanded_changes_rendered_height() {
         let output = (1..=30)
@@ -1945,5 +1908,53 @@ mod toggle_tests {
             "expanded should be taller, got {}",
             block.render(40, true).area.height
         );
+    }
+
+    #[test]
+    fn single_overlong_output_line_is_bounded_when_collapsed() {
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": "cat big.log"}),
+            "x".repeat(2_000),
+            false,
+        );
+
+        let collapsed = block.render(40, false);
+        // Title + COLLAPSED_MAX_LINES output rows even though the single
+        // source line wraps into dozens of visual rows.
+        assert_eq!(
+            collapsed.area.height,
+            1 + crate::ansi::COLLAPSED_MAX_LINES as u16
+        );
+        assert!(row_text(&collapsed, 3).contains("truncated for display"));
+        assert_eq!(collapsed.area.height, block.render(40, false).area.height);
+
+        let expanded = block.render(40, true);
+        assert!(expanded.area.height > 1 + crate::ansi::COLLAPSED_MAX_LINES as u16);
+    }
+
+    #[test]
+    fn overlong_continuation_command_lines_obey_the_collapsed_budget() {
+        let command = format!("echo first\n{}", "x".repeat(200));
+        let block = LiveBlock::tool(
+            1,
+            "bash".to_string(),
+            serde_json::json!({"command": command}),
+            "done".to_string(),
+            false,
+        );
+
+        let collapsed = block.render(40, false);
+        // Title + at most COLLAPSED_MAX_LINES continuation rows + output row.
+        assert_eq!(
+            collapsed.area.height,
+            1 + crate::ansi::COLLAPSED_MAX_LINES as u16 + 1
+        );
+        assert!(row_text(&collapsed, 3).contains("truncated for display"));
+        assert!(row_text(&collapsed, 6).contains("done"));
+
+        let expanded = block.render(40, true);
+        assert!(expanded.area.height > collapsed.area.height);
     }
 }

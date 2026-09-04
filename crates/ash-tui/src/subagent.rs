@@ -1,4 +1,4 @@
-use ash_core::{SessionEvent, SessionId, TurnId, TurnStats};
+use ash_core::{SessionEvent, SessionId, TurnActivity, TurnId};
 
 /// Presentation-only snapshot of a child agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,10 +7,9 @@ pub struct SubagentView {
     pub session_id: SessionId,
     pub name: String,
     pub state: SubagentViewState,
-    pub stats: TurnStats,
+    pub activity: TurnActivity,
     pub context_tokens: Option<u64>,
     pub context_limit: Option<u64>,
-    pub tool_calls: usize,
     pub active_turn: Option<TurnId>,
 }
 

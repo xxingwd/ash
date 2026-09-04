@@ -9,8 +9,6 @@
 //! so the agent still receives the full tool output for reasoning.
 
 use ansi_to_tui::IntoText;
-#[cfg(test)]
-use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -258,76 +256,6 @@ pub fn wrap_highlighted_line(line: &Line<'static>, width: usize) -> Vec<Line<'st
     crate::wrap::wrap_styled_line(line, width)
 }
 
-#[cfg(test)]
-/// Render tool output for display: the first `head` lines, then an ellipsis
-/// marker, then the last `tail` lines when the output is too long. Each shown
-/// line is parsed for ANSI colors and dimmed to visually recede behind the
-/// tool title. The first line uses `first_prefix` (e.g. `└ `) and all later
-/// lines use `subsequent_prefix` (e.g. four spaces).
-pub fn split_output(
-    output: &str,
-    head: usize,
-    tail: usize,
-    first_prefix: &str,
-    subsequent_prefix: &str,
-    dim: bool,
-) -> Vec<Line<'static>> {
-    let lines: Vec<&str> = output.lines().collect();
-    let rendered = lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let mut rendered = parse_ansi_line(line);
-            let prefix = if index == 0 {
-                first_prefix
-            } else {
-                subsequent_prefix
-            };
-            prefix_line(&mut rendered, prefix, dim);
-            rendered
-        })
-        .collect::<Vec<_>>();
-    let total = rendered.len();
-    if total <= head + tail {
-        return rendered;
-    }
-    let omitted = total - head - tail;
-    let mut ellipsis = Line::from(format!(
-        "{subsequent_prefix}… +{omitted} lines (truncated for display)"
-    ));
-    for span in &mut ellipsis.spans {
-        span.style = span.style.add_modifier(Modifier::DIM);
-    }
-    split_with_ellipsis(rendered, head, tail, ellipsis)
-}
-
-/// Keep the first `head` and last `tail` items of `items`, inserting
-/// `ellipsis` between them when anything was omitted. Shared by tool output
-/// and multi-line bash command truncation.
-pub fn split_with_ellipsis<T>(mut items: Vec<T>, head: usize, tail: usize, ellipsis: T) -> Vec<T> {
-    let total = items.len();
-    if total <= head + tail {
-        return items;
-    }
-    let mut selected: Vec<T> = items.drain(..head).collect();
-    selected.push(ellipsis);
-    selected.extend(items.drain(total - head - tail..));
-    selected
-}
-
-#[cfg(test)]
-fn prefix_line(line: &mut Line<'static>, prefix: &str, dim: bool) {
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::raw(prefix.to_string()));
-    spans.extend(std::mem::take(&mut line.spans));
-    if dim {
-        for span in &mut spans {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        }
-    }
-    line.spans = spans;
-}
-
 /// Expand tabs to spaces so gutter alignment stays stable.
 fn expand_tabs(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains('\t') {
@@ -352,36 +280,6 @@ mod tests {
         assert_eq!(combined, "red text");
         // First span carries the red foreground.
         assert!(line.spans[0].style.fg.is_some());
-    }
-
-    #[test]
-    fn split_output_keeps_head_and_tail_with_ellipsis() {
-        let output = (1..=10)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let lines = split_output(&output, 3, 2, "  └ ", "    ", true);
-        let text: Vec<String> = lines.iter().map(plain).collect();
-        assert_eq!(text[0], "  └ line 1");
-        assert_eq!(text[1], "    line 2");
-        assert_eq!(text[2], "    line 3");
-        assert!(text[3].contains("+5 lines"));
-        assert_eq!(text[4], "    line 9");
-        assert_eq!(text[5], "    line 10");
-    }
-
-    #[test]
-    fn split_output_returns_all_lines_when_short() {
-        let lines = split_output("a\nb", 3, 3, "", "", true);
-        let text: Vec<String> = lines.iter().map(plain).collect();
-        assert_eq!(text, vec!["a", "b"]);
-    }
-
-    fn plain(line: &Line<'static>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.to_string())
-            .collect()
     }
 }
 
