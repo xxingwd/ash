@@ -58,9 +58,11 @@ cargo run -p ash-cli -- \
 `thinking.type=adaptive;output_config.effort=high`。Ash 不解释这些供应商字段，只在发送前
 写入请求 body；`model`、`messages`、`input`、`tools`、`stream`、`system` 和
 `instructions` 等请求结构字段不能覆盖。
+这些配置在启动时读取、解析一次；嵌入式调用通过 `ProviderConfig.model_config` 显式传入，
+不同 adapter 的配置相互独立，请求转换不再读取进程环境变量。
 
 模型上下文窗口默认是 1M token，可用 `--max-context-tokens` 或
-`ASH_MAX_CONTEXT_TOKENS` 覆盖。Ash 使用每 4 个字符约 1 token 的轻量估算，不引入 tokenizer
+`ASH_MAX_CONTEXT_TOKENS` 覆盖。Ash 使用每 4 个 UTF-8 字节约 1 token 的轻量估算，不引入 tokenizer
 依赖；该估算只用于模型调用前的 context preflight 和自动压缩判断。Turn 结束后的 `Worked`
 行显示本轮所有模型请求返回的输入、输出 token、生成速度和实际工具调用数；服务端未返回
 usage 时不会用本地估算回填。
@@ -68,9 +70,9 @@ usage 时不会用本地估算回填。
 估算输入达到模型上限的 80% 时，Ash 会在正式请求前自动压缩模型上下文。压缩器使用固定
 system prompt，在一次不带工具、未指定业务输出上限的独立请求中摘要全部已完成 Turn；当前
 正在运行的 input 和 steps 始终留在摘要外。再次压缩只发送旧摘要之后新增的 Turn。原始
-Conversation、终端 scrollback 和会话标题保持完整，只有模型上下文使用 checkpoint。摘要
-prompt 会限制工具文本且不携带附件；工具刚执行完写入会话前仍有 64 KiB 的运行时上限。
-交互模式下可用 `/compact` 随时主动更新 checkpoint。
+JSONL 和会话标题保持完整；内存 `Conversation` 在 checkpoint 落盘后立即释放其覆盖的 Turn，
+只保留摘要与之后的 Turn。摘要 prompt 会限制工具文本且不携带附件；工具刚执行完写入会话前
+仍有 64 KiB 的运行时上限。交互模式下可用 `/compact` 随时主动更新 checkpoint。
 
 单次输出模式：
 
@@ -78,6 +80,12 @@ prompt 会限制工具文本且不携带附件；工具刚执行完写入会话�
 cargo run -p ash-cli -- run "inspect this project"
 cargo run -p ash-cli -- run --log "inspect this project"  # 额外输出 debug 日志到 stderr，便于排查
 ```
+
+非交互模式按已提交的 step 输出文本，而不是立即输出每个流式 delta，避免网络重试时将被丢弃的
+响应混入 stdout。交互模式仍显示实时预览，重试时会清除当前未提交的响应。
+
+每个 Session 最多接收 64 个尚未完成的 turn，包含正在执行的 turn。异步 `submit` 在容量耗尽时
+等待，`try_submit` 立即返回队列已满；CLI 使用后者，保持控制命令可响应。
 
 ## 项目上下文
 
@@ -122,17 +130,19 @@ Session ID：
 <session-id>.jsonl
 ```
 
-普通新会话的文件在第一个 Turn 完成时才会创建；带非空历史的 fork 会立即写入新文件。
-持久化只有三种记录：`Init { identity, created_at, title }`、`Turn { turn, summary }` 和
-`Checkpoint { summary }`。首行 `Init` 不夹带历史；后续每个完整 Turn 单独占一行。恢复时
-按记录位置推导 checkpoint 覆盖的 Turn，UI 重放完整 Conversation，模型请求只读取未被摘要
-覆盖的 Turn。旧格式不读取或迁移。恢复时
-沿用当前运行配置，不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此
-API Key、访问令牌和自定义接口地址内容不会写入文件。
+普通新会话在第一个 Step 完成或 Turn 结束时创建文件；带非空历史的 fork 会立即写入新文件。
+首行是 `Init { identity, created_at, title }`，每轮随后写入一个 `TurnStart { id, input }`、零个
+或多个 `TurnStep { step }`，最后由 `TurnEnd { result, stats, summary }` 封口；独立的
+`Checkpoint { summary }` 记录手动压缩。每个完成 Step 都会先刷新并同步到磁盘，再用于下一次
+模型请求和通知 UI。恢复时单次流式重放，遇到 checkpoint 就丢弃它覆盖的 Turn，
+不会把整个 JSONL 长期留在内存；若文件尾部留下开放 Turn，则从 `TurnStart` 起截断，既不显示也
+不放入最终会话。旧格式不读取或迁移。恢复会话沿用当前运行配置，
+不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此 API Key、访问令牌和
+自定义接口地址内容不会写入文件。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
 Session。`/status` 显示当前会话的模型、协议和工作目录。`/exit`（别名 `/quit`）退出
-Ash。`/resume` 会用所选 JSONL 重建模型上下文，并把完整消息重放到终端 scrollback。
+Ash。`/resume` 会用所选 JSONL 的最新摘要和之后的消息重建内存与终端 scrollback。
 `/undo` 会把最近一轮（上一条用户输入及其回答）从模型会话历史和终端 viewport 中移除，
 并把该输入恢复到输入框，便于修改后重新提交。`/fork` 会列出当前会话的历史用户输入；
 选中后创建一个新的 fork Session，继承该输入之前的消息，并把所选输入恢复到输入框。
@@ -168,13 +178,14 @@ child 与 root 使用同一套普通 Session 和 JSONL 持久化规则，保留�
 ## 终端行为
 
 交互界面使用 Ratatui inline viewport，不进入 alternate screen，也不捕获鼠标。终端原生
-滚动、选择和复制因此保持可用。当前用户消息、流式 Thought、工具与回答只存在于本轮 live
+滚动、选择和复制因此保持可用。尚未完成的流式 Thought、工具与回答存在于本轮 live
 viewport；它按实际内容高度增长，填满首屏后在首屏内部跟随最新内容。
 
-收到携带完整 `Turn` 的 `Finished` 事件后，UI 才在一次同步更新中把整轮语义块依次写到终端 scrollback，
-随后从 live transcript 移入轻量语义历史并释放渲染缓存。完成历史不参与逐帧渲染；只有
-resize 会先清空可见屏幕与 scrollback，再按当前宽度从头重放。重放逐块渲染并立即释放
-Buffer，不会同时缓存整段历史。日常滚动、选择和复制仍由终端模拟器负责。`/new`、
+收到已经持久化的 `StepCommitted` 后，UI 会用完整 Step 替换当前预览，并立即写入终端
+scrollback；`Finished` 只补齐可能遗漏的 Step 和本轮 footer，不重复输出已经提交的内容。
+完成历史随后释放渲染缓存，不参与逐帧渲染。resume、fork 和压缩都把当前内存
+`Conversation`（可选摘要及其后的 Turn）转换成相同的历史块；resize 使用同一历史块渲染器
+按新尺寸清空并重放当前内存内容。日常滚动、选择和复制仍由终端模拟器负责。`/new`、
 `/clear` 会同时清除语义历史、可见屏幕和 scrollback，`/resume` 和完成的 `/fork`
 则从对应 Session 消息重新渲染历史。
 
@@ -202,8 +213,8 @@ Shell 意图。聚合只影响展示，底层工具调用、结果和会话记�
 - `Ctrl-Home` / `Ctrl-End`：跳到当前 live turn 顶部或底部
 - `Ctrl-O`：在所有可见工具输出与思考区之间切换折叠（5 行预览）与完整展开
 - 鼠标滚轮和终端原生快捷键：浏览已完成的 scrollback
-- 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；没有后续排队任务时，只有
-  已完成的工具结果会保留本轮，否则撤销整轮并把原问题恢复到输入框
+- 任务运行时按一次 `Esc`：撤回未完成的响应块并中断当前轮；已经提交的 Step 保留在历史中，
+  尚无完成 Step 且没有后续排队任务时撤销整轮并把原问题恢复到输入框
 - 任务运行且输入框为空时 `Ctrl-C`：取消当前 Turn；有草稿时先清空输入
 - 空闲且输入框为空时 `Ctrl-C` 或 `Ctrl-D`：退出
 - `exit` / `quit`：退出

@@ -8,8 +8,6 @@ pub struct SubagentView {
     pub name: String,
     pub state: SubagentViewState,
     pub activity: TurnActivity,
-    pub context_tokens: Option<u64>,
-    pub context_limit: Option<u64>,
     pub active_turn: Option<TurnId>,
 }
 

@@ -62,7 +62,10 @@ pub struct ProviderConfig {
     pub protocol: Protocol,
     pub api_key: secrecy::SecretString,
     pub base_url: Option<String>,
+    pub model_config: ModelConfig,
 }
+
+pub use model_config::ModelConfig;
 
 impl ProviderConfig {
     pub(crate) fn base_url<'a>(&'a self, default: &'a str) -> &'a str {
@@ -136,7 +139,9 @@ pub fn create_adapter(cfg: ProviderConfig) -> Arc<dyn ModelClient> {
     }
 }
 
-pub(crate) fn context_turns(context: &ModelContext) -> impl Iterator<Item = (&Input, &[Step])> {
+pub(crate) fn context_turns(
+    context: &ModelContext,
+) -> impl Iterator<Item = (&Input, &[Arc<Step>])> {
     context
         .turns()
         .iter()
@@ -156,7 +161,7 @@ pub(crate) mod test_support {
             model: ModelId::new("test"),
             system: None,
             context: ModelContext::default()
-                .with_current(Input::user("question"), vec![Step { items }]),
+                .with_current(Input::user("question"), vec![Step { items }.into()]),
             tools: Vec::new(),
             max_tokens: None,
         }
@@ -232,6 +237,7 @@ mod tests {
             protocol: Protocol::Completions,
             api_key: secrecy::SecretString::new("key".into()),
             base_url: None,
+            model_config: ModelConfig::default(),
         };
         assert_eq!(
             default.base_url("https://api.openai.com"),
@@ -242,6 +248,7 @@ mod tests {
             protocol: Protocol::Completions,
             api_key: secrecy::SecretString::new("key".into()),
             base_url: Some("https://example.com/v1/".to_string()),
+            model_config: ModelConfig::default(),
         };
         assert_eq!(
             configured.base_url("https://api.openai.com"),

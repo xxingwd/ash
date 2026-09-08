@@ -2,12 +2,12 @@
 
 ## 项目结构与模块组织
 
-Ash 是位于 `crates/` 下的 Rust 2021 workspace。`ash-core` 定义共享类型；`ash-protocol` 实现流式适配器；`ash-tools` 包含文件和 shell 工具；`ash-agent` 负责会话、提示词、技能与 MCP；`ash-collab` 实现子代理协调；`ash-tui` 实现内联 UI；`ash-cli` 构建可执行二进制。集成测试与 Insta 快照测试位于 `crates/ash-core/tests/`。架构约束记录在 `DESIGN.md` 中。
+Ash 是位于 `crates/` 下的 Rust 2021 workspace。`ash-core` 定义共享类型；`ash-protocol` 实现流式适配器；`ash-tools` 包含文件和 shell 工具；`ash-agent` 负责会话、提示词、技能与 MCP；`ash-collab` 实现子代理协调；`ash-workflow` 实现 JavaScript 工作流与子任务生命周期；`ash-tui` 实现内联 UI；`ash-cli` 构建可执行二进制。测试与被测模块放在一起，序列化契约的回归测试主要位于 `ash-core` 与持久化模块中。架构约束记录在 `DESIGN.md` 中。
 
 ## 构建、测试与开发命令
 
-- `cargo run -p ash-cli -- --print "inspect this project"` 运行一次非交互式请求。
-- `cargo test --workspace` 运行所有单元测试、集成测试与快照测试。
+- `cargo run -p ash-cli -- run "inspect this project"` 运行一次非交互式请求。
+- `cargo test --workspace` 运行所有 workspace 测试。
 - `cargo fmt --all -- --check` 校验标准 Rust 格式。
 - `cargo clippy --workspace --all-targets -- -D warnings` 将所有 lint 警告视为错误。
 
@@ -50,4 +50,4 @@ Ash 是位于 `crates/` 下的 Rust 2021 workspace。`ash-core` 定义共享类�
 
 ## 安全与配置
 
-绝不提交 API 密钥、提供商令牌、日志或生成的文件。修改文件或进程执行相关代码时，保留工具层的工作目录边界以及取消/超时行为。
+绝不提交 API 密钥、提供商令牌、日志或生成的文件。工作目录是相对路径的解析基准，不是文件系统沙箱；文件工具允许绝对路径和工作目录外的路径，shell 使用当前进程权限执行。修改文件或进程执行相关代码时，保留明确的路径语义以及取消/超时行为，不要将路径类型误当成权限校验。需要隔离时应在外部执行环境中配置。

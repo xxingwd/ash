@@ -2,25 +2,27 @@ use std::{collections::VecDeque, sync::Arc};
 
 use ash_core::{
     AshError, CancellationToken, Conversation, Input, SessionError, SessionEvent, SessionId,
-    SessionIdentity, Turn, TurnId, TurnResult,
+    SessionIdentity, Step, Turn, TurnId, TurnResult,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     context::estimate_request_tokens,
-    engine::{compact, run_turn, EngineOutcome},
-    jsonl::{JsonlSessionStore, OpenedSession, SessionWriter},
+    engine::{compact, run_turn, EngineOutcome, StepCommitter, TurnChannels},
+    jsonl::{JsonlSessionStore, OpenedSession, SessionWriter, TurnStart},
     Agent, Runtime,
 };
 
 const EMPTY_INPUT_ERROR: &str = "session input cannot be empty";
+const MAX_PENDING_TURNS: usize = 64;
 
 #[derive(Clone)]
 pub struct Session {
     identity: SessionIdentity,
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<SessionEvent>,
+    capacity: Arc<Semaphore>,
 }
 
 pub struct TurnHandle {
@@ -39,7 +41,8 @@ struct QueuedTurn {
     id: TurnId,
     input: Input,
     cancellation: CancellationToken,
-    completion: Option<oneshot::Sender<Result<Arc<Turn>, AshError>>>,
+    completion: oneshot::Sender<Result<Arc<Turn>, AshError>>,
+    _permit: OwnedSemaphorePermit,
 }
 
 enum Command {
@@ -50,7 +53,10 @@ enum Command {
         turn_id: TurnId,
         reply: oneshot::Sender<Result<Option<ForkedSession>, AshError>>,
     },
-    Compact(oneshot::Sender<Result<bool, AshError>>),
+    Compact {
+        cancellation: CancellationToken,
+        reply: oneshot::Sender<Result<bool, AshError>>,
+    },
 }
 
 impl Session {
@@ -59,6 +65,8 @@ impl Session {
         let (commands, command_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(256);
         let actor_events = events.clone();
+        let capacity = Arc::new(Semaphore::new(MAX_PENDING_TURNS));
+        let actor_capacity = Arc::clone(&capacity);
         tokio::spawn(async move {
             if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                 run_session(state, command_rx, actor_events),
@@ -71,11 +79,13 @@ impl Session {
                     "session actor panicked"
                 );
             }
+            actor_capacity.close();
         });
         Self {
             identity,
             commands,
             events,
+            capacity,
         }
     }
 
@@ -95,13 +105,28 @@ impl Session {
     }
 
     pub async fn submit(&self, input: impl Into<Input>) -> Result<TurnHandle, AshError> {
-        let (command, handle) = self.prepare_submission(input.into())?;
+        let input = input.into();
+        ensure_nonempty(&input)?;
+        let permit = Arc::clone(&self.capacity)
+            .acquire_owned()
+            .await
+            .map_err(|_| closed())?;
+        let (command, handle) = self.prepare_submission(input, permit);
         self.commands.send(command).await.map_err(|_| closed())?;
         Ok(handle)
     }
 
     pub fn try_submit(&self, input: impl Into<Input>) -> Result<TurnHandle, AshError> {
-        let (command, handle) = self.prepare_submission(input.into())?;
+        let input = input.into();
+        ensure_nonempty(&input)?;
+        let permit =
+            Arc::clone(&self.capacity)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::NoPermits => SessionError::QueueFull,
+                    tokio::sync::TryAcquireError::Closed => SessionError::Closed,
+                })?;
+        let (command, handle) = self.prepare_submission(input, permit);
         self.commands
             .try_send(command)
             .map_err(|error| match error {
@@ -124,7 +149,19 @@ impl Session {
     }
 
     pub async fn compact(&self) -> Result<bool, AshError> {
-        self.ask(Command::Compact).await
+        self.compact_with_cancellation(CancellationToken::new())
+            .await
+    }
+
+    pub async fn compact_with_cancellation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<bool, AshError> {
+        self.ask(|reply| Command::Compact {
+            cancellation,
+            reply,
+        })
+        .await
     }
 
     async fn ask<T>(
@@ -139,17 +176,21 @@ impl Session {
         result.await.map_err(|_| closed())?
     }
 
-    fn prepare_submission(&self, input: Input) -> Result<(Command, TurnHandle), AshError> {
-        ensure_nonempty(&input)?;
+    fn prepare_submission(
+        &self,
+        input: Input,
+        permit: OwnedSemaphorePermit,
+    ) -> (Command, TurnHandle) {
         let id = TurnId::new();
         let cancellation = CancellationToken::new();
         let (completion_tx, completion) = oneshot::channel();
-        Ok((
+        (
             Command::Submit(QueuedTurn {
                 id,
                 input,
                 cancellation: cancellation.clone(),
-                completion: Some(completion_tx),
+                completion: completion_tx,
+                _permit: permit,
             }),
             TurnHandle {
                 session_id: self.id(),
@@ -157,7 +198,7 @@ impl Session {
                 cancellation,
                 completion,
             },
-        ))
+        )
     }
 }
 
@@ -212,9 +253,11 @@ async fn run_queued_turn(
         input,
         cancellation,
         completion,
+        _permit,
     } = queued;
     publish(events, SessionEvent::Started(id));
     let (live_tx, mut live_rx) = mpsc::channel(64);
+    let (committer, mut commits) = StepCommitter::channel();
     let model = state.runtime.model_handle();
     let agent = state.agent.clone();
     let conversation = state.conversation.clone();
@@ -223,8 +266,8 @@ async fn run_queued_turn(
         &agent,
         &conversation,
         id,
-        input,
-        live_tx,
+        input.clone(),
+        TurnChannels::new(live_tx, committer),
         ash_core::ToolContext {
             identity: state.identity,
             cancellation: cancellation.clone(),
@@ -232,10 +275,45 @@ async fn run_queued_turn(
         },
     );
     tokio::pin!(execution);
+    let mut committed_steps = 0;
+    let mut commit_error = None;
     let outcome = loop {
         tokio::select! {
             biased;
             outcome = &mut execution => break outcome,
+            commit = commits.recv(), if commit_error.is_none() => {
+                let Some(commit) = commit else {
+                    continue;
+                };
+                while let Ok(event) = live_rx.try_recv() {
+                    publish(events, event);
+                }
+                let start = (committed_steps == 0).then(|| TurnStart {
+                    id,
+                    input: input.clone(),
+                });
+                match state
+                    .commit_step(start, Arc::clone(&commit.step))
+                    .await
+                {
+                    Ok(()) => {
+                        publish(
+                            events,
+                            SessionEvent::StepCommitted {
+                                turn_id: id,
+                                index: committed_steps,
+                                step: commit.step,
+                            },
+                        );
+                        committed_steps += 1;
+                        let _ = commit.reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        commit_error = Some(error.to_string());
+                        let _ = commit.reply.send(Err(error));
+                    }
+                }
+            }
             event = live_rx.recv() => {
                 if let Some(event) = event {
                     publish(events, event);
@@ -260,7 +338,16 @@ async fn run_queued_turn(
     let discard = matches!(outcome.turn.result, TurnResult::Cancelled)
         && !outcome.turn.has_tools()
         && queue.is_empty();
-    let result = if discard {
+    let result = if let Some(error) = commit_error {
+        publish(
+            events,
+            SessionEvent::Discarded {
+                turn_id: id,
+                error: Some(error.clone()),
+            },
+        );
+        Err(outcome.error.unwrap_or_else(|| AshError::Config(error)))
+    } else if discard {
         publish(
             events,
             SessionEvent::Discarded {
@@ -270,20 +357,23 @@ async fn run_queued_turn(
         );
         Err(AshError::Cancelled)
     } else {
-        commit_outcome(state, outcome, events).await
+        commit_outcome(state, outcome, committed_steps > 0, events).await
     };
-    if let Some(completion) = completion {
-        let _ = completion.send(result);
-    }
+    let _ = completion.send(result);
 }
 
 async fn commit_outcome(
     state: &mut SessionActorState,
     outcome: EngineOutcome,
+    start_written: bool,
     events: &broadcast::Sender<SessionEvent>,
 ) -> Result<Arc<Turn>, AshError> {
     let turn = Arc::clone(&outcome.turn);
-    if let Err(error) = state.commit_turn(Arc::clone(&turn), outcome.summary).await {
+    let summary = outcome.summary;
+    if let Err(error) = state
+        .commit_turn(Arc::clone(&turn), summary.clone(), start_written)
+        .await
+    {
         publish(
             events,
             SessionEvent::Discarded {
@@ -293,7 +383,13 @@ async fn commit_outcome(
         );
         return Err(error);
     }
-    publish(events, SessionEvent::Finished(Arc::clone(&turn)));
+    publish(
+        events,
+        SessionEvent::Finished {
+            turn: Arc::clone(&turn),
+            summary,
+        },
+    );
     match outcome.error {
         Some(error) => Err(error),
         None => Ok(turn),
@@ -306,7 +402,7 @@ fn dispatch_active(command: Command, queue: &mut VecDeque<QueuedTurn>) {
         Command::View(reply) => reject_busy(reply),
         Command::Undo(reply) => reject_busy(reply),
         Command::Fork { reply, .. } => reject_busy(reply),
-        Command::Compact(reply) => reject_busy(reply),
+        Command::Compact { reply, .. } => reject_busy(reply),
     }
 }
 
@@ -338,8 +434,22 @@ async fn dispatch_idle(
             });
             let _ = reply.send(result);
         }
-        Command::Compact(reply) => {
-            let _ = reply.send(state.compact().await);
+        Command::Compact {
+            cancellation,
+            mut reply,
+        } => {
+            let operation = state.compact(&cancellation);
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                () = reply.closed() => {
+                    cancellation.cancel();
+                    let _ = operation.await;
+                }
+                result = &mut operation => {
+                    let _ = reply.send(result);
+                }
+            }
         }
     }
 }
@@ -351,6 +461,7 @@ fn reject_busy<T>(reply: oneshot::Sender<Result<T, AshError>>) {
 fn publish(events: &broadcast::Sender<SessionEvent>, event: SessionEvent) {
     match &event {
         SessionEvent::Started(turn_id) => tracing::info!(%turn_id, "turn started"),
+        SessionEvent::Retrying { turn_id } => tracing::info!(%turn_id, "model response retrying"),
         SessionEvent::Text { turn_id, text } => {
             tracing::debug!(%turn_id, chars = text.len(), "text streamed")
         }
@@ -383,10 +494,21 @@ fn publish(events: &broadcast::Sender<SessionEvent>, event: SessionEvent) {
             Ok(output) => tracing::info!(%turn_id, %id, chars = output.len(), "tool finished"),
             Err(_) => tracing::warn!(%turn_id, %id, "tool failed"),
         },
-        SessionEvent::Finished(turn) => tracing::info!(
+        SessionEvent::StepCommitted {
+            turn_id,
+            index,
+            step,
+        } => tracing::info!(
+            %turn_id,
+            index,
+            items = step.items.len(),
+            "turn step committed"
+        ),
+        SessionEvent::Finished { turn, summary } => tracing::info!(
             turn_id = %turn.id,
             tools = turn.completed_tool_calls(),
             result = turn_result_label(&turn.result),
+            compacted = summary.is_some(),
             "turn finished"
         ),
         SessionEvent::Discarded { turn_id, error } if error.is_some() => {
@@ -457,16 +579,36 @@ impl SessionActorState {
         &mut self,
         turn: Arc<Turn>,
         summary: Option<String>,
+        start_written: bool,
     ) -> Result<(), AshError> {
         let writer = self.writer().await?;
         writer
-            .commit_turn(Arc::clone(&turn), summary.clone())
+            .finish_turn(
+                (!start_written).then(|| TurnStart {
+                    id: turn.id,
+                    input: turn.input.clone(),
+                }),
+                turn.result.clone(),
+                turn.stats,
+                summary.clone(),
+            )
             .await?;
         self.conversation.push(turn, summary);
         Ok(())
     }
 
-    async fn compact(&mut self) -> Result<bool, AshError> {
+    async fn commit_step(
+        &mut self,
+        start: Option<TurnStart>,
+        step: Arc<Step>,
+    ) -> Result<(), AshError> {
+        self.writer().await?.commit_step(start, step).await
+    }
+
+    async fn compact(&mut self, cancellation: &CancellationToken) -> Result<bool, AshError> {
+        if cancellation.is_cancelled() {
+            return Err(AshError::Cancelled);
+        }
         let tools = self.agent.tool_definitions();
         let before = estimate_request_tokens(
             self.agent.system_prompt(),
@@ -477,7 +619,7 @@ impl SessionActorState {
             self.runtime.model(),
             &self.agent,
             &self.conversation,
-            &CancellationToken::new(),
+            cancellation,
         )
         .await?
         else {
@@ -514,9 +656,9 @@ impl SessionActorState {
             return Ok(None);
         };
         let mut state = Self::new(self.agent.clone(), self.runtime.clone());
-        if !conversation.turns().is_empty() {
+        if conversation.summary().is_some() || !conversation.turns().is_empty() {
             let mut writer = state.store.open_new(state.identity).await?;
-            writer.seed(conversation.turns()).await?;
+            writer.seed(&conversation, &input).await?;
             state.writer = Some(writer);
         }
         state.conversation = conversation;
@@ -560,7 +702,11 @@ mod tests {
         },
     };
 
-    use ash_core::{ModelEvent, ModelId, ModelRequest, ModelStream, ProtocolError, StopReason};
+    use ash_core::{
+        define_tool, ModelEvent, ModelId, ModelRequest, ModelStream, ProtocolError, StopReason,
+        TurnStats,
+    };
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     use super::*;
@@ -597,6 +743,31 @@ mod tests {
         started: tokio::sync::Notify,
     }
 
+    struct StepThenPendingModel {
+        calls: AtomicUsize,
+    }
+
+    impl ash_core::ModelClient for StepThenPendingModel {
+        fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ProtocolError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::pin(futures::stream::iter(
+                    [
+                        ModelEvent::ToolCall {
+                            id: ash_core::ToolCallId::from_provider("call"),
+                            name: "test".to_string(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ModelEvent::Stop(StopReason::EndTurn),
+                    ]
+                    .into_iter()
+                    .map(Ok),
+                )))
+            } else {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+    }
+
     impl ash_core::ModelClient for QueueModel {
         fn stream(&self, _request: ModelRequest) -> Result<ModelStream, ProtocolError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -623,6 +794,119 @@ mod tests {
             ModelEvent::Text(text.to_string()),
             ModelEvent::Stop(StopReason::EndTurn),
         ]
+    }
+
+    #[tokio::test]
+    async fn bounds_all_accepted_turns_even_after_the_mailbox_is_drained() {
+        let directory = TempDir::new().unwrap();
+        let session = runtime(Arc::new(PendingModel), &directory).start(&agent());
+        let mut handles = VecDeque::new();
+        for index in 0..MAX_PENDING_TURNS {
+            handles.push_back(session.try_submit(format!("turn {index}")).unwrap());
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            session.try_submit("overflow"),
+            Err(AshError::Session(SessionError::QueueFull))
+        ));
+        let first = handles.pop_front().unwrap();
+        first.cancellation_token().cancel();
+        first.wait().await.unwrap();
+        handles.push_back(session.try_submit("released slot").unwrap());
+        for handle in handles {
+            handle.cancellation_token().cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn async_submission_waits_for_capacity_without_losing_a_slot() {
+        let directory = TempDir::new().unwrap();
+        let session = runtime(Arc::new(PendingModel), &directory).start(&agent());
+        let mut handles = VecDeque::new();
+        for _ in 0..MAX_PENDING_TURNS {
+            handles.push_back(session.submit("pending").await.unwrap());
+        }
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            session.submit("overflow")
+        )
+        .await
+        .is_err());
+        let first = handles.pop_front().unwrap();
+        first.cancellation_token().cancel();
+        first.wait().await.unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), session.submit("next"))
+            .await
+            .unwrap()
+            .unwrap();
+        handles.push_back(next);
+        for handle in handles {
+            handle.cancellation_token().cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_manual_compaction_preserves_history_and_releases_the_actor() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime(Arc::new(PendingModel), &directory);
+        let mut state = SessionActorState::new(agent(), runtime);
+        state.conversation.push(
+            Arc::new(Turn {
+                id: TurnId::new(),
+                input: Input::user("history"),
+                steps: Vec::new(),
+                result: TurnResult::Stopped(StopReason::EndTurn),
+                stats: Default::default(),
+            }),
+            None,
+        );
+        let session = Session::spawn(state);
+        let cancellation = CancellationToken::new();
+        let running = session.clone();
+        let token = cancellation.clone();
+        let task = tokio::spawn(async move { running.compact_with_cancellation(token).await });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(AshError::Cancelled)
+        ));
+        let conversation = session.conversation().await.unwrap();
+        assert_eq!(conversation.turns().len(), 1);
+        assert!(conversation.summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_manual_compaction_cancels_the_model_wait() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime(Arc::new(PendingModel), &directory);
+        let mut state = SessionActorState::new(agent(), runtime);
+        state.conversation.push(
+            Arc::new(Turn {
+                id: TurnId::new(),
+                input: Input::user("history"),
+                steps: Vec::new(),
+                result: TurnResult::Stopped(StopReason::EndTurn),
+                stats: Default::default(),
+            }),
+            None,
+        );
+        let session = Session::spawn(state);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), session.compact())
+                .await
+                .is_err()
+        );
+        let conversation =
+            tokio::time::timeout(std::time::Duration::from_secs(1), session.conversation())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(conversation.turns().len(), 1);
+        assert!(conversation.summary().is_none());
     }
 
     #[tokio::test]
@@ -658,8 +942,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1]["summary"], serde_json::Value::Null);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[1]["type"], "turn_start");
+        assert_eq!(records[2]["type"], "turn_step");
+        assert_eq!(records[3]["summary"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -686,6 +972,34 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn fork_preserves_a_checkpoint_before_the_selected_loaded_turn() {
+        let directory = TempDir::new().unwrap();
+        let runtime = runtime(Arc::new(MockModel::new([])), &directory);
+        let mut state = SessionActorState::new(agent(), runtime);
+        state.conversation.compact("older turns".to_string());
+        let selected = Arc::new(Turn {
+            id: TurnId::new(),
+            input: Input::user("selected"),
+            steps: Vec::new(),
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: TurnStats::default(),
+        });
+        state.conversation.push(Arc::clone(&selected), None);
+
+        let (fork, input) = state.fork_at(selected.id).await.unwrap().unwrap();
+        let fork_id = fork.identity.id();
+
+        assert_eq!(input, selected.input);
+        assert_eq!(fork.conversation.summary(), Some("older turns"));
+        assert!(fork.conversation.turns().is_empty());
+        drop(fork);
+
+        let stored = state.store.load(fork_id).await.unwrap().unwrap();
+        assert_eq!(stored.conversation.summary(), Some("older turns"));
+        assert!(stored.conversation.turns().is_empty());
     }
 
     #[tokio::test]
@@ -746,5 +1060,57 @@ mod tests {
         let conversation = session.conversation().await.unwrap();
         assert_eq!(conversation.turns().len(), 2);
         assert_eq!(conversation.turns()[0].result, TurnResult::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn step_is_persisted_and_published_before_the_turn_finishes() {
+        let directory = TempDir::new().unwrap();
+        let model = Arc::new(StepThenPendingModel {
+            calls: AtomicUsize::new(0),
+        });
+        let tool = define_tool("test", "test", |_, (): ()| async { Ok("done") }).unwrap();
+        let runtime = runtime(model, &directory);
+        let session = runtime.start(&Agent::new(ModelId::new("test-model"), vec![tool]));
+        let mut events = session.events();
+        let handle = session.submit("run").await.unwrap();
+
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut tool_finished = false;
+            loop {
+                match events.next().await {
+                    Some(Ok(SessionEvent::ToolFinished { .. })) => tool_finished = true,
+                    Some(Ok(event @ SessionEvent::StepCommitted { .. })) => {
+                        assert!(tool_finished);
+                        break event;
+                    }
+                    Some(Ok(_)) | Some(Err(_)) => {}
+                    None => panic!("session event stream closed"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            committed,
+            SessionEvent::StepCommitted { index: 0, .. }
+        ));
+
+        let path = directory.path().join(format!("{}.jsonl", session.id()));
+        let records = tokio::fs::read_to_string(&path).await.unwrap();
+        let types = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["type"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["init", "turn_start", "turn_step"]);
+
+        handle.cancellation_token().cancel();
+        let turn = handle.wait().await.unwrap();
+        assert_eq!(turn.result, TurnResult::Cancelled);
+        let records = tokio::fs::read_to_string(path).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(records.lines().last().unwrap()).unwrap()
+                ["type"],
+            "turn_end"
+        );
     }
 }

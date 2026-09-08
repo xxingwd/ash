@@ -9,7 +9,6 @@ use std::{
 };
 
 use ash_core::{CancellationToken, ToolError};
-use cap_std::{ambient_authority, fs::Dir};
 use ignore::WalkBuilder;
 
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -17,22 +16,17 @@ const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 const IO_BUFFER_BYTES: usize = 8 * 1024;
 
 pub struct WorkspacePath {
-    dir: Arc<Dir>,
-    relative: PathBuf,
     full_path: PathBuf,
 }
 
 pub struct SearchPath {
-    dir: Arc<Dir>,
     workspace: PathBuf,
     full_path: PathBuf,
 }
 
-/// Capability for filesystem operations rooted at one canonical workspace.
-/// The directory handle is opened once and shared by all built-in tools.
+/// Filesystem operations rooted at one workspace.
 pub(crate) struct Workspace {
     root: PathBuf,
-    dir: Arc<Dir>,
 }
 
 impl Workspace {
@@ -44,16 +38,7 @@ impl Workspace {
                 requested.display()
             ))
         })?;
-        let dir = Dir::open_ambient_dir(&root, ambient_authority()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot access working directory {}: {error}",
-                root.display()
-            ))
-        })?;
-        Ok(Arc::new(Self {
-            root,
-            dir: Arc::new(dir),
-        }))
+        Ok(Arc::new(Self { root }))
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -61,43 +46,19 @@ impl Workspace {
     }
 
     pub(crate) fn path(&self, requested: &str) -> Result<WorkspacePath, ToolError> {
-        let relative = relative_path(&self.root, requested)?;
-        let full_path = self.root.join(&relative);
-        Ok(WorkspacePath {
-            dir: Arc::clone(&self.dir),
-            relative,
-            full_path,
-        })
+        let full_path = resolve_path(&self.root, requested);
+        Ok(WorkspacePath { full_path })
     }
 
     pub(crate) fn search_path(&self, requested: &str) -> Result<SearchPath, ToolError> {
         let path = self.path(requested)?;
-        let metadata = std::fs::symlink_metadata(path.full_path()).map_err(|error| {
-            ToolError::Execution(format!(
-                "cannot access {}: {error}",
-                path.full_path().display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ToolError::Execution(format!(
-                "search path cannot be a symbolic link: {}",
-                path.full_path().display()
-            )));
-        }
         let full_path = std::fs::canonicalize(path.full_path()).map_err(|error| {
             ToolError::Execution(format!(
                 "cannot resolve {}: {error}",
                 path.full_path().display()
             ))
         })?;
-        if !full_path.starts_with(&self.root) {
-            return Err(ToolError::Execution(format!(
-                "path is outside working directory: {}",
-                full_path.display()
-            )));
-        }
         Ok(SearchPath {
-            dir: Arc::clone(&self.dir),
             workspace: self.root.clone(),
             full_path,
         })
@@ -111,12 +72,6 @@ impl Workspace {
                 candidate.display()
             ))
         })?;
-        if !resolved.starts_with(&self.root) {
-            return Err(ToolError::Execution(format!(
-                "working directory is outside the session working directory: {}",
-                resolved.display()
-            )));
-        }
         if !resolved.is_dir() {
             return Err(ToolError::Execution(format!(
                 "working directory is not a directory: {}",
@@ -217,19 +172,8 @@ impl SearchPath {
             .to_path_buf()
     }
 
-    /// Opens a file inside the workspace through the capability-backed
-    /// directory handle, so symlink escapes and absolute/`..` redirects are
-    /// rejected by the sandbox instead of being followed.
-    pub(crate) fn open_file(&self, path: &Path) -> std::io::Result<cap_std::fs::File> {
-        let relative = path.strip_prefix(&self.workspace).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "path escapes the workspace",
-            )
-        })?;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true);
-        self.dir.open_with(relative, &options)
+    pub(crate) fn open_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(path)
     }
 }
 
@@ -245,30 +189,32 @@ impl WorkspacePath {
 
     pub(crate) fn open_with(
         &self,
-        options: &cap_std::fs::OpenOptions,
-    ) -> std::io::Result<cap_std::fs::File> {
-        self.dir.open_with(&self.relative, options)
+        options: &std::fs::OpenOptions,
+    ) -> std::io::Result<std::fs::File> {
+        options.open(&self.full_path)
     }
 
     pub(crate) fn atomic_write(
         &self,
         content: &[u8],
-        permissions: Option<cap_std::fs::Permissions>,
+        permissions: Option<std::fs::Permissions>,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<(), ToolError> {
         ensure_running(cancellation, deadline)?;
-        let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
-        self.dir.create_dir_all(parent).map_err(write_error)?;
+        let parent = self.full_path.parent().unwrap_or_else(|| Path::new(""));
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(write_error)?;
+        }
         ensure_running(cancellation, deadline)?;
 
         let permissions = self.prepare_permissions(permissions)?;
         let file_name = self
-            .relative
+            .full_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file");
-        let mut options = cap_std::fs::OpenOptions::new();
+        let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
 
         for _ in 0..MAX_TEMP_FILE_ATTEMPTS {
@@ -277,7 +223,7 @@ impl WorkspacePath {
                 ".{file_name}.ash-write-{}-{id}",
                 std::process::id()
             ));
-            let file = match self.dir.open_with(&temp, &options) {
+            let file = match options.open(&temp) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(write_error(error)),
@@ -291,7 +237,7 @@ impl WorkspacePath {
                 deadline,
             );
             if result.is_err() {
-                let _ = self.dir.remove_file(&temp);
+                let _ = std::fs::remove_file(&temp);
             }
             return result;
         }
@@ -301,36 +247,26 @@ impl WorkspacePath {
         )))
     }
 
-    /// Decides the permissions for the replacement file: an explicit request,
-    /// the existing file's permissions, or none for a new file. Existing
-    /// symlinks are rejected because the atomic rename would otherwise replace
-    /// the link itself.
     fn prepare_permissions(
         &self,
-        permissions: Option<cap_std::fs::Permissions>,
-    ) -> Result<Option<cap_std::fs::Permissions>, ToolError> {
+        permissions: Option<std::fs::Permissions>,
+    ) -> Result<Option<std::fs::Permissions>, ToolError> {
         if let Some(permissions) = permissions {
             return Ok(Some(permissions));
         }
-        match self.dir.symlink_metadata(&self.relative) {
-            Ok(metadata) if metadata.file_type().is_symlink() => Err(ToolError::Execution(
-                "cannot write file: symbolic links are not writable".into(),
-            )),
+        match std::fs::metadata(&self.full_path) {
             Ok(metadata) => Ok(Some(metadata.permissions())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(write_error(error)),
         }
     }
 
-    /// Writes the content into the freshly-created temporary file, syncs it,
-    /// and renames it over the target path. On error the caller removes the
-    /// temporary file.
     fn commit_temp_file(
         &self,
-        mut file: cap_std::fs::File,
+        mut file: std::fs::File,
         temp: &Path,
         content: &[u8],
-        permissions: Option<&cap_std::fs::Permissions>,
+        permissions: Option<&std::fs::Permissions>,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<(), ToolError> {
@@ -343,9 +279,7 @@ impl WorkspacePath {
         file.sync_all().map_err(write_error)?;
         drop(file);
         ensure_running(cancellation, deadline)?;
-        self.dir
-            .rename(temp, &self.dir, &self.relative)
-            .map_err(write_error)
+        std::fs::rename(temp, &self.full_path).map_err(write_error)
     }
 }
 
@@ -378,44 +312,30 @@ where
         .map_err(|error| ToolError::Execution(format!("filesystem task failed: {error}")))?
 }
 
-fn relative_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
+fn resolve_path(root: &Path, requested: &str) -> PathBuf {
     let requested = Path::new(requested);
-    let relative = if requested.is_absolute() {
-        requested.strip_prefix(root).map_err(|_| {
-            ToolError::Execution(format!(
-                "path is outside working directory: {}",
-                requested.display()
-            ))
-        })?
+    let combined = if requested.is_absolute() {
+        requested.to_path_buf()
     } else {
-        requested
+        root.join(requested)
     };
+    normalize_path(&combined)
+}
 
+fn normalize_path(path: &Path) -> PathBuf {
     let mut clean = PathBuf::new();
-    for component in relative.components() {
+    for component in path.components() {
         match component {
-            Component::Normal(part) => clean.push(part),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !clean.pop() {
-                    return Err(ToolError::Execution(format!(
-                        "path escapes working directory: {}",
-                        requested.display()
-                    )));
-                }
+                clean.pop();
             }
-            // `relative` is always the result of `strip_prefix` (for absolute
-            // requests) or a plain relative request, so it never begins with a
-            // root or prefix component; this arm is defensive and unreachable.
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(ToolError::Execution(format!(
-                    "invalid path: {}",
-                    requested.display()
-                )));
-            }
+            Component::Normal(part) => clean.push(part),
+            Component::RootDir => clean.push(Component::RootDir),
+            Component::Prefix(prefix) => clean.push(Component::Prefix(prefix)),
         }
     }
-    Ok(clean)
+    clean
 }
 
 #[cfg(test)]
@@ -533,9 +453,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parent_escape() {
+    fn allows_parent_escape() {
         let root = tempfile::tempdir().unwrap();
-        assert!(WorkspacePath::new(root.path(), "../secret").is_err());
+        let path = WorkspacePath::new(root.path(), "../secret").unwrap();
+        let expected = root.path().parent().unwrap().join("secret");
+        assert_eq!(path.full_path(), expected);
     }
 
     #[test]
@@ -561,18 +483,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cannot_follow_a_symlink_outside_the_workdir() {
+    fn can_follow_a_symlink_outside_the_workdir() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let link = root.path().join("outside.txt");
         let target = outside.path().join("secret.txt");
         std::fs::write(&target, "secret").unwrap();
-        std::os::unix::fs::symlink(target, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let path = WorkspacePath::new(root.path(), "outside.txt").unwrap();
-        let mut options = cap_std::fs::OpenOptions::new();
+        let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        assert!(path.open_with(&options).is_err());
-        assert!(SearchPath::new(root.path(), "outside.txt").is_err());
+        assert!(path.open_with(&options).is_ok());
+        let search = SearchPath::new(root.path(), "outside.txt").unwrap();
+        assert_eq!(search.full_path(), std::fs::canonicalize(&target).unwrap());
     }
 }

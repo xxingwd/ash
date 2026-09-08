@@ -8,7 +8,7 @@ use crate::path::Workspace;
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteArgs {
-    /// File path, relative to the working directory or absolute within it
+    /// File path, relative to the working directory or absolute
     path: String,
     /// Complete file content
     content: String,
@@ -133,9 +133,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn allows_writes_outside_the_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+
+        let result = write_file(
+            &workspace,
+            target.to_str().unwrap(),
+            "outside content",
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.path, target);
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "outside content"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_symlink_writes_outside_the_workdir() {
+    async fn allows_symlink_writes_overwriting_link() {
         let root = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(root.path()).unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -143,7 +167,7 @@ mod tests {
         std::fs::write(&target, "secret").unwrap();
         std::os::unix::fs::symlink(&target, root.path().join("link.txt")).unwrap();
 
-        let error = write_file(
+        let result = write_file(
             &workspace,
             "link.txt",
             "changed",
@@ -151,16 +175,15 @@ mod tests {
             Instant::now() + Duration::from_mins(1),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        let full_path = root.path().join("link.txt");
-        assert!(matches!(
-            error,
-            ToolError::Execution(message)
-                if message == "cannot write file: symbolic links are not writable"
-                    && !message.contains(&full_path.display().to_string())
-        ));
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "secret");
+        assert_eq!(result.path, root.path().join("link.txt"));
+        assert_eq!(
+            tokio::fs::read_to_string(root.path().join("link.txt"))
+                .await
+                .unwrap(),
+            "changed"
+        );
     }
 
     #[tokio::test]

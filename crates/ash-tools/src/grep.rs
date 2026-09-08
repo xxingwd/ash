@@ -51,7 +51,7 @@ enum LineRead {
 pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "grep",
-        "Search file contents with a regular expression inside the working directory. Optionally filters files by glob and returns at most 100 matching lines.",
+        "Search file contents with a regular expression. Optionally filters files by glob and returns at most 100 matching lines.",
         move |ctx, args: GrepArgs| {
             let root = Arc::clone(&working_dir);
             let deadline = ctx.require_deadline();
@@ -486,7 +486,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlinked_files_that_escape_the_workspace() {
+    fn searches_symlinked_files_outside_the_workspace() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
@@ -496,23 +496,42 @@ mod tests {
         )
         .unwrap();
 
-        // The file is a symlink to a path outside the workspace, so it must
-        // not be readable through the capability-backed open even when a
-        // traversal swapped it in after the walker enumerated it.
         let search_path = SearchPath::new(root.path(), ".").unwrap();
         let link = root.path().join("link.txt");
-        assert!(search_path.open_file(&link).is_err());
+        assert!(search_path.open_file(&link).is_ok());
 
         let output = search(
             root.path(),
-            ".",
+            "link.txt",
             "needle",
             None,
             &CancellationToken::new(),
             Instant::now() + Duration::from_mins(1),
         )
         .unwrap();
-        assert_eq!(output, "No matches found");
+
+        assert!(output.contains("Found 1 matching lines"));
+        assert!(output.contains("needle"));
+    }
+
+    #[test]
+    fn searches_outside_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
+
+        let output = search(
+            root.path(),
+            outside.path().to_str().unwrap(),
+            "needle",
+            None,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .unwrap();
+
+        assert!(output.contains("Found 1 matching lines"));
+        assert!(output.contains("needle"));
     }
 
     #[test]

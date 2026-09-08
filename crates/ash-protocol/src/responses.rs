@@ -6,7 +6,7 @@ use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    content_value, context_turns, image_data_url, model_config,
+    content_value, context_turns, image_data_url,
     pending_calls::{usage_event, PendingCall},
     sse, text_tool_result, ProviderConfig,
 };
@@ -68,7 +68,6 @@ impl ResponsesAdapter {
         if let Some(max_tokens) = req.max_tokens {
             body["max_output_tokens"] = json!(max_tokens);
         }
-        model_config::apply_from_env(&mut body)?;
         Ok(body)
     }
 }
@@ -150,7 +149,8 @@ fn responses_content(contents: &[ash_core::Content]) -> Value {
 
 impl ModelClient for ResponsesAdapter {
     fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
-        let body = Self::build_request(&req)?;
+        let mut body = Self::build_request(&req)?;
+        self.config.model_config.apply(&mut body)?;
         let request = self
             .client
             .post(format!(
@@ -699,6 +699,7 @@ mod tests {
             protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let request = test_support::request(vec![
             Item::Thought {
@@ -734,6 +735,7 @@ mod tests {
             protocol: Protocol::Responses,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let request = test_support::request(vec![
             test_support::tool_result("first", Ok(test_support::output("first", Vec::new()))),

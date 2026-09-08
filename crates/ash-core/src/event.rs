@@ -3,11 +3,14 @@ use std::sync::Arc;
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
-use crate::{ToolCallId, Turn, TurnId, TurnStats};
+use crate::{Step, ToolCallId, Turn, TurnId, TurnStats};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Started(TurnId),
+    Retrying {
+        turn_id: TurnId,
+    },
     Text {
         turn_id: TurnId,
         text: String,
@@ -36,7 +39,15 @@ pub enum SessionEvent {
         id: ToolCallId,
         result: Result<String, String>,
     },
-    Finished(Arc<Turn>),
+    StepCommitted {
+        turn_id: TurnId,
+        index: usize,
+        step: Arc<Step>,
+    },
+    Finished {
+        turn: Arc<Turn>,
+        summary: Option<String>,
+    },
     Discarded {
         turn_id: TurnId,
         error: Option<String>,

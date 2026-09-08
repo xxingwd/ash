@@ -523,9 +523,11 @@ impl AgentControl {
 fn activity_event(event: SessionEvent) -> Option<SessionEvent> {
     match event {
         SessionEvent::Text { .. }
+        | SessionEvent::Retrying { .. }
         | SessionEvent::Thought { .. }
         | SessionEvent::ToolStarted { .. }
-        | SessionEvent::ToolFinished { .. } => None,
+        | SessionEvent::ToolFinished { .. }
+        | SessionEvent::StepCommitted { .. } => None,
         event => Some(event),
     }
 }

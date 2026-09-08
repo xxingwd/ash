@@ -29,6 +29,7 @@ const STATUS_INTERVAL: Duration = Duration::from_millis(350);
 pub enum UiError {
     Agent(AshError),
     ControllerStopped,
+    CommandQueueFull,
     InputDropped,
 }
 
@@ -37,6 +38,7 @@ impl fmt::Display for UiError {
         match self {
             Self::Agent(error) => write!(formatter, "{error}"),
             Self::ControllerStopped => formatter.write_str("session controller has stopped"),
+            Self::CommandQueueFull => formatter.write_str("session command queue is full"),
             Self::InputDropped => formatter.write_str("session controller dropped the input"),
         }
     }
@@ -75,14 +77,24 @@ pub enum UiEvent {
         conversation: Conversation,
         input: Option<Input>,
     },
-    CompactionCompleted(bool),
+    CompactionCompleted {
+        changed: bool,
+        conversation: Conversation,
+    },
     SessionsListed {
         sessions: Vec<SessionSummary>,
     },
     CommandFailed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContextUsage {
+    pub(crate) tokens: u64,
+    pub(crate) limit: u64,
+}
+
 pub(crate) struct AppState {
+    submission: Option<PendingSubmission>,
     pub(crate) protocol: String,
     pub(crate) model: String,
     pub(crate) working_dir: PathBuf,
@@ -99,9 +111,9 @@ pub(crate) struct AppState {
     pub(crate) next_block_id: u64,
     pub(crate) status: StatusState,
     pub(crate) turn_activity: Option<TurnActivity>,
-    pub(crate) context_tokens: Option<u64>,
-    pub(crate) context_limit: Option<u64>,
+    pub(crate) context: Option<ContextUsage>,
     pub(crate) current_turn_id: Option<TurnId>,
+    pub(crate) committed_steps: usize,
     pub(crate) reasoning_block_id: Option<u64>,
     pub(crate) assistant_block_id: Option<u64>,
 }
@@ -111,6 +123,49 @@ enum LoopAction {
     Continue,
     ResetTimers,
     Exit,
+}
+
+struct PendingSubmission {
+    input: String,
+    policy: SubmissionPolicy,
+    result: tokio::sync::oneshot::Receiver<Result<TurnId, UiError>>,
+}
+
+impl PendingSubmission {
+    fn send(
+        commands: &tokio::sync::mpsc::Sender<UiCommand>,
+        input: String,
+        policy: SubmissionPolicy,
+    ) -> Result<Self, UiError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(UiCommand::Submit {
+                input: input.clone(),
+                reply,
+            })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => UiError::CommandQueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => UiError::ControllerStopped,
+            })?;
+        Ok(Self {
+            input,
+            policy,
+            result,
+        })
+    }
+
+    async fn wait(&mut self) -> Result<TurnId, UiError> {
+        (&mut self.result)
+            .await
+            .map_err(|_| UiError::InputDropped)?
+    }
+}
+
+async fn submission_result(submission: &mut Option<PendingSubmission>) -> Result<TurnId, UiError> {
+    match submission {
+        Some(submission) => submission.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +183,7 @@ impl AppState {
         working_dir: PathBuf,
     ) -> Self {
         Self {
+            submission: None,
             protocol,
             model,
             working_dir,
@@ -144,9 +200,9 @@ impl AppState {
             next_block_id: 1,
             status: StatusState::default(),
             turn_activity: None,
-            context_tokens: None,
-            context_limit: None,
+            context: None,
             current_turn_id: None,
+            committed_steps: 0,
             reasoning_block_id: None,
             assistant_block_id: None,
         }
@@ -158,8 +214,8 @@ impl AppState {
         self.conversation = conversation;
         self.inputs.clear();
         self.turn_activity = None;
-        self.context_tokens = None;
-        self.context_limit = None;
+        self.context = None;
+        self.committed_steps = 0;
         changed
     }
 
@@ -181,8 +237,6 @@ impl AppState {
                 name: update.name.clone(),
                 state: SubagentViewState::Running,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             });
             self.subagents.len() - 1
@@ -251,42 +305,30 @@ fn update_subagent_session(agent: &mut SubagentView, event: SessionEvent) {
         SessionEvent::Started(turn_id) => {
             agent.active_turn = Some(turn_id);
             agent.activity = TurnActivity::default();
-            agent.context_tokens = None;
-            agent.context_limit = None;
         }
         SessionEvent::Activity { turn_id, activity } if agent.active_turn == Some(turn_id) => {
             agent.activity = activity;
         }
-        SessionEvent::Context {
-            turn_id,
-            tokens,
-            limit,
-        } if agent.active_turn == Some(turn_id) => {
-            agent.context_tokens = Some(tokens);
-            agent.context_limit = Some(limit);
-        }
-        SessionEvent::Finished(turn) if agent.active_turn == Some(turn.id) => {
+        SessionEvent::Finished { turn, .. } if agent.active_turn == Some(turn.id) => {
             agent.active_turn = None;
             agent.activity = TurnActivity {
                 stats: turn.stats,
                 completed_tool_calls: turn.completed_tool_calls(),
             };
-            agent.context_tokens = None;
-            agent.context_limit = None;
         }
         SessionEvent::Discarded { turn_id, .. } if agent.active_turn == Some(turn_id) => {
             agent.active_turn = None;
             agent.activity = TurnActivity::default();
-            agent.context_tokens = None;
-            agent.context_limit = None;
         }
         SessionEvent::Text { .. }
+        | SessionEvent::Retrying { .. }
         | SessionEvent::Thought { .. }
         | SessionEvent::Activity { .. }
         | SessionEvent::Context { .. }
         | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. }
-        | SessionEvent::Finished(_)
+        | SessionEvent::StepCommitted { .. }
+        | SessionEvent::Finished { .. }
         | SessionEvent::Discarded { .. } => {}
     }
 }
@@ -345,6 +387,23 @@ impl App {
 
         loop {
             tokio::select! {
+                biased;
+                result = submission_result(&mut state.submission) => {
+                    let (plan, action) = finish_submission(&mut state, result);
+                    state.apply(&mut terminal, plan)?;
+                    if action == LoopAction::ResetTimers {
+                        status_tick.reset();
+                    }
+                }
+                key = keys.next() => {
+                    let Some(key) = key else { break };
+                    let event = key?;
+                    match handle_terminal_event(&mut state, &mut terminal, &commands, event).await? {
+                        LoopAction::Continue => {}
+                        LoopAction::ResetTimers => status_tick.reset(),
+                        LoopAction::Exit => break,
+                    }
+                }
                 _ = status_tick.tick() => {
                     let mut effect = RenderPlan::None;
                     if state.operation.shows_activity() {
@@ -355,17 +414,6 @@ impl App {
                 event = events.next() => {
                     let Some(event) = event else { break };
                     match handle_ui_event(&mut state, &mut terminal, event)? {
-                        LoopAction::Continue => {}
-                        LoopAction::ResetTimers => {
-                            status_tick.reset();
-                        }
-                        LoopAction::Exit => break,
-                    }
-                }
-                key = keys.next() => {
-                    let Some(key) = key else { break };
-                    let event = key?;
-                    match handle_terminal_event(&mut state, &mut terminal, &commands, event).await? {
                         LoopAction::Continue => {}
                         LoopAction::ResetTimers => {
                             status_tick.reset();
@@ -399,9 +447,18 @@ fn handle_ui_event(
             state.apply(terminal, plan)?;
             Ok(LoopAction::Continue)
         }
-        UiEvent::CompactionCompleted(changed) => {
+        UiEvent::CompactionCompleted {
+            changed,
+            conversation,
+        } => {
+            state.conversation = conversation;
             state.operation.finish();
-            let effect = state.finish_compaction(changed);
+            let effect = if changed {
+                state.restore_session()
+            } else {
+                RenderPlan::None
+            }
+            .merge(state.finish_compaction(changed));
             state.apply(terminal, effect)?;
             Ok(LoopAction::Continue)
         }
@@ -453,6 +510,9 @@ fn handle_session_event(
 #[allow(clippy::too_many_lines)]
 fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, LoopAction) {
     match event {
+        SessionEvent::Retrying { turn_id } if state.current_turn_id() == Some(turn_id) => {
+            (state.reset_response(), LoopAction::Continue)
+        }
         SessionEvent::Started(turn_id) => {
             if state
                 .current_turn_id()
@@ -472,8 +532,7 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             };
             state.track_turn(turn_id);
             state.turn_activity = None;
-            state.context_tokens = None;
-            state.context_limit = None;
+            state.committed_steps = 0;
             let start = state.operation.turn_started();
             let effect = state.turn_started().merge(input_effect);
             let action = match start {
@@ -508,8 +567,7 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             tokens,
             limit,
         } if state.current_turn_id() == Some(turn_id) && state.operation.accepts_live_output() => {
-            state.context_tokens = Some(tokens);
-            state.context_limit = Some(limit);
+            state.context = Some(ContextUsage { tokens, limit });
             (RenderPlan::Redraw, LoopAction::Continue)
         }
         SessionEvent::ToolStarted {
@@ -533,7 +591,18 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             let effect = state.tool_finished(&id, output, is_error);
             (effect, LoopAction::Continue)
         }
-        SessionEvent::Finished(turn) => {
+        SessionEvent::StepCommitted {
+            turn_id,
+            index,
+            step,
+        } if state.current_turn_id() == Some(turn_id)
+            && state.operation.accepts_live_output()
+            && index == state.committed_steps =>
+        {
+            let effect = state.commit_step(&step);
+            (effect, LoopAction::Continue)
+        }
+        SessionEvent::Finished { turn, summary } => {
             let owns_turn = state.current_turn_id() == Some(turn.id)
                 || (state.current_turn_id().is_none() && state.inputs.contains_key(&turn.id));
             if !owns_turn {
@@ -542,11 +611,14 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             state.track_turn(turn.id);
             state.operation.complete_turn();
             state.turn_activity = None;
-            state.context_tokens = None;
-            state.context_limit = None;
             state.finish_turn(turn.id);
-            state.conversation.push(Arc::clone(&turn), None);
-            let effect = state.commit_turn(&turn);
+            let compacted = summary.is_some();
+            state.conversation.push(Arc::clone(&turn), summary);
+            let effect = if compacted {
+                state.restore_session()
+            } else {
+                state.commit_turn(&turn)
+            };
             (effect, LoopAction::Continue)
         }
         SessionEvent::Discarded { turn_id, error }
@@ -554,12 +626,13 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
                 || (state.current_turn_id().is_none() && state.inputs.contains_key(&turn_id)) =>
         {
             let input = state.finish_turn(turn_id);
+            let has_committed_steps = state.committed_steps > 0;
             state.operation.complete_turn();
             state.turn_activity = None;
-            state.context_tokens = None;
-            state.context_limit = None;
-            if let Some(input) = input {
-                state.input.restore_submission(input);
+            if !has_committed_steps {
+                if let Some(input) = input {
+                    state.input.restore_submission(input);
+                }
             }
             let mut effect = state.discard_turn(turn_id);
             if let Some(error) = error {
@@ -568,11 +641,13 @@ fn update_session(state: &mut AppState, event: SessionEvent) -> (RenderPlan, Loo
             (effect, LoopAction::Continue)
         }
         SessionEvent::Text { .. }
+        | SessionEvent::Retrying { .. }
         | SessionEvent::Thought { .. }
         | SessionEvent::Activity { .. }
         | SessionEvent::Context { .. }
         | SessionEvent::ToolStarted { .. }
         | SessionEvent::ToolFinished { .. }
+        | SessionEvent::StepCommitted { .. }
         | SessionEvent::Discarded { .. } => (RenderPlan::None, LoopAction::Continue),
     }
 }
@@ -882,6 +957,9 @@ async fn submit_input(
     terminal: &mut TerminalUi,
     commands: &tokio::sync::mpsc::Sender<UiCommand>,
 ) -> anyhow::Result<LoopAction> {
+    if state.submission.is_some() {
+        return Ok(LoopAction::Continue);
+    }
     let Some(policy) = state.operation.submission_policy() else {
         return Ok(LoopAction::Continue);
     };
@@ -901,11 +979,15 @@ async fn submit_input(
     }
 
     match (policy, parsed) {
-        (SubmissionPolicy::Start, ParsedInput::Message) => {
-            start_message(state, terminal, commands, input).await
-        }
-        (SubmissionPolicy::Queue, ParsedInput::Message) => {
-            queue_message(state, terminal, commands, input).await
+        (policy, ParsedInput::Message) => {
+            match PendingSubmission::send(commands, input.clone(), policy) {
+                Ok(submission) => {
+                    state.submission = Some(submission);
+                    state.apply(terminal, RenderPlan::Redraw)?;
+                    Ok(LoopAction::Continue)
+                }
+                Err(error) => reject_input(state, terminal, input, "submit", &error),
+            }
         }
         (_, ParsedInput::Invalid(error)) => {
             let effect = state.command_error(&error);
@@ -918,62 +1000,39 @@ async fn submit_input(
     }
 }
 
-async fn start_message(
+fn finish_submission(
     state: &mut AppState,
-    terminal: &mut TerminalUi,
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    input: String,
-) -> anyhow::Result<LoopAction> {
-    let (reply, result) = tokio::sync::oneshot::channel();
-    let command = UiCommand::Submit {
-        input: input.clone(),
-        reply,
+    result: Result<TurnId, UiError>,
+) -> (RenderPlan, LoopAction) {
+    let Some(PendingSubmission { input, policy, .. }) = state.submission.take() else {
+        return (RenderPlan::None, LoopAction::Continue);
     };
-    match send_confirmed(commands, command, result).await {
-        Ok(turn_id) => {
-            state.operation.start_turn();
-            state.queue_input(turn_id, input.clone());
-            let effect = state.commit_input(turn_id, &input);
-            state.input.record_submission(&input);
-            state.apply(terminal, effect)?;
-            Ok(LoopAction::ResetTimers)
-        }
-        Err(error) => reject_input(state, terminal, input, "submit", &error),
-    }
-}
-
-async fn queue_message(
-    state: &mut AppState,
-    terminal: &mut TerminalUi,
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    input: String,
-) -> anyhow::Result<LoopAction> {
-    let (reply, result) = tokio::sync::oneshot::channel();
-    let command = UiCommand::Submit {
-        input: input.clone(),
-        reply,
-    };
-    match send_confirmed(commands, command, result).await {
+    match result {
         Ok(turn_id) => {
             state.queue_input(turn_id, input.clone());
+            let (effect, action) = match policy {
+                SubmissionPolicy::Start => {
+                    state.operation.start_turn();
+                    let draft = std::mem::take(&mut state.input);
+                    let effect = state.commit_input(turn_id, &input);
+                    state.input = draft;
+                    (effect, LoopAction::ResetTimers)
+                }
+                SubmissionPolicy::Queue => (RenderPlan::Redraw, LoopAction::Continue),
+            };
             state.input.record_submission(&input);
-            state.apply(terminal, RenderPlan::Redraw)?;
-            Ok(LoopAction::Continue)
+            (effect, action)
         }
-        Err(error) => reject_input(state, terminal, input, "queue", &error),
+        Err(error) => {
+            if state.input.is_empty() {
+                state.input.set_text(input);
+            } else {
+                state.input.record_submission(&input);
+            }
+            let plan = state.error(&format!("Failed to submit input: {error}"));
+            (plan, LoopAction::Continue)
+        }
     }
-}
-
-async fn send_confirmed<T>(
-    commands: &tokio::sync::mpsc::Sender<UiCommand>,
-    command: UiCommand,
-    result: tokio::sync::oneshot::Receiver<Result<T, UiError>>,
-) -> Result<T, UiError> {
-    commands
-        .send(command)
-        .await
-        .map_err(|_| UiError::ControllerStopped)?;
-    result.await.map_err(|_| UiError::InputDropped)?
 }
 
 fn reject_input(
@@ -1088,6 +1147,24 @@ mod tests {
     }
 
     #[test]
+    fn retry_discards_only_the_uncommitted_response_preview() {
+        let mut state = test_state();
+        let turn_id = TurnId::new();
+        state.operation.start_turn();
+        state.commit_input(turn_id, "hello");
+        state.thinking("old thought");
+        state.text("old answer");
+        assert_eq!(state.blocks.pending().len(), 3);
+        update_session(&mut state, SessionEvent::Retrying { turn_id });
+        assert_eq!(state.blocks.pending().len(), 1);
+        assert!(state.reasoning_block_id.is_none());
+        assert!(state.assistant_block_id.is_none());
+        assert_eq!(state.current_turn_id(), Some(turn_id));
+        state.text("new answer");
+        assert_eq!(state.blocks.pending().len(), 2);
+    }
+
+    #[test]
     fn derives_terminal_view_from_one_app_state() {
         let mut state = test_state();
         state.input.set_text("/");
@@ -1199,16 +1276,9 @@ mod tests {
         state.update_subagent(update(SubagentUpdateKind::Session(
             SessionEvent::Activity { turn_id, activity },
         )));
-        state.update_subagent(update(SubagentUpdateKind::Session(SessionEvent::Context {
-            turn_id,
-            tokens: 800,
-            limit: 1_000,
-        })));
         let agent = &state.subagents[0];
         assert_eq!(agent.active_turn, Some(turn_id));
         assert_eq!(agent.activity, activity);
-        assert_eq!(agent.context_tokens, Some(800));
-        assert_eq!(agent.context_limit, Some(1_000));
         assert_eq!(agent.activity.completed_tool_calls, 1);
     }
 
@@ -1267,7 +1337,10 @@ mod tests {
 
         let (_, action) = update_session(
             &mut state,
-            SessionEvent::Finished(settled_turn(id, "hello")),
+            SessionEvent::Finished {
+                turn: settled_turn(id, "hello"),
+                summary: None,
+            },
         );
 
         assert_eq!(action, LoopAction::Continue);
@@ -1276,12 +1349,203 @@ mod tests {
     }
 
     #[test]
+    fn finished_turn_does_not_project_an_already_committed_step_twice() {
+        let mut state = test_state();
+        let id = TurnId::new();
+        let step = Arc::new(ash_core::Step {
+            items: vec![ash_core::Item::Text("answer".to_string())],
+        });
+        state.queue_input(id, "question".to_string());
+        update_session(&mut state, SessionEvent::Started(id));
+
+        let (plan, _) = update_session(
+            &mut state,
+            SessionEvent::StepCommitted {
+                turn_id: id,
+                index: 0,
+                step: Arc::clone(&step),
+            },
+        );
+        assert_eq!(plan, RenderPlan::Commit);
+        assert_eq!(state.committed_steps, 1);
+        let next_block_id = state.next_block_id;
+
+        let turn = Arc::new(ash_core::Turn {
+            id,
+            input: Input::user("question"),
+            steps: vec![step],
+            result: ash_core::TurnResult::Stopped(ash_core::StopReason::EndTurn),
+            stats: ash_core::TurnStats::default(),
+        });
+        let (plan, _) = update_session(
+            &mut state,
+            SessionEvent::Finished {
+                turn,
+                summary: None,
+            },
+        );
+
+        assert_eq!(plan, RenderPlan::Commit);
+        assert_eq!(
+            state.next_block_id,
+            next_block_id + 1,
+            "only the footer is new"
+        );
+        assert_eq!(state.committed_steps, 0);
+    }
+
+    #[test]
+    fn context_snapshot_survives_turn_boundaries() {
+        let mut state = test_state();
+        let id = TurnId::new();
+        state.queue_input(id, "question".to_string());
+        update_session(&mut state, SessionEvent::Started(id));
+        update_session(
+            &mut state,
+            SessionEvent::Context {
+                turn_id: id,
+                tokens: 500,
+                limit: 1_000,
+            },
+        );
+
+        update_session(
+            &mut state,
+            SessionEvent::Finished {
+                turn: settled_turn(id, "question"),
+                summary: None,
+            },
+        );
+
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 500,
+                limit: 1_000
+            })
+        );
+
+        let next = TurnId::new();
+        state.queue_input(next, "follow up".to_string());
+        update_session(&mut state, SessionEvent::Started(next));
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 500,
+                limit: 1_000
+            })
+        );
+
+        update_session(
+            &mut state,
+            SessionEvent::Context {
+                turn_id: next,
+                tokens: 800,
+                limit: 1_000,
+            },
+        );
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 800,
+                limit: 1_000
+            })
+        );
+    }
+
+    #[test]
+    fn finished_turn_projects_a_missed_committed_step() {
+        let mut state = test_state();
+        let id = TurnId::new();
+        state.queue_input(id, "question".to_string());
+        update_session(&mut state, SessionEvent::Started(id));
+        let next_block_id = state.next_block_id;
+        let turn = Arc::new(ash_core::Turn {
+            id,
+            input: Input::user("question"),
+            steps: vec![Arc::new(ash_core::Step {
+                items: vec![ash_core::Item::Text("answer".to_string())],
+            })],
+            result: ash_core::TurnResult::Stopped(ash_core::StopReason::EndTurn),
+            stats: ash_core::TurnStats::default(),
+        });
+
+        let (plan, _) = update_session(
+            &mut state,
+            SessionEvent::Finished {
+                turn,
+                summary: None,
+            },
+        );
+
+        assert_eq!(plan, RenderPlan::Commit);
+        assert_eq!(state.next_block_id, next_block_id + 2);
+    }
+
+    #[test]
+    fn automatic_compaction_rebuilds_from_the_reduced_conversation() {
+        let mut state = test_state();
+        let old = settled_turn(TurnId::new(), "old");
+        state.conversation.push(Arc::clone(&old), None);
+        let id = TurnId::new();
+        state.queue_input(id, "new".to_string());
+        update_session(&mut state, SessionEvent::Started(id));
+
+        let (plan, _) = update_session(
+            &mut state,
+            SessionEvent::Finished {
+                turn: settled_turn(id, "new"),
+                summary: Some("old summary".to_string()),
+            },
+        );
+
+        assert_eq!(plan, RenderPlan::Rebuild);
+        assert_eq!(state.conversation.summary(), Some("old summary"));
+        assert_eq!(state.conversation.turns().len(), 1);
+        assert_eq!(state.conversation.turns()[0].id, id);
+        assert_eq!(Arc::strong_count(&old), 1);
+    }
+
+    #[test]
+    fn discarded_turn_does_not_restore_input_after_a_step_was_committed() {
+        let mut state = test_state();
+        let id = TurnId::new();
+        state.queue_input(id, "do not retry".to_string());
+        update_session(&mut state, SessionEvent::Started(id));
+        update_session(
+            &mut state,
+            SessionEvent::StepCommitted {
+                turn_id: id,
+                index: 0,
+                step: Arc::new(ash_core::Step {
+                    items: vec![ash_core::Item::Text("durable".to_string())],
+                }),
+            },
+        );
+
+        let (plan, _) = update_session(
+            &mut state,
+            SessionEvent::Discarded {
+                turn_id: id,
+                error: None,
+            },
+        );
+
+        assert_eq!(plan, RenderPlan::Redraw);
+        assert!(state.input.text().is_empty());
+        assert_eq!(state.committed_steps, 0);
+    }
+
+    #[test]
     fn ignores_a_finished_turn_after_session_state_was_replaced() {
         let mut state = test_state();
 
         let (plan, action) = update_session(
             &mut state,
-            SessionEvent::Finished(settled_turn(TurnId::new(), "old")),
+            SessionEvent::Finished {
+                turn: settled_turn(TurnId::new(), "old"),
+                summary: None,
+            },
         );
 
         assert_eq!(plan, RenderPlan::None);
@@ -1365,18 +1629,12 @@ mod tests {
     #[tokio::test]
     async fn confirmed_input_returns_the_controller_rejection() {
         let (commands, mut incoming) = tokio::sync::mpsc::channel(1);
-        let client = tokio::spawn(async move {
-            let (reply, result) = tokio::sync::oneshot::channel();
-            send_confirmed(
-                &commands,
-                UiCommand::Submit {
-                    input: "change direction".into(),
-                    reply,
-                },
-                result,
-            )
-            .await
-        });
+        let mut submission = PendingSubmission::send(
+            &commands,
+            "change direction".into(),
+            SubmissionPolicy::Start,
+        )
+        .unwrap();
 
         let Some(UiCommand::Submit { input, reply }) = incoming.recv().await else {
             panic!("expected submit command");
@@ -1388,8 +1646,66 @@ mod tests {
             ))))
             .unwrap();
 
-        let error = client.await.unwrap().unwrap_err();
+        let error = submission.wait().await.unwrap_err();
         assert_eq!(error.to_string(), SessionError::InactiveTurn.to_string());
+    }
+
+    #[tokio::test]
+    async fn pending_submission_keeps_event_backpressure_from_blocking_confirmation() {
+        let (commands, mut incoming) = tokio::sync::mpsc::channel(1);
+        let (outgoing, mut events) = tokio::sync::mpsc::channel(1);
+        outgoing.send(()).await.unwrap();
+        let turn_id = TurnId::new();
+        let controller = tokio::spawn(async move {
+            outgoing.send(()).await.unwrap();
+            let Some(UiCommand::Submit { reply, .. }) = incoming.recv().await else {
+                panic!("expected submission");
+            };
+            reply.send(Ok(turn_id)).unwrap();
+        });
+        let mut submission = Some(
+            PendingSubmission::send(&commands, "hello".into(), SubmissionPolicy::Start).unwrap(),
+        );
+        let confirmed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = submission_result(&mut submission) => break result.unwrap(),
+                    Some(()) = events.recv() => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(confirmed, turn_id);
+        controller.await.unwrap();
+    }
+
+    #[test]
+    fn submission_confirmation_preserves_the_next_draft() {
+        let (commands, _incoming) = tokio::sync::mpsc::channel(1);
+        let mut state = test_state();
+        state.submission = Some(
+            PendingSubmission::send(&commands, "submitted".into(), SubmissionPolicy::Start)
+                .unwrap(),
+        );
+        state.input.set_text("next draft");
+        let turn_id = TurnId::new();
+        let (_, action) = finish_submission(&mut state, Ok(turn_id));
+        assert_eq!(action, LoopAction::ResetTimers);
+        assert_eq!(state.input.text(), "next draft");
+        assert_eq!(state.input(turn_id), Some("submitted"));
+        assert!(state.submission.is_none());
+    }
+
+    #[test]
+    fn submission_rejects_a_full_command_queue_without_waiting() {
+        let (commands, _incoming) = tokio::sync::mpsc::channel(1);
+        commands.try_send(UiCommand::Cancel).unwrap();
+        assert!(matches!(
+            PendingSubmission::send(&commands, "hello".into(), SubmissionPolicy::Start),
+            Err(UiError::CommandQueueFull)
+        ));
     }
 
     #[test]

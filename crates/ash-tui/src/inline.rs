@@ -1,6 +1,6 @@
 use std::{fmt, io, time::Instant};
 
-use ash_core::{Item, ToolCallId, Turn, TurnId, TurnResult};
+use ash_core::{Item, Step, ToolCallId, Turn, TurnId, TurnResult};
 use crossterm::terminal;
 use serde_json::Value;
 
@@ -212,7 +212,7 @@ impl AppState {
 
     pub fn finish_compaction(&mut self, changed: bool) -> RenderPlan {
         let message = if changed {
-            "Model context was compacted. Full history remains visible.".to_string()
+            "Model context was compacted.".to_string()
         } else {
             "Model context is already compact; no new summary was created.".to_string()
         };
@@ -236,6 +236,9 @@ impl AppState {
     pub fn restore_session(&mut self) -> RenderPlan {
         self.begin_fresh_viewport();
         self.enqueue_welcome();
+        if let Some(summary) = self.conversation.summary() {
+            self.push_history_block(HistoryBlock::info(summary));
+        }
         for turn in self.conversation.turns().to_vec() {
             self.current_turn_id = Some(turn.id);
             self.push_turn(&turn, true);
@@ -387,10 +390,17 @@ impl AppState {
 
     pub fn discard_turn(&mut self, turn_id: TurnId) -> RenderPlan {
         self.finish_live_output();
-        self.blocks.remove_turn(turn_id);
+        let plan = if self.committed_steps == 0 {
+            self.blocks.remove_turn(turn_id);
+            RenderPlan::Rebuild
+        } else {
+            self.blocks
+                .retain_pending(|block| !block.belongs_to_turn(turn_id));
+            RenderPlan::Redraw
+        };
         self.scroll_top = None;
         self.reset_turn_state();
-        RenderPlan::Rebuild
+        plan
     }
 
     /// Discard unfinished streamed output after the user cancels.
@@ -403,6 +413,15 @@ impl AppState {
         self.assistant_block_id = None;
     }
 
+    pub fn reset_response(&mut self) -> RenderPlan {
+        if let Some(turn_id) = self.current_turn_id {
+            self.blocks.remove_streamed_turn(Some(turn_id), turn_id);
+        }
+        self.reasoning_block_id = None;
+        self.assistant_block_id = None;
+        RenderPlan::Redraw
+    }
+
     pub fn error(&mut self, error: &str) -> RenderPlan {
         self.finish_live_output();
         self.push_history_block(HistoryBlock::error(error));
@@ -413,8 +432,19 @@ impl AppState {
         }
     }
 
-    /// Commit a settled turn: replace the streamed preview with the canonical
-    /// projection of the turn's messages, then move it into the scrollback.
+    /// Replace the current preview with one durable step and move it into scrollback.
+    pub fn commit_step(&mut self, step: &Step) -> RenderPlan {
+        self.finish_live_output();
+        if let Some(turn_id) = self.current_turn_id {
+            self.blocks.remove_streamed_turn(Some(turn_id), turn_id);
+        }
+        self.assistant_block_id = None;
+        self.push_step(step);
+        self.committed_steps += 1;
+        RenderPlan::Commit
+    }
+
+    /// Finish a settled turn, appending any steps missed by the event receiver.
     pub fn commit_turn(&mut self, turn: &Turn) -> RenderPlan {
         self.finish_live_output();
         let elapsed_seconds = self.status.elapsed_seconds();
@@ -422,9 +452,12 @@ impl AppState {
         self.blocks
             .remove_streamed_turn(self.current_turn_id, turn.id);
         self.assistant_block_id = None;
-        self.push_turn(turn, false);
+        for step in turn.steps.iter().skip(self.committed_steps) {
+            self.push_step(step);
+        }
         self.push_history_block(footer);
         self.current_turn_id = None;
+        self.committed_steps = 0;
         RenderPlan::Commit
     }
 }
@@ -525,6 +558,7 @@ impl AppState {
     fn reset_turn_state(&mut self) {
         self.status.reset();
         self.current_turn_id = None;
+        self.committed_steps = 0;
         self.reasoning_block_id = None;
         self.assistant_block_id = None;
     }
@@ -703,7 +737,13 @@ impl AppState {
         if render_input {
             self.push_history_block(HistoryBlock::user(&turn.input.text()));
         }
-        for item in turn.items() {
+        for step in &turn.steps {
+            self.push_step(step);
+        }
+    }
+
+    fn push_step(&mut self, step: &Step) {
+        for item in &step.items {
             match item {
                 Item::Text(text) if !text.is_empty() => {
                     self.push_assistant_block(text.clone());
@@ -835,6 +875,7 @@ fn restored_turn_footer(turn: &Turn) -> HistoryBlock {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn test_turn(n: u128) -> TurnId {
@@ -979,14 +1020,14 @@ mod tests {
         let turn = Turn {
             id: test_turn(7),
             input: ash_core::Input::user("question"),
-            steps: vec![ash_core::Step {
+            steps: vec![std::sync::Arc::new(ash_core::Step {
                 items: vec![Item::ToolCall(ash_core::ToolCall {
                     id: ToolCallId::from_provider("call"),
                     name: "read".to_string(),
                     arguments: serde_json::json!({}),
                     result: Ok("done".into()),
                 })],
-            }],
+            })],
             result: TurnResult::Stopped(ash_core::StopReason::EndTurn),
             stats: ash_core::TurnStats {
                 input_tokens: 10,

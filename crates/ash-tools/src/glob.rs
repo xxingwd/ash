@@ -20,22 +20,26 @@ struct GlobArgs {
 pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "glob",
-        "Find files by glob pattern inside the working directory. Respects ignore files and returns at most 100 workspace-relative paths.",
+        "Find files by glob pattern. Respects ignore files and returns at most 100 paths.",
         move |ctx, args: GlobArgs| {
             let root = Arc::clone(&working_dir);
             let deadline = ctx.require_deadline();
             let cancellation = ctx.cancellation;
             async move {
                 let deadline = deadline?;
-                crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
-                    find_files_in_workspace(
-                        &root,
-                        args.path.as_deref().unwrap_or("."),
-                        &args.pattern,
-                        &cancellation,
-                        deadline,
-                    )
-                })
+                crate::path::run_tool_blocking(
+                    cancellation,
+                    deadline,
+                    move |cancellation, deadline| {
+                        find_files_in_workspace(
+                            &root,
+                            args.path.as_deref().unwrap_or("."),
+                            &args.pattern,
+                            &cancellation,
+                            deadline,
+                        )
+                    },
+                )
                 .await
             }
         },
@@ -233,5 +237,45 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ToolError::Cancelled));
+    }
+
+    #[test]
+    fn searches_outside_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "").unwrap();
+
+        let output = find_files(
+            root.path(),
+            outside.path().to_str().unwrap(),
+            "*.rs",
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .unwrap();
+
+        assert!(output.contains("Found 1 files"));
+        assert!(output.contains("secret.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn searches_symlinked_directory_target() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
+
+        let output = find_files(
+            root.path(),
+            "outside",
+            "*.rs",
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .unwrap();
+
+        assert!(output.contains("Found 1 files"));
+        assert!(output.contains("secret.rs"));
     }
 }

@@ -9,7 +9,7 @@ use crate::truncate::{self, LimitKind, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 #[derive(Deserialize, JsonSchema)]
 struct ReadArgs {
-    /// File path, relative to the working directory or absolute within it
+    /// File path, relative to the working directory or absolute
     path: String,
     /// First line to read (1-indexed)
     offset: Option<NonZeroUsize>,
@@ -159,7 +159,7 @@ async fn read_file(
     let path = workspace.path(&requested)?;
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
-        let mut options = cap_std::fs::OpenOptions::new();
+        let mut options = std::fs::OpenOptions::new();
         options.read(true);
         crate::path::ensure_running(&cancellation, deadline)?;
         let mut file = path
@@ -510,5 +510,51 @@ mod tests {
                     && !message.contains(&full_path.display().to_string())
                     && !message.contains(requested)
         ));
+    }
+
+    #[tokio::test]
+    async fn reads_file_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file_path = outside.path().join("outside.txt");
+        tokio::fs::write(&file_path, "outside content\n")
+            .await
+            .unwrap();
+
+        let output = read_file(
+            &Workspace::new(root.path()).unwrap(),
+            file_path.to_str().unwrap(),
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.text, "outside content\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reads_symlinked_file_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.txt");
+        tokio::fs::write(&target, "secret content\n").await.unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("link.txt")).unwrap();
+
+        let output = read_file(
+            &Workspace::new(root.path()).unwrap(),
+            "link.txt",
+            None,
+            None,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.text, "secret content\n");
     }
 }

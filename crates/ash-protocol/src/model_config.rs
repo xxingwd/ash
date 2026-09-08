@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::env::VarError;
+use std::str::FromStr;
 
 use ash_core::ProtocolError;
 use serde_json::{Map, Number, Value};
@@ -16,47 +16,51 @@ const RESERVED_ROOTS: &[&str] = &[
     "tools",
 ];
 
-pub fn apply_from_env(body: &mut Value) -> Result<(), ProtocolError> {
-    match std::env::var(ENV_VAR) {
-        Ok(config) => apply(body, &config),
-        Err(VarError::NotPresent) => Ok(()),
-        Err(VarError::NotUnicode(_)) => Err(ProtocolError::InvalidRequest(format!(
-            "{ENV_VAR} must contain valid Unicode"
-        ))),
+#[derive(Debug, Clone, Default)]
+pub struct ModelConfig {
+    entries: Vec<(Vec<String>, Value)>,
+}
+
+impl FromStr for ModelConfig {
+    type Err = ProtocolError;
+
+    fn from_str(config: &str) -> Result<Self, Self::Err> {
+        let mut entries = Vec::new();
+        let mut paths = HashSet::new();
+
+        for (index, entry) in config.split(';').enumerate() {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (path, value) = parse_entry(entry, index + 1)?;
+            let display_path = path.join(".");
+            if !paths.insert(path.clone()) {
+                return Err(ProtocolError::InvalidRequest(format!(
+                    "{ENV_VAR} sets '{display_path}' more than once"
+                )));
+            }
+            if paths.iter().any(|other| {
+                other != &path && (other.starts_with(&path) || path.starts_with(other))
+            }) {
+                return Err(ProtocolError::InvalidRequest(format!(
+                    "{ENV_VAR} has conflicting paths involving '{display_path}'"
+                )));
+            }
+            entries.push((path, value));
+        }
+
+        Ok(Self { entries })
     }
 }
 
-pub fn apply(body: &mut Value, config: &str) -> Result<(), ProtocolError> {
-    let mut entries = Vec::new();
-    let mut paths = HashSet::new();
-
-    for (index, entry) in config.split(';').enumerate() {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
+impl ModelConfig {
+    pub(crate) fn apply(&self, body: &mut Value) -> Result<(), ProtocolError> {
+        for (path, value) in &self.entries {
+            insert_value(body, path, value.clone())?;
         }
-        let (path, value) = parse_entry(entry, index + 1)?;
-        let display_path = path.join(".");
-        if !paths.insert(path.clone()) {
-            return Err(ProtocolError::InvalidRequest(format!(
-                "{ENV_VAR} sets '{display_path}' more than once"
-            )));
-        }
-        if paths
-            .iter()
-            .any(|other| other != &path && (other.starts_with(&path) || path.starts_with(other)))
-        {
-            return Err(ProtocolError::InvalidRequest(format!(
-                "{ENV_VAR} has conflicting paths involving '{display_path}'"
-            )));
-        }
-        entries.push((path, value));
+        Ok(())
     }
-
-    for (path, value) in entries {
-        insert_value(body, &path, value)?;
-    }
-    Ok(())
 }
 
 fn parse_entry(entry: &str, index: usize) -> Result<(Vec<String>, Value), ProtocolError> {
@@ -145,6 +149,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn apply(body: &mut Value, config: &str) -> Result<(), ProtocolError> {
+        config.parse::<ModelConfig>()?.apply(body)
+    }
+
+    #[test]
+    fn parsed_config_is_reusable_and_independent_of_other_adapters() {
+        let first = "temperature=0.2".parse::<ModelConfig>().unwrap();
+        let second = "temperature=0.9".parse::<ModelConfig>().unwrap();
+        let mut first_body = json!({});
+        let mut second_body = json!({});
+        first.apply(&mut first_body).unwrap();
+        second.apply(&mut second_body).unwrap();
+        assert_eq!(first_body["temperature"], 0.2);
+        assert_eq!(second_body["temperature"], 0.9);
+        let mut repeated = json!({});
+        first.apply(&mut repeated).unwrap();
+        assert_eq!(first_body, repeated);
+    }
 
     #[test]
     fn applies_nested_paths_and_scalar_values() {

@@ -6,7 +6,7 @@ use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
 use crate::{
-    base64_image, context_turns, model_config,
+    base64_image, context_turns,
     pending_calls::{usage_event, PendingCall},
     sse, ProviderConfig,
 };
@@ -86,7 +86,6 @@ impl AnthropicAdapter {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        model_config::apply_from_env(&mut body)?;
         Ok(body)
     }
 }
@@ -144,7 +143,8 @@ fn push_step(messages: &mut Vec<Value>, step: &Step) {
 
 impl ModelClient for AnthropicAdapter {
     fn stream(&self, req: ModelRequest) -> Result<ModelStream, ProtocolError> {
-        let body = Self::build_request(&req)?;
+        let mut body = Self::build_request(&req)?;
+        self.config.model_config.apply(&mut body)?;
         let request = self
             .client
             .post(format!(
@@ -509,6 +509,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let request = test_support::request(Vec::new());
 
@@ -523,6 +524,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let mut request = test_support::request(Vec::new());
         request.max_tokens = Some(1_024);
@@ -538,6 +540,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let request = test_support::request(vec![
             Item::Thought {
@@ -592,6 +595,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             api_key: SecretString::from("test"),
             base_url: None,
+            model_config: crate::ModelConfig::default(),
         });
         let request = test_support::request(vec![test_support::tool_result(
             "call",

@@ -22,8 +22,7 @@ struct BashArgs {
     /// Bash command to execute
     command: String,
     /// Working directory for the command, relative to the session working
-    /// directory or absolute within it; defaults to the session working
-    /// directory
+    /// directory or absolute; defaults to the session working directory
     cwd: Option<String>,
     /// Timeout in seconds; omitted means no tool-specific timeout
     timeout: Option<f64>,
@@ -32,7 +31,7 @@ struct BashArgs {
 pub fn tool(working_dir: Arc<Workspace>) -> Result<Arc<dyn Tool>, ToolError> {
     define_tool(
         "bash",
-        "Execute a bash command in the current working directory. Set `cwd` to run in a subdirectory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
+        "Execute a bash command in the working directory. Set `cwd` to run in a different directory instead of prefixing the command with `cd`. Returns stdout and stderr. Output keeps the last 2000 lines or 50KB; truncated output is saved to a temporary file.",
         move |ctx, args: BashArgs| {
             let working_dir = Arc::clone(&working_dir);
             let deadline = ctx.require_deadline();
@@ -522,26 +521,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_cwd_outside_working_dir() {
+    async fn allows_cwd_outside_working_dir() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(outside.path()).unwrap();
 
-        let error = run_in(root.path(), "pwd", Some(outside.path().to_str().unwrap()))
+        let output = run_in(root.path(), "pwd", Some(outside.path().to_str().unwrap()))
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.to_string().contains("outside working directory"));
+        assert_eq!(output.trim(), expected.to_str().unwrap());
     }
 
     #[tokio::test]
-    async fn rejects_cwd_escaping_via_parent() {
+    async fn allows_cwd_escaping_via_parent() {
         let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let expected = std::fs::canonicalize(root.path()).unwrap();
 
-        let error = run_in(root.path(), "pwd", Some("../elsewhere"))
-            .await
-            .unwrap_err();
+        let output = run_in(&sub, "pwd", Some("..")).await.unwrap();
 
-        assert!(error.to_string().contains("escapes working directory"));
+        assert_eq!(output.trim(), expected.to_str().unwrap());
     }
 
     #[tokio::test]
@@ -573,18 +574,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_cwd_symlink_that_resolves_outside_working_dir() {
+    async fn allows_cwd_symlink_that_resolves_outside_working_dir() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
+        let expected = std::fs::canonicalize(outside.path()).unwrap();
 
-        let error = run_in(root.path(), "pwd", Some("outside"))
-            .await
-            .unwrap_err();
+        let output = run_in(root.path(), "pwd", Some("outside")).await.unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("outside the session working directory"));
+        assert_eq!(output.trim(), expected.to_str().unwrap());
     }
 
     #[cfg(unix)]

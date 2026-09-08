@@ -130,7 +130,7 @@ pub enum TurnResult {
 pub struct Turn {
     pub id: TurnId,
     pub input: Input,
-    pub steps: Vec<Step>,
+    pub steps: Vec<Arc<Step>>,
     pub result: TurnResult,
     pub stats: TurnStats,
 }
@@ -141,7 +141,7 @@ impl Turn {
     }
 
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
-        self.steps.iter().flat_map(Step::tool_calls)
+        self.steps.iter().flat_map(|step| step.tool_calls())
     }
 
     /// Completed tool-call count derived from `steps`; saturates instead of
@@ -171,7 +171,6 @@ impl Turn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Checkpoint {
     summary: String,
-    tail: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -195,17 +194,17 @@ impl Conversation {
     }
 
     #[must_use]
-    pub fn context(&self) -> ModelContext {
-        let tail = self
-            .checkpoint
+    pub fn summary(&self) -> Option<&str> {
+        self.checkpoint
             .as_ref()
-            .map_or(0, |checkpoint| checkpoint.tail);
+            .map(|checkpoint| checkpoint.summary.as_str())
+    }
+
+    #[must_use]
+    pub fn context(&self) -> ModelContext {
         ModelContext {
-            summary: self
-                .checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.summary.clone()),
-            turns: self.turns[tail..].to_vec(),
+            summary: self.summary().map(str::to_string),
+            turns: self.turns.to_vec(),
             current: None,
         }
     }
@@ -221,28 +220,20 @@ impl Conversation {
 
     pub fn push(&mut self, turn: Arc<Turn>, summary: Option<String>) {
         if let Some(summary) = summary {
-            self.checkpoint = Some(Checkpoint {
-                summary,
-                tail: self.turns.len(),
-            });
+            self.turns = Vec::new();
+            self.checkpoint = Some(Checkpoint { summary });
         }
         self.turns.push(turn);
     }
 
     pub fn compact(&mut self, summary: String) {
-        self.checkpoint = Some(Checkpoint {
-            summary,
-            tail: self.turns.len(),
-        });
+        self.turns = Vec::new();
+        self.checkpoint = Some(Checkpoint { summary });
     }
 
     #[must_use]
     pub fn compact_prompt(&self) -> Option<String> {
-        let tail = self
-            .checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.tail);
-        if tail == self.turns.len() {
+        if self.turns.is_empty() {
             return None;
         }
 
@@ -252,7 +243,7 @@ impl Conversation {
             prompt.push_str(checkpoint.summary.trim());
             prompt.push_str("\n\n");
         }
-        for turn in &self.turns[tail..] {
+        for turn in &self.turns {
             prompt.push_str("[User]\n");
             prompt.push_str(&turn.input.text());
             prompt.push('\n');
@@ -295,7 +286,7 @@ impl Conversation {
         Some((
             Self {
                 turns: self.turns[..index].to_vec(),
-                checkpoint: None,
+                checkpoint: self.checkpoint.clone(),
             },
             self.turns[index].input.clone(),
         ))
@@ -314,13 +305,13 @@ fn push_compact_tool_output(prompt: &mut String, output: &str) {
 pub struct ModelContext {
     summary: Option<String>,
     turns: Vec<Arc<Turn>>,
-    current: Option<(Input, Vec<Step>)>,
+    current: Option<(Arc<Input>, Vec<Arc<Step>>)>,
 }
 
 impl ModelContext {
     #[must_use]
-    pub fn with_current(mut self, input: Input, steps: Vec<Step>) -> Self {
-        self.current = Some((input, steps));
+    pub fn with_current(mut self, input: impl Into<Arc<Input>>, steps: Vec<Arc<Step>>) -> Self {
+        self.current = Some((input.into(), steps));
         self
     }
 
@@ -335,10 +326,10 @@ impl ModelContext {
     }
 
     #[must_use]
-    pub fn current(&self) -> Option<(&Input, &[Step])> {
+    pub fn current(&self) -> Option<(&Input, &[Arc<Step>])> {
         self.current
             .as_ref()
-            .map(|(input, steps)| (input, steps.as_slice()))
+            .map(|(input, steps)| (input.as_ref(), steps.as_slice()))
     }
 }
 
@@ -357,18 +348,32 @@ mod tests {
     }
 
     #[test]
+    fn cloning_a_model_context_shares_current_input_and_committed_steps() {
+        let input = Arc::new(Input::user("question"));
+        let step = Arc::new(Step {
+            items: vec![Item::Text("answer".into())],
+        });
+        let context =
+            ModelContext::default().with_current(Arc::clone(&input), vec![Arc::clone(&step)]);
+        let cloned = context.clone();
+        let (cloned_input, cloned_steps) = cloned.current.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&input, cloned_input));
+        assert!(Arc::ptr_eq(&step, &cloned_steps[0]));
+    }
+
+    #[test]
     fn legacy_stats_with_a_tool_call_field_still_parse_and_derive_the_count() {
         let turn = Turn {
             id: TurnId::from_u128(1),
             input: Input::user("run"),
-            steps: vec![Step {
+            steps: vec![Arc::new(Step {
                 items: vec![Item::ToolCall(ToolCall {
                     id: ToolCallId::from_provider("call"),
                     name: "read".to_string(),
                     arguments: serde_json::json!({}),
                     result: Ok("done".into()),
                 })],
-            }],
+            })],
             result: TurnResult::Stopped(StopReason::EndTurn),
             stats: TurnStats {
                 input_tokens: 12,
@@ -385,21 +390,23 @@ mod tests {
     }
 
     #[test]
-    fn before_returns_an_uncheckpointed_prefix_and_selected_input() {
+    fn before_preserves_the_checkpoint_and_loaded_prefix() {
         let first = turn(1, "first");
         let second = turn(2, "second");
         let third = turn(3, "third");
+        let fourth = turn(4, "fourth");
         let mut conversation = Conversation::new();
-        conversation.push(Arc::clone(&first), None);
-        conversation.push(Arc::clone(&second), None);
+        conversation.push(first, None);
+        conversation.push(second, None);
         conversation.compact("summary".to_string());
         conversation.push(Arc::clone(&third), None);
+        conversation.push(Arc::clone(&fourth), None);
 
-        let (prefix, input) = conversation.before(second.id).unwrap();
+        let (prefix, input) = conversation.before(fourth.id).unwrap();
 
-        assert_eq!(prefix.turns(), &[first]);
-        assert_eq!(prefix.context().summary(), None);
-        assert_eq!(input, second.input);
+        assert_eq!(prefix.turns(), &[third]);
+        assert_eq!(prefix.summary(), Some("summary"));
+        assert_eq!(input, fourth.input);
     }
 
     #[test]
@@ -413,6 +420,7 @@ mod tests {
 
         let context = conversation.context();
 
+        assert_eq!(conversation.turns(), &[Arc::clone(&second)]);
         assert_eq!(context.summary(), Some("summary"));
         assert_eq!(context.turns(), &[second]);
     }
@@ -425,7 +433,7 @@ mod tests {
             Arc::new(Turn {
                 id: TurnId::from_u128(1),
                 input: Input::user("run"),
-                steps: vec![Step {
+                steps: vec![Arc::new(Step {
                     items: vec![Item::ToolCall(ToolCall {
                         id: ToolCallId::from_provider("call"),
                         name: "read".to_string(),
@@ -438,7 +446,7 @@ mod tests {
                             }],
                         )),
                     })],
-                }],
+                })],
                 result: TurnResult::Stopped(StopReason::EndTurn),
                 stats: TurnStats::default(),
             }),

@@ -10,8 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    scrollback::sanitize_terminal_text,
-    status_line::{format_token_rate, format_token_usage},
+    scrollback::sanitize_terminal_text, status_line::format_activity_metrics,
     wrap::render_prefixed_lines,
 };
 
@@ -158,18 +157,14 @@ fn worked_separator(worked: &Worked, width: u16) -> String {
     );
     let stats = worked.stats;
     let completed_tool_calls = worked.completed_tool_calls;
-    if stats.input_tokens > 0 || stats.output_tokens > 0 || completed_tool_calls > 0 {
-        let _ = write!(
-            label,
-            " · {}",
-            format_token_usage(stats.input_tokens, stats.output_tokens)
-        );
-        if let Some(rate) = format_token_rate(stats.output_tokens, stats.generation_ms) {
-            let _ = write!(label, " · {rate}");
-        }
-        if completed_tool_calls > 0 {
-            let _ = write!(label, " · {} tools", completed_tool_calls);
-        }
+    let metrics = format_activity_metrics(
+        stats.input_tokens,
+        stats.output_tokens,
+        stats.generation_ms,
+        completed_tool_calls,
+    );
+    if !metrics.is_empty() {
+        let _ = write!(label, " · {metrics}");
     }
     label.push_str(" ─");
     let width = usize::from(width);
@@ -275,9 +270,7 @@ mod tests {
         let buffer = HistoryBlock::worked("2m 05s".to_string(), stats, 2).render(64);
         let separator = row_text(&buffer, 0);
 
-        assert!(
-            separator.starts_with("─ Worked for 2m 05s · 1.2k in / 345 out · 230 tok/s · 2 tools")
-        );
+        assert!(separator.starts_with("─ Worked for 2m 05s · 1.2k / 345 · 230/s · 2 tools"));
         assert_eq!(UnicodeWidthStr::width(separator.as_str()), 64);
         assert!(buffer
             .cell((0, 0))

@@ -9,7 +9,7 @@ use ash_core::{
     ToolError, ToolOutput, ToolTimeout, Turn, TurnActivity, TurnId, TurnResult, TurnStats,
 };
 use futures::{future::join_all, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use crate::{
@@ -75,13 +75,65 @@ pub(crate) struct EngineOutcome {
     pub(crate) error: Option<AshError>,
 }
 
+pub(crate) struct StepCommit {
+    pub(crate) step: Arc<Step>,
+    pub(crate) reply: oneshot::Sender<Result<(), AshError>>,
+}
+
+#[derive(Clone)]
+pub(crate) enum StepCommitter {
+    Channel(mpsc::Sender<StepCommit>),
+    #[cfg(test)]
+    Immediate,
+}
+
+impl StepCommitter {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<StepCommit>) {
+        let (sender, receiver) = mpsc::channel(1);
+        (Self::Channel(sender), receiver)
+    }
+
+    async fn commit(&self, step: Arc<Step>) -> Result<(), AshError> {
+        let sender = match self {
+            Self::Channel(sender) => sender,
+            #[cfg(test)]
+            Self::Immediate => return Ok(()),
+        };
+        let (reply, result) = oneshot::channel();
+        sender
+            .send(StepCommit { step, reply })
+            .await
+            .map_err(|_| ash_core::SessionError::Closed)?;
+        result.await.map_err(|_| ash_core::SessionError::Closed)?
+    }
+}
+
+pub(crate) struct TurnChannels {
+    events: mpsc::Sender<SessionEvent>,
+    committer: StepCommitter,
+}
+
+impl TurnChannels {
+    pub(crate) const fn new(events: mpsc::Sender<SessionEvent>, committer: StepCommitter) -> Self {
+        Self { events, committer }
+    }
+
+    #[cfg(test)]
+    const fn immediate(events: mpsc::Sender<SessionEvent>) -> Self {
+        Self {
+            events,
+            committer: StepCommitter::Immediate,
+        }
+    }
+}
+
 pub(crate) async fn run_turn(
     model: &dyn ModelClient,
     agent: &Agent,
     conversation: &Conversation,
     id: TurnId,
     input: Input,
-    events: mpsc::Sender<SessionEvent>,
+    channels: TurnChannels,
     context: ToolContext,
 ) -> EngineOutcome {
     TurnRunner {
@@ -89,8 +141,9 @@ pub(crate) async fn run_turn(
         agent,
         conversation,
         id,
-        input,
-        events,
+        input: Arc::new(input),
+        events: channels.events,
+        committer: channels.committer,
         context,
         steps: Vec::new(),
         stats: TurnStats::default(),
@@ -106,10 +159,11 @@ struct TurnRunner<'a> {
     agent: &'a Agent,
     conversation: &'a Conversation,
     id: TurnId,
-    input: Input,
+    input: Arc<Input>,
     events: mpsc::Sender<SessionEvent>,
+    committer: StepCommitter,
     context: ToolContext,
-    steps: Vec<Step>,
+    steps: Vec<Arc<Step>>,
     stats: TurnStats,
     pending_summary: Option<String>,
     last_context: Option<(u64, u64)>,
@@ -117,10 +171,14 @@ struct TurnRunner<'a> {
 
 impl TurnRunner<'_> {
     async fn run(mut self) -> EngineOutcome {
-        let (result, error) = self.run_loop().await;
+        let (result, error) = match self.run_loop().await {
+            Ok(result) => (result, None),
+            Err(AshError::Cancelled) => (TurnResult::Cancelled, None),
+            Err(error) => (TurnResult::Failed(error.to_string()), Some(error)),
+        };
         let turn = Turn {
             id: self.id,
-            input: self.input,
+            input: Arc::unwrap_or_clone(self.input),
             steps: self.steps,
             result,
             stats: self.stats,
@@ -132,20 +190,12 @@ impl TurnRunner<'_> {
         }
     }
 
-    async fn run_loop(&mut self) -> (TurnResult, Option<AshError>) {
+    async fn run_loop(&mut self) -> Result<TurnResult, AshError> {
         loop {
             if self.context.cancellation.is_cancelled() {
-                return (TurnResult::Cancelled, None);
+                return Ok(TurnResult::Cancelled);
             }
-            let request = match self.prepare_request().await {
-                Ok(request) => request,
-                Err(error) => {
-                    return match error {
-                        AshError::Cancelled => (TurnResult::Cancelled, None),
-                        error => (TurnResult::Failed(error.to_string()), Some(error)),
-                    };
-                }
-            };
+            let request = self.prepare_request().await?;
 
             let mut retries = 0;
             let response = loop {
@@ -171,11 +221,12 @@ impl TurnRunner<'_> {
                     break response;
                 }
                 let delay = retry_delay(retries, RETRY_BASE, RETRY_MAX);
+                send_event(&self.events, SessionEvent::Retrying { turn_id: self.id }).await;
                 debug!(turn_id = %self.id, retries, ?delay, "retrying model call");
                 tokio::select! {
                     biased;
                     () = self.context.cancellation.cancelled() => {
-                        return (TurnResult::Cancelled, None);
+                        return Ok(TurnResult::Cancelled);
                     }
                     () = tokio::time::sleep(delay) => {}
                 }
@@ -183,14 +234,11 @@ impl TurnRunner<'_> {
             };
 
             match response {
-                ModelResponse::Cancelled { .. } => return (TurnResult::Cancelled, None),
-                ModelResponse::Failed { error, .. } => {
-                    let error: AshError = error.into();
-                    return (TurnResult::Failed(error.to_string()), Some(error));
-                }
+                ModelResponse::Cancelled { .. } => return Ok(TurnResult::Cancelled),
+                ModelResponse::Failed { error, .. } => return Err(error.into()),
                 ModelResponse::Truncated { content, .. } => {
-                    self.push_without_tools(content);
-                    return (TurnResult::Truncated, None);
+                    self.commit_without_tools(content).await?;
+                    return Ok(TurnResult::Truncated);
                 }
                 ModelResponse::Stopped {
                     content,
@@ -198,16 +246,13 @@ impl TurnRunner<'_> {
                     stats: _,
                 } => {
                     if reason != StopReason::EndTurn || !has_tool_calls(&content) {
-                        self.push_without_tools(content);
-                        return (TurnResult::Stopped(reason), None);
+                        self.commit_without_tools(content).await?;
+                        return Ok(TurnResult::Stopped(reason));
                     }
                     let step = self.execute_tools(content).await;
-                    if !step.items.is_empty() {
-                        self.steps.push(step);
-                        self.publish_activity().await;
-                    }
+                    self.commit_step(step).await?;
                     if self.context.cancellation.is_cancelled() {
-                        return (TurnResult::Cancelled, None);
+                        return Ok(TurnResult::Cancelled);
                     }
                 }
             }
@@ -309,10 +354,11 @@ impl TurnRunner<'_> {
     }
 
     fn completed_tool_calls(&self) -> u64 {
-        u64::try_from(self.steps.iter().flat_map(Step::tool_calls).count()).unwrap_or(u64::MAX)
+        u64::try_from(self.steps.iter().flat_map(|step| step.tool_calls()).count())
+            .unwrap_or(u64::MAX)
     }
 
-    fn push_without_tools(&mut self, content: Vec<ContentBlock>) {
+    async fn commit_without_tools(&mut self, content: Vec<ContentBlock>) -> Result<(), AshError> {
         let items = content
             .into_iter()
             .filter_map(|block| match block {
@@ -327,9 +373,24 @@ impl TurnRunner<'_> {
                 ContentBlock::ToolCall { .. } => None,
             })
             .collect::<Vec<_>>();
-        if !items.is_empty() {
-            self.steps.push(Step { items });
+        if items.is_empty() {
+            return Ok(());
         }
+        self.commit_step(Step { items }).await
+    }
+
+    async fn commit_step(&mut self, step: Step) -> Result<(), AshError> {
+        if step.items.is_empty() {
+            return Ok(());
+        }
+        let has_tools = step.tool_calls().next().is_some();
+        let step = Arc::new(step);
+        self.committer.commit(Arc::clone(&step)).await?;
+        self.steps.push(step);
+        if has_tools {
+            self.publish_activity().await;
+        }
+        Ok(())
     }
 
     async fn execute_tools(&self, content: Vec<ContentBlock>) -> Step {
@@ -804,6 +865,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retries_reset_the_preview_before_publishing_the_next_attempt() {
+        let model = MockModel {
+            responses: StdMutex::new(VecDeque::from([
+                vec![Ok(ModelEvent::Text("discarded".into()))],
+                vec![
+                    Ok(ModelEvent::Text("final".into())),
+                    Ok(ModelEvent::Stop(StopReason::EndTurn)),
+                ],
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        };
+        let (events, mut incoming) = mpsc::channel(64);
+        let outcome = run_turn(
+            &model,
+            &Agent::new(ModelId::new("model"), Vec::new()),
+            &Conversation::new(),
+            TurnId::new(),
+            Input::user("retry"),
+            TurnChannels::immediate(events),
+            ToolContext {
+                identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                cancellation: CancellationToken::new(),
+                deadline: None,
+            },
+        )
+        .await;
+        let mut preview = String::new();
+        let mut resets = 0;
+        while let Ok(event) = incoming.try_recv() {
+            match event {
+                SessionEvent::Text { text, .. } => preview.push_str(&text),
+                SessionEvent::Retrying { .. } => {
+                    preview.clear();
+                    resets += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(resets, 1);
+        assert_eq!(preview, "final");
+        assert_eq!(outcome.turn.visible_text().as_deref(), Some("final"));
+    }
+
     #[test]
     fn large_tool_output_keeps_valid_utf8_tail() {
         let source = "a".repeat(MAX_AGENT_OUTPUT_BYTES) + "中文tail";
@@ -881,7 +986,7 @@ mod tests {
             &Conversation::new(),
             turn_id,
             Input::user("hello"),
-            events.clone(),
+            TurnChannels::immediate(events.clone()),
             ToolContext {
                 identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
                 cancellation: CancellationToken::new(),
@@ -926,7 +1031,7 @@ mod tests {
             &Conversation::new(),
             TurnId::new(),
             Input::user("hello"),
-            events,
+            TurnChannels::immediate(events),
             ToolContext {
                 identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
                 cancellation: CancellationToken::new(),
@@ -994,7 +1099,7 @@ mod tests {
             &conversation,
             TurnId::new(),
             Input::user("run tools"),
-            events,
+            TurnChannels::immediate(events),
             ToolContext {
                 identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
                 cancellation: CancellationToken::new(),
@@ -1071,7 +1176,7 @@ mod tests {
             &Conversation::new(),
             TurnId::new(),
             Input::user("run tools"),
-            events,
+            TurnChannels::immediate(events),
             ToolContext {
                 identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
                 cancellation: CancellationToken::new(),
@@ -1176,7 +1281,7 @@ mod tests {
                 &conversation,
                 TurnId::new(),
                 Input::user("current"),
-                events,
+                TurnChannels::immediate(events),
                 context,
             ),
             async {

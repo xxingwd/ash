@@ -5,11 +5,12 @@ use std::{
 };
 
 use ash_core::{
-    ash_data_dir, Conversation, SessionId, SessionIdentity, SessionSummary, StorageError, Turn,
+    ash_data_dir, Conversation, Input, SessionId, SessionIdentity, SessionSummary, Step,
+    StorageError, Turn, TurnId, TurnResult, TurnStats,
 };
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tracing::warn;
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
@@ -36,13 +37,26 @@ enum Record {
         created_at: String,
         title: String,
     },
-    Turn {
-        turn: Arc<Turn>,
+    TurnStart {
+        id: TurnId,
+        input: Input,
+    },
+    TurnStep {
+        step: Arc<Step>,
+    },
+    TurnEnd {
+        result: TurnResult,
+        stats: TurnStats,
         summary: Option<String>,
     },
     Checkpoint {
         summary: String,
     },
+}
+
+pub(crate) struct TurnStart {
+    pub(crate) id: TurnId,
+    pub(crate) input: Input,
 }
 
 #[derive(Debug)]
@@ -72,33 +86,75 @@ impl SessionWriter {
         }
     }
 
-    pub(crate) async fn commit_turn(
+    #[cfg(test)]
+    async fn commit_turn(
         &mut self,
         turn: Arc<Turn>,
         summary: Option<String>,
     ) -> Result<(), ash_core::AshError> {
-        self.append(vec![Record::Turn { turn, summary }]).await
+        self.append(turn_records(turn.as_ref(), summary)).await
+    }
+
+    pub(crate) async fn commit_step(
+        &mut self,
+        start: Option<TurnStart>,
+        step: Arc<Step>,
+    ) -> Result<(), ash_core::AshError> {
+        let mut records = start.into_iter().map(Record::from).collect::<Vec<_>>();
+        records.push(Record::TurnStep { step });
+        self.append(records).await
+    }
+
+    pub(crate) async fn finish_turn(
+        &mut self,
+        start: Option<TurnStart>,
+        result: TurnResult,
+        stats: TurnStats,
+        summary: Option<String>,
+    ) -> Result<(), ash_core::AshError> {
+        let mut records = start.into_iter().map(Record::from).collect::<Vec<_>>();
+        records.push(Record::TurnEnd {
+            result,
+            stats,
+            summary,
+        });
+        self.append(records).await
     }
 
     pub(crate) async fn checkpoint(&mut self, summary: String) -> Result<(), ash_core::AshError> {
         self.append(vec![Record::Checkpoint { summary }]).await
     }
 
-    pub(crate) async fn seed(&mut self, turns: &[Arc<Turn>]) -> Result<(), ash_core::AshError> {
-        self.append(
-            turns
-                .iter()
-                .cloned()
-                .map(|turn| Record::Turn {
-                    turn,
-                    summary: None,
-                })
-                .collect(),
-        )
-        .await
+    pub(crate) async fn seed(
+        &mut self,
+        conversation: &Conversation,
+        title: &Input,
+    ) -> Result<(), ash_core::AshError> {
+        let records = conversation
+            .summary()
+            .map(|summary| Record::Checkpoint {
+                summary: summary.to_string(),
+            })
+            .into_iter()
+            .chain(
+                conversation
+                    .turns()
+                    .iter()
+                    .flat_map(|turn| turn_records(turn, None)),
+            )
+            .collect();
+        self.append_with_title(records, Some(title)).await
     }
 
     async fn append(&mut self, records: Vec<Record>) -> Result<(), ash_core::AshError> {
+        self.append_with_title(records, None).await
+    }
+
+    async fn append_with_title(
+        &mut self,
+        records: Vec<Record>,
+        title: Option<&Input>,
+    ) -> Result<(), ash_core::AshError> {
         if records.is_empty() {
             return Ok(());
         }
@@ -109,14 +165,18 @@ impl SessionWriter {
             ))
             .into());
         }
-        let result = self.append_inner(records).await;
+        let result = self.append_inner(records, title).await;
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    async fn append_inner(&mut self, records: Vec<Record>) -> Result<(), ash_core::AshError> {
+    async fn append_inner(
+        &mut self,
+        records: Vec<Record>,
+        title: Option<&Input>,
+    ) -> Result<(), ash_core::AshError> {
         let is_new = self.file.is_none();
         let directory = if is_new {
             Some(
@@ -135,11 +195,17 @@ impl SessionWriter {
         };
         let mut data = Vec::new();
         if is_new {
-            let first_turn = records.iter().find_map(|record| match record {
-                Record::Turn { turn, .. } => Some(turn.as_ref()),
-                Record::Init { .. } | Record::Checkpoint { .. } => None,
-            });
-            let Some(first_turn) = first_turn else {
+            let first_input = records
+                .iter()
+                .find_map(|record| match record {
+                    Record::TurnStart { input, .. } => Some(input),
+                    Record::Init { .. }
+                    | Record::TurnStep { .. }
+                    | Record::TurnEnd { .. }
+                    | Record::Checkpoint { .. } => None,
+                })
+                .or(title);
+            let Some(first_input) = first_input else {
                 return Err(corrupt("a new session must start with a turn"));
             };
             encode(
@@ -147,7 +213,7 @@ impl SessionWriter {
                 &Record::Init {
                     identity: self.identity,
                     created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                    title: turn_title(first_turn),
+                    title: input_title(first_input),
                 },
             )?;
         }
@@ -173,6 +239,34 @@ impl SessionWriter {
         }
         Ok(())
     }
+}
+
+impl From<TurnStart> for Record {
+    fn from(start: TurnStart) -> Self {
+        Self::TurnStart {
+            id: start.id,
+            input: start.input,
+        }
+    }
+}
+
+fn turn_records(turn: &Turn, summary: Option<String>) -> Vec<Record> {
+    std::iter::once(Record::TurnStart {
+        id: turn.id,
+        input: turn.input.clone(),
+    })
+    .chain(
+        turn.steps
+            .iter()
+            .cloned()
+            .map(|step| Record::TurnStep { step }),
+    )
+    .chain(std::iter::once(Record::TurnEnd {
+        result: turn.result.clone(),
+        stats: turn.stats,
+        summary,
+    }))
+    .collect()
 }
 
 pub(crate) struct JsonlSessionStore {
@@ -212,25 +306,28 @@ impl JsonlSessionStore {
             return Ok(None);
         }
         let mut file = open_locked(&path).await?;
-        let (stored, valid_len) = replay_file(&mut file, &path).await?;
-        if stored.identity.id() != session_id {
+        let replay = replay_file(&mut file, &path).await?;
+        if replay.session.identity.id() != session_id {
             return Err(StorageError::IdentityMismatch {
                 expected: session_id,
-                actual: stored.identity.id(),
+                actual: replay.session.identity.id(),
             }
             .into());
         }
         let length = file.metadata().await.map_err(StorageError::from)?.len();
-        if valid_len < length {
-            file.set_len(valid_len).await.map_err(StorageError::from)?;
+        if replay.valid_len < length {
+            file.set_len(replay.valid_len)
+                .await
+                .map_err(StorageError::from)?;
             file.sync_data().await.map_err(StorageError::from)?;
         }
         file.seek(std::io::SeekFrom::End(0))
             .await
             .map_err(StorageError::from)?;
+        let writer = SessionWriter::existing(path, replay.session.identity, file);
         Ok(Some(OpenedSession {
-            writer: SessionWriter::existing(path, stored.identity, file),
-            session: stored,
+            writer,
+            session: replay.session,
         }))
     }
 
@@ -249,8 +346,8 @@ impl JsonlSessionStore {
         let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(StorageError::from)?;
-        let (stored, _) = replay_file(&mut file, &path).await?;
-        Ok(Some(stored))
+        let replay = replay_file(&mut file, &path).await?;
+        Ok(Some(replay.session))
     }
 
     pub(crate) async fn list_roots(&self) -> Result<Vec<SessionSummary>, ash_core::AshError> {
@@ -362,33 +459,109 @@ struct Init {
     title: String,
 }
 
+struct OpenTurn {
+    id: TurnId,
+    input: Input,
+    steps: Vec<Arc<Step>>,
+}
+
+struct Replay {
+    session: StoredSession,
+    valid_len: u64,
+}
+
+struct SessionScan {
+    init: Init,
+    valid_len: u64,
+    replay_offset: u64,
+}
+
+#[derive(Default)]
+struct RecordValidator {
+    ids: HashSet<TurnId>,
+    open: Option<u64>,
+}
+
+impl RecordValidator {
+    fn validate(
+        &mut self,
+        record: &Record,
+        offset: u64,
+        path: &Path,
+    ) -> Result<Option<u64>, ash_core::AshError> {
+        match record {
+            Record::Init { .. } => Err(corrupt_at(
+                path,
+                "Init record appears after the first line",
+                None,
+            )),
+            Record::TurnStart { id, .. } => {
+                if self.open.is_some() {
+                    return Err(corrupt_at(
+                        path,
+                        "turn starts before previous turn ends",
+                        None,
+                    ));
+                }
+                if !self.ids.insert(*id) {
+                    return Err(corrupt_at(path, "duplicate turn id", None));
+                }
+                self.open = Some(offset);
+                Ok(None)
+            }
+            Record::TurnStep { .. } => {
+                if self.open.is_none() {
+                    return Err(corrupt_at(path, "turn step appears outside a turn", None));
+                }
+                Ok(None)
+            }
+            Record::TurnEnd { summary, .. } => {
+                let start = self
+                    .open
+                    .take()
+                    .ok_or_else(|| corrupt_at(path, "turn ends without starting", None))?;
+                validate_summary(summary.as_deref(), path)?;
+                Ok(summary.is_some().then_some(start))
+            }
+            Record::Checkpoint { summary } => {
+                if self.open.is_some() {
+                    return Err(corrupt_at(
+                        path,
+                        "checkpoint appears inside open turn",
+                        None,
+                    ));
+                }
+                validate_summary(Some(summary), path)?;
+                Ok(Some(offset))
+            }
+        }
+    }
+
+    fn open_offset(&self) -> Option<u64> {
+        self.open
+    }
+}
+
 async fn replay_file(
     file: &mut tokio::fs::File,
     path: &Path,
-) -> Result<(StoredSession, u64), ash_core::AshError> {
-    file.seek(std::io::SeekFrom::Start(0))
+) -> Result<Replay, ash_core::AshError> {
+    let scan = scan_file(file, path).await?;
+    file.seek(std::io::SeekFrom::Start(scan.replay_offset))
         .await
         .map_err(StorageError::from)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .await
-        .map_err(StorageError::from)?;
-    let valid_len = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let complete = &bytes[..valid_len];
-    let mut records = complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty());
-    let first = records
-        .next()
-        .ok_or_else(|| corrupt_at(path, "missing Init record", None))?;
-    let init = init_from_record(decode(first, path)?, path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
     let mut conversation = Conversation::new();
-    let mut ids = HashSet::new();
-    for line in records {
-        match decode(line, path)? {
+    let mut open = None;
+    loop {
+        let Some(_) = read_complete_line(&mut reader, &mut line).await? else {
+            break;
+        };
+        if line.is_empty() {
+            continue;
+        }
+        match decode(&line, path)? {
             Record::Init { .. } => {
                 return Err(corrupt_at(
                     path,
@@ -396,26 +569,109 @@ async fn replay_file(
                     None,
                 ));
             }
-            Record::Turn { turn, summary } => {
-                if !ids.insert(turn.id) {
-                    return Err(corrupt_at(path, "duplicate turn id", None));
-                }
-                validate_summary(summary.as_deref(), path)?;
-                conversation.push(turn, summary);
+            Record::TurnStart { id, input } => {
+                open = Some(OpenTurn {
+                    id,
+                    input,
+                    steps: Vec::new(),
+                });
+            }
+            Record::TurnStep { step } => {
+                let active = open
+                    .as_mut()
+                    .ok_or_else(|| corrupt_at(path, "turn step appears outside a turn", None))?;
+                active.steps.push(step);
+            }
+            Record::TurnEnd {
+                result,
+                stats,
+                summary,
+            } => {
+                let active = open
+                    .take()
+                    .ok_or_else(|| corrupt_at(path, "turn ends without starting", None))?;
+                conversation.push(
+                    Arc::new(Turn {
+                        id: active.id,
+                        input: active.input,
+                        steps: active.steps,
+                        result,
+                        stats,
+                    }),
+                    summary,
+                );
             }
             Record::Checkpoint { summary } => {
-                validate_summary(Some(&summary), path)?;
                 conversation.compact(summary);
             }
         }
     }
-    Ok((
-        StoredSession {
-            identity: init.identity,
+    Ok(Replay {
+        session: StoredSession {
+            identity: scan.init.identity,
             conversation,
         },
-        u64::try_from(valid_len).unwrap_or(u64::MAX),
-    ))
+        valid_len: scan.valid_len,
+    })
+}
+
+async fn scan_file(
+    file: &mut tokio::fs::File,
+    path: &Path,
+) -> Result<SessionScan, ash_core::AshError> {
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(StorageError::from)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut valid_len = 0_u64;
+    let first = loop {
+        let Some(read) = read_complete_line(&mut reader, &mut line).await? else {
+            return Err(corrupt_at(path, "missing Init record", None));
+        };
+        valid_len = valid_len.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if !line.is_empty() {
+            break decode(&line, path)?;
+        }
+    };
+    let init = init_from_record(first, path)?;
+    let mut validator = RecordValidator::default();
+    let mut replay_offset = valid_len;
+    loop {
+        let offset = valid_len;
+        let Some(read) = read_complete_line(&mut reader, &mut line).await? else {
+            break;
+        };
+        valid_len = valid_len.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(boundary) = validator.validate(&decode(&line, path)?, offset, path)? {
+            replay_offset = boundary;
+        }
+    }
+    let valid_len = validator.open_offset().unwrap_or(valid_len);
+    Ok(SessionScan {
+        init,
+        valid_len,
+        replay_offset,
+    })
+}
+
+async fn read_complete_line(
+    reader: &mut BufReader<&mut tokio::fs::File>,
+    line: &mut Vec<u8>,
+) -> Result<Option<usize>, ash_core::AshError> {
+    line.clear();
+    let read = reader
+        .read_until(b'\n', line)
+        .await
+        .map_err(StorageError::from)?;
+    if read == 0 || !line.ends_with(b"\n") {
+        return Ok(None);
+    }
+    line.pop();
+    Ok(Some(read))
 }
 
 async fn read_init(path: &Path) -> Result<Init, ash_core::AshError> {
@@ -454,9 +710,10 @@ fn init_from_record(record: Record, path: &Path) -> Result<Init, ash_core::AshEr
             title,
         }),
         Record::Init { .. } => Err(corrupt_at(path, "Init fields cannot be empty", None)),
-        Record::Turn { .. } | Record::Checkpoint { .. } => {
-            Err(corrupt_at(path, "first record is not Init", None))
-        }
+        Record::TurnStart { .. }
+        | Record::TurnStep { .. }
+        | Record::TurnEnd { .. }
+        | Record::Checkpoint { .. } => Err(corrupt_at(path, "first record is not Init", None)),
     }
 }
 
@@ -579,8 +836,8 @@ fn canonical_session_id(path: &Path) -> Option<SessionId> {
     path.file_stem()?.to_str()?.parse().ok()
 }
 
-fn turn_title(turn: &Turn) -> String {
-    shorten_title(turn.input.title().unwrap_or(UNTITLED_CHAT))
+fn input_title(input: &Input) -> String {
+    shorten_title(input.title().unwrap_or(UNTITLED_CHAT))
 }
 
 fn shorten_title(title: &str) -> String {
@@ -639,21 +896,21 @@ mod tests {
         Arc::new(Turn {
             id: ash_core::TurnId::from_u128(id),
             input: "inspect".into(),
-            steps: vec![Step {
+            steps: vec![Arc::new(Step {
                 items: vec![Item::ToolCall(ToolCall {
                     id: ToolCallId::from_provider("call"),
                     name: "read".to_string(),
                     arguments: serde_json::json!({}),
                     result: Ok("done".into()),
                 })],
-            }],
+            })],
             result: TurnResult::Stopped(StopReason::EndTurn),
             stats: TurnStats::default(),
         })
     }
 
     #[tokio::test]
-    async fn root_commit_is_init_then_turn() {
+    async fn root_commit_is_init_start_then_end() {
         let directory = TempDir::new().unwrap();
         let store = JsonlSessionStore::new(directory.path());
         let id = SessionId::new();
@@ -665,7 +922,7 @@ mod tests {
             .await
             .unwrap();
         let lines = data.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         let init = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
         assert_eq!(init["type"], "init");
         assert_eq!(init["title"], "hello");
@@ -673,7 +930,11 @@ mod tests {
         assert!(init.get("turns").is_none());
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(lines[1]).unwrap()["type"],
-            "turn"
+            "turn_start"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[2]).unwrap()["type"],
+            "turn_end"
         );
     }
 
@@ -695,7 +956,7 @@ mod tests {
         let context = stored.conversation.context();
         assert_eq!(context.summary(), Some("first summary"));
         assert_eq!(context.turns(), &[second]);
-        assert_eq!(stored.conversation.turns().len(), 2);
+        assert_eq!(stored.conversation.turns().len(), 1);
     }
 
     #[tokio::test]
@@ -714,7 +975,7 @@ mod tests {
                     },
                 ],
             },
-            steps: vec![Step {
+            steps: vec![Arc::new(Step {
                 items: vec![
                     Item::Thought {
                         text: "reasoning".to_string(),
@@ -734,7 +995,7 @@ mod tests {
                     }),
                     Item::Text("answer".to_string()),
                 ],
-            }],
+            })],
             result: TurnResult::Stopped(StopReason::EndTurn),
             stats: TurnStats {
                 input_tokens: 10,
@@ -755,7 +1016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_records_omit_the_tool_count_and_legacy_records_still_load() {
+    async fn derived_tool_count_remains_canonical_with_legacy_stats() {
         let directory = TempDir::new().unwrap();
         let store = JsonlSessionStore::new(directory.path());
         let id = SessionId::new();
@@ -769,9 +1030,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert!(records[1]["turn"]["stats"].get("tool_calls").is_none());
-        // Simulate a legacy record carrying the removed derived field.
-        records[1]["turn"]["stats"]["tool_calls"] = serde_json::json!(99);
+        assert!(records[2].get("stats").is_none());
+        assert!(records[3]["stats"].get("tool_calls").is_none());
+        records[3]["stats"]["tool_calls"] = serde_json::json!(99);
         let data = records
             .iter()
             .map(serde_json::Value::to_string)
@@ -800,6 +1061,33 @@ mod tests {
         let context = stored.conversation.context();
         assert_eq!(context.summary(), Some("all turns"));
         assert!(context.turns().is_empty());
+        assert!(stored.conversation.turns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_keeps_only_the_latest_checkpoint_and_its_tail() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "first"), None).await.unwrap();
+        writer
+            .checkpoint("first summary".to_string())
+            .await
+            .unwrap();
+        writer.commit_turn(turn(2, "second"), None).await.unwrap();
+        writer
+            .checkpoint("latest summary".to_string())
+            .await
+            .unwrap();
+        let tail = turn(3, "tail");
+        writer.commit_turn(Arc::clone(&tail), None).await.unwrap();
+        drop(writer);
+
+        let stored = store.load(id).await.unwrap().unwrap();
+
+        assert_eq!(stored.conversation.summary(), Some("latest summary"));
+        assert_eq!(stored.conversation.turns(), &[tail]);
     }
 
     #[tokio::test]
@@ -808,8 +1096,11 @@ mod tests {
         let store = JsonlSessionStore::new(directory.path());
         let id = SessionId::new();
         let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        let mut conversation = Conversation::new();
+        conversation.push(turn(1, "first"), None);
+        conversation.push(turn(2, "second"), None);
         writer
-            .seed(&[turn(1, "first"), turn(2, "second")])
+            .seed(&conversation, &Input::user("first"))
             .await
             .unwrap();
         drop(writer);
@@ -821,10 +1112,67 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 5);
         assert_eq!(records[0]["title"], "first");
-        assert_eq!(records[1]["summary"], serde_json::Value::Null);
+        assert_eq!(records[1]["type"], "turn_start");
         assert_eq!(records[2]["summary"], serde_json::Value::Null);
+        assert_eq!(records[3]["type"], "turn_start");
+        assert_eq!(records[4]["summary"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn seed_preserves_a_checkpoint_before_loaded_turns() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        let mut conversation = Conversation::new();
+        conversation.compact("older turns".to_string());
+        let tail = turn(2, "tail");
+        conversation.push(Arc::clone(&tail), None);
+
+        writer
+            .seed(&conversation, &Input::user("selected"))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let stored = store.load(id).await.unwrap().unwrap();
+        assert_eq!(stored.conversation.summary(), Some("older turns"));
+        assert_eq!(stored.conversation.turns(), &[tail]);
+    }
+
+    #[tokio::test]
+    async fn open_turn_is_discarded_and_truncated_on_open() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let step = Arc::new(tool_turn(1).steps[0].clone());
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(0, "complete"), None).await.unwrap();
+        writer
+            .commit_step(
+                Some(TurnStart {
+                    id: ash_core::TurnId::from_u128(1),
+                    input: Input::user("inspect"),
+                }),
+                Arc::clone(&step),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let opened = store.open(id).await.unwrap().unwrap();
+        assert_eq!(
+            opened.session.conversation.turns()[0].input.text(),
+            "complete"
+        );
+        drop(opened);
+
+        let records = tokio::fs::read_to_string(directory.path().join(session_filename(id)))
+            .await
+            .unwrap();
+        assert_eq!(records.lines().count(), 3);
     }
 
     #[tokio::test]
@@ -880,6 +1228,55 @@ mod tests {
         let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
         writer.commit_turn(turn(1, "first"), None).await.unwrap();
         writer.commit_turn(turn(1, "again"), None).await.unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            store.open(id).await,
+            Err(ash_core::AshError::Storage(StorageError::Corrupt { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphan_step_is_corrupt() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer.commit_turn(turn(1, "first"), None).await.unwrap();
+        writer
+            .append(vec![Record::TurnStep {
+                step: Arc::new(Step::default()),
+            }])
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            store.open(id).await,
+            Err(ash_core::AshError::Storage(StorageError::Corrupt { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_inside_open_turn_is_corrupt() {
+        let directory = TempDir::new().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let id = SessionId::new();
+        let mut writer = store.open_new(SessionIdentity::root(id)).await.unwrap();
+        writer
+            .commit_step(
+                Some(TurnStart {
+                    id: ash_core::TurnId::from_u128(1),
+                    input: Input::user("inspect"),
+                }),
+                Arc::new(Step::default()),
+            )
+            .await
+            .unwrap();
+        writer
+            .checkpoint("invalid boundary".to_string())
+            .await
+            .unwrap();
         drop(writer);
 
         assert!(matches!(

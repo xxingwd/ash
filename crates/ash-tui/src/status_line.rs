@@ -33,7 +33,7 @@ pub fn format_token_count(tokens: u64) -> String {
 
 pub fn format_token_usage(input_tokens: u64, output_tokens: u64) -> String {
     format!(
-        "{} in / {} out",
+        "{} / {}",
         format_token_count(input_tokens),
         format_token_count(output_tokens),
     )
@@ -43,11 +43,74 @@ pub fn format_token_rate(tokens: u64, duration_ms: u64) -> Option<String> {
     (tokens > 0 && duration_ms > 0).then(|| {
         let tenths = tokens.saturating_mul(10_000) / duration_ms;
         if tenths.is_multiple_of(10) {
-            format!("{} tok/s", tenths / 10)
+            format!("{}/s", tenths / 10)
         } else {
-            format!("{}.{:01} tok/s", tenths / 10, tenths % 10)
+            format!("{}.{:01}/s", tenths / 10, tenths % 10)
         }
     })
+}
+
+pub fn format_activity_metrics(
+    input_tokens: u64,
+    output_tokens: u64,
+    generation_ms: u64,
+    completed_tool_calls: u64,
+) -> String {
+    activity_parts(
+        input_tokens,
+        output_tokens,
+        generation_ms,
+        completed_tool_calls,
+    )
+    .join(" · ")
+}
+
+pub fn fit_activity_metrics(
+    input_tokens: u64,
+    output_tokens: u64,
+    generation_ms: u64,
+    completed_tool_calls: u64,
+    available: usize,
+) -> String {
+    let mut parts = activity_parts(
+        input_tokens,
+        output_tokens,
+        generation_ms,
+        completed_tool_calls,
+    );
+    loop {
+        if parts.is_empty() {
+            return String::new();
+        }
+        let metrics = parts.join(" · ");
+        if UnicodeWidthStr::width(metrics.as_str()) <= available {
+            return metrics;
+        }
+        if parts.len() >= 3 {
+            parts.remove(1);
+        } else {
+            parts.pop();
+        }
+    }
+}
+
+fn activity_parts(
+    input_tokens: u64,
+    output_tokens: u64,
+    generation_ms: u64,
+    completed_tool_calls: u64,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if input_tokens > 0 || output_tokens > 0 {
+        parts.push(format_token_usage(input_tokens, output_tokens));
+        if let Some(rate) = format_token_rate(output_tokens, generation_ms) {
+            parts.push(rate);
+        }
+    }
+    if completed_tool_calls > 0 {
+        parts.push(format!("{completed_tool_calls} tools"));
+    }
+    parts
 }
 
 pub fn format_elapsed(elapsed_seconds: u64) -> String {
@@ -130,10 +193,23 @@ mod tests {
         assert_eq!(format_token_count(999), "999");
         assert_eq!(format_token_count(12_345), "12.3k");
         assert_eq!(format_token_count(1_234_567), "1.2M");
-        assert_eq!(format_token_usage(12_345, 678), "12.3k in / 678 out");
-        assert_eq!(format_token_rate(250, 2_000).as_deref(), Some("125 tok/s"));
-        assert_eq!(format_token_rate(1, 300).as_deref(), Some("3.3 tok/s"));
+        assert_eq!(format_token_usage(12_345, 678), "12.3k / 678");
+        assert_eq!(format_token_rate(250, 2_000).as_deref(), Some("125/s"));
+        assert_eq!(format_token_rate(1, 300).as_deref(), Some("3.3/s"));
         assert_eq!(format_token_rate(1, 0), None);
+        assert_eq!(
+            format_activity_metrics(120, 25, 200, 3),
+            "120 / 25 · 125/s · 3 tools"
+        );
+        assert_eq!(format_activity_metrics(120, 25, 200, 0), "120 / 25 · 125/s");
+        assert_eq!(format_activity_metrics(0, 0, 0, 2), "2 tools");
+        assert_eq!(format_activity_metrics(0, 0, 0, 0), "");
+        assert_eq!(
+            fit_activity_metrics(120, 25, 200, 3, 18),
+            "120 / 25 · 3 tools"
+        );
+        assert_eq!(fit_activity_metrics(120, 25, 200, 3, 8), "120 / 25");
+        assert_eq!(fit_activity_metrics(120, 25, 200, 3, 7), "");
     }
 
     #[test]

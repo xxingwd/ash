@@ -18,9 +18,7 @@ use crate::{
     operation::ActivityView,
     scrollback::sanitize_single_line,
     slash_command::CommandCompletion,
-    status_line::{
-        compact_path, fit_status_left, format_elapsed, format_token_rate, format_token_usage,
-    },
+    status_line::{compact_path, fit_activity_metrics, fit_status_left, format_elapsed},
     text_width::truncate_end,
     SubagentView, SubagentViewState,
 };
@@ -29,7 +27,6 @@ const FOOTER_ROWS: u16 = 1;
 const MAX_COMPOSER_ROWS: u16 = 8;
 const MENU_MAX_ROWS: usize = 8;
 const SCREEN_SPACING: u16 = 1;
-const TURN_STATS_STATUS_WIDTH: u16 = 80;
 const SUBAGENTS_MAX_ROWS: usize = 4;
 const FOOTER_SIDE_PADDING: u16 = 2;
 const FOOTER_COLUMN_GAP: u16 = 3;
@@ -120,8 +117,8 @@ pub(crate) fn render(state: &AppState, width: u16, height: u16) -> ViewportFrame
         status_header: &status_header,
         elapsed: &elapsed,
         turn_activity: state.turn_activity,
-        context_tokens: state.context_tokens,
-        context_limit: state.context_limit,
+        context_tokens: state.context.map(|context| context.tokens),
+        context_limit: state.context.map(|context| context.limit),
         prompt_lines: &prompt.lines,
         prompt_cursor_row: prompt.cursor_row,
         prompt_cursor_column: prompt.cursor_column,
@@ -501,38 +498,37 @@ fn render_subagents(area: Rect, subagents: &[SubagentView], buffer: &mut Buffer)
     for (index, subagent) in subagents.iter().take(visible).enumerate() {
         let state_symbol = subagent_state_symbol(subagent.state);
         let state_color = subagent_state_color(subagent.state);
-        let metrics = activity_metrics(subagent.activity);
-        let context = context_display(subagent.context_tokens, subagent.context_limit)
-            .map(|context| format!("ctx {}", context.text));
-        let metrics = match (metrics.is_empty(), context) {
-            (true, Some(context)) => context,
-            (false, Some(context)) => format!("{metrics} · {context}"),
-            _ => metrics,
-        };
-        let metrics = (!metrics.is_empty()).then(|| format!("  {metrics}"));
         let prefix_width = UnicodeWidthStr::width(state_symbol).saturating_add(1);
         let available = usize::from(area.width).saturating_sub(prefix_width);
-        let fixed = metrics.map_or_else(
-            || truncate_end(&subagent.name, available),
-            |metrics| {
-                let metrics_width = UnicodeWidthStr::width(metrics.as_str());
-                let name_width = UnicodeWidthStr::width(subagent.name.as_str());
-                if name_width.saturating_add(metrics_width) <= available {
-                    format!("{}{metrics}", subagent.name)
-                } else {
-                    truncate_end(&subagent.name, available)
-                }
-            },
+        let name_width = UnicodeWidthStr::width(subagent.name.as_str());
+        let metrics = activity_metrics(
+            subagent.activity,
+            available.saturating_sub(name_width).saturating_sub(2),
         );
-        let spans = vec![
+        let show_metrics = !metrics.is_empty()
+            && name_width
+                .saturating_add(UnicodeWidthStr::width(metrics.as_str()).saturating_add(2))
+                <= available;
+        let name = if show_metrics {
+            subagent.name.clone()
+        } else {
+            truncate_end(&subagent.name, available)
+        };
+        let mut spans = vec![
             Span::styled(
                 format!("{state_symbol} "),
                 Style::default()
                     .fg(state_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(fixed, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
         ];
+        if show_metrics {
+            spans.push(Span::styled(
+                format!("  {metrics}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
         let line = Line::from(spans);
         buffer.set_line(
             area.x,
@@ -575,6 +571,8 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
+    let prefix = format!("• {} ({})", input.status_header, input.elapsed);
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let mut spans = vec![
         Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(
@@ -586,33 +584,28 @@ fn render_status(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
             Style::default().add_modifier(Modifier::DIM),
         ),
     ];
-    if input.terminal_width >= TURN_STATS_STATUS_WIDTH {
-        let metrics = activity_metrics(input.turn_activity.unwrap_or_default());
-        if !metrics.is_empty() {
-            spans.push(Span::styled(
-                format!("  {metrics}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
+    let available = usize::from(area.width)
+        .saturating_sub(prefix_width)
+        .saturating_sub(2);
+    let metrics = activity_metrics(input.turn_activity.unwrap_or_default(), available);
+    if !metrics.is_empty() {
+        spans.push(Span::styled(
+            format!("  {metrics}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
-fn activity_metrics(activity: TurnActivity) -> String {
-    if activity == TurnActivity::default() {
-        return String::new();
-    }
+fn activity_metrics(activity: TurnActivity, available: usize) -> String {
     let stats = activity.stats;
-    let mut metrics = format!(
-        "{} · {} tools",
-        format_token_usage(stats.input_tokens, stats.output_tokens),
+    fit_activity_metrics(
+        stats.input_tokens,
+        stats.output_tokens,
+        stats.generation_ms,
         activity.completed_tool_calls,
-    );
-    if let Some(rate) = format_token_rate(stats.output_tokens, stats.generation_ms) {
-        metrics.push_str(" · ");
-        metrics.push_str(&rate);
-    }
-    metrics
+        available,
+    )
 }
 
 fn render_composer(area: Rect, prompt: &PromptWindow<'_>, buffer: &mut Buffer) {
@@ -656,23 +649,27 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         return;
     }
     let path = compact_path(input.working_dir);
-    let context = context_display(input.context_tokens, input.context_limit);
-    let protocol = (!input.protocol.is_empty()).then_some(input.protocol);
-    let context_text = context
-        .as_ref()
-        .map(|context| format!("ctx {}", context.text));
-    let (context, protocol) = if footer_right_fits(area, context_text.as_deref(), protocol) {
-        (context, protocol)
-    } else if footer_right_fits(area, context_text.as_deref(), None) {
-        (context, None)
-    } else if footer_right_fits(area, None, protocol) {
-        (None, protocol)
-    } else {
-        (None, None)
-    };
-    let displayed_context = context
-        .as_ref()
-        .map(|_| context_text.as_deref().unwrap_or_default());
+    let mut context = context_display(input.context_tokens, input.context_limit);
+    let mut protocol = (!input.protocol.is_empty()).then_some(input.protocol);
+    if !footer_right_fits(
+        area,
+        context.as_ref().map(|context| context.text.as_str()),
+        protocol,
+    ) {
+        if footer_right_fits(
+            area,
+            context.as_ref().map(|context| context.text.as_str()),
+            None,
+        ) {
+            protocol = None;
+        } else if footer_right_fits(area, None, protocol) {
+            context = None;
+        } else {
+            context = None;
+            protocol = None;
+        }
+    }
+    let displayed_context = context.as_ref().map(|context| context.text.as_str());
     let right_width = footer_right_width(displayed_context, protocol);
     let left_width = if right_width > 0 {
         area.width
@@ -703,7 +700,7 @@ fn render_footer(area: Rect, input: &ViewportInput<'_>, buffer: &mut Buffer) {
         let mut spans = Vec::new();
         if let Some(context) = context {
             spans.push(Span::styled(
-                context_text.as_deref().unwrap_or_default(),
+                context.text,
                 Style::default().fg(context.color),
             ));
         }
@@ -1082,12 +1079,16 @@ mod tests {
         };
 
         assert_eq!(
-            status_text_with_stats(79, "Working", Some(activity)),
-            "• Working (2s)"
+            status_text_with_stats(30, "Working", Some(activity)),
+            "• Working (2s)  120 / 25"
+        );
+        assert_eq!(
+            status_text_with_stats(40, "Working", Some(activity)),
+            "• Working (2s)  120 / 25 · 3 tools"
         );
         assert_eq!(
             status_text_with_stats(80, "Working", Some(activity)),
-            "• Working (2s)  120 in / 25 out · 3 tools · 125 tok/s"
+            "• Working (2s)  120 / 25 · 125/s · 3 tools"
         );
     }
 
@@ -1132,7 +1133,7 @@ mod tests {
 
         assert!((0..frame.buffer.area.height)
             .map(|row| row_text(&frame.buffer, row))
-            .any(|row| row.contains("ctx 50%") && row.contains("openai")));
+            .any(|row| row.contains("50%") && row.contains("openai")));
     }
 
     #[test]
@@ -1145,8 +1146,6 @@ mod tests {
                 name: "inspect_glob".to_string(),
                 state: SubagentViewState::Running,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             },
             SubagentView {
@@ -1155,8 +1154,6 @@ mod tests {
                 name: "fix_bash".to_string(),
                 state: SubagentViewState::Running,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             },
         ];
@@ -1197,8 +1194,6 @@ mod tests {
             name: "inspect_glob".to_string(),
             state: SubagentViewState::Idle,
             activity: TurnActivity::default(),
-            context_tokens: None,
-            context_limit: None,
             active_turn: None,
         }];
         let frame = render_view(ViewportInput {
@@ -1237,8 +1232,6 @@ mod tests {
                 name: "idle".to_string(),
                 state: SubagentViewState::Idle,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             },
             SubagentView {
@@ -1247,8 +1240,6 @@ mod tests {
                 name: "running".to_string(),
                 state: SubagentViewState::Running,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             },
         ];
@@ -1269,8 +1260,6 @@ mod tests {
             name: "a_very_long_agent_name_that_would_hide_usage".to_string(),
             state: SubagentViewState::Idle,
             activity: TurnActivity::default(),
-            context_tokens: None,
-            context_limit: None,
             active_turn: None,
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 54, 1));
@@ -1296,18 +1285,23 @@ mod tests {
                 },
                 completed_tool_calls: 2,
             },
-            context_tokens: Some(500),
-            context_limit: Some(1_000),
             active_turn: Some(TurnId::new()),
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 1));
 
         render_subagents(Rect::new(0, 0, 80, 1), &[agent], &mut buffer);
 
-        assert_eq!(
-            row_text(&buffer, 0),
-            "● worker  120 in / 25 out · 2 tools · 125 tok/s · ctx 50%"
-        );
+        assert_eq!(row_text(&buffer, 0), "● worker  120 / 25 · 125/s · 2 tools");
+        assert!(buffer
+            .cell((2, 0))
+            .expect("name")
+            .modifier
+            .contains(Modifier::BOLD));
+        assert!(buffer
+            .cell((10, 0))
+            .expect("metrics")
+            .modifier
+            .contains(Modifier::DIM));
     }
 
     #[test]
@@ -1320,8 +1314,6 @@ mod tests {
                 name: format!("agent_{index}"),
                 state: SubagentViewState::Idle,
                 activity: TurnActivity::default(),
-                context_tokens: None,
-                context_limit: None,
                 active_turn: None,
             })
             .collect::<Vec<_>>();

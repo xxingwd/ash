@@ -17,7 +17,7 @@ struct Replacement {
 
 #[derive(Deserialize, JsonSchema)]
 struct EditArgs {
-    /// File path, relative to the working directory or absolute within it
+    /// File path, relative to the working directory or absolute
     path: String,
     /// Non-overlapping replacements matched against the original file
     edits: Vec<Replacement>,
@@ -64,7 +64,7 @@ async fn edit_file(
     let path = workspace.path(&requested)?;
     crate::path::run_tool_blocking(cancellation, deadline, move |cancellation, deadline| {
         crate::path::ensure_running(&cancellation, deadline)?;
-        let mut options = cap_std::fs::OpenOptions::new();
+        let mut options = std::fs::OpenOptions::new();
         options.read(true);
         crate::path::ensure_running(&cancellation, deadline)?;
         let mut file = path
@@ -333,5 +333,26 @@ mod tests {
                     && !message.contains(&full_path.display().to_string())
                     && !message.contains(requested)
         ));
+    }
+
+    #[tokio::test]
+    async fn edits_files_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file_path = outside.path().join("outside.txt");
+        std::fs::write(&file_path, "one\r\ntwo\r\n").unwrap();
+
+        let result = edit_file(
+            &Workspace::new(root.path()).unwrap(),
+            file_path.to_str().unwrap(),
+            vec![replacement("one\ntwo", "three")],
+            CancellationToken::new(),
+            Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.path, file_path);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "three\r\n");
     }
 }

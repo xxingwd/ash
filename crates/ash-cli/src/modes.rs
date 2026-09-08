@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::{collections::VecDeque, io::Write, path::PathBuf};
 
 use crate::input_history::InputHistory;
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use ash_agent::{
 };
 use ash_collab::{SubagentEvent, SubagentEventKind, SubagentState};
 use ash_core::{Conversation, ModelId, SessionEvent, SessionId, TurnId, TurnResult};
-use ash_protocol::{create_adapter, Protocol, ProviderConfig};
+use ash_protocol::{create_adapter, ModelConfig, Protocol, ProviderConfig};
 use ash_tui::{SubagentUpdate, SubagentUpdateKind, SubagentViewState, UiCommand, UiEvent};
 use futures::StreamExt;
 use owo_colors::OwoColorize;
@@ -64,15 +64,16 @@ struct AgentSetup {
     subagent_events: tokio::sync::broadcast::Receiver<SubagentEvent>,
 }
 
-pub async fn run(cli: Cli) -> Result<()> {
-    let setup = build_config(&cli)?;
-    match cli.command {
+pub async fn run(mut cli: Cli) -> Result<()> {
+    let command = cli.command.take();
+    let setup = tokio::task::spawn_blocking(move || build_setup(&cli)).await??;
+    match command {
         Some(Command::Run { prompt, .. }) => run_print(setup, prompt).await,
         None => run_interactive(setup).await,
     }
 }
 
-fn build_config(cli: &Cli) -> Result<AgentSetup> {
+fn build_setup(cli: &Cli) -> Result<AgentSetup> {
     let protocol = resolve_protocol(cli)?;
     let api_key = env_value("ASH_API_KEY").context("set ASH_API_KEY in the process environment")?;
     let model = resolve_model(cli, &protocol)?;
@@ -99,6 +100,7 @@ fn build_config(cli: &Cli) -> Result<AgentSetup> {
         protocol: protocol.clone(),
         api_key: SecretString::from(api_key),
         base_url,
+        model_config: load_model_config()?,
     };
     let mut agent = Agent::new(ModelId::new(model), tools)
         .with_system_prompt(system_prompt)
@@ -187,6 +189,14 @@ fn env_value(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn load_model_config() -> Result<ModelConfig> {
+    match std::env::var("ASH_MODEL_CONFIG") {
+        Ok(config) => Ok(config.parse()?),
+        Err(std::env::VarError::NotPresent) => Ok(ModelConfig::default()),
+        Err(error) => Err(error).context("ASH_MODEL_CONFIG must contain valid Unicode"),
+    }
+}
+
 fn env_usize(name: &str) -> Result<Option<usize>> {
     env_value(name)
         .map(|value| {
@@ -222,17 +232,20 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
     let mut events = session.events();
     let turn = session.submit(input).await?;
     let mut completion = Box::pin(turn.wait());
+    let mut stdout = std::io::stdout();
+    let mut printed_steps = 0;
 
     loop {
         tokio::select! {
             biased;
             event = events.next() => match event {
-                Some(Ok(event)) => print_event(event),
+                Some(Ok(event)) => print_event(event, &mut stdout, &mut printed_steps)?,
                 Some(Err(error)) => tracing::warn!(%error, "session event receiver lagged"),
                 None => break,
             },
             result = &mut completion => {
                 let completed = result?;
+                write_turn(&completed, &mut stdout, &mut printed_steps)?;
                 println!();
                 print_usage(&completed);
                 return Ok(());
@@ -256,26 +269,56 @@ fn print_usage(turn: &ash_core::Turn) {
     );
 }
 
-fn print_event(event: SessionEvent) {
+fn print_event(
+    event: SessionEvent,
+    output: &mut impl Write,
+    printed_steps: &mut usize,
+) -> std::io::Result<()> {
     match event {
-        SessionEvent::Text { text, .. } => print!("{text}"),
+        SessionEvent::StepCommitted { step, index, .. } if index == *printed_steps => {
+            write_step(&step, output)?;
+            *printed_steps += 1;
+        }
         SessionEvent::ToolStarted { name, .. } => {
             eprintln!("{}", format!("[tool: {name}]").cyan());
         }
         SessionEvent::ToolFinished {
             result: Err(error), ..
         } => eprintln!("{}", format!("[error: {error}]").red()),
-        SessionEvent::Finished(turn) => match &turn.result {
-            TurnResult::Failed(error) => {
-                eprintln!("{}", format!("[error: {error}]").red());
+        SessionEvent::Finished { turn, .. } => {
+            write_turn(&turn, output, printed_steps)?;
+            match &turn.result {
+                TurnResult::Failed(error) => {
+                    eprintln!("{}", format!("[error: {error}]").red());
+                }
+                TurnResult::Stopped(_) | TurnResult::Cancelled | TurnResult::Truncated => {}
             }
-            TurnResult::Stopped(_) | TurnResult::Cancelled | TurnResult::Truncated => {}
-        },
+        }
         SessionEvent::Discarded {
             error: Some(error), ..
         } => eprintln!("{}", format!("[error: {error}]").red()),
         _ => {}
     }
+    Ok(())
+}
+
+fn write_step(step: &ash_core::Step, output: &mut impl Write) -> std::io::Result<()> {
+    for text in step.items.iter().filter_map(ash_core::Item::text) {
+        output.write_all(text.as_bytes())?;
+    }
+    output.flush()
+}
+
+fn write_turn(
+    turn: &ash_core::Turn,
+    output: &mut impl Write,
+    printed_steps: &mut usize,
+) -> std::io::Result<()> {
+    for step in turn.steps.iter().skip(*printed_steps) {
+        write_step(step, output)?;
+        *printed_steps += 1;
+    }
+    Ok(())
 }
 
 async fn run_interactive(setup: AgentSetup) -> Result<()> {
@@ -335,15 +378,17 @@ impl InteractiveController {
                 event = events.next() => match event {
                     Some(Ok(event)) => {
                         match &event {
-                            SessionEvent::Finished(turn) => turns.finish(turn.id),
+                            SessionEvent::Finished { turn, .. } => turns.finish(turn.id),
                             SessionEvent::Discarded { turn_id, .. } => turns.finish(*turn_id),
                             SessionEvent::Started(_)
+                            | SessionEvent::Retrying { .. }
                             | SessionEvent::Text { .. }
                             | SessionEvent::Thought { .. }
                             | SessionEvent::Activity { .. }
                             | SessionEvent::Context { .. }
                             | SessionEvent::ToolStarted { .. }
-                            | SessionEvent::ToolFinished { .. } => {}
+                            | SessionEvent::ToolFinished { .. }
+                            | SessionEvent::StepCommitted { .. } => {}
                         }
                         let _ = self.event_tx.send(UiEvent::Session(event)).await;
                     }
@@ -366,7 +411,7 @@ impl InteractiveController {
                     let Some(command) = command else { break };
                     match command {
                         UiCommand::Submit { input, reply } => {
-                            let result = match self.session.submit(input.clone()).await {
+                            let result = match self.session.try_submit(input.clone()) {
                                 Ok(turn) => {
                                     let turn_id = turn.id();
                                     turns.track(turn);
@@ -463,8 +508,21 @@ impl InteractiveController {
     }
 
     async fn compact_session(&self) {
-        let event = match self.session.compact().await {
-            Ok(result) => UiEvent::CompactionCompleted(result),
+        let result = tokio::select! {
+            biased;
+            () = self.event_tx.closed() => return,
+            result = self.session.compact() => result,
+        };
+        let event = match result {
+            Ok(changed) => match self.session.conversation().await {
+                Ok(conversation) => UiEvent::CompactionCompleted {
+                    changed,
+                    conversation,
+                },
+                Err(error) => {
+                    UiEvent::CommandFailed(format!("Failed to load compacted context: {error}"))
+                }
+            },
             Err(error) => UiEvent::CommandFailed(format!("Failed to compact context: {error}")),
         };
         self.send_ui_event(event).await;
@@ -533,6 +591,68 @@ impl InteractiveController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_output_ignores_retry_previews_and_recovers_missed_steps_once() {
+        use ash_core::{Input, Item, Step, StopReason, Turn};
+        use std::sync::Arc;
+        let id = TurnId::new();
+        let step = Arc::new(Step {
+            items: vec![Item::Text("final".into())],
+        });
+        let mut output = Vec::new();
+        let mut printed = 0;
+        print_event(
+            SessionEvent::Text {
+                turn_id: id,
+                text: "discarded".into(),
+            },
+            &mut output,
+            &mut printed,
+        )
+        .unwrap();
+        print_event(
+            SessionEvent::Retrying { turn_id: id },
+            &mut output,
+            &mut printed,
+        )
+        .unwrap();
+        assert!(output.is_empty());
+        print_event(
+            SessionEvent::StepCommitted {
+                turn_id: id,
+                index: 0,
+                step: Arc::clone(&step),
+            },
+            &mut output,
+            &mut printed,
+        )
+        .unwrap();
+        let turn = Arc::new(Turn {
+            id,
+            input: Input::user("question"),
+            steps: vec![
+                step,
+                Arc::new(Step {
+                    items: vec![Item::Text(" tail".into())],
+                }),
+            ],
+            result: TurnResult::Stopped(StopReason::EndTurn),
+            stats: Default::default(),
+        });
+        print_event(
+            SessionEvent::Finished {
+                turn: Arc::clone(&turn),
+                summary: None,
+            },
+            &mut output,
+            &mut printed,
+        )
+        .unwrap();
+        write_turn(&turn, &mut output, &mut printed).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "final tail");
+        assert_eq!(printed, 2);
+    }
 
     #[test]
     fn model_context_limit_defaults_to_one_million() {
