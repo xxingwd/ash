@@ -286,6 +286,10 @@ impl JsonlSessionStore {
         }
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub(crate) async fn open_new(
         &self,
         identity: SessionIdentity,

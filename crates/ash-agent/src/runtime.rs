@@ -28,6 +28,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn session_directory(&self) -> PathBuf {
+        self.session_store.directory().to_path_buf()
+    }
+
+    #[must_use]
     pub fn start(&self, agent: &Agent) -> Session {
         Session::spawn(SessionActorState::new(agent.clone(), self.clone()))
     }

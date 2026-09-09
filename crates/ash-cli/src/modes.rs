@@ -110,10 +110,14 @@ fn build_setup(cli: &Cli) -> Result<AgentSetup> {
     }
     let protocol = protocol.as_cli_name().to_string();
     let runtime = Runtime::new(create_adapter(provider));
+    let base_agent = agent.clone();
     let (agent, control) = ash_collab::install_collaboration(agent, runtime.clone())?;
+    let workflow = ash_workflow::tool(runtime.clone(), base_agent)?;
+    let agent = agent.pushing_tools([workflow]);
     let system_prompt = [
         agent.system_prompt().unwrap_or_default(),
         COLLABORATION_INSTRUCTIONS,
+        ash_workflow::WORKFLOW_INSTRUCTIONS,
     ]
     .into_iter()
     .filter(|part| !part.is_empty())
