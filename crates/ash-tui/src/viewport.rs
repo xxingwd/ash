@@ -1740,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_outputless_tools_group_only_while_collapsed() {
+    fn consecutive_groupable_tools_follow_their_grouping_policy() {
         let blocks = [
             LiveBlock::tool(
                 1,

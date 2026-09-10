@@ -60,27 +60,66 @@ pub enum OutputPresentation {
     Preview,
 }
 
-pub fn tool_renderer(name: &str, is_error: bool) -> ToolRenderer {
-    let kind = ToolKind::from_name(name);
-    match (kind, is_error) {
-        (ToolKind::Bash, _) => ToolRenderer::Bash,
-        (ToolKind::Edit, false) => ToolRenderer::Edit,
-        (ToolKind::Write, false) => ToolRenderer::Write,
-        (_, true) => ToolRenderer::Generic(OutputPresentation::Preview),
-        (ToolKind::Glob | ToolKind::Grep | ToolKind::WebFetch, false) => {
-            ToolRenderer::Generic(OutputPresentation::Summary)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolGrouping {
+    Never,
+    Always,
+    Collapsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolDisplay {
+    pub renderer: ToolRenderer,
+    pub grouping: ToolGrouping,
+}
+
+impl ToolDisplay {
+    const fn generic(output: OutputPresentation, grouping: ToolGrouping) -> Self {
+        Self {
+            renderer: ToolRenderer::Generic(output),
+            grouping,
         }
-        (ToolKind::Read, false) => ToolRenderer::Generic(OutputPresentation::Omitted),
-        (
-            ToolKind::Skill
-            | ToolKind::Agent
-            | ToolKind::MessageAgent
-            | ToolKind::ListAgents
-            | ToolKind::RemoveAgent
-            | ToolKind::WaitAgent,
-            false,
-        ) => ToolRenderer::Generic(OutputPresentation::Expandable),
-        _ => ToolRenderer::Generic(OutputPresentation::Preview),
+    }
+}
+
+const GENERIC_PREVIEW: ToolDisplay =
+    ToolDisplay::generic(OutputPresentation::Preview, ToolGrouping::Never);
+const GENERIC_SUMMARY: ToolDisplay =
+    ToolDisplay::generic(OutputPresentation::Summary, ToolGrouping::Never);
+const GENERIC_EXPANDABLE: ToolDisplay =
+    ToolDisplay::generic(OutputPresentation::Expandable, ToolGrouping::Collapsed);
+
+pub fn tool_display_for(name: &str) -> ToolDisplay {
+    match ToolKind::from_name(name) {
+        ToolKind::Bash => ToolDisplay {
+            renderer: ToolRenderer::Bash,
+            grouping: ToolGrouping::Never,
+        },
+        ToolKind::Edit => ToolDisplay {
+            renderer: ToolRenderer::Edit,
+            grouping: ToolGrouping::Never,
+        },
+        ToolKind::Write => ToolDisplay {
+            renderer: ToolRenderer::Write,
+            grouping: ToolGrouping::Never,
+        },
+        ToolKind::Read => ToolDisplay::generic(OutputPresentation::Omitted, ToolGrouping::Always),
+        ToolKind::Glob | ToolKind::Grep | ToolKind::WebFetch => GENERIC_SUMMARY,
+        ToolKind::Skill
+        | ToolKind::Agent
+        | ToolKind::MessageAgent
+        | ToolKind::ListAgents
+        | ToolKind::RemoveAgent
+        | ToolKind::WaitAgent => GENERIC_EXPANDABLE,
+        ToolKind::Other => GENERIC_PREVIEW,
+    }
+}
+
+pub fn tool_display_for_result(name: &str, is_error: bool) -> ToolDisplay {
+    if is_error {
+        GENERIC_PREVIEW
+    } else {
+        tool_display_for(name)
     }
 }
 
@@ -91,16 +130,13 @@ pub fn tool_call_summary(name: &str, arguments: &Value) -> (String, String) {
     (name.to_string(), tool_detail(name, arguments))
 }
 
-/// A tool can join a consecutive same-name group exactly when its successful
-/// output is not visible in the current display mode.
+/// Consecutive same-name tools join a group only when this tool's display
+/// policy says so. Failed tools never group, regardless of this setting.
 pub fn is_groupable_tool(name: &str, expanded: bool) -> bool {
-    match tool_renderer(name, false) {
-        ToolRenderer::Generic(OutputPresentation::Omitted) => true,
-        ToolRenderer::Generic(OutputPresentation::Expandable) => !expanded,
-        ToolRenderer::Bash
-        | ToolRenderer::Edit
-        | ToolRenderer::Write
-        | ToolRenderer::Generic(OutputPresentation::Summary | OutputPresentation::Preview) => false,
+    match tool_display_for(name).grouping {
+        ToolGrouping::Always => true,
+        ToolGrouping::Collapsed => !expanded,
+        ToolGrouping::Never => false,
     }
 }
 
@@ -339,73 +375,48 @@ mod tests {
     }
 
     #[test]
-    fn groupability_follows_output_visibility() {
-        for name in ["read", "skill", "agent", "wait_agent"] {
-            assert!(is_groupable_tool(name, false), "{name} collapsed");
+    fn display_policy_is_centralized_by_tool_kind() {
+        assert_eq!(
+            tool_display_for("bash"),
+            ToolDisplay {
+                renderer: ToolRenderer::Bash,
+                grouping: ToolGrouping::Never,
+            }
+        );
+        assert_eq!(
+            tool_display_for("edit"),
+            ToolDisplay {
+                renderer: ToolRenderer::Edit,
+                grouping: ToolGrouping::Never,
+            }
+        );
+        assert_eq!(
+            tool_display_for("write"),
+            ToolDisplay {
+                renderer: ToolRenderer::Write,
+                grouping: ToolGrouping::Never,
+            }
+        );
+        assert_eq!(
+            tool_display_for("read"),
+            ToolDisplay::generic(OutputPresentation::Omitted, ToolGrouping::Always)
+        );
+        for name in ["grep", "glob", "webfetch"] {
+            assert_eq!(tool_display_for(name), GENERIC_SUMMARY, "{name}");
         }
-        assert!(is_groupable_tool("read", true));
-        for name in ["skill", "agent", "wait_agent"] {
-            assert!(!is_groupable_tool(name, true), "{name} expanded");
+        for name in [
+            "skill",
+            "agent",
+            "wait_agent",
+            "list_agents",
+            "remove_agent",
+        ] {
+            assert_eq!(tool_display_for(name), GENERIC_EXPANDABLE, "{name}");
         }
-        for name in ["bash", "glob", "grep", "webfetch", "write"] {
-            assert!(!is_groupable_tool(name, false), "{name} collapsed");
-            assert!(!is_groupable_tool(name, true), "{name} expanded");
-        }
-    }
-
-    #[test]
-    fn renderer_policy_is_centralized_by_tool_kind() {
-        assert_eq!(tool_renderer("bash", false), ToolRenderer::Bash);
-        assert_eq!(tool_renderer("edit", false), ToolRenderer::Edit);
-        assert_eq!(tool_renderer("write", false), ToolRenderer::Write);
-        assert_eq!(
-            tool_renderer("read", false),
-            ToolRenderer::Generic(OutputPresentation::Omitted)
-        );
-        assert_eq!(
-            tool_renderer("grep", false),
-            ToolRenderer::Generic(OutputPresentation::Summary)
-        );
-        assert_eq!(
-            tool_renderer("glob", false),
-            ToolRenderer::Generic(OutputPresentation::Summary)
-        );
-        assert_eq!(
-            tool_renderer("webfetch", false),
-            ToolRenderer::Generic(OutputPresentation::Summary)
-        );
-        assert_eq!(
-            tool_renderer("skill", false),
-            ToolRenderer::Generic(OutputPresentation::Expandable)
-        );
-        assert_eq!(
-            tool_renderer("agent", false),
-            ToolRenderer::Generic(OutputPresentation::Expandable)
-        );
-        assert_eq!(
-            tool_renderer("wait_agent", false),
-            ToolRenderer::Generic(OutputPresentation::Expandable)
-        );
-        assert_eq!(
-            tool_renderer("list_agents", false),
-            ToolRenderer::Generic(OutputPresentation::Expandable)
-        );
-        assert_eq!(
-            tool_renderer("remove_agent", false),
-            ToolRenderer::Generic(OutputPresentation::Expandable)
-        );
-        assert_eq!(
-            tool_renderer("read", true),
-            ToolRenderer::Generic(OutputPresentation::Preview)
-        );
-        assert_eq!(
-            tool_renderer("wait_agent", true),
-            ToolRenderer::Generic(OutputPresentation::Preview)
-        );
-        assert_eq!(
-            tool_renderer("custom_tool", false),
-            ToolRenderer::Generic(OutputPresentation::Preview)
-        );
+        assert_eq!(tool_display_for("custom_tool"), GENERIC_PREVIEW);
+        assert_eq!(tool_display_for_result("read", true), GENERIC_PREVIEW);
+        assert_eq!(tool_display_for_result("wait_agent", true), GENERIC_PREVIEW);
+        assert_eq!(tool_display_for_result("bash", true), GENERIC_PREVIEW);
     }
 
     #[test]
@@ -413,10 +424,7 @@ mod tests {
         use std::path::Path;
         let root = Path::new("/home/user/workspace/project");
         assert_eq!(
-            workspace_path(
-                "/home/user/workspace/project/docs/design.md",
-                root,
-            ),
+            workspace_path("/home/user/workspace/project/docs/design.md", root,),
             "docs/design.md"
         );
         assert_eq!(workspace_path("/etc/hosts", root), "/etc/hosts");

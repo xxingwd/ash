@@ -15,7 +15,7 @@ use crate::{
     history_block::HistoryBlock,
     markdown::{render_markdown, RenderedLine, StreamingMarkdownCache},
     scrollback::sanitize_terminal_text,
-    tool_display::{tool_call_summary, tool_renderer, OutputPresentation, ToolRenderer},
+    tool_display::{tool_call_summary, tool_display_for, OutputPresentation, ToolRenderer},
     welcome_card::{welcome_card, WelcomeLine, WelcomeStyle},
     wrap::{render_hanging_lines, render_rows, truncate_rows, wrap_line_hanging},
 };
@@ -731,18 +731,19 @@ fn render_tool(
     expanded: bool,
     working_dir: Option<&std::path::Path>,
 ) -> Buffer {
-    let output_presentation = match tool_renderer(name, is_error) {
+    let display = crate::tool_display::tool_display_for_result(name, is_error);
+    let output_presentation = match display.renderer {
         ToolRenderer::Bash => {
             return render_bash_tool(name, arguments, output, is_error, width, expanded);
         }
         ToolRenderer::Edit => {
-            if let Some(rendered) = render_edit_tool(arguments, width, working_dir) {
+            if let Some(rendered) = render_edit_tool(arguments, width, expanded, working_dir) {
                 return rendered;
             }
             OutputPresentation::Preview
         }
         ToolRenderer::Write => {
-            if let Some(rendered) = render_write_tool(arguments, width, working_dir) {
+            if let Some(rendered) = render_write_tool(arguments, width, expanded, working_dir) {
                 return rendered;
             }
             OutputPresentation::Preview
@@ -796,15 +797,13 @@ fn render_running_tool(
     working_dir: Option<&std::path::Path>,
 ) -> Buffer {
     let (action, mut detail) = tool_call_summary(name, arguments);
-    if matches!(
-        tool_renderer(name, false),
-        ToolRenderer::Edit | ToolRenderer::Write
-    ) {
+    let renderer = tool_display_for(name).renderer;
+    if matches!(renderer, ToolRenderer::Edit | ToolRenderer::Write) {
         if let Some(working_dir) = working_dir {
             detail = crate::tool_display::workspace_path(&detail, working_dir);
         }
     }
-    if matches!(tool_renderer(name, false), ToolRenderer::Bash) {
+    if matches!(renderer, ToolRenderer::Bash) {
         let (title, continuation) =
             render_bash_command_line_with_action(arguments, &action, Color::Cyan, width, expanded);
         return match continuation {
@@ -996,30 +995,37 @@ fn display_label(label: &str) -> String {
 }
 
 fn render_tool_title_with_color(action: &str, detail: &str, color: Color, width: u16) -> Buffer {
-    let bullet_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let mut prefix = vec![Span::styled("•", bullet_style), Span::raw(" ")];
-    prefix.push(Span::styled(
-        display_label(action),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    if !detail.is_empty() {
-        prefix.push(Span::raw(" "));
-    }
     render_hanging_lines(
-        [(Line::from(prefix), Line::from(detail.to_string()))],
+        [(
+            tool_title_prefix(action, color, !detail.is_empty()),
+            Line::from(detail.to_string()),
+        )],
         width,
     )
+}
+
+fn tool_title_prefix(action: &str, color: Color, trailing_space: bool) -> Line<'static> {
+    let mut prefix = vec![
+        Span::styled("•", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(
+            display_label(action),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if trailing_space {
+        prefix.push(Span::raw(" "));
+    }
+    Line::from(prefix)
 }
 
 fn render_edit_tool(
     arguments: &Value,
     width: u16,
+    expanded: bool,
     working_dir: Option<&std::path::Path>,
 ) -> Option<Buffer> {
-    let path = tool_argument(arguments, "path")?;
-    let path = working_dir.map_or(path.clone(), |working_dir| {
-        crate::tool_display::workspace_path(&path, working_dir)
-    });
+    let path = workspace_tool_path(arguments, working_dir)?;
     let edits = arguments.get("edits")?.as_array()?;
     let mut lines = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
@@ -1033,24 +1039,31 @@ fn render_edit_tool(
     }
     let (added, removed) = changed_line_counts(&lines);
     Some(render_file_change(
-        "edit", &path, added, removed, &lines, width,
+        "edit", &path, added, removed, &lines, width, expanded,
     ))
 }
 
 fn render_write_tool(
     arguments: &Value,
     width: u16,
+    expanded: bool,
     working_dir: Option<&std::path::Path>,
 ) -> Option<Buffer> {
-    let path = tool_argument(arguments, "path")?;
-    let path = working_dir.map_or(path.clone(), |working_dir| {
-        crate::tool_display::workspace_path(&path, working_dir)
-    });
+    let path = workspace_tool_path(arguments, working_dir)?;
     let content = tool_argument(arguments, "content")?;
     let mut lines = Vec::new();
     extend_change_lines(&mut lines, '+', &content);
     let added = lines.len();
-    Some(render_file_change("write", &path, added, 0, &lines, width))
+    Some(render_file_change(
+        "write", &path, added, 0, &lines, width, expanded,
+    ))
+}
+
+fn workspace_tool_path(arguments: &Value, working_dir: Option<&std::path::Path>) -> Option<String> {
+    let path = tool_argument(arguments, "path")?;
+    Some(working_dir.map_or(path.clone(), |working_dir| {
+        crate::tool_display::workspace_path(&path, working_dir)
+    }))
 }
 
 fn tool_argument(arguments: &Value, name: &str) -> Option<String> {
@@ -1068,23 +1081,18 @@ fn render_file_change(
     removed: usize,
     lines: &[String],
     width: u16,
+    expanded: bool,
 ) -> Buffer {
-    let prefix = Line::from(vec![
-        Span::styled(
-            "•",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            display_label(tool_name),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ]);
-    let detail = format!("{path} (+{added} -{removed})");
-    let title = render_hanging_lines([(prefix, Line::from(detail))], width);
+    let title = render_hanging_lines(
+        [(
+            tool_title_prefix(tool_name, Color::Green, true),
+            file_change_detail(path, added, removed),
+        )],
+        width,
+    );
+    if !expanded {
+        return title;
+    }
     let gutter = Line::from(vec![Span::raw("  ")]);
     let body = render_hanging_lines(
         lines.iter().map(|line| {
@@ -1096,6 +1104,16 @@ fn render_file_change(
         width,
     );
     stack_rows(&[title, body], width)
+}
+
+fn file_change_detail(path: &str, added: usize, removed: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!("{path} (")),
+        Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
+        Span::raw(")"),
+    ])
 }
 
 fn changed_line_counts(lines: &[String]) -> (usize, usize) {
@@ -1365,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn outputless_tools_expose_a_groupable_detail() {
+    fn groupable_tools_expose_a_group_detail() {
         let read = LiveBlock::tool(
             1,
             "read".to_string(),
@@ -1540,6 +1558,8 @@ mod tests {
 
         assert_eq!(row_text(&edit, 0), "• Edit /workspace/src/main.rs (+1 -1)");
         assert_eq!(row_text(&write, 0), "• Write /workspace/src/new.rs (+2 -0)");
+        assert_eq!(edit.area.height, 1);
+        assert_eq!(write.area.height, 1);
 
         let relative = LiveBlock::tool(
             4,
@@ -1553,9 +1573,61 @@ mod tests {
         )
         .render_in(80, false, Some(std::path::Path::new("/workspace")));
         assert_eq!(row_text(&relative, 0), "• Edit src/main.rs (+1 -1)");
-        assert_eq!(edit.cell((2, 1)).expect("deleted line").fg, Color::Red);
-        assert_eq!(edit.cell((2, 2)).expect("added line").fg, Color::Green);
-        assert_eq!(write.cell((2, 1)).expect("written line").fg, Color::Green);
+        assert_eq!(relative.area.height, 1);
+        assert_eq!(
+            cell_fg_at(&edit, '+'),
+            Some(Color::Green),
+            "added count should match added lines"
+        );
+        assert_eq!(
+            cell_fg_at(&edit, '-'),
+            Some(Color::Red),
+            "removed count should match deleted lines"
+        );
+        assert_eq!(
+            cell_fg_at(&write, '+'),
+            Some(Color::Green),
+            "added count should match written lines"
+        );
+
+        let expanded = LiveBlock::tool(
+            1,
+            "edit".to_string(),
+            serde_json::json!({
+                "path": "/workspace/src/main.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+            "Successfully replaced 1 block".to_string(),
+            false,
+        )
+        .render(60, true);
+        assert_eq!(
+            row_text(&expanded, 0),
+            "• Edit /workspace/src/main.rs (+1 -1)"
+        );
+        assert_eq!(row_text(&expanded, 1), "  -old");
+        assert_eq!(row_text(&expanded, 2), "  +new");
+        assert_eq!(expanded.cell((2, 1)).expect("deleted line").fg, Color::Red);
+        assert_eq!(expanded.cell((2, 2)).expect("added line").fg, Color::Green);
+
+        let expanded_write = LiveBlock::tool(
+            2,
+            "write".to_string(),
+            serde_json::json!({"path": "/workspace/src/new.rs", "content": "one\ntwo"}),
+            "Wrote 7 bytes".to_string(),
+            false,
+        )
+        .render(60, true);
+        assert_eq!(
+            row_text(&expanded_write, 0),
+            "• Write /workspace/src/new.rs (+2 -0)"
+        );
+        assert_eq!(row_text(&expanded_write, 1), "  +one");
+        assert_eq!(row_text(&expanded_write, 2), "  +two");
+        assert_eq!(
+            expanded_write.cell((2, 1)).expect("written line").fg,
+            Color::Green
+        );
 
         let tiny = LiveBlock::tool(
             3,
@@ -1581,7 +1653,11 @@ mod tests {
             false,
         );
 
-        let rendered = block.render(60, false);
+        let collapsed = block.render(60, false);
+        assert_eq!(row_text(&collapsed, 0), "• Edit markers.txt (+1 -1)");
+        assert_eq!(collapsed.area.height, 1);
+
+        let rendered = block.render(60, true);
 
         assert_eq!(row_text(&rendered, 0), "• Edit markers.txt (+1 -1)");
         assert_eq!(row_text(&rendered, 1), "  --- before");
@@ -1589,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn long_write_arguments_render_completely() {
+    fn long_write_arguments_expand_to_full_content() {
         let content = (1..=30)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
@@ -1603,10 +1679,8 @@ mod tests {
         );
 
         let collapsed = block.render(80, false);
-        assert_eq!(collapsed.area.height, 31);
-        assert!(row_text(&collapsed, 30).contains("line 30"));
-        assert!(!(0..collapsed.area.height)
-            .any(|row| row_text(&collapsed, row).contains("truncated for display")));
+        assert_eq!(collapsed.area.height, 1);
+        assert_eq!(row_text(&collapsed, 0), "• Write long.txt (+30 -0)");
 
         let expanded = block.render(80, true);
         assert_eq!(expanded.area.height, 31);
@@ -1669,6 +1743,17 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    fn cell_fg_at(buffer: &Buffer, needle: char) -> Option<Color> {
+        let needle = needle.to_string();
+        (0..buffer.area.height).find_map(|y| {
+            (0..buffer.area.width).find_map(|x| {
+                buffer
+                    .cell((x, y))
+                    .and_then(|cell| (cell.symbol() == needle).then_some(cell.fg))
+            })
+        })
     }
 }
 
