@@ -1,17 +1,19 @@
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use ash_core::{define_tool, ModelId, Tool, ToolError};
+use ash_core::{define_tool, with_tool_instructions, ModelId, Tool, ToolError, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::warn;
 
 const SKILL_FILE_LIMIT: usize = 10;
 pub const SKILL_TOOL_NAME: &str = "skill";
+const SKILL_INSTRUCTIONS: &str = include_str!("../skill.md");
 
 #[derive(Deserialize, JsonSchema)]
 struct SkillArgs {
@@ -110,7 +112,14 @@ impl Skill {
             ash_core::AshError::Config(format!("cannot read {}: {e}", path.display()))
         })?;
 
-        let (frontmatter, body) = parse_frontmatter(&content)?;
+        let path = std::fs::canonicalize(path).map_err(|error| {
+            ash_core::AshError::Config(format!("cannot resolve {}: {error}", path.display()))
+        })?;
+        Self::from_markdown(&path, &content)
+    }
+
+    pub fn from_markdown(path: &Path, content: &str) -> Result<Self, ash_core::AshError> {
+        let (frontmatter, body) = parse_frontmatter(content)?;
         let metadata: SkillFrontmatter = serde_yaml::from_str(&frontmatter)
             .map_err(|e| ash_core::AshError::Config(format!("invalid skill frontmatter: {e}")))?;
         Ok(Self {
@@ -119,14 +128,7 @@ impl Skill {
             tools: metadata.tools,
             model: metadata.model,
             instructions: body,
-            source_path: std::fs::canonicalize(path).unwrap_or_else(|error| {
-                warn!(
-                    path = %path.display(),
-                    %error,
-                    "cannot canonicalize skill path; keeping it as given"
-                );
-                path.to_path_buf()
-            }),
+            source_path: path.to_path_buf(),
         })
     }
 
@@ -150,26 +152,91 @@ impl Skill {
 ///
 /// Returns `ToolError` when the tool cannot be defined.
 pub fn tool(skills: Vec<Skill>) -> Result<Arc<dyn Tool>, ToolError> {
+    tool_with_active(skills, None)
+}
+
+pub fn install(
+    mut agent: crate::Agent,
+    mut skills: Vec<Skill>,
+    active_skill: Option<&Skill>,
+) -> Result<crate::Agent, ToolError> {
+    if skills.is_empty() && active_skill.is_none() {
+        return Ok(agent);
+    }
+    if let Some(active) = active_skill {
+        agent.apply_output(&ToolOutput {
+            installed_tools: active.tools.clone().unwrap_or_default(),
+            ..ToolOutput::default()
+        })?;
+        if !skills.iter().any(|skill| skill.name == active.name) {
+            skills.push(active.clone());
+        }
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    agent.installing_tools([tool_with_active(skills, active_skill)?])
+}
+
+fn tool_with_active(
+    skills: Vec<Skill>,
+    active_skill: Option<&Skill>,
+) -> Result<Arc<dyn Tool>, ToolError> {
+    let instructions = format!(
+        "{}\n\n{}",
+        SKILL_INSTRUCTIONS.trim(),
+        skills_context(&skills, active_skill).unwrap_or_default()
+    );
+    let active_name = active_skill.map(|skill| skill.name.clone());
     let skills = Arc::new(skills);
-    define_tool(
+    let tool = define_tool(
         SKILL_TOOL_NAME,
         "Load a specialized skill when its description matches the task. The name must match one of the skills listed in the system prompt.",
         move |_ctx, args: SkillArgs| {
             let skills = Arc::clone(&skills);
+            let already_active = active_name.as_deref() == Some(args.name.as_str());
             async move {
                 // Skill discovery and loading are blocking filesystem walks;
                 // run them off the async worker threads.
-                tokio::task::spawn_blocking(move || load_skill(&skills, &args.name))
+                tokio::task::spawn_blocking(move || {
+                    let text = load_skill(&skills, &args.name, already_active)?;
+                    let installed_tools = skills.iter().find(|skill| skill.name == args.name)
+                        .and_then(|skill| skill.tools.clone()).unwrap_or_default();
+                    Ok::<_, ToolError>(ToolOutput { text, installed_tools, ..ToolOutput::default() })
+                })
                     .await
                     .map_err(|error| {
                         ToolError::Execution(format!("skill loader task failed: {error}"))
                     })?
             }
         },
-    )
+    )?;
+    Ok(with_tool_instructions(tool, instructions))
 }
 
-fn load_skill(skills: &[Skill], name: &str) -> Result<String, ToolError> {
+pub(crate) fn skills_context(skills: &[Skill], active_skill: Option<&Skill>) -> Option<String> {
+    if skills.is_empty() && active_skill.is_none() {
+        return None;
+    }
+    let mut output = String::from("<skills>\n## Available skills\n");
+    if skills.is_empty() {
+        output.push_str("- None discovered.\n");
+    } else {
+        for skill in skills {
+            let _ = writeln!(output, "- `{}`: {}", skill.name, skill.description);
+        }
+    }
+    if let Some(skill) = active_skill {
+        let _ = writeln!(
+            output,
+            "\n## Active skill: {}\n\n{}",
+            skill.name,
+            skill.instructions()
+        );
+    }
+    output.push_str("</skills>");
+    Some(output)
+}
+
+fn load_skill(skills: &[Skill], name: &str, already_active: bool) -> Result<String, ToolError> {
     let skill = skills
         .iter()
         .find(|skill| skill.name == name)
@@ -192,7 +259,11 @@ fn load_skill(skills: &[Skill], name: &str) -> Result<String, ToolError> {
         format!("<skill_content name=\"{}\">", skill.name),
         format!("# Skill: {}", skill.name),
         String::new(),
-        skill.instructions().trim().to_string(),
+        if already_active {
+            "This skill's instructions are already present in the system context.".into()
+        } else {
+            skill.instructions().trim().to_string()
+        },
         String::new(),
         format!("Base directory for this skill: {}", directory.display()),
         "Relative paths in this skill are relative to this base directory.".into(),
@@ -256,32 +327,61 @@ fn skill_files(skill: &Skill) -> Result<Vec<PathBuf>, ToolError> {
 }
 
 fn parse_frontmatter(content: &str) -> Result<(String, String), ash_core::AshError> {
-    let content = content.trim_start();
-    let mut lines = content.split_inclusive('\n');
-    let first_line = lines.next().unwrap_or_default();
-    if first_line.trim_end_matches(['\r', '\n']) != "---" {
-        return Err(ash_core::AshError::Config(
-            "skill file must start with ---".into(),
-        ));
-    }
-
-    let frontmatter_start = first_line.len();
-    let mut offset = frontmatter_start;
-    for line in lines {
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            return Ok((
-                content[frontmatter_start..offset].trim().to_string(),
-                content[offset + line.len()..].trim().to_string(),
-            ));
-        }
-        offset += line.len();
-    }
-    Err(ash_core::AshError::Config("missing closing ---".into()))
+    crate::frontmatter::parse(content)
+        .map(|(metadata, body)| (metadata.to_string(), body.to_string()))
+        .map_err(|error| {
+            ash_core::AshError::Config(match error {
+                "file must start with ---" => "skill file must start with ---".into(),
+                error => error.into(),
+            })
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn installed_skill_owns_context_without_repeating_active_body() {
+        let skill = Skill {
+            name: "example".into(),
+            description: "example description".into(),
+            tools: None,
+            model: None,
+            instructions: "specialized rules".into(),
+            source_path: PathBuf::from("example.md"),
+        };
+        let base = crate::Agent::new(ModelId::new("model"), Vec::new());
+        let idle = install(base.clone(), vec![skill.clone()], None).unwrap();
+        assert!(idle
+            .system_prompt()
+            .unwrap()
+            .contains("example description"));
+        assert!(!idle.system_prompt().unwrap().contains("specialized rules"));
+        let agent = install(base.clone(), vec![skill.clone()], Some(&skill)).unwrap();
+        let prompt = agent.system_prompt().unwrap();
+        assert_eq!(prompt.matches("specialized rules").count(), 1);
+        let output = agent.tools()[0]
+            .execute(
+                ash_core::ToolContext {
+                    identity: ash_core::SessionIdentity::root(ash_core::SessionId::new()),
+                    cancellation: ash_core::CancellationToken::new(),
+                    deadline: None,
+                },
+                serde_json::json!({"name": "example"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.text.contains("specialized rules"));
+        assert!(output.text.contains("already present"));
+        assert!(output.text.contains("Base directory"));
+        assert!(agent
+            .without_tools(&[SKILL_TOOL_NAME])
+            .system_prompt()
+            .is_none());
+        assert!(base.system_prompt().is_none());
+        assert!(install(base, Vec::new(), None).unwrap().tools().is_empty());
+    }
 
     #[test]
     fn loads_only_standard_skill_directories_in_stable_order() {
@@ -353,7 +453,7 @@ mod tests {
         std::fs::write(skill_dir.join("references/checklist.md"), "checklist").unwrap();
         let skills = Skill::load_from_dir(&root.path().join(".agents/skills")).unwrap();
 
-        let output = load_skill(&skills, "review").unwrap();
+        let output = load_skill(&skills, "review", false).unwrap();
 
         assert!(output.contains("<skill_content name=\"review\">"));
         assert!(output.contains("Review carefully."));
@@ -395,7 +495,7 @@ mod tests {
             source_path: PathBuf::from(".agents/skills/review/SKILL.md"),
         };
 
-        let error = load_skill(&[skill], "missing").unwrap_err();
+        let error = load_skill(&[skill], "missing", false).unwrap_err();
 
         assert!(error.to_string().contains("Available skills: review"));
     }

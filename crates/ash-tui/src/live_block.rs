@@ -1932,25 +1932,25 @@ mod generic_output_tests {
 
     #[test]
     fn expandable_tools_hide_success_until_expanded_but_errors_surface() {
-        let snapshot = r#"{"completions":[{"name":"research","turn_id":"…"}]}"#;
+        let snapshot = r#"{"result":{"sender_id":"research-id","message":"done"}}"#;
         let done = LiveBlock::tool(
             1,
-            "wait_agent".to_string(),
-            serde_json::json!({}),
+            "wait".to_string(),
+            serde_json::json!({"agent_id":"research-id"}),
             snapshot.to_string(),
             false,
         );
         let rendered = done.render(50, false);
         assert_eq!(rendered.area.height, 1);
-        assert!(row_text(&rendered, 0).contains("Wait agent"));
+        assert!(row_text(&rendered, 0).contains("Wait"));
 
         let expanded = done.render(80, true);
-        assert!(rendered_to_string(&expanded).contains("completions"));
+        assert!(rendered_to_string(&expanded).contains("result"));
 
         let failed = LiveBlock::tool(
             1,
-            "wait_agent".to_string(),
-            serde_json::json!({}),
+            "wait".to_string(),
+            serde_json::json!({"agent_id":"research-id"}),
             "wait failed".to_string(),
             true,
         );

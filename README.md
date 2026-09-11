@@ -6,7 +6,7 @@ Ash 是一个 Rust 编写的命令行 coding agent。目前主链路包括：
 - 真正的 SSE 增量输出
 - 连续对话与工具调用历史
 - 默认启用 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`webfetch` 七个内置工具
-- 可并行提交、异步收取结果的命名子 Agent
+- 独立子 Agent、串行协作 Group 和动态规划组织的 Workflow 管理者
 - 保留终端原生 scrollback 的 inline TUI
 
 ## 运行
@@ -84,6 +84,9 @@ cargo run -p ash-cli -- run --log "inspect this project"  # 额外输出 debug �
 非交互模式按已提交的 step 输出文本，而不是立即输出每个流式 delta，避免网络重试时将被丢弃的
 响应混入 stdout。交互模式仍显示实时预览，重试时会清除当前未提交的响应。
 
+非交互 `run` 结束时若仍有运行中或未接收结果的协作工作，会列出目标及 owner、关闭后代并非零退出。
+这只检查执行与接收事实，不判断业务成功。交互模式提醒未收尾工作，不自动推进；wait 开始时会显示正在等待的目标。
+
 每个 Session 最多接收 64 个尚未完成的 turn，包含正在执行的 turn。异步 `submit` 在容量耗尽时
 等待，`try_submit` 立即返回队列已满；CLI 使用后者，保持控制命令可响应。
 
@@ -92,11 +95,36 @@ cargo run -p ash-cli -- run --log "inspect this project"  # 额外输出 debug �
 Ash 启动时会构建一份精简的系统上下文，包含：
 
 - 内置的 coding agent 工作约定
+- 选定角色的职责和工作原则（`--profile`，默认 `default`）
 - 当前目录、shell、日期、时区、操作系统和架构
+- 已安装工具所属模块提供的说明，包括协作与 Skills 的可选项
 - 从 Git 项目根目录到当前目录依次生效的 `AGENTS.md`
-- 项目和用户目录中可用的 Skills，以及通过 `--skill` 显式启用的 Skill 指令
 
-更深目录中的 `AGENTS.md` 指令优先级更高。找不到 Git 项目根时，只读取当前目录。
+更深目录中的 `AGENTS.md` 指令优先级更高。初始只加载项目根到 cwd；文件工具首次进入新作用域时先返回适用规则，本次不执行操作，模型阅读后重试。规则按文件路径去重，同一文件更新替换旧内容，不加载兄弟目录规则。找不到 Git 项目根时从 cwd 开始。此检查不是文件沙箱，bash 仍需主动检查适用规则。
+
+### Agent 角色
+
+内置角色位于 `crates/ash-agent/agents/{default,explore,review}.md`，以 Markdown 正文定义
+角色指令，frontmatter 只声明非空 `description` 和可选的逗号分隔 `tools` 字符串，不配置模型。
+这些文件编译进二进制，当前不从用户 / 项目目录覆盖或热加载。
+
+- `default`：通用开发，默认七个常规工具。
+- `explore`：代码定位与关系梳理，初始工具去掉 `write` / `edit`。
+- `review`：核实正确性与回归风险，初始工具与 `explore` 相同。
+
+例如 `cargo run -p ash-cli -- --profile review run "review the current changes"`。
+角色的工具选择不是安全沙箱：`explore` / `review` 仍可使用 `bash`，显式启用的 Skill 也可增加工具。
+
+普通委派调用 `agent({"profile":"review","prompt":"review the changes"})`；省略 `profile`
+使用 `default`，省略 `prompt` 只创建、不执行。后续通过返回的 `agent_id` 调用 `message` 和
+`wait`。角色定义在创建时固定，恢复也不替换为新版同名角色。
+
+`ash-workflow` 另内置 `workflow` 角色：只在创建这种子代理时安装组织装配工具与专用说明。
+可选角色名称与用途由主 agent 的 `agent` 工具或管理者的 `workflow` 工具根据实际定义自动注入，不在主模块维护另一份名单。
+普通子代理默认没有创建下级的工具；组员只获得组内交流工具，拥有蓝图预建下级时才获得对应的管理工具。
+Workflow 管理者只通过蓝图创建组织，不混用 `agent` / `group` 创建入口；Skill 不能重新开放被组织身份禁止的工具。
+
+### Skills
 
 项目 Skill 使用 `.agents/skills/<name>/SKILL.md`，用户 Skill 使用
 `~/.agents/skills/<name>/SKILL.md`。项目 Skill 优先于同名用户 Skill，更深目录中的项目
@@ -113,13 +141,15 @@ tools:
 Review the relevant code and report concrete findings.
 ```
 
-使用 `--skill review` 会在启动时加载完整 Skill 指令，并应用可选的模型和工具覆盖。Skill
-未写 `tools` 时默认启用全部七个内置工具；写了 `tools` 时则只启用名单中的内置工具。
+使用 `--skill review` 会在启动时加载完整 Skill 指令，并保留可选的模型覆盖行为。
+Skill 的 `tools` 现在是对角色初始工具集的追加，不再限制已有工具；省略或空列表不增加工具，
+重复名称复用既有实现，未知名称使装配失败。启动 Skill 同样应用于本次 CLI 装配的普通子代理定义；
+Workflow 管理者由专用模块安装 skill，可按需加载项目 skill。
 
 未显式启用 Skill 时，系统上下文只提供可用 Skills 的名称和描述。模型在任务
 匹配时调用 `skill({"name":"review"})`，再获得完整指令、Skill 基础目录和最多 10 个资源
-文件路径。`skill` 是 Agent 层的运行时工具，不受 Skill 的内置工具名单影响，也不会动态
-修改模型或底层工具配置。
+文件路径。对启动时已激活的 Skill，工具只返回资源信息与已加载提示，不重复正文。
+`skill` 也是 Agent 层的运行时工具。调用会为当前 Session 追加声明的已注册工具；工具结果持久化后，下一次模型请求才看见新工具。同批调用不能提前使用它们，其他 Session 不受影响。重复激活幂等，未知工具使整次安装失败。运行中不修改模型；能力快照随个人记录恢复，缺少实现时明确报错。
 
 ## 会话历史
 
@@ -131,14 +161,16 @@ Session ID：
 ```
 
 普通新会话在第一个 Step 完成或 Turn 结束时创建文件；带非空历史的 fork 会立即写入新文件。
-首行是 `Init { identity, created_at, title }`，每轮随后写入一个 `TurnStart { id, input }`、零个
-或多个 `TurnStep { step }`，最后由 `TurnEnd { result, stats, summary }` 封口；独立的
-`Checkpoint { summary }` 记录手动压缩。每个完成 Step 都会先刷新并同步到磁盘，再用于下一次
-模型请求和通知 UI。恢复时单次流式重放，遇到 checkpoint 就丢弃它覆盖的 Turn，
-不会把整个 JSONL 长期留在内存；若文件尾部留下开放 Turn，则从 `TurnStart` 起截断，既不显示也
-不放入最终会话。旧格式不读取或迁移。恢复会话沿用当前运行配置，
-不从 JSONL 恢复模型、协议、工作目录、系统提示词或工具定义，因此 API Key、访问令牌和
-自定义接口地址内容不会写入文件。
+首行 `Init` 保存身份、标题和初始角色 / 提示词 / 能力快照。每轮写入 `TurnStart`、零个或多个
+`TurnStep` 和 `TurnEnd`；`TurnStep` 将工具结果与更新后的能力快照一起同步落盘，然后才用于下一次
+模型请求。`Checkpoint` 保存压缩摘要。恢复遇到未封口的 Turn 时截去其对话内容，但通过
+`Definition` 记录保留已经提交的能力快照，避免再次恢复时丢失已安装工具。
+
+恢复使用保存的角色正文、工具名单、模块说明和已观察目录规则；工具实现仍由当前运行时提供，
+缺失实现会报错。模型、协议、密钥和供应商配置由当前启动配置提供，不自动写入定义快照；
+但提示词、工具输出及聊天属于持久化内容，不应将敏感数据放入其中。环境上下文保留创建时快照，
+实际文件 / shell 操作仍使用当前运行时的工作目录，恢复时应使用原工作目录。旧协作 / JS workflow
+没有兼容入口或迁移层。
 
 `/new` 和 `/clear` 使用相同逻辑：清空模型会话历史和终端 scrollback，并建立新的
 Session。`/status` 显示当前会话的模型、协议和工作目录。`/exit`（别名 `/quit`）退出
@@ -152,28 +184,53 @@ Ash。`/resume` 会用所选 JSONL 的最新摘要和之后的消息重建内存
 `/resume` 和 `/fork` 都会在输入框下方显示选择菜单，使用方向键选择。输入框的跨进程
 历史单独保存在 `~/.ash/history.jsonl`。
 
-## 子 Agent
+## 协作与 Workflow
 
-默认交互链路提供五个异步协作工具：
+普通委派不要求建组。模型可用六个通用协作工具，名称统一为小写：
 
-- `agent`：创建命名 Agent、提交初始 `message`，立即返回 accepted 和 Turn ID
-- `message_agent`：向现有命名 Agent 提交 FIFO follow-up，立即返回 accepted 和 Turn ID
-- `wait_agent`：返回当前全部未读结果；仍有任务但暂无结果时等待下一次完成
-- `list_agents`：读取当前根 Session 下 Agent 的 idle/running 状态
-- `remove_agent`：删除没有运行任务和未读结果的 Agent
+| 工具 | 参数 | 作用 |
+| --- | --- | --- |
+| `agent` | `profile="default"`, `prompt?` | 创建固定角色的直属实例；有 prompt 才启动 |
+| `message` | `agent_id`, `message` | 向直属实例 / 所有组成员委派或打断；当前组员向同组成员登记后继 |
+| `group` | `group_id`, `agent_id?` | 按 owner 范围查找或新建组，幂等加入尚未运行的直属实例 |
+| `history` | `group_id?`, `before?`, `limit=10` | 查询公共聊天；组员可省略所属组 ID，parent 需要明确组 |
+| `wait` | `agent_id?`, `group_id?`，恰选一个 | 等待目标完全停止，接收最后消息或异常诊断 |
+| `list` | `group_id?` | 查询直属子代理、组或指定可见组的状态，不接收结果 |
 
-每个 child 自己保存 pending Turn 和未读结果；`wait_agent` 是唯一消费结果的入口，没有队列
-参数和内部超时。取消等待不会消费结果，也不会取消 child。一次 wait 会取走当时所有 Agent
-的未读结果；同一 child 内保持 FIFO，不承诺不同 child 之间的全局完成顺序。结果消费完且
-Agent idle 后可以删除，名字随后可立即复用。
+`group_id` 创建时可用名称，返回值是稳定 ID；后续建议使用返回的 ID。一个组同时最多运行一个
+直接成员。组员可调用 `message` 登记唯一后继，只有当前成员正常停止后才启动下一位；没有后继
+就停止。不同组与独立 agent 可并行，但首版共用工作目录，**不提供 worktree 或并发写入隔离**。
 
-这些工具只安装在主 Agent 上。子 Agent 从干净的基础 Agent 派生，继承当前模型、普通工具、
-AGENTS.md 和 Skills 配置，但不继承协作工具或主 Agent 的编排提示，并从空历史开始。名字在
-当前 root Session 内有效：trim 后必须非空、不含控制字符且不超过 64 个 Unicode 字符。
+目标运行时的 `message` 采用取消旧 turn 后启动替代输入，不排 FIFO；已接受的改派尚在收束时再次
+改派会报错，不默默丢中间输入。目标已停止但最后结果未接收时，必须先 `wait`，才能再次发消息。
+`wait` 在父会话工具结果持久化后才解除未读门禁；取消等待不取消目标。组必须整体 wait，不能单独
+wait 组员。停止不是业务成功，失败、取消、截断也返回，parent 决定是否继续。
 
-child 与 root 使用同一套普通 Session 和 JSONL 持久化规则，保留自己的多轮历史，并通过
-`root_id`、`parent_id` 记录 lineage。root 会话列表不展示 child；tree 查询和删除覆盖其下
-的 durable child。目前不提供 child picker 或单独 resume 入口。
+组员可读共享聊天，但不共享个人历史或思考。每组在
+`~/.ash/sessions/collab/<root-id>/groups/<group-id>/` 下保存 `prompt.md` 和 `chat.jsonl`。
+`group` / `list` 返回具体路径。共享提示词每个成员 turn 开始时读取；编辑聊天文件不触发调度。
+历史默认最新 10 条，`before` 是排他分页锚点，返回上限 100 条 / 64 KiB，原记录不因展示截断而改写。
+
+### Workflow 入口
+
+```text
+/workflow 分析需求，实现修改，并组织复核
+```
+
+快捷命令与 `agent({"profile":"workflow","prompt":"任务"})` 走同一创建路径；外部主 agent 仍为
+`default`。Workflow 管理者读取内置 skill，针对任务生成蓝图，再调用其专有的 `workflow(blueprint)`
+工具。蓝图描述 `agents[{name,profile?,parent?}]` 和 `groups[{name,owner?,members,prompt?}]`；
+名称只用于蓝图内部引用，省略 parent / owner 表示管理者。无需预先准备 YAML 文件。
+
+装配器先校验引用、归属和无环 parent 树，再创建整套未启动实例及共享文件，返回真实 ID 和路径。
+执行时仍只用 `message` / `wait` / `history`，不增加脚本语言或第二套调度器。组员没有动态创建工具，
+但能管理蓝图预建的直属下级。管理者提前答复不等于后代停止，后续 turn 可查询并接管。
+
+恢复重建组织和子会话；中断中的工作交付 `interrupted` 诊断，不自动重发消息、重跑 shell 或重启后继。
+接收是否持久化不确定时允许重复交付，不承诺外部副作用恰好执行一次。退出、新建、fork / undo 切换
+会由 CLI 关闭旧根组织；fork 复制个人历史和能力，不克隆协作组织，也不回滚文件修改。
+
+模块边界与完整时序见 `COLLABORATION.md`、`DESIGN.md`；契约与验收记录见 `todo.md`。
 
 ## 终端行为
 
@@ -195,7 +252,7 @@ Completions 兼容接口会识别 `reasoning_content`、`reasoning` 和 `thinkin
 Responses 接口只展示 reasoning summary，不展示原始 reasoning text。
 
 工具调用使用语义化单行摘要，不直接打印参数 JSON。折叠状态下没有结果正文的连续同名
-工具（如 `read`、`skill`、`agent`、`wait_agent`）会聚成一个摘要；展开后需要显示正文的
+工具（如 `read`、`skill`、`agent`、`wait`）会聚成一个摘要；展开后需要显示正文的
 工具会恢复为独立调用。`glob`、`grep` 折叠时显示结果数量，`webfetch` 显示 HTTP 状态和
 字符数，因此不参与聚合；三者展开时都显示完整结果。`bash` 始终显示实际命令，不猜测
 Shell 意图。聚合只影响展示，底层工具调用、结果和会话记录仍保持独立。

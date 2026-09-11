@@ -26,6 +26,7 @@ pub struct Session {
 }
 
 pub struct TurnHandle {
+    started: Option<oneshot::Receiver<()>>,
     session_id: SessionId,
     id: TurnId,
     cancellation: CancellationToken,
@@ -38,6 +39,7 @@ pub struct ForkedSession {
 }
 
 struct QueuedTurn {
+    started: oneshot::Sender<()>,
     id: TurnId,
     input: Input,
     cancellation: CancellationToken,
@@ -184,8 +186,10 @@ impl Session {
         let id = TurnId::new();
         let cancellation = CancellationToken::new();
         let (completion_tx, completion) = oneshot::channel();
+        let (started_tx, started) = oneshot::channel();
         (
             Command::Submit(QueuedTurn {
+                started: started_tx,
                 id,
                 input,
                 cancellation: cancellation.clone(),
@@ -193,6 +197,7 @@ impl Session {
                 _permit: permit,
             }),
             TurnHandle {
+                started: Some(started),
                 session_id: self.id(),
                 id,
                 cancellation,
@@ -203,6 +208,12 @@ impl Session {
 }
 
 impl TurnHandle {
+    pub async fn wait_started(&mut self) -> Result<(), AshError> {
+        if let Some(started) = self.started.take() {
+            started.await.map_err(|_| closed())?;
+        }
+        Ok(())
+    }
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
@@ -249,12 +260,14 @@ async fn run_queued_turn(
     events: &broadcast::Sender<SessionEvent>,
 ) {
     let QueuedTurn {
+        started,
         id,
         input,
         cancellation,
         completion,
         _permit,
     } = queued;
+    let _ = started.send(());
     publish(events, SessionEvent::Started(id));
     let (live_tx, mut live_rx) = mpsc::channel(64);
     let (committer, mut commits) = StepCommitter::channel();
@@ -546,7 +559,7 @@ impl SessionActorState {
         Self::with_identity(agent, runtime, parent.child())
     }
 
-    fn with_identity(agent: Agent, runtime: Runtime, identity: SessionIdentity) -> Self {
+    pub(crate) fn with_identity(agent: Agent, runtime: Runtime, identity: SessionIdentity) -> Self {
         let store = runtime.session_store_handle();
         Self {
             identity,
@@ -565,14 +578,33 @@ impl SessionActorState {
         if !opened.session.identity.is_root() {
             return Err(SessionError::ChildSession.into());
         }
-        self.restore(opened);
+        self.restore(opened)?;
         Ok(true)
     }
 
-    fn restore(&mut self, opened: OpenedSession) {
+    fn restore(&mut self, opened: OpenedSession) -> Result<(), AshError> {
+        if let Some(snapshot) = &opened.session.definition {
+            self.agent = self.agent.restore(snapshot)?;
+        }
         self.identity = opened.session.identity;
         self.conversation = opened.session.conversation;
         self.writer = Some(opened.writer);
+        self.writer
+            .as_mut()
+            .ok_or_else(closed)?
+            .set_definition(self.agent.snapshot());
+        Ok(())
+    }
+
+    pub(crate) async fn resume_child(&mut self) -> Result<bool, AshError> {
+        let Some(opened) = self.store.open(self.identity.id()).await? else {
+            return Ok(false);
+        };
+        if opened.session.identity != self.identity {
+            return Err(AshError::Config("child identity mismatch".into()));
+        }
+        self.restore(opened)?;
+        Ok(true)
     }
 
     async fn commit_turn(
@@ -602,7 +634,15 @@ impl SessionActorState {
         start: Option<TurnStart>,
         step: Arc<Step>,
     ) -> Result<(), AshError> {
-        self.writer().await?.commit_step(start, step).await
+        let mut candidate = self.agent.clone();
+        candidate
+            .apply_step(&step)
+            .map_err(|error| AshError::Config(error.to_string()))?;
+        let snapshot = candidate.snapshot();
+        self.writer().await?.set_definition(snapshot);
+        self.writer().await?.commit_step(start, step).await?;
+        self.agent = candidate;
+        Ok(())
     }
 
     async fn compact(&mut self, cancellation: &CancellationToken) -> Result<bool, AshError> {
@@ -611,7 +651,7 @@ impl SessionActorState {
         }
         let tools = self.agent.tool_definitions();
         let before = estimate_request_tokens(
-            self.agent.system_prompt(),
+            self.agent.system_prompt().as_deref(),
             &self.conversation.context(),
             &tools,
         );
@@ -626,7 +666,7 @@ impl SessionActorState {
             return Ok(false);
         };
         let after = estimate_request_tokens(
-            self.agent.system_prompt(),
+            self.agent.system_prompt().as_deref(),
             &self.conversation.context_with_summary(&summary),
             &tools,
         );
@@ -658,6 +698,7 @@ impl SessionActorState {
         let mut state = Self::new(self.agent.clone(), self.runtime.clone());
         if conversation.summary().is_some() || !conversation.turns().is_empty() {
             let mut writer = state.store.open_new(state.identity).await?;
+            writer.set_definition(state.agent.snapshot());
             writer.seed(&conversation, &input).await?;
             state.writer = Some(writer);
         }
@@ -668,6 +709,11 @@ impl SessionActorState {
     async fn writer(&mut self) -> Result<&mut SessionWriter, AshError> {
         if self.writer.is_none() {
             self.writer = Some(self.store.open_new(self.identity).await?);
+            let snapshot = self.agent.snapshot();
+            self.writer
+                .as_mut()
+                .ok_or_else(closed)?
+                .set_definition(snapshot);
         }
         self.writer.as_mut().ok_or_else(closed)
     }
@@ -710,6 +756,134 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn capability_commit_is_session_local_and_restores_the_original_profile() {
+        struct InspectModel {
+            requests: StdMutex<Vec<ModelRequest>>,
+        }
+        impl ash_core::ModelClient for InspectModel {
+            fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProtocolError> {
+                let index = self.requests.lock().unwrap().len();
+                self.requests.lock().unwrap().push(request);
+                let call = |id: &str, name: &str| ModelEvent::ToolCall {
+                    id: ash_core::ToolCallId::from_provider(id),
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                };
+                let events = match index {
+                    0 => vec![
+                        call("activate", "activate"),
+                        call("too-soon", "write"),
+                        ModelEvent::Stop(StopReason::EndTurn),
+                    ],
+                    1 => vec![
+                        call("allowed", "write"),
+                        ModelEvent::Stop(StopReason::EndTurn),
+                    ],
+                    _ => vec![
+                        ModelEvent::Text("done".into()),
+                        ModelEvent::Stop(StopReason::EndTurn),
+                    ],
+                };
+                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let model = Arc::new(InspectModel {
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runtime = Runtime::new(model.clone()).with_session_directory(directory.path());
+        let activate = define_tool(
+            "activate",
+            "activate extra tools",
+            |_, _: serde_json::Value| async {
+                Ok(ash_core::ToolOutput {
+                    text: "activated".into(),
+                    installed_tools: vec!["write".into()],
+                    ..Default::default()
+                })
+            },
+        )
+        .unwrap();
+        let write = define_tool("write", "write", |_, _: serde_json::Value| async {
+            Ok("written")
+        })
+        .unwrap();
+        let profile = crate::Profile::parse(
+            "test",
+            "---\ndescription: old role\ntools: activate\n---\noriginal role instructions",
+        )
+        .unwrap();
+        let base = Agent::new(ModelId::new("model"), vec![activate, write])
+            .with_profile(profile)
+            .unwrap();
+        let session = runtime.start(&base);
+        let id = session.id();
+        let turn = session
+            .submit("activate")
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let calls = turn.tool_calls().collect::<Vec<_>>();
+        assert!(calls[0].result.is_ok());
+        assert!(calls[1].result.is_err());
+        assert!(calls[2].result.is_ok());
+        assert!(!model.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "write"));
+        assert!(model.requests.lock().unwrap()[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "write"));
+        let second = runtime.start(&base);
+        second
+            .submit("independent")
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert!(!model.requests.lock().unwrap()[3]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "write"));
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let changed = base
+            .with_profile(
+                crate::Profile::parse(
+                    "test",
+                    "---\ndescription: new role\n---\nreplacement role instructions",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let restored = runtime.resume(&changed, id).await.unwrap().unwrap();
+        restored
+            .submit("resume")
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        assert!(last
+            .system
+            .as_ref()
+            .unwrap()
+            .contains("original role instructions"));
+        assert!(!last
+            .system
+            .as_ref()
+            .unwrap()
+            .contains("replacement role instructions"));
+        assert!(last.tools.iter().any(|tool| tool.name == "write"));
+    }
 
     struct MockModel {
         responses: StdMutex<VecDeque<Vec<ModelEvent>>>,

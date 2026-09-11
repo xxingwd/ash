@@ -180,6 +180,7 @@ pub(crate) mod test_support {
         ToolOutput {
             text: text.to_string(),
             attachments,
+            ..ToolOutput::default()
         }
     }
 }

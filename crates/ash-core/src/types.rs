@@ -64,8 +64,10 @@ impl Default for TurnId {
     From,
     Into,
     Display,
+    schemars::JsonSchema,
 )]
-pub struct SessionId(Uuid);
+#[schemars(inline)]
+pub struct SessionId(#[schemars(with = "String")] Uuid);
 
 impl SessionId {
     #[must_use]

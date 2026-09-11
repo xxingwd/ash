@@ -1,19 +1,22 @@
 mod agent;
 mod context;
 mod engine;
+mod frontmatter;
 mod jsonl;
 mod mcp;
+mod profile;
 mod project;
 mod prompt;
 mod runtime;
 mod session;
 mod skill;
 
-pub use agent::{Agent, DEFAULT_MAX_CONTEXT_TOKENS};
+pub use agent::{Agent, AgentSnapshot, DEFAULT_MAX_CONTEXT_TOKENS};
 pub use ash_core::{Input, SessionEvent};
 pub use mcp::{load_mcp_tools, McpManager, McpServerConfig};
-pub use prompt::build_system_prompt;
+pub use profile::Profile;
+pub use prompt::{PromptContext, BASE_INSTRUCTIONS};
 pub use runtime::Runtime;
 pub(crate) use session::SessionActorState;
 pub use session::{ForkedSession, Session, TurnHandle};
-pub use skill::{tool as skill_tool, Skill};
+pub use skill::{install as install_skills, tool as skill_tool, Skill};

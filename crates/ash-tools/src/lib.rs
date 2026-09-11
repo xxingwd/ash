@@ -3,6 +3,7 @@ mod edit;
 mod glob;
 mod grep;
 mod image;
+mod instructions;
 mod path;
 mod read;
 mod timeout;
@@ -59,12 +60,15 @@ fn all_tools(workspace: &Arc<Workspace>) -> Result<Vec<Arc<dyn Tool>>, ToolError
         read::tool(Arc::clone(workspace))?,
         glob::tool(Arc::clone(workspace))?,
         grep::tool(Arc::clone(workspace))?,
-        bash::tool(Arc::clone(workspace))?,
+        ash_core::with_tool_instructions(bash::tool(Arc::clone(workspace))?, "Before shell commands touch a new directory, inspect its applicable AGENTS.md files. Shell scripts are not automatically analyzed for file targets; bash is not a read-only sandbox."),
         edit::tool(Arc::clone(workspace))?,
         write::tool(Arc::clone(workspace))?,
         webfetch::tool()?,
     ];
-    Ok(tools)
+    Ok(tools
+        .into_iter()
+        .map(|tool| instructions::wrap(tool, workspace.root().to_path_buf()))
+        .collect())
 }
 
 #[cfg(test)]

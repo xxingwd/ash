@@ -1,43 +1,39 @@
-use std::fmt::Write as _;
+use ash_core::RepositoryInstruction;
 use std::path::Path;
 
 use chrono::Local;
 
-use crate::Skill;
-
-const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
+pub const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
 const MAX_AGENTS_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 
-/// Build the full system prompt for a working directory: base instructions,
-/// environment context, AGENTS.md instructions, and the skills list.
-///
-/// This performs synchronous filesystem reads (canonicalization, AGENTS.md
-/// discovery). Callers in an async context must wrap it in
-/// `tokio::task::spawn_blocking` so the blocking IO stays off the async
-/// worker threads.
-/// # Errors
-///
-/// Returns `AshError` when the working directory cannot be canonicalized
-/// or an AGENTS.md file cannot be read.
-pub fn build_system_prompt(
-    working_dir: &Path,
-    skills: &[Skill],
-    active_skill: Option<&Skill>,
-) -> Result<String, ash_core::AshError> {
-    let working_dir = std::fs::canonicalize(working_dir).map_err(|error| {
-        ash_core::AshError::Config(format!(
-            "cannot resolve working directory {}: {error}",
-            working_dir.display()
-        ))
-    })?;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PromptContext {
+    environment: String,
+    #[serde(skip)]
+    repository: Vec<RepositoryInstruction>,
+}
 
-    let mut sections = vec![BASE_INSTRUCTIONS.trim().to_string()];
-    sections.push(environment_context(&working_dir));
-    sections.extend(load_agents_instructions(&working_dir)?);
-    if let Some(skills) = skills_context(skills, active_skill) {
-        sections.push(skills);
+impl PromptContext {
+    pub fn load(working_dir: &Path) -> Result<Self, ash_core::AshError> {
+        let working_dir = std::fs::canonicalize(working_dir).map_err(|error| {
+            ash_core::AshError::Config(format!(
+                "cannot resolve working directory {}: {error}",
+                working_dir.display()
+            ))
+        })?;
+        Ok(Self {
+            environment: environment_context(&working_dir),
+            repository: load_agents_instructions(&working_dir)?,
+        })
     }
-    Ok(sections.join("\n\n"))
+
+    pub(crate) fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    pub(crate) fn take_repository(&mut self) -> Vec<RepositoryInstruction> {
+        std::mem::take(&mut self.repository)
+    }
 }
 
 fn environment_context(working_dir: &Path) -> String {
@@ -56,56 +52,48 @@ fn environment_context(working_dir: &Path) -> String {
     )
 }
 
-fn load_agents_instructions(working_dir: &Path) -> Result<Vec<String>, ash_core::AshError> {
-    let mut sections = Vec::new();
+fn load_agents_instructions(
+    working_dir: &Path,
+) -> Result<Vec<RepositoryInstruction>, ash_core::AshError> {
+    let mut sections: Vec<RepositoryInstruction> = Vec::new();
     let mut remaining = MAX_AGENTS_INSTRUCTIONS_BYTES;
     for directory in crate::project::directories(working_dir) {
         let path = directory.join("AGENTS.md");
-        if !path.is_file() {
-            continue;
-        }
         if remaining == 0 {
+            if let Some(last) = sections.last_mut() {
+                last.content.push_str("\n[Additional repository instructions exceeded the initial 64 KiB budget. Inspect applicable AGENTS.md files before operating in a new scope.]");
+            }
             break;
         }
 
-        let contents = std::fs::read_to_string(&path).map_err(|error| {
-            ash_core::AshError::Config(format!("cannot read {}: {error}", path.display()))
-        })?;
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ash_core::AshError::Config(format!(
+                    "cannot read {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        let truncated = contents.trim().len() > remaining;
         let contents = truncate_utf8(contents.trim(), remaining);
         remaining = remaining.saturating_sub(contents.len());
-        sections.push(format!(
-            "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-            directory.display(),
-            contents
-        ));
+        sections.push(RepositoryInstruction {
+            path,
+            scope: directory,
+            content: format!(
+                "{}{}",
+                contents,
+                if truncated {
+                    "\n[truncated at the initial 64 KiB instruction budget]"
+                } else {
+                    ""
+                }
+            ),
+        });
     }
     Ok(sections)
-}
-
-fn skills_context(skills: &[Skill], active_skill: Option<&Skill>) -> Option<String> {
-    if skills.is_empty() && active_skill.is_none() {
-        return None;
-    }
-
-    let mut output = String::from("<skills>\n## Available skills\n");
-    if skills.is_empty() {
-        output.push_str("- None discovered.\n");
-    } else {
-        for skill in skills {
-            let _ = writeln!(output, "- `{}`: {}", skill.name, skill.description);
-        }
-    }
-
-    if let Some(skill) = active_skill {
-        let _ = writeln!(
-            output,
-            "\n## Active skill: {}\n\n{}",
-            skill.name,
-            skill.instructions()
-        );
-    }
-    output.push_str("</skills>");
-    Some(output)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -129,6 +117,7 @@ fn escape_xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Skill;
 
     fn skill(path: &Path, name: &str, instructions: &str) -> Skill {
         Skill {
@@ -155,8 +144,13 @@ mod tests {
         let skill_path = project.join(".agents/skills/review/SKILL.md");
         let skill = skill(&skill_path, "review", "review carefully");
 
-        let prompt =
-            build_system_prompt(&nested, std::slice::from_ref(&skill), Some(&skill)).unwrap();
+        let agent = crate::Agent::new(ash_core::ModelId::new("test"), Vec::new())
+            .with_system_prompt(BASE_INSTRUCTIONS)
+            .with_prompt_context(PromptContext::load(&nested).unwrap());
+        let prompt = crate::install_skills(agent, vec![skill.clone()], Some(&skill))
+            .unwrap()
+            .system_prompt()
+            .unwrap();
 
         assert!(prompt.contains("<environment_context>"));
         assert!(prompt.contains("project rules"));
@@ -174,5 +168,38 @@ mod tests {
     #[test]
     fn truncates_agents_instructions_on_utf8_boundaries() {
         assert_eq!(truncate_utf8("你好吗", 4), "你");
+    }
+
+    #[test]
+    fn composes_explicit_role_tools_and_scoped_repository_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "nested rules").unwrap();
+        let tool = ash_core::define_tool("example", "example", |_, ()| async { Ok("ok") }).unwrap();
+        let agent = crate::Agent::new(ash_core::ModelId::new("model"), Vec::new())
+            .with_system_prompt("explicit rules")
+            .with_profile(
+                crate::Profile::parse("test", "---\ndescription: test\n---\nrole rules").unwrap(),
+            )
+            .unwrap()
+            .with_prompt_context(PromptContext::load(&nested).unwrap())
+            .installing_tools([ash_core::with_tool_instructions(tool, "tool rules")])
+            .unwrap();
+        let prompt = agent.system_prompt().unwrap();
+        let positions = [
+            "explicit rules",
+            "role rules",
+            "<environment_context>",
+            "tool rules",
+            "root rules",
+            "nested rules",
+        ]
+        .map(|section| prompt.find(section).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(prompt.contains(&nested.to_string_lossy().to_string()));
+        assert_eq!(agent.clone().system_prompt(), Some(prompt));
     }
 }

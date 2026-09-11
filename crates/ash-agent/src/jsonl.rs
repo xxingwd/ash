@@ -14,11 +14,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufR
 use tracing::warn;
 
 const MAX_SESSION_TITLE_CHARS: usize = 160;
-const MAX_INIT_RECORD_BYTES: usize = 16 * 1024;
+const MAX_INIT_RECORD_BYTES: usize = 1024 * 1024;
 const UNTITLED_CHAT: &str = "Untitled chat";
 
 #[derive(Debug)]
 pub(crate) struct StoredSession {
+    pub(crate) definition: Option<crate::AgentSnapshot>,
     pub(crate) identity: SessionIdentity,
     pub(crate) conversation: Conversation,
 }
@@ -33,6 +34,7 @@ pub(crate) struct OpenedSession {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Record {
     Init {
+        definition: Option<crate::AgentSnapshot>,
         identity: SessionIdentity,
         created_at: String,
         title: String,
@@ -43,6 +45,7 @@ enum Record {
     },
     TurnStep {
         step: Arc<Step>,
+        definition: Option<crate::AgentSnapshot>,
     },
     TurnEnd {
         result: TurnResult,
@@ -51,6 +54,9 @@ enum Record {
     },
     Checkpoint {
         summary: String,
+    },
+    Definition {
+        definition: crate::AgentSnapshot,
     },
 }
 
@@ -61,6 +67,8 @@ pub(crate) struct TurnStart {
 
 #[derive(Debug)]
 pub(crate) struct SessionWriter {
+    initial_definition: Option<crate::AgentSnapshot>,
+    definition: Option<crate::AgentSnapshot>,
     path: PathBuf,
     identity: SessionIdentity,
     file: Option<tokio::fs::File>,
@@ -70,6 +78,8 @@ pub(crate) struct SessionWriter {
 impl SessionWriter {
     fn new(directory: &Path, identity: SessionIdentity) -> Self {
         Self {
+            initial_definition: None,
+            definition: None,
             path: directory.join(session_filename(identity.id())),
             identity,
             file: None,
@@ -79,6 +89,8 @@ impl SessionWriter {
 
     fn existing(path: PathBuf, identity: SessionIdentity, file: tokio::fs::File) -> Self {
         Self {
+            initial_definition: None,
+            definition: None,
             path,
             identity,
             file: Some(file),
@@ -101,7 +113,10 @@ impl SessionWriter {
         step: Arc<Step>,
     ) -> Result<(), ash_core::AshError> {
         let mut records = start.into_iter().map(Record::from).collect::<Vec<_>>();
-        records.push(Record::TurnStep { step });
+        records.push(Record::TurnStep {
+            step,
+            definition: self.definition.clone(),
+        });
         self.append(records).await
     }
 
@@ -119,6 +134,13 @@ impl SessionWriter {
             summary,
         });
         self.append(records).await
+    }
+
+    pub(crate) fn set_definition(&mut self, definition: crate::AgentSnapshot) {
+        if self.initial_definition.is_none() {
+            self.initial_definition = Some(definition.clone());
+        }
+        self.definition = Some(definition);
     }
 
     pub(crate) async fn checkpoint(&mut self, summary: String) -> Result<(), ash_core::AshError> {
@@ -202,6 +224,7 @@ impl SessionWriter {
                     Record::Init { .. }
                     | Record::TurnStep { .. }
                     | Record::TurnEnd { .. }
+                    | Record::Definition { .. }
                     | Record::Checkpoint { .. } => None,
                 })
                 .or(title);
@@ -211,11 +234,17 @@ impl SessionWriter {
             encode(
                 &mut data,
                 &Record::Init {
+                    definition: self.initial_definition.clone(),
                     identity: self.identity,
                     created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                     title: input_title(first_input),
                 },
             )?;
+            if data.len() > MAX_INIT_RECORD_BYTES {
+                return Err(corrupt(
+                    "initial session definition exceeds the 1 MiB metadata limit",
+                ));
+            }
         }
         for record in records {
             encode(&mut data, &record)?;
@@ -255,12 +284,10 @@ fn turn_records(turn: &Turn, summary: Option<String>) -> Vec<Record> {
         id: turn.id,
         input: turn.input.clone(),
     })
-    .chain(
-        turn.steps
-            .iter()
-            .cloned()
-            .map(|step| Record::TurnStep { step }),
-    )
+    .chain(turn.steps.iter().cloned().map(|step| Record::TurnStep {
+        step,
+        definition: None,
+    }))
     .chain(std::iter::once(Record::TurnEnd {
         result: turn.result.clone(),
         stats: turn.stats,
@@ -298,6 +325,48 @@ impl JsonlSessionStore {
         Ok(SessionWriter::new(&self.directory, identity))
     }
 
+    pub(crate) async fn receipt_recorded(
+        &self,
+        session: SessionId,
+        message_id: &str,
+    ) -> Result<bool, ash_core::AshError> {
+        let file = match tokio::fs::File::open(self.directory.join(session_filename(session))).await
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
+        let mut lines = BufReader::new(file).lines();
+        let mut matched = false;
+        while let Some(line) = lines.next_line().await.map_err(StorageError::from)? {
+            let record = match serde_json::from_str::<Record>(&line) {
+                Ok(record) => record,
+                Err(_) => return Ok(false),
+            };
+            match record {
+                Record::TurnStart { .. } => matched = false,
+                Record::TurnStep { step, .. } => {
+                    matched |= step.tool_calls().any(|call| {
+                        call.name == "wait"
+                            && call
+                                .result
+                                .as_ref()
+                                .ok()
+                                .and_then(|output| {
+                                    serde_json::from_str::<serde_json::Value>(&output.text).ok()
+                                })
+                                .is_some_and(|value| {
+                                    value["result"]["message_id"].as_str() == Some(message_id)
+                                })
+                    });
+                }
+                Record::TurnEnd { .. } if matched => return Ok(true),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) async fn open(
         &self,
         session_id: SessionId,
@@ -328,6 +397,19 @@ impl JsonlSessionStore {
         file.seek(std::io::SeekFrom::End(0))
             .await
             .map_err(StorageError::from)?;
+        if replay.valid_len < length {
+            if let Some(definition) = &replay.session.definition {
+                let mut data = Vec::new();
+                encode(
+                    &mut data,
+                    &Record::Definition {
+                        definition: definition.clone(),
+                    },
+                )?;
+                file.write_all(&data).await.map_err(StorageError::from)?;
+                file.sync_data().await.map_err(StorageError::from)?;
+            }
+        }
         let writer = SessionWriter::existing(path, replay.session.identity, file);
         Ok(Some(OpenedSession {
             writer,
@@ -458,6 +540,7 @@ impl JsonlSessionStore {
 }
 
 struct Init {
+    definition: Option<crate::AgentSnapshot>,
     identity: SessionIdentity,
     created_at: String,
     title: String,
@@ -475,6 +558,7 @@ struct Replay {
 }
 
 struct SessionScan {
+    definition: Option<crate::AgentSnapshot>,
     init: Init,
     valid_len: u64,
     replay_offset: u64,
@@ -494,6 +578,7 @@ impl RecordValidator {
         path: &Path,
     ) -> Result<Option<u64>, ash_core::AshError> {
         match record {
+            Record::Definition { .. } => Ok(None),
             Record::Init { .. } => Err(corrupt_at(
                 path,
                 "Init record appears after the first line",
@@ -566,6 +651,7 @@ async fn replay_file(
             continue;
         }
         match decode(&line, path)? {
+            Record::Definition { .. } => {}
             Record::Init { .. } => {
                 return Err(corrupt_at(
                     path,
@@ -580,7 +666,7 @@ async fn replay_file(
                     steps: Vec::new(),
                 });
             }
-            Record::TurnStep { step } => {
+            Record::TurnStep { step, .. } => {
                 let active = open
                     .as_mut()
                     .ok_or_else(|| corrupt_at(path, "turn step appears outside a turn", None))?;
@@ -612,6 +698,7 @@ async fn replay_file(
     }
     Ok(Replay {
         session: StoredSession {
+            definition: scan.definition,
             identity: scan.init.identity,
             conversation,
         },
@@ -639,6 +726,7 @@ async fn scan_file(
         }
     };
     let init = init_from_record(first, path)?;
+    let mut definition = init.definition.clone();
     let mut validator = RecordValidator::default();
     let mut replay_offset = valid_len;
     loop {
@@ -650,12 +738,24 @@ async fn scan_file(
         if line.is_empty() {
             continue;
         }
-        if let Some(boundary) = validator.validate(&decode(&line, path)?, offset, path)? {
+        let record = decode(&line, path)?;
+        if let Some(boundary) = validator.validate(&record, offset, path)? {
             replay_offset = boundary;
+        }
+        match record {
+            Record::TurnStep {
+                definition: Some(snapshot),
+                ..
+            }
+            | Record::Definition {
+                definition: snapshot,
+            } => definition = Some(snapshot),
+            _ => {}
         }
     }
     let valid_len = validator.open_offset().unwrap_or(valid_len);
     Ok(SessionScan {
+        definition,
         init,
         valid_len,
         replay_offset,
@@ -705,16 +805,19 @@ async fn read_init(path: &Path) -> Result<Init, ash_core::AshError> {
 fn init_from_record(record: Record, path: &Path) -> Result<Init, ash_core::AshError> {
     match record {
         Record::Init {
+            definition,
             identity,
             created_at,
             title,
         } if !created_at.trim().is_empty() && !title.trim().is_empty() => Ok(Init {
+            definition,
             identity,
             created_at,
             title,
         }),
         Record::Init { .. } => Err(corrupt_at(path, "Init fields cannot be empty", None)),
         Record::TurnStart { .. }
+        | Record::Definition { .. }
         | Record::TurnStep { .. }
         | Record::TurnEnd { .. }
         | Record::Checkpoint { .. } => Err(corrupt_at(path, "first record is not Init", None)),
@@ -1249,6 +1352,7 @@ mod tests {
         writer.commit_turn(turn(1, "first"), None).await.unwrap();
         writer
             .append(vec![Record::TurnStep {
+                definition: None,
                 step: Arc::new(Step::default()),
             }])
             .await

@@ -138,7 +138,7 @@ pub(crate) async fn run_turn(
 ) -> EngineOutcome {
     TurnRunner {
         model,
-        agent,
+        agent: agent.clone(),
         conversation,
         id,
         input: Arc::new(input),
@@ -156,7 +156,7 @@ pub(crate) async fn run_turn(
 
 struct TurnRunner<'a> {
     model: &'a dyn ModelClient,
-    agent: &'a Agent,
+    agent: Agent,
     conversation: &'a Conversation,
     id: TurnId,
     input: Arc<Input>,
@@ -262,7 +262,7 @@ impl TurnRunner<'_> {
     fn request(&self) -> ModelRequest {
         ModelRequest {
             model: self.agent.model().clone(),
-            system: self.agent.system_prompt().map(str::to_string),
+            system: self.agent.system_prompt(),
             context: self.model_context(),
             tools: self.agent.tool_definitions(),
             max_tokens: None,
@@ -287,7 +287,7 @@ impl TurnRunner<'_> {
         {
             if let Some((summary, stats)) = compact(
                 self.model,
-                self.agent,
+                &self.agent,
                 self.conversation,
                 &self.context.cancellation,
             )
@@ -385,8 +385,27 @@ impl TurnRunner<'_> {
         }
         let has_tools = step.tool_calls().next().is_some();
         let step = Arc::new(step);
+        let mut candidate = self.agent.clone();
+        candidate
+            .apply_step(&step)
+            .map_err(|error| AshError::Config(error.to_string()))?;
         self.committer.commit(Arc::clone(&step)).await?;
-        self.steps.push(step);
+        self.steps.push(Arc::clone(&step));
+        for call in step.tool_calls() {
+            if let Ok(output) = &call.result {
+                if let Some(tool) = self
+                    .agent
+                    .tools()
+                    .iter()
+                    .find(|tool| tool.name() == call.name)
+                {
+                    tool.committed(self.context.clone(), &call.arguments, output)
+                        .await
+                        .map_err(|error| AshError::Config(error.to_string()))?;
+                }
+            }
+        }
+        self.agent = candidate;
         if has_tools {
             self.publish_activity().await;
         }
@@ -486,7 +505,21 @@ impl TurnRunner<'_> {
             deadline: timeout.map(|timeout| Instant::now() + timeout),
         };
         context
-            .run(tool.execute(context.clone(), arguments))
+            .run(async {
+                let output = match tool
+                    .prepare(
+                        context.clone(),
+                        &arguments,
+                        self.agent.observed_instructions(),
+                    )
+                    .await?
+                {
+                    Some(output) => output,
+                    None => tool.execute(context.clone(), arguments).await?,
+                };
+                self.agent.clone().apply_output(&output)?;
+                Ok(output)
+            })
             .await?
     }
 }

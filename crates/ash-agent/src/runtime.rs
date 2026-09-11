@@ -47,6 +47,36 @@ impl Runtime {
         ))
     }
 
+    pub fn start_at(&self, agent: &Agent, identity: SessionIdentity) -> Session {
+        Session::spawn(SessionActorState::with_identity(
+            agent.clone(),
+            self.clone(),
+            identity,
+        ))
+    }
+
+    pub async fn receipt_recorded(
+        &self,
+        session: SessionId,
+        message_id: &str,
+    ) -> Result<bool, ash_core::AshError> {
+        self.session_store
+            .receipt_recorded(session, message_id)
+            .await
+    }
+
+    pub async fn restore_child(
+        &self,
+        agent: &Agent,
+        identity: SessionIdentity,
+    ) -> Result<Option<Session>, ash_core::AshError> {
+        let mut state = SessionActorState::with_identity(agent.clone(), self.clone(), identity);
+        if !state.resume_child().await? {
+            return Ok(None);
+        }
+        Ok(Some(Session::spawn(state)))
+    }
+
     /// Resume an existing session by id.
     ///
     /// # Errors

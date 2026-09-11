@@ -4,6 +4,7 @@ use crate::SubagentState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentEvent {
+    pub group_id: Option<SessionId>,
     pub root_id: SessionId,
     pub session_id: SessionId,
     pub name: String,

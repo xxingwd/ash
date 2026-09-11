@@ -419,6 +419,24 @@ impl ResponsesDecoder {
             ));
         }
         let response = &event["response"];
+        let output_kinds = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["type"].as_str())
+            .collect::<Vec<_>>();
+        let output_tools = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            ?output_kinds,
+            ?output_tools,
+            "Responses completion structure"
+        );
         let usage = response.get("usage").unwrap_or_else(|| &event["usage"]);
         if !usage.is_null() {
             items.push(usage_event(

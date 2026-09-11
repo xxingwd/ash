@@ -72,6 +72,10 @@ pub enum UiCommand {
 pub enum UiEvent {
     Session(SessionEvent),
     Subagent(SubagentUpdate),
+    SubagentsChanged {
+        root_id: SessionId,
+        agents: Vec<SubagentUpdate>,
+    },
     ConversationChanged {
         session_id: SessionId,
         conversation: Conversation,
@@ -85,6 +89,7 @@ pub enum UiEvent {
         sessions: Vec<SessionSummary>,
     },
     CommandFailed(String),
+    Warning(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,7 +248,10 @@ impl AppState {
         });
         let agent = &mut self.subagents[position];
         match update.kind {
-            SubagentUpdateKind::StateChanged(state) => agent.state = state,
+            SubagentUpdateKind::StateChanged(state) => {
+                agent.state = state;
+                agent.name = update.name;
+            }
             SubagentUpdateKind::Session(event) => update_subagent_session(agent, event),
             SubagentUpdateKind::Removed => {}
         }
@@ -441,9 +449,22 @@ fn handle_ui_event(
             state.apply(terminal, RenderPlan::Redraw)?;
             Ok(LoopAction::Continue)
         }
+        UiEvent::SubagentsChanged { root_id, agents } => {
+            state.subagents.retain(|agent| agent.root_id != root_id);
+            for agent in agents {
+                state.update_subagent(agent);
+            }
+            state.apply(terminal, RenderPlan::Redraw)?;
+            Ok(LoopAction::Continue)
+        }
         UiEvent::CommandFailed(error) => {
             state.finish_command_failure();
             let plan = state.error(&error).merge(RenderPlan::Redraw);
+            state.apply(terminal, plan)?;
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::Warning(message) => {
+            let plan = state.error(&message).merge(RenderPlan::Redraw);
             state.apply(terminal, plan)?;
             Ok(LoopAction::Continue)
         }
@@ -1057,6 +1078,10 @@ async fn run_command(
 ) -> anyhow::Result<LoopAction> {
     let mut effect = RenderPlan::Redraw;
     let outgoing = match command {
+        SlashCommand::Workflow => {
+            effect = effect.merge(state.command_error("use /workflow <task>"));
+            None
+        }
         SlashCommand::New | SlashCommand::Clear => {
             state.menu.close_picker();
             effect = effect.merge(state.start_new_session());
@@ -1175,7 +1200,7 @@ mod tests {
         let crate::menu::MenuView::Commands { items, .. } = state.menu.view() else {
             panic!("expected command completions");
         };
-        assert_eq!(items.len(), 8);
+        assert_eq!(items.len(), 9);
     }
 
     #[test]

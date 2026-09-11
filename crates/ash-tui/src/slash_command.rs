@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Compact,
     Resume,
     Status,
+    Workflow,
     Exit,
 }
 
@@ -84,6 +85,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: SlashCommand::Status,
     },
     CommandSpec {
+        name: "workflow",
+        aliases: &[],
+        description: "start a workflow manager: /workflow <task>",
+        command: SlashCommand::Workflow,
+    },
+    CommandSpec {
         name: "exit",
         aliases: &["quit"],
         description: "exit Ash",
@@ -106,6 +113,13 @@ pub fn parse(input: &str) -> ParsedInput {
     let Some(name) = parts.next() else {
         return ParsedInput::Invalid("enter a command after '/'".to_string());
     };
+    if name == "workflow" {
+        return if parts.next().is_some() {
+            ParsedInput::Message
+        } else {
+            ParsedInput::Invalid("use /workflow <task>".into())
+        };
+    }
     if parts.next().is_some() {
         return ParsedInput::Invalid(format!("/{name} does not accept arguments"));
     }

@@ -16,10 +16,12 @@ enum ToolKind {
     Bash,
     Skill,
     Agent,
-    MessageAgent,
-    ListAgents,
-    RemoveAgent,
-    WaitAgent,
+    Message,
+    Group,
+    History,
+    List,
+    Wait,
+    Workflow,
     Other,
 }
 
@@ -35,10 +37,12 @@ impl ToolKind {
             "bash" => Self::Bash,
             "skill" => Self::Skill,
             "agent" => Self::Agent,
-            "message_agent" => Self::MessageAgent,
-            "list_agents" => Self::ListAgents,
-            "remove_agent" => Self::RemoveAgent,
-            "wait_agent" => Self::WaitAgent,
+            "message" => Self::Message,
+            "group" => Self::Group,
+            "history" => Self::History,
+            "list" => Self::List,
+            "wait" => Self::Wait,
+            "workflow" => Self::Workflow,
             _ => Self::Other,
         }
     }
@@ -107,10 +111,12 @@ pub fn tool_display_for(name: &str) -> ToolDisplay {
         ToolKind::Glob | ToolKind::Grep | ToolKind::WebFetch => GENERIC_SUMMARY,
         ToolKind::Skill
         | ToolKind::Agent
-        | ToolKind::MessageAgent
-        | ToolKind::ListAgents
-        | ToolKind::RemoveAgent
-        | ToolKind::WaitAgent => GENERIC_EXPANDABLE,
+        | ToolKind::Message
+        | ToolKind::Group
+        | ToolKind::History
+        | ToolKind::List
+        | ToolKind::Wait
+        | ToolKind::Workflow => GENERIC_EXPANDABLE,
         ToolKind::Other => GENERIC_PREVIEW,
     }
 }
@@ -158,10 +164,22 @@ fn tool_detail(name: &str, arguments: &Value) -> String {
         ToolKind::WebFetch => url_argument(arguments),
         ToolKind::Bash => string_argument(arguments, "command"),
         ToolKind::Skill => string_argument(arguments, "name"),
-        ToolKind::Agent | ToolKind::MessageAgent | ToolKind::RemoveAgent => {
-            string_argument(arguments, "name")
+        ToolKind::Agent => arguments.get("profile").map_or_else(
+            || "default".into(),
+            |_| string_argument(arguments, "profile"),
+        ),
+        ToolKind::Message => string_argument(arguments, "agent_id"),
+        ToolKind::Group | ToolKind::History | ToolKind::List => {
+            string_argument(arguments, "group_id")
         }
-        ToolKind::ListAgents | ToolKind::WaitAgent | ToolKind::Other => String::new(),
+        ToolKind::Wait => {
+            if arguments.get("group_id").is_some_and(Value::is_string) {
+                string_argument(arguments, "group_id")
+            } else {
+                string_argument(arguments, "agent_id")
+            }
+        }
+        ToolKind::Workflow | ToolKind::Other => String::new(),
     }
 }
 
@@ -293,15 +311,29 @@ mod tests {
     fn collaboration_tool_names_read_as_labels() {
         assert_eq!(
             tool_call_summary(
-                "message_agent",
-                &json!({"name": "research", "message": "hi", "wait": false}),
+                "message",
+                &json!({"agent_id": "research-id", "message": "hi"}),
             ),
-            ("message_agent".to_string(), "research".to_string())
+            ("message".to_string(), "research-id".to_string())
         );
         assert_eq!(
-            tool_call_summary("remove_agent", &json!({"name": "research"})),
-            ("remove_agent".to_string(), "research".to_string())
+            tool_call_summary("agent", &json!({"profile": "review"})),
+            ("agent".to_string(), "review".to_string())
         );
+        assert_eq!(
+            tool_call_summary("agent", &json!({})),
+            ("agent".into(), "default".into())
+        );
+        assert_eq!(
+            tool_call_summary("wait", &json!({"agent_id":"child-id"})),
+            ("wait".into(), "child-id".into())
+        );
+        for name in ["group", "history", "list", "wait"] {
+            assert_eq!(
+                tool_call_summary(name, &json!({"group_id":"line-id"})),
+                (name.into(), "line-id".into())
+            );
+        }
         assert_eq!(
             tool_call_summary("custom_tool", &json!({"payload": "x"})),
             ("custom_tool".to_string(), String::new())
@@ -405,17 +437,13 @@ mod tests {
             assert_eq!(tool_display_for(name), GENERIC_SUMMARY, "{name}");
         }
         for name in [
-            "skill",
-            "agent",
-            "wait_agent",
-            "list_agents",
-            "remove_agent",
+            "skill", "agent", "message", "group", "history", "wait", "list", "workflow",
         ] {
             assert_eq!(tool_display_for(name), GENERIC_EXPANDABLE, "{name}");
         }
         assert_eq!(tool_display_for("custom_tool"), GENERIC_PREVIEW);
         assert_eq!(tool_display_for_result("read", true), GENERIC_PREVIEW);
-        assert_eq!(tool_display_for_result("wait_agent", true), GENERIC_PREVIEW);
+        assert_eq!(tool_display_for_result("wait", true), GENERIC_PREVIEW);
         assert_eq!(tool_display_for_result("bash", true), GENERIC_PREVIEW);
     }
 

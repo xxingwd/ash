@@ -22,6 +22,13 @@ struct Cli {
     #[arg(short, long)]
     skill: Option<String>,
 
+    #[arg(
+        long,
+        default_value = "default",
+        help = "Agent role: default, explore, or review"
+    )]
+    profile: String,
+
     /// Provider protocol (anthropic, openai, openai-responses)
     #[arg(long, value_parser = parse_protocol_arg)]
     protocol: Option<Protocol>,
@@ -82,6 +89,17 @@ fn init_logging(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_defaults_and_explicit_role_are_parsed() {
+        assert_eq!(Cli::try_parse_from(["ash"]).unwrap().profile, "default");
+        assert_eq!(
+            Cli::try_parse_from(["ash", "--profile", "review", "run", "inspect"])
+                .unwrap()
+                .profile,
+            "review"
+        );
+    }
 
     #[test]
     fn run_subcommand_parses_with_log_flag() {

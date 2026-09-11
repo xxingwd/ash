@@ -65,10 +65,32 @@ impl ToolContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryInstruction {
+    pub path: std::path::PathBuf,
+    pub scope: std::path::PathBuf,
+    pub content: String,
+}
+
+impl RepositoryInstruction {
+    pub fn render(&self) -> String {
+        format!(
+            "Instructions from {} apply only to {} and descendants:\n{}",
+            self.path.display(),
+            self.scope.display(),
+            self.content
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub text: String,
     pub attachments: Vec<Content>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_instructions: Vec<RepositoryInstruction>,
 }
 
 impl ToolOutput {
@@ -76,6 +98,7 @@ impl ToolOutput {
         Self {
             text: text.into(),
             attachments,
+            ..Self::default()
         }
     }
 }
@@ -85,6 +108,7 @@ impl From<String> for ToolOutput {
         Self {
             text,
             attachments: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -94,6 +118,7 @@ impl From<&str> for ToolOutput {
         Self {
             text: text.to_string(),
             attachments: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -102,6 +127,9 @@ impl From<&str> for ToolOutput {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn instructions(&self) -> Option<&str> {
+        None
+    }
     fn timeout(&self) -> ToolTimeout {
         ToolTimeout::Session
     }
@@ -113,11 +141,94 @@ pub trait Tool: Send + Sync {
         }
     }
     fn parameters_schema(&self) -> serde_json::Value;
+    async fn prepare(
+        &self,
+        _ctx: ToolContext,
+        _args: &serde_json::Value,
+        _observed: &[RepositoryInstruction],
+    ) -> Result<Option<ToolOutput>, ToolError> {
+        Ok(None)
+    }
+    async fn committed(
+        &self,
+        _ctx: ToolContext,
+        _args: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
     async fn execute(
         &self,
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> std::result::Result<ToolOutput, ToolError>;
+}
+
+pub fn with_tool_instructions(
+    tool: Arc<dyn Tool>,
+    instructions: impl Into<String>,
+) -> Arc<dyn Tool> {
+    Arc::new(InstructedTool {
+        tool,
+        instructions: instructions.into(),
+    })
+}
+
+struct InstructedTool {
+    tool: Arc<dyn Tool>,
+    instructions: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for InstructedTool {
+    async fn prepare(
+        &self,
+        ctx: ToolContext,
+        args: &serde_json::Value,
+        observed: &[RepositoryInstruction],
+    ) -> Result<Option<ToolOutput>, ToolError> {
+        self.tool.prepare(ctx, args, observed).await
+    }
+
+    async fn committed(
+        &self,
+        ctx: ToolContext,
+        args: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> Result<(), ToolError> {
+        self.tool.committed(ctx, args, output).await
+    }
+    fn name(&self) -> &str {
+        self.tool.name()
+    }
+
+    fn description(&self) -> &str {
+        self.tool.description()
+    }
+
+    fn instructions(&self) -> Option<&str> {
+        Some(&self.instructions)
+    }
+
+    fn timeout(&self) -> ToolTimeout {
+        self.tool.timeout()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.tool.definition()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.tool.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        self.tool.execute(ctx, args).await
+    }
 }
 
 struct FnTool<Args, F, Fut, Output> {
@@ -270,5 +381,45 @@ mod tests {
             empty_description,
             Err(ToolError::Execution(message)) if message == "tool description cannot be empty"
         ));
+    }
+
+    #[tokio::test]
+    async fn instructions_wrapper_preserves_tool_contract_and_execution() {
+        let tool = define_tool_with_timeout(
+            "sample",
+            "sample tool",
+            ToolTimeout::Disabled,
+            |_, fail: bool| async move {
+                if fail {
+                    Err(ToolError::Execution("failure".into()))
+                } else {
+                    Ok("output")
+                }
+            },
+        )
+        .unwrap();
+        let definition = serde_json::to_value(tool.definition()).unwrap();
+        let wrapped = with_tool_instructions(tool, "module rules");
+        assert_eq!(wrapped.instructions(), Some("module rules"));
+        assert_eq!(wrapped.timeout(), ToolTimeout::Disabled);
+        assert_eq!(
+            serde_json::to_value(wrapped.definition()).unwrap(),
+            definition
+        );
+        let context = ToolContext {
+            identity: SessionIdentity::root(SessionId::new()),
+            cancellation: CancellationToken::new(),
+            deadline: None,
+        };
+        assert_eq!(
+            wrapped
+                .execute(context.clone(), false.into())
+                .await
+                .unwrap()
+                .text,
+            "output"
+        );
+        assert!(matches!(wrapped.execute(context, true.into()).await,
+            Err(ToolError::Execution(message)) if message == "failure"));
     }
 }

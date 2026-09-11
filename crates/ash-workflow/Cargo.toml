@@ -5,16 +5,13 @@ edition.workspace = true
 
 [dependencies]
 ash-agent = { workspace = true }
+ash-collab = { workspace = true }
 ash-core = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
-rquickjs = { workspace = true }
-rquickjs-serde = { workspace = true }
 schemars = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
