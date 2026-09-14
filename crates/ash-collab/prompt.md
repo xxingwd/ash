@@ -4,6 +4,6 @@ Use message to address a direct child, including one chosen member of an owned g
 
 When a child or owned group stops, runtime delivers its final message and status automatically. Read the delivered result: stopped is not proof of business success. A stopped coordinator may still have running descendants; list identifies that work and its owner. Ask the responsible direct child to collect it rather than bypassing ownership.
 
-Only wait receives results. list and history are inspection, not receipt. There is no automatic completion notification that resumes your turn. After dispatching independent lines, actually call wait for each line before your final reply; saying that you will wait does not execute the tool. While wait is running, its tool result is not yet available.
+Completion results are delivered automatically after the target stops. list and history are inspection tools. Do not poll or wait for a result after every message. Continue from the completion notice in the next turn; inspect list or history only when the notice is insufficient.
 
 Use list to discover existing children and groups. Where available, history reads shared chat, latest 10 entries by default. To ask your parent for help, return a clear final answer; do not message or wait your parent or yourself. Managing existing children does not grant permission to create more.
