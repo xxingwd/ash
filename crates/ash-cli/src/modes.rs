@@ -262,13 +262,8 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
                 write_turn(&completed, &mut stdout, &mut printed_steps)?;
                 println!();
                 print_usage(&completed);
+                setup.control.wait_idle(session.identity().root_id()).await;
                 if let Some(notice) = setup.control.collect_pending(session.identity()).await? {
-                    setup.control.wait_idle(session.identity().root_id()).await;
-                    let notice = setup
-                        .control
-                        .collect_pending(session.identity())
-                        .await?
-                        .unwrap_or(notice);
                     let input = prepare_input(&setup.control, session.identity(), &notice).await?;
                     completion = Box::pin(session.submit(input).await?.wait());
                     continue;
@@ -285,8 +280,8 @@ async fn finish_print(
     control: &ash_collab::AgentControl,
     identity: ash_core::SessionIdentity,
 ) -> Result<()> {
-    let pending = control.pending(identity).await;
     control.close(identity.id()).await;
+    let pending = control.pending(identity).await;
     if let Some(notice) = ash_collab::pending_notice(&pending?) {
         anyhow::bail!("Root turn ended before collaboration was collected.\nSnapshot at turn completion:\n{notice}\nAny running descendants were cancelled during shutdown.");
     }
