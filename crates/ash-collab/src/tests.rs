@@ -375,8 +375,6 @@ async fn stopped_or_replaced_coordinator_can_collect_its_running_descendant() {
                     .as_ref()
                     .is_ok_and(|output| output.text.contains("child complete"))));
         complete(response, "collected existing child");
-        let (_, auto_response) = harness.next().await;
-        complete(auto_response, "automatic child completion");
         assert_eq!(
             harness.receive(agent_wait(coordinator)).await["result"]["message"],
             "collected existing child"

@@ -5,11 +5,9 @@ use crate::{
     store, SubagentEvent, SubagentEventKind, SubagentState,
 };
 use ash_agent::{Agent, AgentSnapshot, Runtime};
-#[cfg(test)]
-use ash_core::ToolOutput;
 use ash_core::{
     define_tool_with_timeout, with_tool_instructions, CancellationToken, SessionId,
-    SessionIdentity, Tool, ToolContext, ToolError, ToolTimeout,
+    SessionIdentity, Tool, ToolContext, ToolError, ToolOutput, ToolTimeout,
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -260,7 +258,7 @@ impl AgentControl {
             )?);
         }
         let weak = self.downgrade();
-        let message = define_tool_with_timeout("message", "Send work to a direct child or register the next same-group member. Running work is interrupted. Completion results are delivered automatically.", ToolTimeout::Disabled,
+        let message = define_tool_with_timeout("message", "Send work to a direct child or register the next same-group member. Running work is interrupted; receive a stopped result with wait before sending more work.", ToolTimeout::Disabled,
             move |ctx, args: MessageArgs| { let weak = weak.clone(); async move { weak.upgrade()?.message(ctx, args).await } })?;
         let instructions = [
             access.coordinates().then_some(include_str!("../prompt.md")),
@@ -277,23 +275,20 @@ impl AgentControl {
         let weak = self.downgrade();
         tools.push(define_tool_with_timeout("list", "List direct child work lines and your own group, or inspect one visible group. Does not receive results.", ToolTimeout::Disabled,
             move |ctx, args: ListArgs| { let weak = weak.clone(); async move { weak.upgrade()?.list(ctx, args).await } })?);
-        #[cfg(test)]
-        {
-            let weak = self.downgrade();
-            let wait = define_tool_with_timeout(
-                "wait",
-                "Test-only synchronization primitive.",
-                ToolTimeout::Disabled,
-                move |ctx, args: WaitArgs| {
-                    let weak = weak.clone();
-                    async move { weak.upgrade()?.wait(ctx, args).await }
-                },
-            )?;
-            tools.push(Arc::new(TestWaitTool {
-                tool: wait,
-                control: self.downgrade(),
-            }));
-        }
+        let weak = self.downgrade();
+        let wait = define_tool_with_timeout(
+            "wait",
+            "Wait until an independent child or an entire owned group stops, then receive its last message, including failure diagnostics. Select exactly one target. Never wait an individual group member.",
+            ToolTimeout::Disabled,
+            move |ctx, args: WaitArgs| {
+                let weak = weak.clone();
+                async move { weak.upgrade()?.wait(ctx, args).await }
+            },
+        )?;
+        tools.push(Arc::new(WaitTool {
+            tool: wait,
+            control: self.downgrade(),
+        }));
         tools.retain(|tool| access.allows(tool.name()));
         Ok(tools)
     }
@@ -1172,39 +1167,10 @@ impl AgentControl {
                 line.unread = true;
                 tracing::error!(%error, "collaboration stopped");
             }
-            let parent_session = if tree.line(&target).execution.is_none() {
-                let owner = match &target {
-                    Target::Agent(id) => tree
-                        .nodes
-                        .get(id)
-                        .and_then(|node| node.identity.parent_id()),
-                    Target::Group(id) => tree.groups.get(id).map(|group| group.owner),
-                };
-                owner.and_then(|id| tree.nodes.get(&id).and_then(|node| node.session.clone()))
-            } else {
-                None
-            };
             if tree.line(&target).execution.is_none() {
                 self.publish(root, completion.sender_id, SubagentState::Idle, tree);
             }
             self.inner.updates.notify_waiters();
-            drop(trees);
-
-            if let Some(session) = parent_session {
-                let target = match target {
-                    Target::Agent(id) => format!("agent {id}"),
-                    Target::Group(id) => format!("group {id}"),
-                };
-                let notice = format!(
-                    "<collaboration_completion>\nTarget: {target}\nStatus: {:?}\nResult: {}\n</collaboration_completion>",
-                    completion.status, completion.message
-                );
-                tokio::spawn(async move {
-                    if let Ok(turn) = session.try_submit(notice) {
-                        let _ = turn.wait().await;
-                    }
-                });
-            }
         })
     }
 
@@ -1381,7 +1347,6 @@ impl AgentControl {
         }
     }
 
-    #[cfg(test)]
     async fn received(
         &self,
         context: ToolContext,
@@ -1488,67 +1453,6 @@ impl AgentControl {
             return Err(store::error("caller is not in this organization"));
         }
         Ok(pending_work(tree, &[identity.id()]))
-    }
-
-    pub async fn collect_pending(
-        &self,
-        identity: SessionIdentity,
-    ) -> Result<Option<String>, ToolError> {
-        self.ensure_tree(identity).await?;
-        let mut trees = self.inner.trees.lock().await;
-        let tree = trees
-            .get_mut(&identity.root_id())
-            .ok_or_else(|| store::error("missing tree"))?;
-        let pending = pending_work(tree, &[identity.id()]);
-        let notice = pending_notice(&pending);
-        let idle = pending
-            .iter()
-            .all(|work| work.state != PendingState::Running);
-        let completion = if idle {
-            pending
-                .iter()
-                .filter_map(|work| {
-                    let result = match &work.target {
-                        PendingTarget::Agent { agent_id } => {
-                            tree.nodes.get(agent_id)?.line.result.as_ref()
-                        }
-                        PendingTarget::Group { group_id } => {
-                            tree.groups.get(group_id)?.line.result.as_ref()
-                        }
-                    };
-                    let result = result?;
-                    Some(format!(
-                        "target: {:?}\nstatus: {:?}\nresult: {}",
-                        work.target, result.status, result.message
-                    ))
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let notice = if completion.is_empty() {
-            notice
-        } else {
-            Some(format!(
-                "<collaboration_completion>\n{}\n</collaboration_completion>",
-                completion.join("\n\n")
-            ))
-        };
-        if notice.is_some() && idle {
-            for node in tree.nodes.values_mut() {
-                if node.identity.parent_id() == Some(identity.id()) && node.line.execution.is_none()
-                {
-                    node.line.unread = false;
-                }
-            }
-            for group in tree.groups.values_mut() {
-                if group.owner == identity.id() && group.line.execution.is_none() {
-                    group.line.unread = false;
-                }
-            }
-            store::save(&self.directory(), identity.root_id(), tree).await?;
-        }
-        Ok(notice)
     }
 
     pub async fn list(&self, context: ToolContext, args: ListArgs) -> Result<String, ToolError> {
@@ -1693,7 +1597,7 @@ impl AgentControl {
         self.wait_idle(root).await;
     }
 
-    pub async fn wait_idle(&self, root: SessionId) {
+    async fn wait_idle(&self, root: SessionId) {
         loop {
             let notified = self.inner.updates.notified();
             tokio::pin!(notified);
@@ -1717,15 +1621,13 @@ impl AgentControl {
     }
 }
 
-#[cfg(test)]
-struct TestWaitTool {
+struct WaitTool {
     tool: Arc<dyn Tool>,
     control: WeakControl,
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
-impl Tool for TestWaitTool {
+impl Tool for WaitTool {
     fn name(&self) -> &str {
         self.tool.name()
     }

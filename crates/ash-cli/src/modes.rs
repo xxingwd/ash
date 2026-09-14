@@ -262,12 +262,6 @@ async fn run_print(setup: AgentSetup, prompt: Option<String>) -> Result<()> {
                 write_turn(&completed, &mut stdout, &mut printed_steps)?;
                 println!();
                 print_usage(&completed);
-                setup.control.wait_idle(session.identity().root_id()).await;
-                if let Some(notice) = setup.control.collect_pending(session.identity()).await? {
-                    let input = prepare_input(&setup.control, session.identity(), &notice).await?;
-                    completion = Box::pin(session.submit(input).await?.wait());
-                    continue;
-                }
                 return finish_print(&setup.control, session.identity()).await;
             }
         }
@@ -280,8 +274,8 @@ async fn finish_print(
     control: &ash_collab::AgentControl,
     identity: ash_core::SessionIdentity,
 ) -> Result<()> {
-    control.close(identity.id()).await;
     let pending = control.pending(identity).await;
+    control.close(identity.id()).await;
     if let Some(notice) = ash_collab::pending_notice(&pending?) {
         anyhow::bail!("Root turn ended before collaboration was collected.\nSnapshot at turn completion:\n{notice}\nAny running descendants were cancelled during shutdown.");
     }
@@ -757,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn print_exit_requires_receipt_and_always_closes_running_descendants() {
-        for state in ["running", "unread"] {
+        for state in ["running", "unread", "received"] {
             let (_directory, control, root) = print_test_control(state == "running");
             let context = ash_core::ToolContext {
                 identity: root,
@@ -785,16 +779,33 @@ mod tests {
             if state != "running" {
                 control.wait(context.clone(), args.clone()).await.unwrap();
             }
+            if state == "received" {
+                let parent = control
+                    .install_root(Agent::new(ModelId::new("test"), Vec::new()))
+                    .unwrap();
+                let wait = parent
+                    .tools()
+                    .iter()
+                    .find(|tool| tool.name() == "wait")
+                    .unwrap();
+                let args = serde_json::to_value(args).unwrap();
+                let output = wait.execute(context.clone(), args.clone()).await.unwrap();
+                wait.committed(context, &args, &output).await.unwrap();
+            }
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 finish_print(&control, root),
             )
             .await
             .unwrap();
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains(&child.to_string()));
-            assert!(error.contains(state));
-            assert!(error.contains("before collaboration was collected"));
+            if state == "received" {
+                assert!(result.is_ok());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&child.to_string()));
+                assert!(error.contains(state));
+                assert!(error.contains("before collaboration was collected"));
+            }
             assert!(control
                 .pending(root)
                 .await

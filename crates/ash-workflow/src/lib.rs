@@ -19,9 +19,11 @@ pub fn manager_input(task: &str, receipt: &str) -> String {
         "The user requested this workflow task:\n{task}\n\n\
          The workflow launcher already created its manager using the agent tool path. \
          Creation receipt:\n{receipt}\n\n\
-         Do not create another manager. The manager owns its groups and receives their completion \
-         notices automatically. If its reply is only a progress update, message this same manager \
-         to continue. Do not treat a submission receipt or a preliminary reply as the completed task."
+         Do not create another manager. Use wait with this manager's agent_id, not group_id. \
+         The manager owns its groups; ask it to collect them rather than querying its groups directly. \
+         If its reply is only a progress update, message this same manager to continue collecting \
+         its results, then wait again. Do not treat a submission receipt or a preliminary reply as \
+         the completed task."
     )
 }
 

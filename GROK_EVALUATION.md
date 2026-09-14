@@ -1,5 +1,28 @@
 # Grok 真实模型验收
 
+## 2026-09-14：撤回自动通知，恢复显式 wait
+
+本节为当前回退后的验收，后文保留历史样本。恢复正式 wait 工具和持久化接收边界，
+删除自动父会话续轮、CLI 自动收集和清除未读路径；workflow 由 AI 按内置角色及 skill 规范推进。
+未重置 Git 历史，profile、组织权限、共享聊天与蓝图创建保持原有设计。
+
+使用重新编译的 `target/debug/ash -m grok --protocol openai-responses --max-context-tokens=500000 run ...`，
+两次受控任务在独立临时工作目录并行运行；沿用当前环境连接配置，未替换已安装的 ash。
+原始输出和会话摘要保存在 `/tmp/ash-wait-rollback-8tgix5pq/`，个人会话与组织记录仍使用默认数据目录。
+
+| 场景 | 实际证据 | 结果 |
+| --- | --- | --- |
+| 单 review 实例两轮复用 | parent 实际调用 agent → message → wait → message → wait；review 两轮均无工具调用 | 39.72 秒，退出 0，最终 `323 352` |
+| 两组计算 / 复核及两层接收 | manager 调用 skill → workflow → message → message → wait → wait；两名 explore 各 message 接力，两个 reviewer 各 history；root 仅 wait manager | 98.91 秒，退出 0，最终 `391`、`403`、总和 `794` |
+
+逐条核对 JSONL：管理者等待两个 group_id，外层等待管理者 agent_id，无工具错误；
+两棵组织树最终均为 running=0、unread=0。每组公共聊天包含登记后继及两名成员的完成记录。
+这次验证真实接收结果和父级汇总，不以“自动开启了下一轮”或单独退出码判断通过。
+
+全 workspace 498 项测试、rustfmt 检查、Clippy（警告视为错误）、diff 检查通过。
+CLI 测试重新包含 received 正常退出分支；生产与测试不再安装不同的 wait 工具。
+以上是两个最小受控样本，不代表复杂编码工作流稳定成功；TUI 长时间等待和复杂业务仍需后续采样。
+
 日期：2026-09-10。使用当前环境配置的 `grok` 模型别名与 OpenAI Responses 协议；不推断别名对应的供应商版本。
 
 首轮执行 11 类场景、17 次真实模型 CLI 运行（含复测），不是 17 次底层 API 请求。首轮最后一次双组复测通过，前序失败仍保留。

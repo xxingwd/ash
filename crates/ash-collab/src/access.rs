@@ -9,8 +9,9 @@ pub(crate) enum Access {
     },
 }
 
-pub(crate) const COLLAB_TOOLS: &[&str] =
-    &["agent", "group", "workflow", "message", "history", "list"];
+pub(crate) const COLLAB_TOOLS: &[&str] = &[
+    "agent", "group", "workflow", "message", "wait", "history", "list",
+];
 
 impl Access {
     pub(crate) fn member(self) -> bool {
@@ -32,7 +33,6 @@ impl Access {
             "agent" | "group" => self == Self::Root,
             "workflow" => self == Self::Manager,
             "message" | "list" => self.coordinates() || self.member(),
-            #[cfg(test)]
             "wait" => self.coordinates(),
             "history" => {
                 matches!(

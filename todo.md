@@ -422,3 +422,13 @@ System 只组合三类来源：**显式定义的提示词 + 已安装工具注�
 - [ ] 在新工具 / 提示词范围下重测复杂订单、多组集成及 reviewer 会话复用；不能用最小成功样本宣称稳定完成率。
 - [x] 再次真实复测权限和两层 wait：leaf 能力保持收紧；Workflow 的 group wait 已返回且组已读，但 manager 尚未结束，parent 未继续 wait manager，根收尾以退出码1正确报告，见 `GROK_EVALUATION.md` 追加章节。
 - [ ] 补 Workflow manager → parent 的最小重复样本：区分“group 已完成、manager 仍在处理 wait 结果”和“manager 已最终结束”；不自动转发 group 结果或续跑 manager。
+
+### 2026-09-14：恢复显式 wait
+
+- [x] 生产和测试使用相同的正式 wait 工具；移除 test-only 安装，普通叶子仍不获得协作工具。
+- [x] 撤下自动父会话续轮、CLI 自动收集和隐式清除未读结果；wait 工具结果提交后才确认接收。
+- [x] 协作提示词、Workflow 角色、内置 skill、启动器输入和 pending 诊断统一为显式接收。
+- [x] Workflow 规范：先派发独立工作线 → wait 独立 child / 整组 → 检查失败或求助 → 决定继续、重试或汇总；外层 parent 只 wait 管理者。
+- [x] 恢复 CLI 接收成功后的正常退出测试；保留未接收收尾诊断、取消、串行接力、并行组、持久化与旧回执隔离测试。
+- [x] 全量 498 项测试、格式、Clippy 通过；Grok 实测同一 review 两轮复用及双组两层 wait 均闭环，最终 running=0、unread=0，证据见 `GROK_EVALUATION.md` 最新章节。
+- [ ] 对复杂业务继续采样；最小受控案例不能替代稳定性验收，遗漏 wait 时仍报告 pending。

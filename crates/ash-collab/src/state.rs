@@ -215,7 +215,7 @@ pub fn pending_notice(pending: &[PendingWork]) -> Option<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Some(format!("Uncollected collaboration work:\n{details}\nA running target may still be working or waiting; this snapshot does not imply a deadlock. Completion results are delivered automatically when the owner continues."))
+    Some(format!("Uncollected collaboration work:\n{details}\nEach owner must receive its work with wait. A running target may still be working or waiting; this snapshot does not imply a deadlock."))
 }
 
 impl Tree {
